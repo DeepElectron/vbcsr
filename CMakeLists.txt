@@ -41,6 +41,20 @@ if(NOT pybind11_FOUND)
 endif()
 
 # Source files
+# Create the interface library for C++ core
+add_library(vbcsr INTERFACE)
+add_library(vbcsr::vbcsr ALIAS vbcsr)
+
+# Link dependencies
+target_link_libraries(vbcsr INTERFACE MPI::MPI_CXX OpenMP::OpenMP_CXX ${BLAS_LIBRARIES})
+
+# Include directories
+target_include_directories(vbcsr INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/vbcsr/core>
+    $<INSTALL_INTERFACE:include>
+)
+
+# Source files for Python binding
 set(SOURCES
     vbcsr/pybind_vbcsr.cpp
 )
@@ -48,11 +62,50 @@ set(SOURCES
 # Create the extension module
 pybind11_add_module(vbcsr_core ${SOURCES})
 
-# Link libraries
-target_link_libraries(vbcsr_core PRIVATE MPI::MPI_CXX OpenMP::OpenMP_CXX ${BLAS_LIBRARIES})
+# Link libraries for Python binding
+target_link_libraries(vbcsr_core PRIVATE vbcsr)
 
-# Include directories
-target_include_directories(vbcsr_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vbcsr/core)
+# Install rules
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 
-# Install rule (optional, but good for pip install)
+# Install headers
+install(DIRECTORY vbcsr/core/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/vbcsr)
+
+# Install the library target
+install(TARGETS vbcsr
+    EXPORT vbcsrTargets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+# Install the Python extension (optional, but good for pip install)
 install(TARGETS vbcsr_core DESTINATION .)
+
+# Export targets
+install(EXPORT vbcsrTargets
+    FILE vbcsrTargets.cmake
+    NAMESPACE vbcsr::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/vbcsr
+)
+
+# Create and install config files
+set(CVERSION "0.1.0") # Set version as needed
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/vbcsrConfigVersion.cmake"
+    VERSION ${CVERSION}
+    COMPATIBILITY AnyNewerVersion
+)
+
+configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/vbcsrConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/vbcsrConfig.cmake"
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/vbcsr
+)
+
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/vbcsrConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/vbcsrConfigVersion.cmake"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/vbcsr
+)
