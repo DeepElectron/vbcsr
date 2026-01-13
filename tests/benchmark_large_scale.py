@@ -31,7 +31,15 @@ def main():
     parser.add_argument("--density", type=float, default=0.01, help="Sparsity density")
     parser.add_argument("--complex", action="store_true", help="Use complex numbers")
     parser.add_argument("--scipy", action="store_true", help="Compare with SciPy (Serial only)")
+    parser.add_argument("--mkl", action="store_true", help="Compare with MKL (Serial only)")
     args = parser.parse_args()
+
+    if args.mkl:
+        try:
+            import sparse_dot_mkl
+        except ImportError:
+            print("Error: sparse_dot_mkl not found. Please install it to use --mkl.")
+            return
 
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
@@ -71,13 +79,13 @@ def main():
     mat = vbcsr.VBCSR.create_distributed(comm, owned_indices, my_block_sizes, my_adj, dtype)
     
     # Generate data and fill
-    # We also collect data for SciPy if needed
+    # We also collect data for SciPy/MKL if needed
     scipy_rows = []
     scipy_cols = []
     scipy_data = []
     
-    # Pre-calculate offsets for SciPy
-    if args.scipy and rank == 0:
+    # Pre-calculate offsets for SciPy/MKL
+    if (args.scipy or args.mkl) and rank == 0:
         row_offsets = np.zeros(args.blocks + 1, dtype=int)
         np.cumsum(block_sizes, out=row_offsets[1:])
     
@@ -89,11 +97,11 @@ def main():
         
         # Row offset for this block
         r_start = 0
-        if args.scipy:
-            # This is slow for distributed, but we assume --scipy is used mostly in serial
+        if args.scipy or args.mkl:
+            # This is slow for distributed, but we assume --scipy/--mkl is used mostly in serial
             # or we only collect on rank 0. 
             # Actually, constructing SciPy matrix in parallel is hard.
-            # We will only support SciPy comparison in serial (size=1).
+            # We will only support SciPy/MKL comparison in serial (size=1).
             if size == 1:
                 r_start = row_offsets[global_i]
 
@@ -106,7 +114,7 @@ def main():
             
             mat.add_block(global_i, global_j, data)
             
-            if args.scipy and size == 1:
+            if (args.scipy or args.mkl) and size == 1:
                 c_start = row_offsets[global_j]
                 # Expand block to COO
                 # This is heavy loop in python, might be slow for generation
@@ -144,8 +152,10 @@ def main():
     if rank == 0:
         print(f"VBCSR Average SpMV Time: {t_vbcsr:.6f} s ({n_iter} iterations)")
 
-    # SciPy Comparison
-    if args.scipy and size == 1:
+    # SciPy/MKL Matrix Construction
+    sp_mat = None
+    v_np = None
+    if (args.scipy or args.mkl) and size == 1:
         print("Building SciPy CSR...", flush=True)
         t0 = time.perf_counter()
         # Flatten lists
@@ -160,7 +170,9 @@ def main():
         print(f"SciPy Generation Time: {t_sp_gen:.4f} s")
         
         v_np = v.to_numpy()
-        
+
+    # SciPy Comparison
+    if args.scipy and size == 1:
         print("Benchmarking SciPy SpMV...", flush=True)
         t_start = time.perf_counter()
         n_iter_sp = 0
@@ -176,7 +188,32 @@ def main():
         res = mat.mult(v)
         res_sp = sp_mat.dot(v_np)
         diff = np.linalg.norm(res.to_numpy() - res_sp) / np.linalg.norm(res_sp)
-        print(f"Relative Difference: {diff:.2e}")
+        print(f"Relative Difference (SciPy): {diff:.2e}")
+
+    # MKL Comparison
+    if args.mkl and size == 1:
+        print("Benchmarking MKL SpMV...", flush=True)
+        
+        # Ensure matrix is in CSR format and sorted indices for MKL if needed, 
+        # but sparse_dot_mkl handles CSR.
+        # sparse_dot_mkl might need float32 or float64 specifically, check support.
+        # It supports float32, float64, complex64, complex128.
+        
+        t_start = time.perf_counter()
+        n_iter_mkl = 0
+        while time.perf_counter() - t_start < 1.0 or n_iter_mkl < 10:
+            sparse_dot_mkl.dot_product_mkl(sp_mat, v_np)
+            n_iter_mkl += 1
+        t_mkl = (time.perf_counter() - t_start) / n_iter_mkl
+        print(f"MKL Average SpMV Time: {t_mkl:.6f} s ({n_iter_mkl} iterations)")
+        
+        print(f"Speedup (MKL / VBCSR): {t_mkl / t_vbcsr:.2f}x")
+        
+        # Verify correctness
+        res = mat.mult(v)
+        res_mkl = sparse_dot_mkl.dot_product_mkl(sp_mat, v_np)
+        diff = np.linalg.norm(res.to_numpy() - res_mkl) / np.linalg.norm(res_mkl)
+        print(f"Relative Difference (MKL): {diff:.2e}")
 
 if __name__ == "__main__":
     main()
