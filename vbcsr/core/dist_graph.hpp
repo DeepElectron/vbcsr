@@ -32,8 +32,9 @@ public:
     std::vector<int> block_sizes;
     
     // Adjacency list for the block graph (local rows to column blocks)
-    // Indices in adj_list are LOCAL indices
-    std::vector<std::vector<int>> adj_list;
+    // Indices in adj_ind are LOCAL indices
+    std::vector<int> adj_ptr;
+    std::vector<int> adj_ind;
 
     // Communication pattern
     std::vector<int> send_counts;
@@ -78,7 +79,8 @@ public:
         ghost_global_indices = other.ghost_global_indices;
         global_to_local = other.global_to_local;
         block_sizes = other.block_sizes;
-        adj_list = other.adj_list;
+        adj_ptr = other.adj_ptr;
+        adj_ind = other.adj_ind;
         send_counts = other.send_counts;
         recv_counts = other.recv_counts;
         send_indices = other.send_indices;
@@ -194,7 +196,8 @@ public:
         // 3. Build local graph and identify ghosts
         global_to_local.clear();
         block_sizes.clear();
-        adj_list.clear();
+        adj_ptr.clear();
+        adj_ind.clear();
         ghost_global_indices.clear();
 
         // 3.1 Add owned blocks
@@ -240,16 +243,21 @@ public:
         }
         
         // 3.3 Build adjacency list
-        adj_list.resize(n_owned);
+        adj_ptr.resize(n_owned + 1);
+        adj_ptr[0] = 0;
+        adj_ind.clear();
         for (int i = 0; i < n_owned; ++i) {
             int gid = owned_global_indices[i];
             int start = adj_offsets[gid];
             int end = adj_offsets[gid+1];
             
+            std::vector<int> row_cols;
             for (int k = start; k < end; ++k) {
-                int neighbor_gid = flat_adj[k];
-                adj_list[i].push_back(global_to_local[neighbor_gid]);
+                row_cols.push_back(global_to_local[flat_adj[k]]);
             }
+            std::sort(row_cols.begin(), row_cols.end());
+            adj_ind.insert(adj_ind.end(), row_cols.begin(), row_cols.end());
+            adj_ptr[i+1] = adj_ind.size();
         }
         
         // 4. Build communication pattern
@@ -277,7 +285,8 @@ public:
         // Let's build the local graph
         global_to_local.clear();
         block_sizes.clear();
-        adj_list.clear();
+        adj_ptr.clear();
+        adj_ind.clear();
         ghost_global_indices.clear();
 
         // Add owned
@@ -319,11 +328,17 @@ public:
         }
         
         // Build adjacency list
-        adj_list.resize(n_owned);
+        adj_ptr.resize(n_owned + 1);
+        adj_ptr[0] = 0;
+        adj_ind.clear();
         for (int i = 0; i < n_owned; ++i) {
+            std::vector<int> row_cols;
             for (int neighbor_gid : my_adj[i]) {
-                adj_list[i].push_back(global_to_local[neighbor_gid]);
+                row_cols.push_back(global_to_local[neighbor_gid]);
             }
+            std::sort(row_cols.begin(), row_cols.end());
+            adj_ind.insert(adj_ind.end(), row_cols.begin(), row_cols.end());
+            adj_ptr[i+1] = adj_ind.size();
         }
         
         // Fetch ghost block sizes
@@ -333,20 +348,9 @@ public:
         build_comm_pattern(displ);
     }
 
-    void get_matrix_structure(std::vector<int>& row_ptr, std::vector<int>& col_ind) {
-        int n_owned = owned_global_indices.size();
-        row_ptr.resize(n_owned + 1);
-        row_ptr[0] = 0;
-        col_ind.clear();
-        
-        for (int i = 0; i < n_owned; ++i) {
-            // Sort column indices for CSR
-            std::vector<int> cols = adj_list[i];
-            std::sort(cols.begin(), cols.end());
-            
-            col_ind.insert(col_ind.end(), cols.begin(), cols.end());
-            row_ptr[i+1] = col_ind.size();
-        }
+    void get_matrix_structure(std::vector<int>& row_ptr, std::vector<int>& col_ind) const {
+        row_ptr = adj_ptr;
+        col_ind = adj_ind;
     }
     
     void get_vector_structure(int& local_size, int& ghost_size) {

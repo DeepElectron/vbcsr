@@ -310,37 +310,18 @@ public:
     void assemble() {
         int size = graph->size;
         
-        // 1. Pack buffers
-        // Protocol: g_row(int), g_col(int), rows(int), cols(int), mode(int), data(T...)
-        // Data is always ColMajor in the protocol
-        std::vector<std::vector<char>> send_bufs(size);
-        
-        for (auto& kv : remote_blocks) {
+        // 1. Counting pass
+        std::vector<int> send_counts(size, 0);
+        for (const auto& kv : remote_blocks) {
             int target = kv.first;
-            auto& blocks_map = kv.second;
-            for (auto& inner_kv : blocks_map) {
-                auto& blk = inner_kv.second;
-                size_t current_size = send_bufs[target].size();
-                size_t data_bytes = blk.data.size() * sizeof(T);
-                size_t packet_size = 4 * sizeof(int) + sizeof(int) + data_bytes;
-                
-                send_bufs[target].resize(current_size + packet_size);
-                char* ptr = send_bufs[target].data() + current_size;
-                
-                std::memcpy(ptr, &blk.g_row, sizeof(int)); ptr += sizeof(int);
-                std::memcpy(ptr, &blk.g_col, sizeof(int)); ptr += sizeof(int);
-                std::memcpy(ptr, &blk.rows, sizeof(int)); ptr += sizeof(int);
-                std::memcpy(ptr, &blk.cols, sizeof(int)); ptr += sizeof(int);
-                int mode_int = static_cast<int>(blk.mode);
-                std::memcpy(ptr, &mode_int, sizeof(int)); ptr += sizeof(int);
-                std::memcpy(ptr, blk.data.data(), data_bytes);
+            size_t bytes = 0;
+            for (const auto& inner_kv : kv.second) {
+                bytes += 5 * sizeof(int) + inner_kv.second.data.size() * sizeof(T);
             }
+            send_counts[target] = static_cast<int>(bytes);
         }
         
-        // 2. Exchange
-        std::vector<int> send_counts(size);
-        for(int i=0; i<size; ++i) send_counts[i] = send_bufs[i].size();
-        
+        // 2. Exchange counts and setup displacements
         std::vector<int> recv_counts(size);
         MPI_Alltoall(send_counts.data(), 1, MPI_INT, recv_counts.data(), 1, MPI_INT, graph->comm);
         
@@ -350,16 +331,31 @@ public:
             rdispls[i+1] = rdispls[i] + recv_counts[i];
         }
         
+        // 3. Pack flat buffer
         std::vector<char> send_blob(sdispls[size]);
-        for(int i=0; i<size; ++i) {
-            std::memcpy(send_blob.data() + sdispls[i], send_bufs[i].data(), send_counts[i]);
+        for (auto& kv : remote_blocks) {
+            int target = kv.first;
+            char* ptr = send_blob.data() + sdispls[target];
+            for (auto& inner_kv : kv.second) {
+                auto& blk = inner_kv.second;
+                size_t data_bytes = blk.data.size() * sizeof(T);
+                
+                std::memcpy(ptr, &blk.g_row, sizeof(int)); ptr += sizeof(int);
+                std::memcpy(ptr, &blk.g_col, sizeof(int)); ptr += sizeof(int);
+                std::memcpy(ptr, &blk.rows, sizeof(int)); ptr += sizeof(int);
+                std::memcpy(ptr, &blk.cols, sizeof(int)); ptr += sizeof(int);
+                int mode_int = static_cast<int>(blk.mode);
+                std::memcpy(ptr, &mode_int, sizeof(int)); ptr += sizeof(int);
+                std::memcpy(ptr, blk.data.data(), data_bytes); ptr += data_bytes;
+            }
         }
         
+        // 4. Exchange data
         std::vector<char> recv_blob(rdispls[size]);
         MPI_Alltoallv(send_blob.data(), send_counts.data(), sdispls.data(), MPI_BYTE,
                       recv_blob.data(), recv_counts.data(), rdispls.data(), MPI_BYTE, graph->comm);
-                      
-        // 3. Process received
+                  
+        // 5. Process received
         for(int i=0; i<size; ++i) {
             char* ptr = recv_blob.data() + rdispls[i];
             char* end = recv_blob.data() + rdispls[i+1];
@@ -376,18 +372,16 @@ public:
                 if (graph->global_to_local.find(g_row) == graph->global_to_local.end()) {
                      throw std::runtime_error("Received block for non-owned row");
                 }
-                int l_row = graph->global_to_local[g_row];
+                int l_row = graph->global_to_local.at(g_row);
                 
-                if (graph->global_to_local.find(g_col) == graph->global_to_local.end()) {
-                     throw std::runtime_error("Received block for unknown col");
+                int l_col = -1;
+                if (graph->global_to_local.count(g_col)) {
+                    l_col = graph->global_to_local.at(g_col);
                 }
-                int l_col = graph->global_to_local[g_col];
                 
                 size_t data_bytes = rows * cols * sizeof(T);
                 
-                // Update local block
-                // Received data is ColMajor (from protocol)
-                if (!update_local_block(l_row, l_col, (const T*)ptr, rows, cols, mode, MatrixLayout::ColMajor)) {
+                if (l_col == -1 || !update_local_block(l_row, l_col, (const T*)ptr, rows, cols, mode, MatrixLayout::ColMajor)) {
                     throw std::runtime_error("Received block not in graph");
                 }
                 
@@ -889,64 +883,37 @@ public:
     }
 
     BlockSpMat transpose() const {
-        // 1. Count blocks to send to each rank
         int size = graph->size;
         int rank = graph->rank;
         
-        std::vector<std::vector<int>> send_reqs(size); // row, col, r_dim, c_dim
-        std::vector<std::vector<T>> send_data(size);
+        // 1. Counting pass
+        std::vector<int> send_counts(size, 0);
+        std::vector<int> send_data_counts(size, 0);
         
         int n_rows = row_ptr.size() - 1;
         for (int i = 0; i < n_rows; ++i) {
-            int g_row = graph->owned_global_indices[i];
             int start = row_ptr[i];
             int end = row_ptr[i+1];
-            
+            int r_dim = graph->block_sizes[i];
             for (int k = start; k < end; ++k) {
                 int g_col = graph->get_global_index(col_ind[k]);
                 int owner = graph->find_owner(g_col);
+                int c_dim = graph->block_sizes[col_ind[k]];
                 
-                // We are sending A_ij. Target is C_ji.
-                // Target row is g_col. Target col is g_row.
-                // Owner of g_col needs to receive this.
-                
-                int r_dim = graph->block_sizes[i];
-                int c_dim = graph->block_sizes[col_ind[k]]; // local col index for size
-                
-                // Pack metadata: target_row (g_col), target_col (g_row), r_dim (of A_ij -> c_dim of C_ji), c_dim (of A_ij -> r_dim of C_ji)
-                // Wait, A_ij is r_dim x c_dim.
-                // C_ji is c_dim x r_dim.
-                // We send A_ij data. Receiver will transpose it.
-                
-                send_reqs[owner].push_back(g_col);
-                send_reqs[owner].push_back(g_row);
-                send_reqs[owner].push_back(c_dim); // New r_dim
-                send_reqs[owner].push_back(r_dim); // New c_dim
-                
-                size_t offset = blk_ptr[k];
-                size_t count = r_dim * c_dim;
-                const T* ptr = val.data() + offset;
-                send_data[owner].insert(send_data[owner].end(), ptr, ptr + count);
+                send_counts[owner] += 4; // g_row, g_col, r_dim, c_dim
+                send_data_counts[owner] += r_dim * c_dim;
             }
         }
         
         // 2. Exchange counts
-        std::vector<int> send_counts(size);
-        std::vector<int> send_data_counts(size);
-        for(int i=0; i<size; ++i) {
-            send_counts[i] = send_reqs[i].size();
-            send_data_counts[i] = send_data[i].size();
-        }
-        
         std::vector<int> recv_counts(size);
         std::vector<int> recv_data_counts(size);
         MPI_Alltoall(send_counts.data(), 1, MPI_INT, recv_counts.data(), 1, MPI_INT, graph->comm);
         MPI_Alltoall(send_data_counts.data(), 1, MPI_INT, recv_data_counts.data(), 1, MPI_INT, graph->comm);
         
-        // 3. Exchange data
+        // 3. Setup displacements
         std::vector<int> sdispls(size + 1, 0), rdispls(size + 1, 0);
         std::vector<int> sdispls_data(size + 1, 0), rdispls_data(size + 1, 0);
-        
         for(int i=0; i<size; ++i) {
             sdispls[i+1] = sdispls[i] + send_counts[i];
             rdispls[i+1] = rdispls[i] + recv_counts[i];
@@ -954,122 +921,108 @@ public:
             rdispls_data[i+1] = rdispls_data[i] + recv_data_counts[i];
         }
         
+        // 4. Pack flat buffers
         std::vector<int> send_buf(sdispls[size]);
-        for(int i=0; i<size; ++i) {
-            if (send_counts[i] > 0)
-                std::memcpy(send_buf.data() + sdispls[i], send_reqs[i].data(), send_counts[i] * sizeof(int));
+        std::vector<T> send_val(sdispls_data[size]);
+        std::vector<int> current_counts(size, 0);
+        std::vector<int> current_data_counts(size, 0);
+        
+        for (int i = 0; i < n_rows; ++i) {
+            int g_row = graph->owned_global_indices[i];
+            int start = row_ptr[i];
+            int end = row_ptr[i+1];
+            int r_dim = graph->block_sizes[i];
+            for (int k = start; k < end; ++k) {
+                int g_col = graph->get_global_index(col_ind[k]);
+                int owner = graph->find_owner(g_col);
+                int c_dim = graph->block_sizes[col_ind[k]];
+                
+                int* meta_ptr = send_buf.data() + sdispls[owner] + current_counts[owner];
+                meta_ptr[0] = g_col;
+                meta_ptr[1] = g_row;
+                meta_ptr[2] = c_dim;
+                meta_ptr[3] = r_dim;
+                current_counts[owner] += 4;
+                
+                size_t offset = blk_ptr[k];
+                size_t count = r_dim * c_dim;
+                std::memcpy(send_val.data() + sdispls_data[owner] + current_data_counts[owner], val.data() + offset, count * sizeof(T));
+                current_data_counts[owner] += count;
+            }
         }
         
+        // 5. Exchange data
         std::vector<int> recv_buf(rdispls[size]);
         MPI_Alltoallv(send_buf.data(), send_counts.data(), sdispls.data(), MPI_INT,
                       recv_buf.data(), recv_counts.data(), rdispls.data(), MPI_INT, graph->comm);
                       
-        std::vector<T> send_val(sdispls_data[size]);
-        for(int i=0; i<size; ++i) {
-             if (send_data_counts[i] > 0)
-                std::memcpy(send_val.data() + sdispls_data[i], send_data[i].data(), send_data_counts[i] * sizeof(T));
-        }
-        
-        // Convert counts to bytes for MPI_BYTE
-        for(int i=0; i<size; ++i) {
-            send_data_counts[i] *= sizeof(T);
-            recv_data_counts[i] *= sizeof(T);
-            sdispls_data[i] *= sizeof(T);
-            rdispls_data[i] *= sizeof(T);
-        }
-        sdispls_data[size] *= sizeof(T);
-        rdispls_data[size] *= sizeof(T);
-        
         std::vector<T> recv_val(rdispls_data[size]);
-        MPI_Alltoallv(send_val.data(), send_data_counts.data(), sdispls_data.data(), MPI_BYTE,
-                      recv_val.data(), recv_data_counts.data(), rdispls_data.data(), MPI_BYTE, graph->comm);
+        std::vector<int> send_data_bytes(size), recv_data_bytes(size), sdispls_data_bytes(size + 1), rdispls_data_bytes(size + 1);
+        for(int i=0; i<size; ++i) {
+            send_data_bytes[i] = send_data_counts[i] * sizeof(T);
+            recv_data_bytes[i] = recv_data_counts[i] * sizeof(T);
+            sdispls_data_bytes[i] = sdispls_data[i] * sizeof(T);
+            rdispls_data_bytes[i] = rdispls_data[i] * sizeof(T);
+        }
+        sdispls_data_bytes[size] = sdispls_data[size] * sizeof(T);
+        rdispls_data_bytes[size] = rdispls_data[size] * sizeof(T);
+
+        MPI_Alltoallv(send_val.data(), send_data_bytes.data(), sdispls_data_bytes.data(), MPI_BYTE,
+                      recv_val.data(), recv_data_bytes.data(), rdispls_data_bytes.data(), MPI_BYTE, graph->comm);
                       
-        // 4. Construct C
-        // Build adjacency for C
+        // 6. Construct C
         std::vector<std::vector<int>> my_adj(graph->owned_global_indices.size());
-        
         int* ptr = recv_buf.data();
         for(int i=0; i<size; ++i) {
             int count = recv_counts[i];
             int* end = ptr + count;
             while(ptr < end) {
-                int g_row = *ptr++; // C's row (owned by me)
+                int g_row = *ptr++; // C's row
                 int g_col = *ptr++; // C's col
-                int r_dim = *ptr++;
-                int c_dim = *ptr++;
+                ptr += 2; // Skip dims
                 
-                // Add to adjacency
                 if (graph->global_to_local.count(g_row)) {
                     int l_row = graph->global_to_local.at(g_row);
-                    if (l_row < (int)my_adj.size()) {
-                        my_adj[l_row].push_back(g_col);
-                    }
+                    my_adj[l_row].push_back(g_col);
                 }
             }
         }
         
-        // Unique adjacency
         for(auto& neighbors : my_adj) {
             std::sort(neighbors.begin(), neighbors.end());
             neighbors.erase(std::unique(neighbors.begin(), neighbors.end()), neighbors.end());
         }
         
-        // Create new graph
         DistGraph* graph_C = new DistGraph(graph->comm);
         graph_C->construct_distributed(graph->owned_global_indices, graph->block_sizes, my_adj);
         
         BlockSpMat C(graph_C);
         C.owns_graph = true;
         
-        // 5. Unpack and Insert
+        // 7. Unpack and Insert
         ptr = recv_buf.data();
         T* val_ptr = recv_val.data();
-        
         for(int i=0; i<size; ++i) {
             int count = recv_counts[i];
             int* end = ptr + count;
-            
             while(ptr < end) {
-                int g_row = *ptr++; // This is C's row (was A's col)
-                int g_col = *ptr++; // This is C's col (was A's row)
-                int r_dim = *ptr++; // C's r_dim
-                int c_dim = *ptr++; // C's c_dim
-                
+                int g_row = *ptr++; 
+                int g_col = *ptr++; 
+                int r_dim = *ptr++; 
+                int c_dim = *ptr++; 
                 int n_elem = r_dim * c_dim;
                 
-                // Transpose the block data
-                // A_ij was r_dim_A x c_dim_A (ColMajor)
-                // We received it as is.
-                // We want C_ji which is c_dim_A x r_dim_A (ColMajor).
-                // C_ji(r, c) = A_ij(c, r).
-                // A_ij flat index for (c, r) is c * r_dim_A + r? No, ColMajor: r + c * r_dim_A.
-                // C_ji flat index for (r, c) is r + c * r_dim_C.
-                // r_dim_C = c_dim_A.
-                // So C_ji(r, c) = A_ij(c, r).
-                
                 std::vector<T> block(n_elem);
-                // Transpose kernel
-                // A_data is r_dim_A x c_dim_A (ColMajor).
-                // We want C_data = A_data^T.
-                // r_dim_A = c_dim (of C). c_dim_A = r_dim (of C).
-                
                 int rows_A = c_dim; 
                 int cols_A = r_dim;
-                
                 for(int c=0; c<cols_A; ++c) {
                     for(int r=0; r<rows_A; ++r) {
-                        // A(r,c) -> C(c,r)
-                        // A index: r + c * rows_A
-                        // C index: c + r * cols_A (which is c + r * r_dim)
-                        
                         T val = val_ptr[r + c * rows_A];
                         val = ConjHelper<T>::apply(val);
                         block[c + r * r_dim] = val;
                     }
                 }
-                
                 C.add_block(g_row, g_col, block.data(), r_dim, c_dim, AssemblyMode::ADD);
-                
                 val_ptr += n_elem;
             }
         }
@@ -1187,110 +1140,110 @@ private:
         }
 
         // 2. Prepare requests
-        std::vector<std::vector<int>> send_reqs(size);
+        std::vector<int> send_req_counts(size, 0);
         for (int global_row : needed_rows) {
-            int owner = graph->find_owner(global_row);
-            send_reqs[owner].push_back(global_row);
+            send_req_counts[graph->find_owner(global_row)]++;
         }
 
-        // 3. Exchange requests
-        std::vector<int> send_counts(size);
-        for(int i=0; i<size; ++i) send_counts[i] = send_reqs[i].size();
-        std::vector<int> recv_counts(size);
-        MPI_Alltoall(send_counts.data(), 1, MPI_INT, recv_counts.data(), 1, MPI_INT, graph->comm);
+        // 3. Exchange counts and setup displacements
+        std::vector<int> recv_req_counts(size);
+        MPI_Alltoall(send_req_counts.data(), 1, MPI_INT, recv_req_counts.data(), 1, MPI_INT, graph->comm);
 
         std::vector<int> sdispls(size + 1, 0), rdispls(size + 1, 0);
         for(int i=0; i<size; ++i) {
-            sdispls[i+1] = sdispls[i] + send_counts[i];
-            rdispls[i+1] = rdispls[i] + recv_counts[i];
+            sdispls[i+1] = sdispls[i] + send_req_counts[i];
+            rdispls[i+1] = rdispls[i] + recv_req_counts[i];
         }
 
-        std::vector<int> send_buf(sdispls[size]);
-        for(int i=0; i<size; ++i) {
-            std::memcpy(send_buf.data() + sdispls[i], send_reqs[i].data(), send_counts[i] * sizeof(int));
+        // 4. Pack request buffer
+        std::vector<int> send_req_buf(sdispls[size]);
+        std::vector<int> current_req_counts(size, 0);
+        for (int global_row : needed_rows) {
+            int owner = graph->find_owner(global_row);
+            send_req_buf[sdispls[owner] + current_req_counts[owner]++] = global_row;
         }
 
-        std::vector<int> recv_buf(rdispls[size]);
-        MPI_Alltoallv(send_buf.data(), send_counts.data(), sdispls.data(), MPI_INT,
-                      recv_buf.data(), recv_counts.data(), rdispls.data(), MPI_INT, graph->comm);
+        std::vector<int> recv_req_buf(rdispls[size]);
+        MPI_Alltoallv(send_req_buf.data(), send_req_counts.data(), sdispls.data(), MPI_INT,
+                      recv_req_buf.data(), recv_req_counts.data(), rdispls.data(), MPI_INT, graph->comm);
 
-        // 4. Process requests and prepare replies
+        // 5. Counting pass for replies
         std::vector<double> B_norms = B.compute_block_norms();
-        std::vector<std::vector<char>> send_replies(size);
-
+        std::vector<int> send_reply_bytes(size, 0);
+        int* ptr = recv_req_buf.data();
         for(int i=0; i<size; ++i) {
-            int* ptr = recv_buf.data() + rdispls[i];
-            int* end = recv_buf.data() + rdispls[i+1];
+            int count = recv_req_counts[i];
+            int* end = ptr + count;
             while(ptr < end) {
                 int global_row = *ptr++;
-                if (graph->global_to_local.find(global_row) == graph->global_to_local.end()) {
-                    continue; 
-                }
-                int local_row = graph->global_to_local.at(global_row);
-                
-                int start = B.row_ptr[local_row];
-                int end_row = B.row_ptr[local_row+1];
-                int n_blocks = end_row - start;
-                
-                size_t packet_size = 2 * sizeof(int) + n_blocks * (sizeof(int) + sizeof(double));
-                size_t current_size = send_replies[i].size();
-                send_replies[i].resize(current_size + packet_size);
-                char* buf = send_replies[i].data() + current_size;
-                
-                std::memcpy(buf, &global_row, sizeof(int)); buf += sizeof(int);
-                std::memcpy(buf, &n_blocks, sizeof(int)); buf += sizeof(int);
-                
-                for(int k=start; k<end_row; ++k) {
-                    int col = B.graph->get_global_index(B.col_ind[k]);
-                    double norm = B_norms[k];
-                    std::memcpy(buf, &col, sizeof(int)); buf += sizeof(int);
-                    std::memcpy(buf, &norm, sizeof(double)); buf += sizeof(double);
+                if (graph->global_to_local.count(global_row)) {
+                    int local_row = graph->global_to_local.at(global_row);
+                    int n_blocks = B.row_ptr[local_row+1] - B.row_ptr[local_row];
+                    send_reply_bytes[i] += 2 * sizeof(int) + n_blocks * (sizeof(int) + sizeof(double));
                 }
             }
         }
 
-        // 5. Exchange replies
-        std::vector<int> send_bytes(size);
-        for(int i=0; i<size; ++i) send_bytes[i] = send_replies[i].size();
-        std::vector<int> recv_bytes(size);
-        MPI_Alltoall(send_bytes.data(), 1, MPI_INT, recv_bytes.data(), 1, MPI_INT, graph->comm);
-        
-        std::vector<int> sdispls_bytes(size + 1, 0), rdispls_bytes(size + 1, 0);
-        for(int i=0; i<size; ++i) {
-            sdispls_bytes[i+1] = sdispls_bytes[i] + send_bytes[i];
-            rdispls_bytes[i+1] = rdispls_bytes[i] + recv_bytes[i];
-        }
-        
-        std::vector<char> send_blob(sdispls_bytes[size]);
-        for(int i=0; i<size; ++i) {
-             std::memcpy(send_blob.data() + sdispls_bytes[i], send_replies[i].data(), send_bytes[i]);
-        }
-        
-        std::vector<char> recv_blob(rdispls_bytes[size]);
-        MPI_Alltoallv(send_blob.data(), send_bytes.data(), sdispls_bytes.data(), MPI_BYTE,
-                      recv_blob.data(), recv_bytes.data(), rdispls_bytes.data(), MPI_BYTE, graph->comm);
+        // 6. Exchange reply counts
+        std::vector<int> recv_reply_bytes(size);
+        MPI_Alltoall(send_reply_bytes.data(), 1, MPI_INT, recv_reply_bytes.data(), 1, MPI_INT, graph->comm);
 
-        // 6. Unpack replies
+        std::vector<int> sdispls_reply(size + 1, 0), rdispls_reply(size + 1, 0);
         for(int i=0; i<size; ++i) {
-            char* ptr = recv_blob.data() + rdispls_bytes[i];
-            char* end = recv_blob.data() + rdispls_bytes[i+1];
+            sdispls_reply[i+1] = sdispls_reply[i] + send_reply_bytes[i];
+            rdispls_reply[i+1] = rdispls_reply[i] + recv_reply_bytes[i];
+        }
+
+        // 7. Pack reply buffer
+        std::vector<char> send_reply_blob(sdispls_reply[size]);
+        ptr = recv_req_buf.data();
+        for(int i=0; i<size; ++i) {
+            char* blob_ptr = send_reply_blob.data() + sdispls_reply[i];
+            int count = recv_req_counts[i];
+            int* end = ptr + count;
             while(ptr < end) {
+                int global_row = *ptr++;
+                if (graph->global_to_local.count(global_row)) {
+                    int local_row = graph->global_to_local.at(global_row);
+                    int start = B.row_ptr[local_row];
+                    int end_row = B.row_ptr[local_row+1];
+                    int n_blocks = end_row - start;
+                    
+                    std::memcpy(blob_ptr, &global_row, sizeof(int)); blob_ptr += sizeof(int);
+                    std::memcpy(blob_ptr, &n_blocks, sizeof(int)); blob_ptr += sizeof(int);
+                    for(int k=start; k<end_row; ++k) {
+                        int col = B.graph->get_global_index(B.col_ind[k]);
+                        double norm = B_norms[k];
+                        std::memcpy(blob_ptr, &col, sizeof(int)); blob_ptr += sizeof(int);
+                        std::memcpy(blob_ptr, &norm, sizeof(double)); blob_ptr += sizeof(double);
+                    }
+                }
+            }
+        }
+
+        // 8. Exchange replies
+        std::vector<char> recv_reply_blob(rdispls_reply[size]);
+        MPI_Alltoallv(send_reply_blob.data(), send_reply_bytes.data(), sdispls_reply.data(), MPI_BYTE,
+                      recv_reply_blob.data(), recv_reply_bytes.data(), rdispls_reply.data(), MPI_BYTE, graph->comm);
+
+        // 9. Unpack replies
+        for(int i=0; i<size; ++i) {
+            char* blob_ptr = recv_reply_blob.data() + rdispls_reply[i];
+            char* end = recv_reply_blob.data() + rdispls_reply[i+1];
+            while(blob_ptr < end) {
                 int global_row, n_blocks;
-                std::memcpy(&global_row, ptr, sizeof(int)); ptr += sizeof(int);
-                std::memcpy(&n_blocks, ptr, sizeof(int)); ptr += sizeof(int);
-                
+                std::memcpy(&global_row, blob_ptr, sizeof(int)); blob_ptr += sizeof(int);
+                std::memcpy(&n_blocks, blob_ptr, sizeof(int)); blob_ptr += sizeof(int);
                 auto& list = metadata[global_row];
                 list.reserve(n_blocks);
-                
                 for(int k=0; k<n_blocks; ++k) {
                     BlockMeta meta;
-                    std::memcpy(&meta.col, ptr, sizeof(int)); ptr += sizeof(int);
-                    std::memcpy(&meta.norm, ptr, sizeof(double)); ptr += sizeof(double);
+                    std::memcpy(&meta.col, blob_ptr, sizeof(int)); blob_ptr += sizeof(int);
+                    std::memcpy(&meta.norm, blob_ptr, sizeof(double)); blob_ptr += sizeof(double);
                     list.push_back(meta);
                 }
             }
         }
-        
         return metadata;
     }
 
@@ -1304,64 +1257,78 @@ private:
         std::vector<double> A_norms = compute_block_norms();
         std::vector<double> B_local_norms = B.compute_block_norms();
         
-        std::set<BlockID> required_set;
-        
-        for (int i = 0; i < n_rows; ++i) {
-            std::map<int, double> c_row_est;
-            
-            int start = row_ptr[i];
-            int end = row_ptr[i+1];
-            
-            for (int k = start; k < end; ++k) {
-                int global_col_A = graph->get_global_index(col_ind[k]);
-                double norm_A = A_norms[k];
+        std::vector<std::vector<int>> thread_cols(n_rows);
+        int max_threads = omp_get_max_threads();
+        std::vector<std::set<BlockID>> thread_required(max_threads);
+
+        #pragma omp parallel
+        {
+            std::map<int, double> c_row_est; 
+            #pragma omp for
+            for (int i = 0; i < n_rows; ++i) {
+                c_row_est.clear();
                 
-                if (graph->find_owner(global_col_A) == graph->rank) {
-                    int local_row_B = graph->global_to_local.at(global_col_A);
-                    int start_B = B.row_ptr[local_row_B];
-                    int end_B = B.row_ptr[local_row_B+1];
-                    for (int j = start_B; j < end_B; ++j) {
-                        int global_col_B = B.graph->get_global_index(B.col_ind[j]);
-                        double norm_B = B_local_norms[j];
-                        c_row_est[global_col_B] += norm_A * norm_B;
-                    }
-                } else {
-                    if (meta.count(global_col_A)) {
-                        const auto& list = meta.at(global_col_A);
-                        for (const auto& m : list) {
-                            c_row_est[m.col] += norm_A * m.norm;
+                int start = row_ptr[i];
+                int end = row_ptr[i+1];
+                
+                for (int k = start; k < end; ++k) {
+                    int global_col_A = graph->get_global_index(col_ind[k]);
+                    double norm_A = A_norms[k];
+                    
+                    if (graph->find_owner(global_col_A) == graph->rank) {
+                        int local_row_B = graph->global_to_local.at(global_col_A);
+                        int start_B = B.row_ptr[local_row_B];
+                        int end_B = B.row_ptr[local_row_B+1];
+                        for (int j = start_B; j < end_B; ++j) {
+                            int global_col_B = B.graph->get_global_index(B.col_ind[j]);
+                            double norm_B = B_local_norms[j];
+                            c_row_est[global_col_B] += norm_A * norm_B;
+                        }
+                    } else {
+                        auto it = meta.find(global_col_A);
+                        if (it != meta.end()) {
+                            for (const auto& m : it->second) {
+                                c_row_est[m.col] += norm_A * m.norm;
+                            }
                         }
                     }
                 }
-            }
-            
-            for (auto const& [col, est] : c_row_est) {
-                if (est > threshold) {
-                    res.c_col_ind.push_back(col);
+                
+                for (auto const& [col, est] : c_row_est) {
+                    if (est > threshold) {
+                        thread_cols[i].push_back(col);
+                    }
                 }
+                std::sort(thread_cols[i].begin(), thread_cols[i].end());
             }
+        }
+        
+        for(int i=0; i<n_rows; ++i) {
+            res.c_col_ind.insert(res.c_col_ind.end(), thread_cols[i].begin(), thread_cols[i].end());
             res.c_row_ptr[i+1] = res.c_col_ind.size();
         }
         
-        for (int i = 0; i < n_rows; ++i) {
-            int c_start = res.c_row_ptr[i];
-            int c_end = res.c_row_ptr[i+1];
-            if (c_start == c_end) continue;
-            
-            std::set<int> active_cols;
-            for(int idx=c_start; idx<c_end; ++idx) active_cols.insert(res.c_col_ind[idx]);
-            
-            int start = row_ptr[i];
-            int end = row_ptr[i+1];
-            for (int k = start; k < end; ++k) {
-                int global_col_A = graph->get_global_index(col_ind[k]);
+        #pragma omp parallel
+        {
+            int tid = omp_get_thread_num();
+            #pragma omp for
+            for (int i = 0; i < n_rows; ++i) {
+                int c_start = res.c_row_ptr[i];
+                int c_end = res.c_row_ptr[i+1];
+                if (c_start == c_end) continue;
                 
-                if (graph->find_owner(global_col_A) != graph->rank) {
-                    if (meta.count(global_col_A)) {
-                        const auto& list = meta.at(global_col_A);
-                        for (const auto& m : list) {
-                            if (active_cols.count(m.col)) {
-                                required_set.insert({global_col_A, m.col});
+                int start = row_ptr[i];
+                int end = row_ptr[i+1];
+                for (int k = start; k < end; ++k) {
+                    int global_col_A = graph->get_global_index(col_ind[k]);
+                    
+                    if (graph->find_owner(global_col_A) != graph->rank) {
+                        auto it = meta.find(global_col_A);
+                        if (it != meta.end()) {
+                            for (const auto& m : it->second) {
+                                if (std::binary_search(res.c_col_ind.begin() + c_start, res.c_col_ind.begin() + c_end, m.col)) {
+                                    thread_required[tid].insert({global_col_A, m.col});
+                                }
                             }
                         }
                     }
@@ -1369,7 +1336,10 @@ private:
             }
         }
         
-        res.required_blocks.assign(required_set.begin(), required_set.end());
+        std::set<BlockID> final_required;
+        for(auto& s : thread_required) final_required.insert(s.begin(), s.end());
+        res.required_blocks.assign(final_required.begin(), final_required.end());
+        
         return res;
     }
 
@@ -1380,109 +1350,128 @@ private:
         int size = graph->size;
         int rank = graph->rank;
         
-        // 1. Prepare requests
-        std::vector<std::vector<int>> send_reqs(size);
+        // 1. Counting pass for requests
+        std::vector<int> send_req_counts(size, 0);
         for (const auto& bid : required_blocks) {
             int owner = graph->find_owner(bid.row);
-            send_reqs[owner].push_back(bid.row);
-            send_reqs[owner].push_back(bid.col);
+            send_req_counts[owner] += 2; // row, col
         }
         
-        // 2. Exchange requests
-        std::vector<int> send_counts(size);
-        for(int i=0; i<size; ++i) send_counts[i] = send_reqs[i].size();
-        std::vector<int> recv_counts(size);
-        MPI_Alltoall(send_counts.data(), 1, MPI_INT, recv_counts.data(), 1, MPI_INT, graph->comm);
+        // 2. Exchange request counts
+        std::vector<int> recv_req_counts(size);
+        MPI_Alltoall(send_req_counts.data(), 1, MPI_INT, recv_req_counts.data(), 1, MPI_INT, graph->comm);
         
+        // 3. Setup request displacements
         std::vector<int> sdispls(size + 1, 0), rdispls(size + 1, 0);
         for(int i=0; i<size; ++i) {
-            sdispls[i+1] = sdispls[i] + send_counts[i];
-            rdispls[i+1] = rdispls[i] + recv_counts[i];
+            sdispls[i+1] = sdispls[i] + send_req_counts[i];
+            rdispls[i+1] = rdispls[i] + recv_req_counts[i];
         }
         
-        std::vector<int> send_buf(sdispls[size]);
-        for(int i=0; i<size; ++i) {
-            std::memcpy(send_buf.data() + sdispls[i], send_reqs[i].data(), send_counts[i] * sizeof(int));
+        // 4. Pack request buffer
+        std::vector<int> send_req_buf(sdispls[size]);
+        std::vector<int> current_req_counts(size, 0);
+        for (const auto& bid : required_blocks) {
+            int owner = graph->find_owner(bid.row);
+            int* ptr = send_req_buf.data() + sdispls[owner] + current_req_counts[owner];
+            ptr[0] = bid.row;
+            ptr[1] = bid.col;
+            current_req_counts[owner] += 2;
         }
         
-        std::vector<int> recv_buf(rdispls[size]);
-        MPI_Alltoallv(send_buf.data(), send_counts.data(), sdispls.data(), MPI_INT,
-                      recv_buf.data(), recv_counts.data(), rdispls.data(), MPI_INT, graph->comm);
+        // 5. Exchange requests
+        std::vector<int> recv_req_buf(rdispls[size]);
+        MPI_Alltoallv(send_req_buf.data(), send_req_counts.data(), sdispls.data(), MPI_INT,
+                      recv_req_buf.data(), recv_req_counts.data(), rdispls.data(), MPI_INT, graph->comm);
                       
-        // 3. Process requests and pack data
-        std::vector<std::vector<char>> send_replies(size);
+        // 6. Counting pass for replies
+        std::vector<int> send_reply_bytes(size, 0);
+        int* ptr = recv_req_buf.data();
         for(int i=0; i<size; ++i) {
-            int* ptr = recv_buf.data() + rdispls[i];
-            int* end = recv_buf.data() + rdispls[i+1];
+            int count = recv_req_counts[i];
+            int* end = ptr + count;
             while(ptr < end) {
                 int g_row = *ptr++;
                 int g_col = *ptr++;
-                
                 if (graph->global_to_local.count(g_row)) {
                     int l_row = graph->global_to_local.at(g_row);
                     int start = row_ptr[l_row];
                     int end_row = row_ptr[l_row+1];
                     for(int k=start; k<end_row; ++k) {
                         if (graph->get_global_index(col_ind[k]) == g_col) {
-                                    size_t offset = blk_ptr[k];
-                                    size_t next_offset = blk_ptr[k+1];
-                                    size_t count = next_offset - offset;
-                                    
-                                    int r_dim = graph->block_sizes[l_row];
-                                    int c_dim = graph->block_sizes[col_ind[k]];
-                                    
-                                    size_t current_size = send_replies[i].size();
-                                    size_t packet_size = 2 * sizeof(int) + 2 * sizeof(int) + count * sizeof(T);
-                                    send_replies[i].resize(current_size + packet_size);
-                                    char* buf = send_replies[i].data() + current_size;
-                                    
-                                    std::memcpy(buf, &g_row, sizeof(int)); buf += sizeof(int);
-                                    std::memcpy(buf, &g_col, sizeof(int)); buf += sizeof(int);
-                                    std::memcpy(buf, &r_dim, sizeof(int)); buf += sizeof(int);
-                                    std::memcpy(buf, &c_dim, sizeof(int)); buf += sizeof(int);
-                                    std::memcpy(buf, val.data() + offset, count * sizeof(T));
-                                    break;
-                                }
+                            int r_dim = graph->block_sizes[l_row];
+                            int c_dim = graph->block_sizes[col_ind[k]];
+                            send_reply_bytes[i] += 4 * sizeof(int) + r_dim * c_dim * sizeof(T);
+                            break;
+                        }
                     }
                 }
             }
         }
         
-        // 4. Exchange replies
-        std::vector<int> send_bytes(size);
-        for(int i=0; i<size; ++i) send_bytes[i] = send_replies[i].size();
-        std::vector<int> recv_bytes(size);
-        MPI_Alltoall(send_bytes.data(), 1, MPI_INT, recv_bytes.data(), 1, MPI_INT, graph->comm);
+        // 7. Exchange reply counts
+        std::vector<int> recv_reply_bytes(size);
+        MPI_Alltoall(send_reply_bytes.data(), 1, MPI_INT, recv_reply_bytes.data(), 1, MPI_INT, graph->comm);
         
-        std::vector<int> sdispls_bytes(size + 1, 0), rdispls_bytes(size + 1, 0);
+        // 8. Setup reply displacements
+        std::vector<int> sdispls_reply(size + 1, 0), rdispls_reply(size + 1, 0);
         for(int i=0; i<size; ++i) {
-            sdispls_bytes[i+1] = sdispls_bytes[i] + send_bytes[i];
-            rdispls_bytes[i+1] = rdispls_bytes[i] + recv_bytes[i];
+            sdispls_reply[i+1] = sdispls_reply[i] + send_reply_bytes[i];
+            rdispls_reply[i+1] = rdispls_reply[i] + recv_reply_bytes[i];
         }
         
-        std::vector<char> send_blob(sdispls_bytes[size]);
+        // 9. Pack reply buffer
+        std::vector<char> send_reply_blob(sdispls_reply[size]);
+        ptr = recv_req_buf.data();
         for(int i=0; i<size; ++i) {
-             std::memcpy(send_blob.data() + sdispls_bytes[i], send_replies[i].data(), send_bytes[i]);
-        }
-        
-        std::vector<char> recv_blob(rdispls_bytes[size]);
-        MPI_Alltoallv(send_blob.data(), send_bytes.data(), sdispls_bytes.data(), MPI_BYTE,
-                      recv_blob.data(), recv_bytes.data(), rdispls_bytes.data(), MPI_BYTE, graph->comm);
-                      
-        // 5. Unpack
-        for(int i=0; i<size; ++i) {
-            char* ptr = recv_blob.data() + rdispls_bytes[i];
-            char* end = recv_blob.data() + rdispls_bytes[i+1];
+            char* blob_ptr = send_reply_blob.data() + sdispls_reply[i];
+            int count = recv_req_counts[i];
+            int* end = ptr + count;
             while(ptr < end) {
+                int g_row = *ptr++;
+                int g_col = *ptr++;
+                if (graph->global_to_local.count(g_row)) {
+                    int l_row = graph->global_to_local.at(g_row);
+                    int start = row_ptr[l_row];
+                    int end_row = row_ptr[l_row+1];
+                    for(int k=start; k<end_row; ++k) {
+                        if (graph->get_global_index(col_ind[k]) == g_col) {
+                            int r_dim = graph->block_sizes[l_row];
+                            int c_dim = graph->block_sizes[col_ind[k]];
+                            size_t offset = blk_ptr[k];
+                            size_t n_elem = r_dim * c_dim;
+                            
+                            std::memcpy(blob_ptr, &g_row, sizeof(int)); blob_ptr += sizeof(int);
+                            std::memcpy(blob_ptr, &g_col, sizeof(int)); blob_ptr += sizeof(int);
+                            std::memcpy(blob_ptr, &r_dim, sizeof(int)); blob_ptr += sizeof(int);
+                            std::memcpy(blob_ptr, &c_dim, sizeof(int)); blob_ptr += sizeof(int);
+                            std::memcpy(blob_ptr, val.data() + offset, n_elem * sizeof(T)); blob_ptr += n_elem * sizeof(T);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 10. Exchange replies
+        std::vector<char> recv_reply_blob(rdispls_reply[size]);
+        MPI_Alltoallv(send_reply_blob.data(), send_reply_bytes.data(), sdispls_reply.data(), MPI_BYTE,
+                      recv_reply_blob.data(), recv_reply_bytes.data(), rdispls_reply.data(), MPI_BYTE, graph->comm);
+                      
+        // 11. Unpack
+        for(int i=0; i<size; ++i) {
+            char* blob_ptr = recv_reply_blob.data() + rdispls_reply[i];
+            char* end = recv_reply_blob.data() + rdispls_reply[i+1];
+            while(blob_ptr < end) {
                 int g_row, g_col, r_dim, c_dim;
-                std::memcpy(&g_row, ptr, sizeof(int)); ptr += sizeof(int);
-                std::memcpy(&g_col, ptr, sizeof(int)); ptr += sizeof(int);
-                std::memcpy(&r_dim, ptr, sizeof(int)); ptr += sizeof(int);
-                std::memcpy(&c_dim, ptr, sizeof(int)); ptr += sizeof(int);
+                std::memcpy(&g_row, blob_ptr, sizeof(int)); blob_ptr += sizeof(int);
+                std::memcpy(&g_col, blob_ptr, sizeof(int)); blob_ptr += sizeof(int);
+                std::memcpy(&r_dim, blob_ptr, sizeof(int)); blob_ptr += sizeof(int);
+                std::memcpy(&c_dim, blob_ptr, sizeof(int)); blob_ptr += sizeof(int);
                 
-                size_t count = r_dim * c_dim;
-                std::vector<T> data(count);
-                std::memcpy(data.data(), ptr, count * sizeof(T)); ptr += count * sizeof(T);
+                size_t n_elem = r_dim * c_dim;
+                std::vector<T> data(n_elem);
+                std::memcpy(data.data(), blob_ptr, n_elem * sizeof(T)); blob_ptr += n_elem * sizeof(T);
                 
                 ghost_data[{g_row, g_col}] = std::move(data);
                 ghost_sizes[g_col] = c_dim;
@@ -1497,56 +1486,96 @@ private:
                           const std::map<int, std::vector<GhostBlockRef>>& ghost_rows,
                           BlockSpMat& C) const {
         int n_rows = row_ptr.size() - 1;
-        #pragma omp parallel for
-        for (int i = 0; i < n_rows; ++i) {
-            // Build map for C row i: GlobalCol -> Offset
-            std::map<int, size_t> c_map;
-            int c_start = C.row_ptr[i];
-            int c_end = C.row_ptr[i+1];
-            for(int k=c_start; k<c_end; ++k) {
-                int l_col = C.col_ind[k];
-                int g_col = C.graph->get_global_index(l_col);
-                c_map[g_col] = C.blk_ptr[k];
-            }
+        
+        int max_threads = omp_get_max_threads();
+        const size_t HASH_SIZE = 4096; 
+        const size_t HASH_MASK = HASH_SIZE - 1;
+        
+        struct HashEntry {
+            int key; 
+            size_t value;
+            int tag; 
+        };
+        
+        std::vector<std::vector<HashEntry>> thread_tables(max_threads, std::vector<HashEntry>(HASH_SIZE, {-1, 0, 0}));
+        std::vector<int> thread_tags(max_threads, 0);
+
+        #pragma omp parallel
+        {
+            int tid = omp_get_thread_num();
+            auto& table = thread_tables[tid];
+            int& tag = thread_tags[tid];
             
-            int a_start = row_ptr[i];
-            int a_end = row_ptr[i+1];
-            int r_dim = graph->block_sizes[i];
-            
-            for (int k = a_start; k < a_end; ++k) {
-                int l_col_A = col_ind[k];
-                int g_col_A = graph->get_global_index(l_col_A);
-                const T* a_val = val.data() + blk_ptr[k];
-                int inner_dim = graph->block_sizes[l_col_A];
+            #pragma omp for
+            for (int i = 0; i < n_rows; ++i) {
+                tag++;
+                if (tag == 0) { 
+                    for(auto& e : table) e.tag = 0;
+                    tag = 1;
+                }
+
+                int c_start = C.row_ptr[i];
+                int c_end = C.row_ptr[i+1];
                 
-                // Iterate B row g_col_A
-                if (graph->find_owner(g_col_A) == graph->rank) {
-                    // Local B
-                    int l_row_B = graph->global_to_local.at(g_col_A);
-                    int b_start = B.row_ptr[l_row_B];
-                    int b_end = B.row_ptr[l_row_B+1];
-                    for(int j=b_start; j<b_end; ++j) {
-                        int l_col_B = B.col_ind[j];
-                        int g_col_B = B.graph->get_global_index(l_col_B);
-                        const T* b_val = B.val.data() + B.blk_ptr[j];
-                        int c_dim = B.graph->block_sizes[l_col_B];
-                        
-                        if (c_map.count(g_col_B)) {
-                            T* c_val = C.val.data() + c_map[g_col_B];
-                            SmartKernel<T>::gemm(r_dim, c_dim, inner_dim, T(1), a_val, r_dim, b_val, inner_dim, T(1), c_val, r_dim);
-                        }
+                for(int k=c_start; k<c_end; ++k) {
+                    int l_col = C.col_ind[k];
+                    int g_col = C.graph->get_global_index(l_col);
+                    size_t offset = C.blk_ptr[k];
+                    
+                    size_t h = (size_t)g_col & HASH_MASK;
+                    while(table[h].tag == tag) {
+                        h = (h + 1) & HASH_MASK;
                     }
-                } else {
-                    // Ghost B
-                    if (ghost_rows.count(g_col_A)) {
-                        for (const auto& block : ghost_rows.at(g_col_A)) {
-                            int g_col_B = block.col;
-                            const T* b_val = block.data;
-                            int c_dim = block.c_dim;
+                    table[h] = {g_col, offset, tag};
+                }
+                
+                int a_start = row_ptr[i];
+                int a_end = row_ptr[i+1];
+                int r_dim = graph->block_sizes[i];
+                
+                for (int k = a_start; k < a_end; ++k) {
+                    int l_col_A = col_ind[k];
+                    int g_col_A = graph->get_global_index(l_col_A);
+                    const T* a_val = val.data() + blk_ptr[k];
+                    int inner_dim = graph->block_sizes[l_col_A];
+                    
+                    if (graph->find_owner(g_col_A) == graph->rank) {
+                        int l_row_B = graph->global_to_local.at(g_col_A);
+                        int b_start = B.row_ptr[l_row_B];
+                        int b_end = B.row_ptr[l_row_B+1];
+                        for(int j=b_start; j<b_end; ++j) {
+                            int l_col_B = B.col_ind[j];
+                            int g_col_B = B.graph->get_global_index(l_col_B);
+                            const T* b_val = B.val.data() + B.blk_ptr[j];
+                            int c_dim = B.graph->block_sizes[l_col_B];
                             
-                            if (c_map.count(g_col_B)) {
-                                T* c_val = C.val.data() + c_map[g_col_B];
-                                SmartKernel<T>::gemm(r_dim, c_dim, inner_dim, T(1), a_val, r_dim, b_val, inner_dim, T(1), c_val, r_dim);
+                            size_t h = (size_t)g_col_B & HASH_MASK;
+                            while(table[h].tag == tag) {
+                                if (table[h].key == g_col_B) {
+                                    T* c_val = C.val.data() + table[h].value;
+                                    SmartKernel<T>::gemm(r_dim, c_dim, inner_dim, T(1), a_val, r_dim, b_val, inner_dim, T(1), c_val, r_dim);
+                                    break;
+                                }
+                                h = (h + 1) & HASH_MASK;
+                            }
+                        }
+                    } else {
+                        auto it = ghost_rows.find(g_col_A);
+                        if (it != ghost_rows.end()) {
+                            for (const auto& block : it->second) {
+                                int g_col_B = block.col;
+                                const T* b_val = block.data;
+                                int c_dim = block.c_dim;
+                                
+                                size_t h = (size_t)g_col_B & HASH_MASK;
+                                while(table[h].tag == tag) {
+                                    if (table[h].key == g_col_B) {
+                                        T* c_val = C.val.data() + table[h].value;
+                                        SmartKernel<T>::gemm(r_dim, c_dim, inner_dim, T(1), a_val, r_dim, b_val, inner_dim, T(1), c_val, r_dim);
+                                        break;
+                                    }
+                                    h = (h + 1) & HASH_MASK;
+                                }
                             }
                         }
                     }

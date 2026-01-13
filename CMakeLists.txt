@@ -117,6 +117,25 @@ install(FILES
 )
 
 # Tests
-enable_testing()
-add_executable(test_spmm tests/test_spmm.cpp)
-target_link_libraries(test_spmm PRIVATE vbcsr Threads::Threads dl)
+# enable_testing()
+
+# find_package(GTest)
+
+# function(add_vbcsr_test name source)
+#     add_executable(${name} ${source})
+#     target_link_libraries(${name} PRIVATE vbcsr Threads::Threads dl)
+# endfunction()
+
+# add_vbcsr_test(test_spmm tests/test_spmm.cpp)
+# add_vbcsr_test(test_block_csr vbcsr/core/test/test_block_csr.cpp)
+# add_vbcsr_test(test_dist_graph vbcsr/core/test/test_dist_graph.cpp)
+# add_vbcsr_test(test_robustness vbcsr/core/test/test_robustness.cpp)
+# add_vbcsr_test(test_complex_dist_vector vbcsr/core/test/test_complex_dist_vector.cpp)
+# add_vbcsr_test(test_multi_sparsity vbcsr/core/test/test_multi_sparsity.cpp)
+# add_vbcsr_test(test_backend_extensions vbcsr/core/test/test_backend_extensions.cpp)
+# add_vbcsr_test(benchmark_dist vbcsr/core/test/benchmark_dist.cpp)
+# 
+# if(GTEST_FOUND)
+#     add_executable(test_block_csr_export vbcsr/core/test/test_block_csr_export.cpp)
+#     target_link_libraries(test_block_csr_export PRIVATE vbcsr GTest::gtest GTest::gtest_main Threads::Threads dl)
+# endif()

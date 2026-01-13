@@ -175,7 +175,7 @@ void test_block_spmat(DistGraph& graph, int rank) {
             if (graph.get_global_index(lid_c) == gid) {
                 found_diag = true;
                 size_t offset = mat.blk_ptr[k];
-                int dim = mat.row_dims[i];
+                int dim = graph.block_sizes[i];
                 for(int j=0; j<dim; ++j) {
                     if (std::abs(mat.val[offset + j*dim + j] - 3.0) > 1e-12) {
                          std::cerr << "BlockSpMat::shift failed" << std::endl;
