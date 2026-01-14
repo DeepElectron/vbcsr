@@ -1255,12 +1255,34 @@ public:
         int max_threads = omp_get_max_threads();
         std::vector<std::set<BlockID>> thread_required(max_threads);
 
+        struct SymbolicHashEntry {
+            int key;
+            double value;
+            int tag;
+        };
+        const size_t HASH_SIZE = 8192;
+        const size_t HASH_MASK = HASH_SIZE - 1;
+        const size_t MAX_ROW_NNZ = static_cast<size_t>(HASH_SIZE * 0.7);
+
+        std::vector<std::vector<SymbolicHashEntry>> thread_tables(max_threads, std::vector<SymbolicHashEntry>(HASH_SIZE, {-1, 0.0, 0}));
+        std::vector<std::vector<int>> thread_touched(max_threads);
+        std::vector<int> thread_tags(max_threads, 0);
+
         #pragma omp parallel
         {
-            std::map<int, double> c_row_est; 
+            int tid = omp_get_thread_num();
+            auto& table = thread_tables[tid];
+            auto& touched = thread_touched[tid];
+            int& tag = thread_tags[tid];
+            
             #pragma omp for
             for (int i = 0; i < n_rows; ++i) {
-                c_row_est.clear();
+                tag++;
+                if (tag == 0) {
+                    for(auto& e : table) e.tag = 0;
+                    tag = 1;
+                }
+                touched.clear();
                 
                 int start = row_ptr[i];
                 int end = row_ptr[i+1];
@@ -1269,28 +1291,46 @@ public:
                     int global_col_A = graph->get_global_index(col_ind[k]);
                     double norm_A = A_norms[k];
                     
+                    auto process_block = [&](int g_col_B, double norm_B) {
+                        size_t h = (size_t)g_col_B & HASH_MASK;
+                        size_t count = 0;
+                        while (table[h].tag == tag) {
+                            if (table[h].key == g_col_B) {
+                                table[h].value += norm_A * norm_B;
+                                return;
+                            }
+                            h = (h + 1) & HASH_MASK;
+                            if (++count > HASH_SIZE) {
+                                throw std::runtime_error("Hash table full in symbolic phase");
+                            }
+                        }
+                        if (touched.size() > MAX_ROW_NNZ) {
+                            throw std::runtime_error("Row density exceeds symbolic hash table capacity");
+                        }
+                        table[h] = {g_col_B, norm_A * norm_B, tag};
+                        touched.push_back(h);
+                    };
+
                     if (graph->find_owner(global_col_A) == graph->rank) {
                         int local_row_B = graph->global_to_local.at(global_col_A);
                         int start_B = B.row_ptr[local_row_B];
                         int end_B = B.row_ptr[local_row_B+1];
                         for (int j = start_B; j < end_B; ++j) {
-                            int global_col_B = B.graph->get_global_index(B.col_ind[j]);
-                            double norm_B = B_local_norms[j];
-                            c_row_est[global_col_B] += norm_A * norm_B;
+                            process_block(B.graph->get_global_index(B.col_ind[j]), B_local_norms[j]);
                         }
                     } else {
                         auto it = meta.find(global_col_A);
                         if (it != meta.end()) {
                             for (const auto& m : it->second) {
-                                c_row_est[m.col] += norm_A * m.norm;
+                                process_block(m.col, m.norm);
                             }
                         }
                     }
                 }
                 
-                for (auto const& [col, est] : c_row_est) {
-                    if (est > threshold) {
-                        thread_cols[i].push_back(col);
+                for (int h_idx : touched) {
+                    if (table[h_idx].value > threshold) {
+                        thread_cols[i].push_back(table[h_idx].key);
                     }
                 }
                 std::sort(thread_cols[i].begin(), thread_cols[i].end());
@@ -1482,7 +1522,7 @@ public:
         int n_rows = row_ptr.size() - 1;
         
         int max_threads = omp_get_max_threads();
-        const size_t HASH_SIZE = 4096; 
+        const size_t HASH_SIZE = 8192; 
         const size_t HASH_MASK = HASH_SIZE - 1;
         
         struct HashEntry {
@@ -1517,8 +1557,12 @@ public:
                     size_t offset = C.blk_ptr[k];
                     
                     size_t h = (size_t)g_col & HASH_MASK;
+                    size_t count = 0;
                     while(table[h].tag == tag) {
                         h = (h + 1) & HASH_MASK;
+                        if (++count > HASH_SIZE) {
+                            throw std::runtime_error("Hash table is full during SpMM population");
+                        }
                     }
                     table[h] = {g_col, offset, tag};
                 }
@@ -1544,6 +1588,7 @@ public:
                             int c_dim = B.graph->block_sizes[l_col_B];
                             
                             size_t h = (size_t)g_col_B & HASH_MASK;
+                            size_t count = 0;
                             while(table[h].tag == tag) {
                                 if (table[h].key == g_col_B) {
                                     T* c_val = C.val.data() + table[h].value;
@@ -1551,6 +1596,9 @@ public:
                                     break;
                                 }
                                 h = (h + 1) & HASH_MASK;
+                                if (++count > HASH_SIZE) {
+                                    throw std::runtime_error("Hash table infinite loop detected during SpMM numeric phase (local)");
+                                }
                             }
                         }
                     } else {
@@ -1562,6 +1610,7 @@ public:
                                 int c_dim = block.c_dim;
                                 
                                 size_t h = (size_t)g_col_B & HASH_MASK;
+                                size_t count = 0;
                                 while(table[h].tag == tag) {
                                     if (table[h].key == g_col_B) {
                                         T* c_val = C.val.data() + table[h].value;
@@ -1569,6 +1618,9 @@ public:
                                         break;
                                     }
                                     h = (h + 1) & HASH_MASK;
+                                    if (++count > HASH_SIZE) {
+                                        throw std::runtime_error("Hash table infinite loop detected during SpMM numeric phase (ghost)");
+                                    }
                                 }
                             }
                         }
