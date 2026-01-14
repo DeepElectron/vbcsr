@@ -76,6 +76,10 @@ public:
     // Pointers to block starts in val
     std::vector<size_t> blk_ptr;
     
+    // Cached block norms
+    mutable std::vector<double> block_norms;
+    mutable bool norms_valid = false;
+
 
 
     bool owns_graph = false;
@@ -105,6 +109,14 @@ public:
             norms[i] = std::sqrt(sum);
         }
         return norms;
+    }
+
+    const std::vector<double>& get_block_norms() const {
+        if (!norms_valid) {
+            block_norms = compute_block_norms();
+            norms_valid = true;
+        }
+        return block_norms;
     }
 
 public:
@@ -164,6 +176,10 @@ public:
         BlockSpMat<T, Kernel> new_mat(new_graph);
         new_mat.owns_graph = new_owns_graph;
         new_mat.copy_from(*this);
+        if (norms_valid) {
+            new_mat.block_norms = block_norms;
+            new_mat.norms_valid = true;
+        }
         return new_mat;
     }
 
@@ -199,6 +215,7 @@ public:
         }
         
         val.resize(blk_ptr[nnz], T(0));
+        norms_valid = false;
     }
 
     // Buffer for remote assembly
@@ -391,6 +408,7 @@ public:
         }
         
         remote_blocks.clear();
+        norms_valid = false;
     }
 
     // Helper to update local block
@@ -669,6 +687,12 @@ public:
         for (size_t i = 0; i < val.size(); ++i) {
             val[i] *= alpha;
         }
+        // Norms are scaled by abs(alpha)
+        if (norms_valid) {
+            double abs_alpha = std::abs(alpha);
+            #pragma omp parallel for
+            for(size_t i=0; i<block_norms.size(); ++i) block_norms[i] *= abs_alpha;
+        }
     }
 
     void copy_from(const BlockSpMat<T, Kernel>& other) {
@@ -685,6 +709,7 @@ public:
             throw std::runtime_error("Matrix value size mismatch in copy_from");
         }
         std::memcpy(val.data(), other.val.data(), val.size() * sizeof(T));
+        norms_valid = false;
     }
 
     void axpy(T alpha, const BlockSpMat<T, Kernel>& other) {
@@ -695,6 +720,7 @@ public:
         for (size_t i = 0; i < val.size(); ++i) {
             val[i] += alpha * other.val[i];
         }
+        norms_valid = false;
     }
 
     // Add alpha to diagonal elements
@@ -733,6 +759,7 @@ public:
                 }
             }
         }
+        norms_valid = false;
     }
 
     // Add vector elements to diagonal: H_ii += v_i
@@ -767,6 +794,7 @@ public:
                 }
             }
         }
+        norms_valid = false;
     }
 
     // Compute C = [H, R] where R is diagonal (stored as DistVector)
@@ -810,13 +838,79 @@ public:
         }
     }
 
+    void filter_blocks(double threshold) {
+        if (threshold <= 0.0) return;
+        
+        // Ensure norms are valid (we need them for filtering)
+        get_block_norms();
+        
+        // Detach graph if not owned
+        if (!owns_graph) {
+            graph = graph->duplicate();
+            owns_graph = true;
+        }
+        
+        int n_rows = row_ptr.size() - 1;
+        std::vector<int> new_row_ptr(n_rows + 1);
+        new_row_ptr[0] = 0;
+        
+        std::vector<int> new_col_ind;
+        std::vector<T> new_val;
+        std::vector<size_t> new_blk_ptr;
+        new_blk_ptr.push_back(0);
+        
+        // Estimate size to reserve
+        new_col_ind.reserve(col_ind.size());
+        new_val.reserve(val.size());
+        new_blk_ptr.reserve(blk_ptr.size());
+        
+        std::vector<double> new_norms;
+        new_norms.reserve(block_norms.size());
+        
+        for (int i = 0; i < n_rows; ++i) {
+            int start = row_ptr[i];
+            int end = row_ptr[i+1];
+            
+            for (int k = start; k < end; ++k) {
+                if (block_norms[k] >= threshold) {
+                    int col = col_ind[k];
+                    new_col_ind.push_back(col);
+                    
+                    size_t offset = blk_ptr[k];
+                    size_t size = blk_ptr[k+1] - offset;
+                    
+                    size_t new_offset = new_val.size();
+                    new_val.insert(new_val.end(), val.begin() + offset, val.begin() + offset + size);
+                    new_blk_ptr.push_back(new_val.size());
+                    
+                    new_norms.push_back(block_norms[k]);
+                }
+            }
+            new_row_ptr[i+1] = new_col_ind.size();
+        }
+        
+        // Swap
+        row_ptr = std::move(new_row_ptr);
+        col_ind = std::move(new_col_ind);
+        val = std::move(new_val);
+        blk_ptr = std::move(new_blk_ptr);
+        block_norms = std::move(new_norms);
+        norms_valid = true;
+        
+        // Sync Graph
+        graph->adj_ptr = row_ptr;
+        graph->adj_ind = col_ind;
+    }
+
     // Map: Global Row of B -> List of (Global Col of B, Norm)
 
     BlockSpMat spmm(const BlockSpMat& B, double threshold, bool transA = false, bool transB = false) const {
+        
         if (transA) {
             BlockSpMat A_T = this->transpose();
             return A_T.spmm(B, threshold, false, transB);
         }
+
         if (transB) {
             BlockSpMat B_T = B.transpose();
             return this->spmm(B_T, threshold, transA, false);
@@ -824,6 +918,10 @@ public:
         
         // 1. Metadata Exchange
         GhostMetadata meta = exchange_ghost_metadata(B);
+        
+        // Ensure norms are ready
+        const auto& A_norms = get_block_norms();
+        const auto& B_local_norms = B.get_block_norms();
         
         // 2. Symbolic Phase (Structure Prediction)
         SymbolicResult sym = symbolic_multiply_filtered(B, meta, threshold);
@@ -835,7 +933,18 @@ public:
         std::map<int, std::vector<GhostBlockRef>> ghost_rows;
         for (const auto& [bid, data] : ghost_data_map) {
             int c_dim = ghost_sizes.at(bid.col);
-            ghost_rows[bid.row].push_back({bid.col, data.data(), c_dim});
+            
+            double norm = 0.0;
+            if (meta.count(bid.row)) {
+                for(const auto& m : meta.at(bid.row)) {
+                    if (m.col == bid.col) {
+                        norm = m.norm;
+                        break;
+                    }
+                }
+            }
+            
+            ghost_rows[bid.row].push_back({bid.col, data.data(), c_dim, norm});
         }
         
         // 4. Construct Result Matrix Structure
@@ -857,7 +966,10 @@ public:
         std::fill(C.val.begin(), C.val.end(), T(0));
         
         // 5. Numeric Phase (GEMM)
-        numeric_multiply(B, ghost_rows, C);
+        numeric_multiply(B, ghost_rows, C, threshold, A_norms, B_local_norms);
+        
+        // 6. Post-filtering
+        C.filter_blocks(threshold);
         
         return C;
     }
@@ -1101,7 +1213,7 @@ public:
     }
 
 public:
-    struct GhostBlockRef { int col; const T* data; int c_dim; };
+    struct GhostBlockRef { int col; const T* data; int c_dim; double norm; };
     using GhostBlockData = std::map<BlockID, std::vector<T>>;
     using GhostSizes = std::map<int, int>;
 
@@ -1519,7 +1631,10 @@ public:
     // SpMM Phase 4: Numerical Multiplication
     void numeric_multiply(const BlockSpMat& B, 
                           const std::map<int, std::vector<GhostBlockRef>>& ghost_rows,
-                          BlockSpMat& C) const {
+                          BlockSpMat& C,
+                          double threshold,
+                          const std::vector<double>& A_norms,
+                          const std::vector<double>& B_local_norms) const {
         int n_rows = row_ptr.size() - 1;
         
         int max_threads = omp_get_max_threads();
@@ -1572,17 +1687,26 @@ public:
                 int a_end = row_ptr[i+1];
                 int r_dim = graph->block_sizes[i];
                 
+                // Dynamic threshold for this row
+                // row_count is number of blocks in C's row i
+                int row_count = c_end - c_start;
+                double row_eps = threshold / std::max(1, row_count);
+                
                 for (int k = a_start; k < a_end; ++k) {
                     int l_col_A = col_ind[k];
                     int g_col_A = graph->get_global_index(l_col_A);
                     const T* a_val = val.data() + blk_ptr[k];
                     int inner_dim = graph->block_sizes[l_col_A];
+                    double norm_A = A_norms[k];
                     
                     if (graph->find_owner(g_col_A) == graph->rank) {
                         int l_row_B = graph->global_to_local.at(g_col_A);
                         int b_start = B.row_ptr[l_row_B];
                         int b_end = B.row_ptr[l_row_B+1];
                         for(int j=b_start; j<b_end; ++j) {
+                            double norm_B = B_local_norms[j];
+                            if (norm_A * norm_B < row_eps) continue;
+
                             int l_col_B = B.col_ind[j];
                             int g_col_B = B.graph->get_global_index(l_col_B);
                             const T* b_val = B.val.data() + B.blk_ptr[j];
@@ -1609,6 +1733,9 @@ public:
                                 int g_col_B = block.col;
                                 const T* b_val = block.data;
                                 int c_dim = block.c_dim;
+                                double norm_B = block.norm;
+                                
+                                if (norm_A * norm_B < row_eps) continue;
                                 
                                 size_t h = (size_t)g_col_B & HASH_MASK;
                                 size_t count = 0;

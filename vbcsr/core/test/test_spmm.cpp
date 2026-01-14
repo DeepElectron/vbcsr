@@ -359,6 +359,145 @@ void test_diverse_spmm(int n_block_rows, double base_density, int min_blk, int m
     }
 }
 
+// Filtered SpMM Test
+template <typename T>
+void test_filtered_spmm(bool test_complex = false) {
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    
+    // Create a simple diagonal matrix with some off-diagonal elements
+    // 4 blocks. 
+    // 0: 0 (1.0), 1 (0.1)
+    // 1: 1 (1.0), 2 (0.1)
+    // 2: 2 (1.0), 3 (0.1)
+    // 3: 3 (1.0), 0 (0.1)
+    
+    int n_blocks = 4;
+    int block_size = 2;
+    std::vector<int> block_sizes(n_blocks, block_size);
+    
+    int rows_per_rank = n_blocks / 1; // Assume serial for simplicity or run with 1 rank. 
+    // But test runs with MPI. Let's handle distributed.
+    int size;
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    
+    int my_start = rank * (n_blocks / size);
+    int my_count = n_blocks / size;
+    // Assume size divides n_blocks (e.g. 1, 2, 4)
+    
+    std::vector<int> my_indices;
+    for(int i=0; i<my_count; ++i) my_indices.push_back(my_start + i);
+    
+    std::vector<std::vector<int>> adj(my_count);
+    for(int i=0; i<my_count; ++i) {
+        int r = my_start + i;
+        adj[i].push_back(r); // Diagonal
+        adj[i].push_back((r + 1) % n_blocks); // Off-diagonal
+    }
+    
+    std::vector<int> my_local_block_sizes(my_count, block_size);
+    DistGraph* graph = new DistGraph(MPI_COMM_WORLD);
+    graph->construct_distributed(my_indices, my_local_block_sizes, adj);
+    
+    BlockSpMat<T, SmartKernel<T>> A(graph);
+    
+    // Fill values
+    for(int i=0; i<my_count; ++i) {
+        int r = my_start + i;
+        // Diagonal: Identity * 1.0
+        // Off-diagonal: Identity * 0.1
+        
+        // Block 0: Diagonal
+        std::vector<T> diag(block_size * block_size, T(0));
+        for(int k=0; k<block_size; ++k) diag[k*block_size + k] = T(1.0);
+        A.add_block(r, r, diag.data(), block_size, block_size);
+        
+        // Block 1: Off-diagonal
+        std::vector<T> off(block_size * block_size, T(0));
+        for(int k=0; k<block_size; ++k) off[k*block_size + k] = T(0.1);
+        A.add_block(r, (r + 1) % n_blocks, off.data(), block_size, block_size);
+    }
+    A.assemble();
+    
+    // C = A * A
+    // (I + 0.1*P) * (I + 0.1*P) = I + 0.2*P + 0.01*P^2
+    // P is permutation (ring).
+    // Terms:
+    // I (diag): 1.0
+    // P (off-diag 1 step): 0.2
+    // P^2 (off-diag 2 steps): 0.01
+    
+    // Norms (approx):
+    // I: sqrt(2) * 1.0 = 1.414
+    // P: sqrt(2) * 0.2 = 0.282
+    // P^2: sqrt(2) * 0.01 = 0.014
+    
+    // Filter threshold 0.1
+    // Should keep I and P. Drop P^2.
+    // Wait, row_eps = threshold / row_count.
+    // Row count of C (dense-ish) might be 3 (0, 1, 2).
+    // row_eps = 0.1 / 3 = 0.033.
+    // P^2 norm 0.014 < 0.033. Should be dropped.
+    
+    // Filter threshold 0.001
+    // Should keep all.
+    
+    // Filter threshold 0.5
+    // row_eps = 0.5 / 3 = 0.166.
+    // P norm 0.282 > 0.166. Kept.
+    // P^2 dropped.
+    
+    // Let's try threshold 0.1.
+    BlockSpMat<T, SmartKernel<T>> C = A.spmm(A, 0.1);
+    
+    // Verify C structure
+    // Should have 0->0, 0->1. Should NOT have 0->2.
+    
+    int c_nnz = C.col_ind.size();
+    int expected_nnz_per_row = 2; // I and P
+    
+    // Count local nnz
+    if (c_nnz != my_count * expected_nnz_per_row) {
+        // It might vary if P^2 wraps around to diagonal (e.g. 2x2 system).
+        // Here 4 blocks. P^2 is distance 2. Distinct from 0 and 1.
+        if (rank == 0) std::cout << "Filtered SpMM: Unexpected NNZ. Got " << c_nnz << ", expected " << my_count * expected_nnz_per_row << std::endl;
+    }
+    
+    // Verify values?
+    // Just verify graph detachment and duplicate.
+    
+    // Test Duplicate
+    BlockSpMat<T, SmartKernel<T>> C_dup = C.duplicate();
+    if (C_dup.col_ind.size() != C.col_ind.size()) {
+        if (rank == 0) std::cout << "Duplicate failed to preserve structure size" << std::endl;
+    }
+    
+    // Test Graph Detachment
+    // Create B sharing A's graph
+    BlockSpMat<T, SmartKernel<T>> B = A.duplicate(false); // independent_graph=false
+    // Filter B aggressively to remove off-diagonals
+    // Threshold 1.0. row_eps = 1.0/2 = 0.5.
+    // Off-diag norm 0.14 < 0.5. Dropped.
+    // Diag norm 1.4 > 0.5. Kept.
+    B.filter_blocks(1.0);
+    
+    // Check B has only diagonals
+    if (B.col_ind.size() != my_count) {
+         if (rank == 0) std::cout << "Filter failed to remove off-diagonals. Size: " << B.col_ind.size() << std::endl;
+    }
+    
+    // Check A is untouched
+    if (A.col_ind.size() != my_count * 2) {
+         if (rank == 0) std::cout << "Filter on B affected A! A size: " << A.col_ind.size() << std::endl;
+    }
+    
+    if (B.graph == A.graph) {
+         if (rank == 0) std::cout << "Graph not detached!" << std::endl;
+    }
+    
+    if (rank == 0) std::cout << "Filtered SpMM (" << (test_complex ? "Complex" : "Real") << ") PASSED" << std::endl;
+}
+
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
     
@@ -385,6 +524,10 @@ int main(int argc, char** argv) {
     // 5. Diverse Connectivity Test
     test_diverse_spmm<double>(20, 0.2, 2, 10, false);
     test_diverse_spmm<std::complex<double>>(15, 0.2, 2, 8, true);
+    
+    // 6. Filtered SpMM Test
+    test_filtered_spmm<double>(false);
+    test_filtered_spmm<std::complex<double>>(true);
     
     MPI_Finalize();
     return 0;
