@@ -115,7 +115,9 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto t5 = std::chrono::high_resolution_clock::now();
     
-    A.numeric_multiply(B, ghost_rows, C);
+    std::vector<double> A_norms = A.compute_block_norms();
+    std::vector<double> B_local_norms = B.compute_block_norms();
+    A.numeric_multiply(B, ghost_rows, C, threshold, A_norms, B_local_norms);
     MPI_Barrier(MPI_COMM_WORLD);
     auto t6 = std::chrono::high_resolution_clock::now();
     

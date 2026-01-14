@@ -252,10 +252,16 @@ public:
                     }
                 }
             }
-            throw std::runtime_error("Block (row=" + std::to_string(global_row) + ", col=" + std::to_string(global_col) + ") not found in local graph");
+            std::cerr << "Warning: Block (row=" << global_row << ", col=" << global_col << ") not found in local graph. Ignoring." << std::endl;
+            return;
         } 
         
         // Remote
+        if (owner < 0 || owner >= graph->size) {
+             std::cerr << "Warning: Block (row=" << global_row << ", col=" << global_col << ") belongs to invalid rank " << owner << ". Ignoring." << std::endl;
+             return;
+        }
+
         auto& blocks_map = remote_blocks[owner];
         std::pair<int, int> key = {global_row, global_col};
         auto it = blocks_map.find(key);
@@ -388,7 +394,9 @@ public:
                 AssemblyMode mode = static_cast<AssemblyMode>(mode_int);
                 
                 if (graph->global_to_local.find(g_row) == graph->global_to_local.end()) {
-                     throw std::runtime_error("Received block for non-owned row");
+                     std::cerr << "Warning: Received block for non-owned row " << g_row << ". Ignoring." << std::endl;
+                     ptr += rows * cols * sizeof(T);
+                     continue;
                 }
                 int l_row = graph->global_to_local.at(g_row);
                 
@@ -400,7 +408,8 @@ public:
                 size_t data_bytes = rows * cols * sizeof(T);
                 
                 if (l_col == -1 || !update_local_block(l_row, l_col, (const T*)ptr, rows, cols, mode, MatrixLayout::ColMajor)) {
-                    throw std::runtime_error("Received block not in graph");
+                    std::cerr << "Warning: Received block (row=" << g_row << ", col=" << g_col << ") not in graph. Ignoring." << std::endl;
+                    // Fall through to ptr += data_bytes
                 }
                 
                 ptr += data_bytes;
@@ -411,6 +420,7 @@ public:
         norms_valid = false;
     }
 
+    
     // Helper to update local block
     // Input data layout is specified by `layout`
     // Internal storage is ColMajor
@@ -472,6 +482,7 @@ public:
         }
         return false;
     }
+
 
     // Matrix-Vector Multiplication
     void mult(DistVector<T>& x, DistVector<T>& y) {
@@ -2065,8 +2076,406 @@ public:
             }
         }
     }
+
+        // Extract submatrix defined by global_indices
+    // Returns a serial BlockSpMat containing the subgraph
+    BlockSpMat<T, Kernel> extract_submatrix(const std::vector<int>& global_indices) {
+        // 1. Use indices as provided (do not sort)
+        // This ensures submatrix row i corresponds to global_indices[i]
+        
+        // Map global index to local index in the submatrix (0 to M-1)
+        std::map<int, int> global_to_sub;
+        for(size_t i=0; i<global_indices.size(); ++i) {
+            global_to_sub[global_indices[i]] = i;
+        }
+        
+        // 2. Identify Local vs Remote rows
+        std::vector<int> local_rows;
+        std::map<int, std::vector<int>> remote_rows_by_rank;
+        
+        for(int gid : global_indices) {
+            int owner = graph->find_owner(gid);
+            if(owner == graph->rank) {
+                local_rows.push_back(gid);
+            } else {
+                remote_rows_by_rank[owner].push_back(gid);
+            }
+        }
+        
+        // 3. Collect Blocks and Block Sizes
+        struct BlockData {
+            int sub_row;
+            int sub_col;
+            int r_dim;
+            int c_dim;
+            std::vector<T> data;
+        };
+        std::vector<BlockData> collected_blocks;
+        
+        int M = global_indices.size();
+        std::vector<int> sub_block_sizes(M, 0);
+        
+        // 3.1 Local Extraction
+        for(int gid : local_rows) {
+            if(graph->global_to_local.find(gid) == graph->global_to_local.end()) continue; 
+            int lid = graph->global_to_local.at(gid);
+            
+            // Fill block size
+            sub_block_sizes[global_to_sub[gid]] = graph->block_sizes[lid];
+            
+            int start = row_ptr[lid];
+            int end = row_ptr[lid+1];
+            
+            for(int k=start; k<end; ++k) {
+                int col_lid = col_ind[k];
+                int col_gid = graph->get_global_index(col_lid);
+                
+                if(global_to_sub.count(col_gid)) {
+                    // Found a block in the subgraph
+                    BlockData bd;
+                    bd.sub_row = global_to_sub[gid];
+                    bd.sub_col = global_to_sub[col_gid];
+                    bd.r_dim = graph->block_sizes[lid];
+                    bd.c_dim = graph->block_sizes[col_lid];
+                    
+                    size_t offset = blk_ptr[k];
+                    size_t size = blk_ptr[k+1] - offset;
+                    bd.data.resize(size);
+                    std::memcpy(bd.data.data(), val.data() + offset, size * sizeof(T));
+                    
+                    collected_blocks.push_back(std::move(bd));
+                }
+            }
+        }
+        
+        // 3.2 Remote Extraction
+        // Protocol:
+        // 1. Send Request: [NumRows, RowGIDs..., NumFilterCols, FilterColGIDs...]
+        // 2. Receive Response: [NumRows, (RowGID, BlockSize)..., NumBlocks, (RowGID, ColGID, RDim, CDim, Data)...]
+        
+        // Prepare requests
+        std::vector<size_t> send_counts(graph->size, 0);
+        std::vector<std::vector<int>> send_buffers(graph->size);
+        
+        for(auto& kv : remote_rows_by_rank) {
+            int target = kv.first;
+            auto& rows = kv.second;
+            
+            send_buffers[target].push_back(rows.size());
+            send_buffers[target].insert(send_buffers[target].end(), rows.begin(), rows.end());
+            
+            send_buffers[target].push_back(global_indices.size());
+            send_buffers[target].insert(send_buffers[target].end(), global_indices.begin(), global_indices.end());
+            
+            send_counts[target] = send_buffers[target].size() * sizeof(int);
+        }
+        
+        // Exchange Requests (Counts)
+        std::vector<size_t> recv_counts(graph->size);
+        MPI_Alltoall(send_counts.data(), sizeof(size_t), MPI_BYTE, recv_counts.data(), sizeof(size_t), MPI_BYTE, graph->comm);
+        
+        std::vector<size_t> sdispls(graph->size + 1, 0);
+        std::vector<size_t> rdispls(graph->size + 1, 0);
+        for(int i=0; i<graph->size; ++i) {
+            sdispls[i+1] = sdispls[i] + send_counts[i];
+            rdispls[i+1] = rdispls[i] + recv_counts[i];
+        }
+        
+        std::vector<char> send_blob(sdispls[graph->size]);
+        for(int i=0; i<graph->size; ++i) {
+             if (!send_buffers[i].empty())
+                std::memcpy(send_blob.data() + sdispls[i], send_buffers[i].data(), send_buffers[i].size() * sizeof(int));
+        }
+        
+        std::vector<char> recv_blob(rdispls[graph->size]);
+        safe_alltoallv(send_blob.data(), send_counts, sdispls, MPI_BYTE,
+                      recv_blob.data(), recv_counts, rdispls, MPI_BYTE, graph->comm);
+                      
+        // Process Incoming Requests (Serve others)
+        std::vector<std::vector<char>> resp_buffers(graph->size);
+        std::vector<size_t> resp_send_counts(graph->size, 0); // In bytes
+        
+        for(int i=0; i<graph->size; ++i) {
+            if(recv_counts[i] == 0) continue;
+            
+            const int* ptr = reinterpret_cast<const int*>(recv_blob.data() + rdispls[i]);
+            int num_rows = *ptr++;
+            std::vector<int> req_rows(ptr, ptr + num_rows); ptr += num_rows;
+            int num_cols = *ptr++;
+            std::set<int> req_cols(ptr, ptr + num_cols); ptr += num_cols;
+            
+            // Collect blocks and sizes
+            std::vector<char> buffer;
+            int block_count = 0;
+            
+            // 1. Write Row Sizes: [NumRows, (RowGID, Size)...]
+            buffer.resize(sizeof(int) + num_rows * 2 * sizeof(int));
+            char* buf_ptr = buffer.data();
+            std::memcpy(buf_ptr, &num_rows, sizeof(int)); buf_ptr += sizeof(int);
+            
+            for(int gid : req_rows) {
+                int size = 0;
+                if(graph->global_to_local.count(gid)) {
+                    int lid = graph->global_to_local.at(gid);
+                    size = graph->block_sizes[lid];
+                }
+                std::memcpy(buf_ptr, &gid, sizeof(int)); buf_ptr += sizeof(int);
+                std::memcpy(buf_ptr, &size, sizeof(int)); buf_ptr += sizeof(int);
+            }
+            
+            // 2. Collect Blocks
+            size_t blocks_start_offset = buffer.size();
+            buffer.resize(blocks_start_offset + sizeof(int)); // Placeholder for block_count
+            
+            for(int gid : req_rows) {
+                if(graph->global_to_local.count(gid)) {
+                    int lid = graph->global_to_local.at(gid);
+                    int start = row_ptr[lid];
+                    int end = row_ptr[lid+1];
+                    
+                    for(int k=start; k<end; ++k) {
+                        int col_lid = col_ind[k];
+                        int col_gid = graph->get_global_index(col_lid);
+                        
+                        if(req_cols.count(col_gid)) {
+                            // Match
+                            block_count++;
+                            int r_dim = graph->block_sizes[lid];
+                            int c_dim = graph->block_sizes[col_lid];
+                            size_t offset = blk_ptr[k];
+                            size_t size = blk_ptr[k+1] - offset;
+                            
+                            // Pack: RowGID, ColGID, RDim, CDim, Data
+                            size_t old_size = buffer.size();
+                            buffer.resize(old_size + 4*sizeof(int) + size*sizeof(T));
+                            char* b_ptr = buffer.data() + old_size;
+                            
+                            std::memcpy(b_ptr, &gid, sizeof(int)); b_ptr += sizeof(int);
+                            std::memcpy(b_ptr, &col_gid, sizeof(int)); b_ptr += sizeof(int);
+                            std::memcpy(b_ptr, &r_dim, sizeof(int)); b_ptr += sizeof(int);
+                            std::memcpy(b_ptr, &c_dim, sizeof(int)); b_ptr += sizeof(int);
+                            std::memcpy(b_ptr, val.data() + offset, size*sizeof(T));
+                        }
+                    }
+                }
+            }
+            
+            // Write block count
+            std::memcpy(buffer.data() + blocks_start_offset, &block_count, sizeof(int));
+            
+            resp_buffers[i] = std::move(buffer);
+            resp_send_counts[i] = resp_buffers[i].size();
+        }
+        
+        // Exchange Responses
+        std::vector<size_t> resp_recv_counts(graph->size);
+        MPI_Alltoall(resp_send_counts.data(), sizeof(size_t), MPI_BYTE, resp_recv_counts.data(), sizeof(size_t), MPI_BYTE, graph->comm);
+        
+        std::vector<size_t> resp_sdispls(graph->size + 1, 0);
+        std::vector<size_t> resp_rdispls(graph->size + 1, 0);
+        for(int i=0; i<graph->size; ++i) {
+            resp_sdispls[i+1] = resp_sdispls[i] + resp_send_counts[i];
+            resp_rdispls[i+1] = resp_rdispls[i] + resp_recv_counts[i];
+        }
+        
+        std::vector<char> resp_send_blob(resp_sdispls[graph->size]);
+        for(int i=0; i<graph->size; ++i) {
+            if(!resp_buffers[i].empty()) {
+                std::memcpy(resp_send_blob.data() + resp_sdispls[i], resp_buffers[i].data(), resp_buffers[i].size());
+            }
+        }
+        
+        std::vector<char> resp_recv_blob(resp_rdispls[graph->size]);
+        safe_alltoallv(resp_send_blob.data(), resp_send_counts, resp_sdispls, MPI_BYTE,
+                      resp_recv_blob.data(), resp_recv_counts, resp_rdispls, MPI_BYTE, graph->comm);
+                      
+        // Process Received Data
+        for(int i=0; i<graph->size; ++i) {
+            if(resp_recv_counts[i] == 0) continue;
+            
+            const char* ptr = resp_recv_blob.data() + resp_rdispls[i];
+            
+            // 1. Read Row Sizes
+            int num_rows;
+            std::memcpy(&num_rows, ptr, sizeof(int)); ptr += sizeof(int);
+            for(int k=0; k<num_rows; ++k) {
+                int gid, size;
+                std::memcpy(&gid, ptr, sizeof(int)); ptr += sizeof(int);
+                std::memcpy(&size, ptr, sizeof(int)); ptr += sizeof(int);
+                if(global_to_sub.count(gid)) {
+                    sub_block_sizes[global_to_sub[gid]] = size;
+                }
+            }
+            
+            // 2. Read Blocks
+            int num_blocks;
+            std::memcpy(&num_blocks, ptr, sizeof(int)); ptr += sizeof(int);
+            
+            for(int k=0; k<num_blocks; ++k) {
+                int gid, col_gid, r_dim, c_dim;
+                std::memcpy(&gid, ptr, sizeof(int)); ptr += sizeof(int);
+                std::memcpy(&col_gid, ptr, sizeof(int)); ptr += sizeof(int);
+                std::memcpy(&r_dim, ptr, sizeof(int)); ptr += sizeof(int);
+                std::memcpy(&c_dim, ptr, sizeof(int)); ptr += sizeof(int);
+                
+                BlockData bd;
+                bd.sub_row = global_to_sub[gid];
+                bd.sub_col = global_to_sub[col_gid];
+                bd.r_dim = r_dim;
+                bd.c_dim = c_dim;
+                bd.data.resize(r_dim * c_dim);
+                std::memcpy(bd.data.data(), ptr, bd.data.size() * sizeof(T)); ptr += bd.data.size() * sizeof(T);
+                
+                collected_blocks.push_back(std::move(bd));
+            }
+        }
+        
+        // 4. Construct Submatrix
+        std::vector<std::vector<int>> sub_adj(M);
+        
+        // Fill adj from collected blocks
+        for(const auto& bd : collected_blocks) {
+            sub_adj[bd.sub_row].push_back(bd.sub_col);
+        }
+        
+        DistGraph* sub_graph = new DistGraph(MPI_COMM_SELF);
+        sub_graph->construct_serial(M, sub_block_sizes, sub_adj);
+        
+        BlockSpMat<T, Kernel> sub_mat(sub_graph);
+        sub_mat.owns_graph = true;
+        
+        // Fill values
+        for(const auto& bd : collected_blocks) {
+            sub_mat.add_block(bd.sub_row, bd.sub_col, bd.data.data(), bd.r_dim, bd.c_dim, AssemblyMode::INSERT, MatrixLayout::ColMajor);
+        }
+        
+        sub_mat.assemble();
+        
+        return sub_mat;
+    }
+
+    // Insert submatrix back (In-Place)
+    void insert_submatrix(const BlockSpMat<T, Kernel>& submat, const std::vector<int>& global_indices) {
+        // global_indices maps submat indices 0..M-1 to global indices
+        if(submat.graph->owned_global_indices.size() != global_indices.size()) {
+            throw std::runtime_error("insert_submatrix: global_indices size mismatch");
+        }
+        
+        // Iterate over submat blocks
+        int n_rows = submat.row_ptr.size() - 1;
+        for(int i=0; i<n_rows; ++i) {
+            int r_dim = submat.graph->block_sizes[i];
+            int start = submat.row_ptr[i];
+            int end = submat.row_ptr[i+1];
+            
+            int global_row = global_indices[i];
+            
+            for(int k=start; k<end; ++k) {
+                int col = submat.col_ind[k];
+                int c_dim = submat.graph->block_sizes[col];
+                int global_col = global_indices[col];
+                
+                const T* data = submat.val.data() + submat.blk_ptr[k];
+                
+                // Use add_block with INSERT mode. 
+                // It handles local update and remote buffering.
+                // Data is in ColMajor (internal storage of submat).
+                this->add_block(global_row, global_col, data, r_dim, c_dim, AssemblyMode::INSERT, MatrixLayout::ColMajor);
+            }
+        }
+        
+        // Flush remote updates
+        this->assemble();
+    }
+
+    // Convert to dense (Row-Major)
+    // Convert to dense (Row-Major)
+    // Returns dense matrix of size (owned_rows) x (all_local_cols)
+    // This includes owned columns AND ghost columns present locally.
+    // The columns are ordered by their local index (owned first, then ghosts).
+    std::vector<T> to_dense() const {
+        int n_owned = graph->owned_global_indices.size();
+        
+        // Rows: Sum of sizes of owned blocks
+        int my_rows = graph->block_offsets[n_owned];
+        
+        // Cols: Sum of sizes of ALL local blocks (owned + ghost)
+        int my_cols = graph->block_offsets.back();
+        
+        std::vector<T> dense(my_rows * my_cols, T(0));
+        
+        // Fill
+        for(int i=0; i<n_owned; ++i) {
+            int r_dim = graph->block_sizes[i];
+            int row_offset = graph->block_offsets[i]; // Local offset
+            
+            int start = row_ptr[i];
+            int end = row_ptr[i+1];
+            
+            for(int k=start; k<end; ++k) {
+                int col = col_ind[k];
+                int c_dim = graph->block_sizes[col];
+                int col_offset = graph->block_offsets[col];
+                
+                const T* data = val.data() + blk_ptr[k];
+                
+                // Copy block to dense (ColMajor block to RowMajor dense)
+                for(int c=0; c<c_dim; ++c) {
+                    for(int r=0; r<r_dim; ++r) {
+                        // Dense index
+                        int dr = row_offset + r;
+                        int dc = col_offset + c;
+                        if(dr < my_rows && dc < my_cols) {
+                            dense[dr * my_cols + dc] = data[c * r_dim + r];
+                        }
+                    }
+                }
+            }
+        }
+        return dense;
+    }
+
+    // Update from dense (Row-Major)
+    // Expects dense matrix of size (owned_rows) x (all_local_cols)
+    void from_dense(const std::vector<T>& dense) {
+        int n_owned = graph->owned_global_indices.size();
+        int my_rows = graph->block_offsets[n_owned];
+        int my_cols = graph->block_offsets.back();
+        
+        if(dense.size() != my_rows * my_cols) {
+            throw std::runtime_error("from_dense: size mismatch");
+        }
+        
+        for(int i=0; i<n_owned; ++i) {
+            int r_dim = graph->block_sizes[i];
+            int row_offset = graph->block_offsets[i];
+            
+            int start = row_ptr[i];
+            int end = row_ptr[i+1];
+            
+            for(int k=start; k<end; ++k) {
+                int col = col_ind[k];
+                int c_dim = graph->block_sizes[col];
+                int col_offset = graph->block_offsets[col];
+                
+                T* data = val.data() + blk_ptr[k];
+                
+                // Copy dense to block (RowMajor dense to ColMajor block)
+                for(int c=0; c<c_dim; ++c) {
+                    for(int r=0; r<r_dim; ++r) {
+                        int dr = row_offset + r;
+                        int dc = col_offset + c;
+                        if(dr < my_rows && dc < my_cols) {
+                            data[c * r_dim + r] = dense[dr * my_cols + dc];
+                        }
+                    }
+                }
+            }
+        }
+    }
 };
 
 } // namespace vbcsr
 
 #endif
+

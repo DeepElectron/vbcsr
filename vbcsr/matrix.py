@@ -398,3 +398,59 @@ class VBCSR(LinearOperator):
         obj._core = core_C
         obj.shape = self.shape
         return obj
+
+    def extract_submatrix(self, global_indices: List[int]) -> 'VBCSR':
+        """
+        Extract a submatrix corresponding to the given global indices.
+        
+        Args:
+            global_indices (List[int]): List of global vertex indices to extract.
+            
+        Returns:
+            VBCSR: A serial VBCSR matrix containing the submatrix.
+        """
+        core_sub = self._core.extract_submatrix(global_indices)
+        
+        obj = VBCSR.__new__(VBCSR)
+        obj.graph = core_sub.graph
+        obj.dtype = self.dtype
+        obj._core = core_sub
+        # Shape is (M, M) where M = len(global_indices)
+        # But let's let the core handle it or compute it.
+        # Since it's serial, we can compute it if needed, but for now (None, None) is safe or we can query graph.
+        # Actually, for serial submatrix, we might want to know the shape.
+        # The core binding doesn't expose block sizes easily unless we query graph.
+        # Let's leave as None for now or improve later.
+        obj.shape = (None, None)
+        return obj
+
+    def insert_submatrix(self, submat: 'VBCSR', global_indices: List[int]) -> None:
+        """
+        Insert a submatrix back into the distributed matrix.
+        
+        Args:
+            submat (VBCSR): The submatrix to insert.
+            global_indices (List[int]): The global indices corresponding to the submatrix rows/cols.
+        """
+        if not isinstance(submat, VBCSR):
+            raise TypeError("submat must be a VBCSR matrix")
+        
+        self._core.insert_submatrix(submat._core, global_indices)
+
+    def to_dense(self) -> np.ndarray:
+        """
+        Convert the local portion of the matrix to a dense numpy array.
+        
+        Returns:
+            np.ndarray: 2D array of shape (owned_rows, all_local_cols).
+        """
+        return self._core.to_dense()
+
+    def from_dense(self, data: np.ndarray) -> None:
+        """
+        Update the local portion of the matrix from a dense numpy array.
+        
+        Args:
+            data (np.ndarray): 2D array of shape (owned_rows, all_local_cols).
+        """
+        self._core.from_dense(data)

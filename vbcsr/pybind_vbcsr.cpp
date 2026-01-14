@@ -127,7 +127,58 @@ void bind_block_spmat(py::module& m, const std::string& name) {
         .def("spmm", &BlockSpMat<T>::spmm, py::arg("B"), py::arg("threshold"), py::arg("transA") = false, py::arg("transB") = false)
         .def("spmm_self", &BlockSpMat<T>::spmm_self, py::arg("threshold"), py::arg("transA") = false)
         .def("add", &BlockSpMat<T>::add, py::arg("B"), py::arg("alpha") = 1.0, py::arg("beta") = 1.0)
-        .def("transpose", &BlockSpMat<T>::transpose);
+        .def("transpose", &BlockSpMat<T>::transpose)
+        .def("extract_submatrix", &BlockSpMat<T>::extract_submatrix, py::arg("global_indices"))
+        .def("insert_submatrix", &BlockSpMat<T>::insert_submatrix, py::arg("submat"), py::arg("global_indices"))
+        .def("to_dense", [](const BlockSpMat<T>& self) {
+            // Return 2D numpy array
+            std::vector<T> vec = self.to_dense();
+            
+            // Calculate dimensions (same logic as in C++ to_dense)
+            int n_owned = self.graph->owned_global_indices.size();
+            int my_rows = self.graph->block_offsets[n_owned];
+            int my_cols = self.graph->block_offsets.back();
+            
+            // Create numpy array with shape (rows, cols)
+            // We let pybind11 copy the data to manage lifetime safely and simply
+            return py::array_t<T>(
+                {my_rows, my_cols}, // shape
+                {my_cols * sizeof(T), sizeof(T)}, // strides (RowMajor)
+                vec.data() // data pointer
+            );
+        })
+        .def("from_dense", [](BlockSpMat<T>& self, py::array_t<T> array) {
+            // Check dimensions
+            if (array.ndim() != 2) throw std::runtime_error("from_dense: array must be 2D");
+            
+            // Convert to flat vector (RowMajor)
+            std::vector<T> vec(array.size());
+            
+            // Copy logic using buffer info
+            py::buffer_info info = array.request();
+            
+            // Check if contiguous and RowMajor for fast copy
+            bool is_contiguous = (info.strides[1] == sizeof(T) && info.strides[0] == sizeof(T) * info.shape[1]);
+            
+            if (is_contiguous) {
+                std::memcpy(vec.data(), info.ptr, sizeof(T) * array.size());
+            } else {
+                // Slow copy for non-contiguous
+                T* ptr = static_cast<T*>(info.ptr);
+                // We need to iterate carefully if strides are weird, but let's assume standard numpy access
+                // Actually, let's just use unchecked access for simplicity if we wanted, but memcpy is preferred.
+                // If not contiguous, we can let numpy copy it to a contiguous buffer first?
+                // Or just loop.
+                auto r = array.template unchecked<2>();
+                for (py::ssize_t i = 0; i < info.shape[0]; i++) {
+                    for (py::ssize_t j = 0; j < info.shape[1]; j++) {
+                        vec[i * info.shape[1] + j] = r(i, j);
+                    }
+                }
+            }
+            
+            self.from_dense(vec);
+        }, py::arg("array"));
 }
 
 PYBIND11_MODULE(vbcsr_core, m) {
