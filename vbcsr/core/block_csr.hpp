@@ -1272,11 +1272,17 @@ public:
             int start = row_ptr[i];
             int end = row_ptr[i+1];
             
-            T R_i = R[i]; // Local row i corresponds to R[i] (owned part)
+            // R is a scalar vector. We assume the diagonal operator is constant per block
+            // or we just take the first value? 
+            // The test implies we treat R as having one value per block.
+            // Using the value at the start of the block seems consistent with the test.
+            int r_offset_vec = graph->block_offsets[i];
+            T R_i = R[r_offset_vec]; 
             
             for (int k = start; k < end; ++k) {
                 int col = col_ind[k];
-                T R_j = R[col]; // col is local index (owned or ghost), maps directly to R vector
+                int c_offset_vec = graph->block_offsets[col];
+                T R_j = R[c_offset_vec]; 
                 
                 T diff = R_j - R_i;
                 
@@ -2336,23 +2342,132 @@ public:
         }
     }
 
-        // Extract submatrix defined by global_indices
-    // Returns a serial BlockSpMat containing the subgraph
-    BlockSpMat<T, Kernel> extract_submatrix(const std::vector<int>& global_indices) {
-        // 1. Use indices as provided (do not sort)
-        // This ensures submatrix row i corresponds to global_indices[i]
+           // Data structure for holding a block with global indices
+    struct BlockData {
+        int global_row;
+        int global_col;
+        int r_dim;
+        int c_dim;
+        std::vector<T> data;
+    };
+
+    // Context holding fetched data (blocks and row sizes)
+    struct FetchContext {
+        std::vector<BlockData> blocks;
+        std::map<int, int> row_sizes; // global_row -> block_size
+    };
+
+    // Helper to serve fetch requests from other processes
+    // req_buffer: [NumRows, (RowGID, NumCols, ColGID...)...]
+    // resp_buffer: Output buffer [TotalBlocks, (RowGID, Size)..., (RowGID, ColGID, RDim, CDim, Data)...]
+    // Note: To simplify unpacking, we will structure response as:
+    // [NumRows, (RowGID, Size)..., NumBlocks, (RowGID, ColGID, RDim, CDim, Data)...]
+    void serve_fetch_requests(const char* req_buffer, std::vector<char>& resp_buffer) {
+        const int* ptr = reinterpret_cast<const int*>(req_buffer);
+        int num_rows = *ptr++;
         
-        // Map global index to local index in the submatrix (0 to M-1)
-        std::map<int, int> global_to_sub;
-        for(size_t i=0; i<global_indices.size(); ++i) {
-            global_to_sub[global_indices[i]] = i;
+        // We need to iterate requests twice: once for sizes, once for blocks.
+        // Save start pointer.
+        const int* req_start = ptr;
+        
+        // 1. Calculate Response Size and Pack Row Sizes
+        // Header: NumRows + (RowGID, Size)*NumRows + NumBlocks
+        size_t header_size = sizeof(int) + num_rows * 2 * sizeof(int) + sizeof(int);
+        
+        // Temporary storage for blocks to avoid double scanning or complex size prediction
+        // But double scanning is fine for memory efficiency if we don't copy data yet.
+        // Let's do two passes.
+        
+        resp_buffer.resize(header_size);
+        char* buf_ptr = resp_buffer.data();
+        
+        // Write NumRows
+        std::memcpy(buf_ptr, &num_rows, sizeof(int)); buf_ptr += sizeof(int);
+        
+        // Pass 1: Write Row Sizes
+        ptr = req_start;
+        for(int r=0; r<num_rows; ++r) {
+            int gid = *ptr++;
+            int num_cols = *ptr++;
+            ptr += num_cols; // Skip cols
+            
+            int size = 0;
+            if(graph->global_to_local.count(gid)) {
+                int lid = graph->global_to_local.at(gid);
+                size = graph->block_sizes[lid];
+            }
+            std::memcpy(buf_ptr, &gid, sizeof(int)); buf_ptr += sizeof(int);
+            std::memcpy(buf_ptr, &size, sizeof(int)); buf_ptr += sizeof(int);
         }
         
-        // 2. Identify Local vs Remote rows
+        // Pass 2: Collect and Pack Blocks
+        int total_blocks = 0;
+        ptr = req_start;
+        
+        for(int r=0; r<num_rows; ++r) {
+            int gid = *ptr++;
+            int num_cols = *ptr++;
+            std::set<int> req_cols(ptr, ptr + num_cols); ptr += num_cols;
+            
+            if(graph->global_to_local.count(gid)) {
+                int lid = graph->global_to_local.at(gid);
+                int start = row_ptr[lid];
+                int end = row_ptr[lid+1];
+                
+                for(int k=start; k<end; ++k) {
+                    int col_lid = col_ind[k];
+                    int col_gid = graph->get_global_index(col_lid);
+                    
+                    if(req_cols.count(col_gid)) {
+                        total_blocks++;
+                        int r_dim = graph->block_sizes[lid];
+                        int c_dim = graph->block_sizes[col_lid];
+                        size_t offset = blk_ptr[k];
+                        size_t size = blk_ptr[k+1] - offset;
+                        
+                        size_t old_size = resp_buffer.size();
+                        resp_buffer.resize(old_size + 4*sizeof(int) + size*sizeof(T));
+                        char* b_ptr = resp_buffer.data() + old_size;
+                        
+                        std::memcpy(b_ptr, &gid, sizeof(int)); b_ptr += sizeof(int);
+                        std::memcpy(b_ptr, &col_gid, sizeof(int)); b_ptr += sizeof(int);
+                        std::memcpy(b_ptr, &r_dim, sizeof(int)); b_ptr += sizeof(int);
+                        std::memcpy(b_ptr, &c_dim, sizeof(int)); b_ptr += sizeof(int);
+                        std::memcpy(b_ptr, val.data() + offset, size*sizeof(T));
+                    }
+                }
+            }
+        }
+        
+        // Write NumBlocks (at the end of the header section)
+        // Header structure: [NumRows] [(GID, Size)...] [NumBlocks]
+        // Offset for NumBlocks is: sizeof(int) + num_rows * 2 * sizeof(int)
+        size_t num_blocks_offset = sizeof(int) + num_rows * 2 * sizeof(int);
+        std::memcpy(resp_buffer.data() + num_blocks_offset, &total_blocks, sizeof(int));
+    }
+
+    // Fetch blocks for a batch of submatrices
+    FetchContext fetch_blocks(const std::vector<std::vector<int>>& batch_indices) {
+        int rank;
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+        std::string fname = "debug_fetch_" + std::to_string(rank) + ".txt";
+        std::ofstream out(fname, std::ios::app);
+        out << "DEBUG: fetch_blocks start" << std::endl;
+
+        FetchContext ctx;
+        
+        // 1. Analyze Requirements
+        std::set<int> all_required_rows;
+        for(const auto& indices : batch_indices) {
+            all_required_rows.insert(indices.begin(), indices.end());
+        }
+        out << "DEBUG: all_required_rows size: " << all_required_rows.size() << std::endl;
+        
+        // 2. Identify Local vs Remote
         std::vector<int> local_rows;
         std::map<int, std::vector<int>> remote_rows_by_rank;
         
-        for(int gid : global_indices) {
+        for(int gid : all_required_rows) {
             int owner = graph->find_owner(gid);
             if(owner == graph->rank) {
                 local_rows.push_back(gid);
@@ -2360,40 +2475,36 @@ public:
                 remote_rows_by_rank[owner].push_back(gid);
             }
         }
-        
-        // 3. Collect Blocks and Block Sizes
-        struct BlockData {
-            int sub_row;
-            int sub_col;
-            int r_dim;
-            int c_dim;
-            std::vector<T> data;
-        };
-        std::vector<BlockData> collected_blocks;
-        
-        int M = global_indices.size();
-        std::vector<int> sub_block_sizes(M, 0);
-        
-        // 3.1 Local Extraction
+        out << "DEBUG: local_rows: " << local_rows.size() << ", remote_rows: " << remote_rows_by_rank.size() << std::endl;
+
+        // Map global_row -> set of required global_cols
+        std::map<int, std::set<int>> required_cols_per_row;
+        for(const auto& indices : batch_indices) {
+            for(int row_gid : indices) {
+                required_cols_per_row[row_gid].insert(indices.begin(), indices.end());
+            }
+        }
+
+        // 3. Local Fetch
+        out << "DEBUG: Starting Local Fetch" << std::endl;
         for(int gid : local_rows) {
-            if(graph->global_to_local.find(gid) == graph->global_to_local.end()) continue; 
+            if(graph->global_to_local.find(gid) == graph->global_to_local.end()) continue;
             int lid = graph->global_to_local.at(gid);
             
-            // Fill block size
-            sub_block_sizes[global_to_sub[gid]] = graph->block_sizes[lid];
+            ctx.row_sizes[gid] = graph->block_sizes[lid];
             
             int start = row_ptr[lid];
             int end = row_ptr[lid+1];
+            const auto& req_cols = required_cols_per_row[gid];
             
             for(int k=start; k<end; ++k) {
                 int col_lid = col_ind[k];
                 int col_gid = graph->get_global_index(col_lid);
                 
-                if(global_to_sub.count(col_gid)) {
-                    // Found a block in the subgraph
+                if(req_cols.count(col_gid)) {
                     BlockData bd;
-                    bd.sub_row = global_to_sub[gid];
-                    bd.sub_col = global_to_sub[col_gid];
+                    bd.global_row = gid;
+                    bd.global_col = col_gid;
                     bd.r_dim = graph->block_sizes[lid];
                     bd.c_dim = graph->block_sizes[col_lid];
                     
@@ -2402,17 +2513,14 @@ public:
                     bd.data.resize(size);
                     std::memcpy(bd.data.data(), val.data() + offset, size * sizeof(T));
                     
-                    collected_blocks.push_back(std::move(bd));
+                    ctx.blocks.push_back(std::move(bd));
                 }
             }
         }
+        out << "DEBUG: Local Fetch Done. Blocks: " << ctx.blocks.size() << std::endl;
         
-        // 3.2 Remote Extraction
-        // Protocol:
-        // 1. Send Request: [NumRows, RowGIDs..., NumFilterCols, FilterColGIDs...]
-        // 2. Receive Response: [NumRows, (RowGID, BlockSize)..., NumBlocks, (RowGID, ColGID, RDim, CDim, Data)...]
-        
-        // Prepare requests
+        // 4. Remote Fetch
+        // Prepare Requests
         std::vector<size_t> send_counts(graph->size, 0);
         std::vector<std::vector<int>> send_buffers(graph->size);
         
@@ -2421,15 +2529,16 @@ public:
             auto& rows = kv.second;
             
             send_buffers[target].push_back(rows.size());
-            send_buffers[target].insert(send_buffers[target].end(), rows.begin(), rows.end());
-            
-            send_buffers[target].push_back(global_indices.size());
-            send_buffers[target].insert(send_buffers[target].end(), global_indices.begin(), global_indices.end());
-            
+            for(int gid : rows) {
+                send_buffers[target].push_back(gid);
+                const auto& cols = required_cols_per_row[gid];
+                send_buffers[target].push_back(cols.size());
+                send_buffers[target].insert(send_buffers[target].end(), cols.begin(), cols.end());
+            }
             send_counts[target] = send_buffers[target].size() * sizeof(int);
         }
         
-        // Exchange Requests (Counts)
+        // Exchange Counts
         std::vector<size_t> recv_counts(graph->size);
         if (graph->size > 1) {
             MPI_Alltoall(send_counts.data(), sizeof(size_t), MPI_BYTE, recv_counts.data(), sizeof(size_t), MPI_BYTE, graph->comm);
@@ -2437,6 +2546,7 @@ public:
             recv_counts = send_counts;
         }
         
+        // Exchange Requests
         std::vector<size_t> sdispls(graph->size + 1, 0);
         std::vector<size_t> rdispls(graph->size + 1, 0);
         for(int i=0; i<graph->size; ++i) {
@@ -2457,80 +2567,14 @@ public:
         } else {
             recv_blob = send_blob;
         }
-                      
-        // Process Incoming Requests (Serve others)
+        
+        // Serve Requests
         std::vector<std::vector<char>> resp_buffers(graph->size);
-        std::vector<size_t> resp_send_counts(graph->size, 0); // In bytes
+        std::vector<size_t> resp_send_counts(graph->size, 0);
         
         for(int i=0; i<graph->size; ++i) {
             if(recv_counts[i] == 0) continue;
-            
-            const int* ptr = reinterpret_cast<const int*>(recv_blob.data() + rdispls[i]);
-            int num_rows = *ptr++;
-            std::vector<int> req_rows(ptr, ptr + num_rows); ptr += num_rows;
-            int num_cols = *ptr++;
-            std::set<int> req_cols(ptr, ptr + num_cols); ptr += num_cols;
-            
-            // Collect blocks and sizes
-            std::vector<char> buffer;
-            int block_count = 0;
-            
-            // 1. Write Row Sizes: [NumRows, (RowGID, Size)...]
-            buffer.resize(sizeof(int) + num_rows * 2 * sizeof(int));
-            char* buf_ptr = buffer.data();
-            std::memcpy(buf_ptr, &num_rows, sizeof(int)); buf_ptr += sizeof(int);
-            
-            for(int gid : req_rows) {
-                int size = 0;
-                if(graph->global_to_local.count(gid)) {
-                    int lid = graph->global_to_local.at(gid);
-                    size = graph->block_sizes[lid];
-                }
-                std::memcpy(buf_ptr, &gid, sizeof(int)); buf_ptr += sizeof(int);
-                std::memcpy(buf_ptr, &size, sizeof(int)); buf_ptr += sizeof(int);
-            }
-            
-            // 2. Collect Blocks
-            size_t blocks_start_offset = buffer.size();
-            buffer.resize(blocks_start_offset + sizeof(int)); // Placeholder for block_count
-            
-            for(int gid : req_rows) {
-                if(graph->global_to_local.count(gid)) {
-                    int lid = graph->global_to_local.at(gid);
-                    int start = row_ptr[lid];
-                    int end = row_ptr[lid+1];
-                    
-                    for(int k=start; k<end; ++k) {
-                        int col_lid = col_ind[k];
-                        int col_gid = graph->get_global_index(col_lid);
-                        
-                        if(req_cols.count(col_gid)) {
-                            // Match
-                            block_count++;
-                            int r_dim = graph->block_sizes[lid];
-                            int c_dim = graph->block_sizes[col_lid];
-                            size_t offset = blk_ptr[k];
-                            size_t size = blk_ptr[k+1] - offset;
-                            
-                            // Pack: RowGID, ColGID, RDim, CDim, Data
-                            size_t old_size = buffer.size();
-                            buffer.resize(old_size + 4*sizeof(int) + size*sizeof(T));
-                            char* b_ptr = buffer.data() + old_size;
-                            
-                            std::memcpy(b_ptr, &gid, sizeof(int)); b_ptr += sizeof(int);
-                            std::memcpy(b_ptr, &col_gid, sizeof(int)); b_ptr += sizeof(int);
-                            std::memcpy(b_ptr, &r_dim, sizeof(int)); b_ptr += sizeof(int);
-                            std::memcpy(b_ptr, &c_dim, sizeof(int)); b_ptr += sizeof(int);
-                            std::memcpy(b_ptr, val.data() + offset, size*sizeof(T));
-                        }
-                    }
-                }
-            }
-            
-            // Write block count
-            std::memcpy(buffer.data() + blocks_start_offset, &block_count, sizeof(int));
-            
-            resp_buffers[i] = std::move(buffer);
+            serve_fetch_requests(recv_blob.data() + rdispls[i], resp_buffers[i]);
             resp_send_counts[i] = resp_buffers[i].size();
         }
         
@@ -2563,23 +2607,21 @@ public:
         } else {
             resp_recv_blob = resp_send_blob;
         }
-                      
-        // Process Received Data
+        
+        // Unpack Responses
         for(int i=0; i<graph->size; ++i) {
             if(resp_recv_counts[i] == 0) continue;
             
             const char* ptr = resp_recv_blob.data() + resp_rdispls[i];
             
-            // 1. Read Row Sizes
+            // 1. Read Sizes
             int num_rows;
             std::memcpy(&num_rows, ptr, sizeof(int)); ptr += sizeof(int);
             for(int k=0; k<num_rows; ++k) {
                 int gid, size;
                 std::memcpy(&gid, ptr, sizeof(int)); ptr += sizeof(int);
                 std::memcpy(&size, ptr, sizeof(int)); ptr += sizeof(int);
-                if(global_to_sub.count(gid)) {
-                    sub_block_sizes[global_to_sub[gid]] = size;
-                }
+                ctx.row_sizes[gid] = size;
             }
             
             // 2. Read Blocks
@@ -2594,39 +2636,86 @@ public:
                 std::memcpy(&c_dim, ptr, sizeof(int)); ptr += sizeof(int);
                 
                 BlockData bd;
-                bd.sub_row = global_to_sub[gid];
-                bd.sub_col = global_to_sub[col_gid];
+                bd.global_row = gid;
+                bd.global_col = col_gid;
                 bd.r_dim = r_dim;
                 bd.c_dim = c_dim;
                 bd.data.resize(r_dim * c_dim);
                 std::memcpy(bd.data.data(), ptr, bd.data.size() * sizeof(T)); ptr += bd.data.size() * sizeof(T);
                 
-                collected_blocks.push_back(std::move(bd));
+                ctx.blocks.push_back(std::move(bd));
             }
         }
         
-        // 4. Construct Submatrix
+        return ctx;
+    }
+
+    // Construct a submatrix from fetched data
+    BlockSpMat<T, Kernel> construct_submatrix(const std::vector<int>& global_indices, const FetchContext& ctx) {
+        // 1. Map global index to local index in the submatrix (0 to M-1)
+        std::map<int, int> global_to_sub;
+        for(size_t i=0; i<global_indices.size(); ++i) {
+            global_to_sub[global_indices[i]] = i;
+        }
+
+        int M = global_indices.size();
+        std::vector<int> sub_block_sizes(M, 0);
         std::vector<std::vector<int>> sub_adj(M);
         
-        // Fill adj from collected blocks
-        for(const auto& bd : collected_blocks) {
-            sub_adj[bd.sub_row].push_back(bd.sub_col);
+        // 2. Fill sizes
+        for(int gid : global_indices) {
+            if(ctx.row_sizes.count(gid)) {
+                sub_block_sizes[global_to_sub[gid]] = ctx.row_sizes.at(gid);
+            }
         }
         
+        // 3. Filter blocks and build adjacency
+        std::vector<const BlockData*> relevant_blocks;
+        for(const auto& bd : ctx.blocks) {
+            if(global_to_sub.count(bd.global_row) && global_to_sub.count(bd.global_col)) {
+                relevant_blocks.push_back(&bd);
+                int sub_row = global_to_sub[bd.global_row];
+                int sub_col = global_to_sub[bd.global_col];
+                sub_adj[sub_row].push_back(sub_col);
+            }
+        }
+        
+        // 4. Construct Matrix
         DistGraph* sub_graph = new DistGraph(MPI_COMM_SELF);
         sub_graph->construct_serial(M, sub_block_sizes, sub_adj);
         
         BlockSpMat<T, Kernel> sub_mat(sub_graph);
         sub_mat.owns_graph = true;
         
-        // Fill values
-        for(const auto& bd : collected_blocks) {
-            sub_mat.add_block(bd.sub_row, bd.sub_col, bd.data.data(), bd.r_dim, bd.c_dim, AssemblyMode::INSERT, MatrixLayout::ColMajor);
+        for(const auto* bd : relevant_blocks) {
+            int sub_row = global_to_sub[bd->global_row];
+            int sub_col = global_to_sub[bd->global_col];
+            
+            // printf("Rank %d: Adding block (%d, %d)\n", rank, sub_row, sub_col);
+            // fflush(stdout);
+            
+            sub_mat.add_block(sub_row, sub_col, bd->data.data(), bd->r_dim, bd->c_dim, AssemblyMode::INSERT, MatrixLayout::ColMajor);
         }
         
         sub_mat.assemble();
-        
         return sub_mat;
+    }
+
+    // Extract submatrix defined by global_indices
+    BlockSpMat<T, Kernel> extract_submatrix(const std::vector<int>& global_indices) {
+        auto ctx = fetch_blocks({global_indices});
+        return construct_submatrix(global_indices, ctx);
+    }
+
+    // Extract multiple submatrices efficiently
+    std::vector<BlockSpMat<T, Kernel>> extract_submatrix_batched(const std::vector<std::vector<int>>& batch_indices) {
+        auto ctx = fetch_blocks(batch_indices);
+        std::vector<BlockSpMat<T, Kernel>> results;
+        results.reserve(batch_indices.size());
+        for(const auto& indices : batch_indices) {
+            results.push_back(construct_submatrix(indices, ctx));
+        }
+        return results;
     }
 
     // Insert submatrix back (In-Place)
