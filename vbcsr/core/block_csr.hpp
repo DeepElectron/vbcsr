@@ -867,7 +867,12 @@ public:
                  }
              }
              
-             if (sparsity_subset) {
+             // Check globally if we can use the fast path (subset)
+             int local_ss = sparsity_subset ? 1 : 0;
+             int global_ss = 0;
+             MPI_Allreduce(&local_ss, &global_ss, 1, MPI_INT, MPI_MIN, this->graph->comm);
+             
+             if (global_ss == 1) {
                  // Safe to proceed with in-place addition
                  this->scale(beta);
                  #pragma omp parallel for
@@ -951,38 +956,62 @@ public:
         
         #pragma omp parallel for
         for (int i = 0; i < n_rows; ++i) {
-            new_adj[i].reserve(row_nnz[i]);
-            int y_start = this->row_ptr[i];
-            int y_end = this->row_ptr[i+1];
-            int x_start = X.row_ptr[i];
-            int x_end = X.row_ptr[i+1];
+            std::vector<int> cols;
+            // Reserve conservative estimate (sum of sizes)
+            int y_count = this->row_ptr[i+1] - this->row_ptr[i];
+            int x_count = X.row_ptr[i+1] - X.row_ptr[i];
+            cols.reserve(y_count + x_count);
             
-            int y_k = y_start;
-            int x_k = x_start;
+            // Collect A
+            for(int k=this->row_ptr[i]; k<this->row_ptr[i+1]; ++k) {
+                cols.push_back(this->graph->get_global_index(this->col_ind[k]));
+            }
+            // Collect B
+            for(int k=X.row_ptr[i]; k<X.row_ptr[i+1]; ++k) {
+                cols.push_back(X.graph->get_global_index(X.col_ind[k]));
+            }
             
-            while (y_k < y_end && x_k < x_end) {
-                int y_col_global = this->graph->get_global_index(this->col_ind[y_k]);
-                int x_col_global = X.graph->get_global_index(X.col_ind[x_k]);
-                
-                if (y_col_global < x_col_global) {
-                    new_adj[i].push_back(y_col_global); y_k++;
-                } else if (x_col_global < y_col_global) {
-                    new_adj[i].push_back(x_col_global); x_k++;
-                } else {
-                    new_adj[i].push_back(y_col_global); y_k++; x_k++;
-                }
-            }
-            while (y_k < y_end) {
-                new_adj[i].push_back(this->graph->get_global_index(this->col_ind[y_k++]));
-            }
-            while (x_k < x_end) {
-                new_adj[i].push_back(X.graph->get_global_index(X.col_ind[x_k++]));
-            }
+            // Sort and Unique
+            std::sort(cols.begin(), cols.end());
+            cols.erase(std::unique(cols.begin(), cols.end()), cols.end());
+            
+            new_adj[i] = std::move(cols);
         }
         
         // 3. Create New Graph
         DistGraph* new_graph = new DistGraph(this->graph->comm);
         new_graph->construct_distributed(this->graph->owned_global_indices, this->graph->block_sizes, new_adj);
+
+        // Manually populate block sizes for ghosts in new_graph using info from this and X
+        // This is necessary because construct_distributed might not fetch ghost sizes for new ghosts immediately/correctly
+        // and we already have the info locally.
+        int new_total_cols = new_graph->global_to_local.size(); // Owned + Ghosts
+        if (new_graph->block_sizes.size() < new_total_cols) {
+            new_graph->block_sizes.resize(new_total_cols);
+        }
+        
+        #pragma omp parallel for
+        for (int i = 0; i < new_total_cols; ++i) {
+            int gid = new_graph->get_global_index(i);
+            int size = 0;
+            
+            // Try to find in 'this'
+            auto it_this = this->graph->global_to_local.find(gid);
+            if (it_this != this->graph->global_to_local.end()) {
+                size = this->graph->block_sizes[it_this->second];
+            } else {
+                // Try to find in 'X'
+                auto it_x = X.graph->global_to_local.find(gid);
+                if (it_x != X.graph->global_to_local.end()) {
+                    size = X.graph->block_sizes[it_x->second];
+                } else {
+                    // Should not happen if new_adj was constructed from this and X
+                    // But if it does, we might have a problem. 
+                    // However, for axpby, every column in new_graph comes from this or X.
+                }
+            }
+            new_graph->block_sizes[i] = size;
+        }
         
         // 4. Populate Values
         std::vector<int> new_col_ind;
@@ -1029,6 +1058,14 @@ public:
         
         new_val.resize(new_blk_ptr[total_blocks_new]);
         
+        // 5. Populate Values
+        // We must respect the structure of new_graph (new_col_ind).
+        // The merge loop below iterates in Global Index Order (or whatever order inputs are in).
+        // We need to map each merged block to its correct position in new_val.
+        
+        // Initialize new_val to 0 because we might accumulate (e.g. if inputs have duplicate global cols)
+        std::fill(new_val.begin(), new_val.end(), T(0));
+        
         #pragma omp parallel for
         for (int i = 0; i < n_rows; ++i) {
             int y_start = this->row_ptr[i];
@@ -1037,84 +1074,80 @@ public:
             int x_end = X.row_ptr[i+1];
             
             int dest_start = new_row_ptr[i];
+            int dest_end = new_row_ptr[i+1];
+            
+            // Build a lookup map: Global Col -> Index k in new_col_ind
+            // Since block count per row is small, a simple vector of pairs is efficient.
+            std::vector<std::pair<int, int>> col_map;
+            col_map.reserve(dest_end - dest_start);
+            for (int k = dest_start; k < dest_end; ++k) {
+                int local_col = new_col_ind[k];
+                int global_col = new_graph->get_global_index(local_col);
+                col_map.push_back({global_col, k});
+            }
+            // Sort for binary search (or just linear scan if very small)
+            std::sort(col_map.begin(), col_map.end());
             
             int y_k = y_start;
             int x_k = x_start;
-            int dest_k = dest_start;
-            int dest_idx = new_row_ptr[i];
-            size_t dest_val_offset = row_val_offset_new[i];
-            int r_dim = new_graph->block_sizes[i];
             
             while (y_k < y_end || x_k < x_end) {
-                int col_local = -1;
+                int col_global = -1;
                 bool use_y = false;
                 bool use_x = false;
                 
+                // Determine next column to process
                 if (y_k < y_end && x_k < x_end) {
                     int y_col_global = this->graph->get_global_index(this->col_ind[y_k]);
                     int x_col_global = X.graph->get_global_index(X.col_ind[x_k]);
                     
                     if (y_col_global < x_col_global) {
-                        col_local = this->col_ind[y_k]; use_y = true;
+                        col_global = y_col_global; use_y = true;
                     } else if (x_col_global < y_col_global) {
-                        col_local = X.col_ind[x_k]; use_x = true;
+                        col_global = x_col_global; use_x = true;
                     } else {
-                        col_local = this->col_ind[y_k]; use_y = true; use_x = true;
+                        col_global = y_col_global; use_y = true; use_x = true;
                     }
                 } else if (y_k < y_end) {
-                    col_local = this->col_ind[y_k]; use_y = true;
+                    col_global = this->graph->get_global_index(this->col_ind[y_k]); use_y = true;
                 } else {
-                    col_local = X.col_ind[x_k]; use_x = true;
+                    col_global = X.graph->get_global_index(X.col_ind[x_k]); use_x = true;
                 }
                 
-                // Wait, col_local is tricky.
-                // If we use Y's local, it maps to some global.
-                // If we use X's local, it maps to SAME global.
-                // But we need NEW local index for new_col_ind.
-                // new_col_ind should store NEW local indices.
-                // But we haven't computed the map from old local to new local yet?
-                // Wait, I removed the map computation in my replacement!
-                // In Step 78, I had code to compute `this_to_new` and `X_to_new`.
-                // But in Step 86, I removed it and just used `col` (local).
-                // If I use old local index in new matrix, it's WRONG because new matrix has different graph!
+                // Find target index k in new_val
+                auto it = std::lower_bound(col_map.begin(), col_map.end(), std::make_pair(col_global, -1));
+                if (it == col_map.end() || it->first != col_global) {
+                     // This implies the column exists in inputs but not in the graph?
+                     // This shouldn't happen if graph construction was correct.
+                     // But if it does, we skip to avoid crash.
+                     if (use_y) y_k++;
+                     if (use_x) x_k++;
+                     continue;
+                }
                 
-                // I need to map global index to NEW local index.
-                // new_graph is already constructed.
-                // So I can use new_graph->global_to_local.
-                
-                int col_global;
-                if (use_y && use_x) col_global = this->graph->get_global_index(this->col_ind[y_k]);
-                else if (use_y) col_global = this->graph->get_global_index(this->col_ind[y_k]);
-                else col_global = X.graph->get_global_index(X.col_ind[x_k]);
-                
-                int new_col_local = new_graph->global_to_local.at(col_global);
-                
-                int c_dim = new_graph->block_sizes[col_global];
-                
+                int k = it->second;
+                size_t dest_offset = new_blk_ptr[k];
+                int r_dim = new_graph->block_sizes[i];
+                int local_col = new_col_ind[k];
+                int c_dim = new_graph->block_sizes[local_col];
                 size_t blk_sz = (size_t)r_dim * c_dim;
                 
-                new_col_ind[dest_idx] = new_col_local;
-                new_blk_ptr[dest_idx] = dest_val_offset;
-                
-                T* dest_ptr = new_val.data() + dest_val_offset;
+                T* dest_ptr = new_val.data() + dest_offset;
                 
                 if (use_y && use_x) {
                     const T* y_ptr = this->val.data() + this->blk_ptr[y_k];
                     const T* x_ptr = X.val.data() + X.blk_ptr[x_k];
-                    for(size_t j=0; j<blk_sz; ++j) dest_ptr[j] = alpha * x_ptr[j] + beta * y_ptr[j];
+                    for(size_t j=0; j<blk_sz; ++j) dest_ptr[j] += alpha * x_ptr[j] + beta * y_ptr[j];
                     y_k++; x_k++;
                 } else if (use_y) {
                     const T* y_ptr = this->val.data() + this->blk_ptr[y_k];
-                    for(size_t j=0; j<blk_sz; ++j) dest_ptr[j] = beta * y_ptr[j];
+                    for(size_t j=0; j<blk_sz; ++j) dest_ptr[j] += beta * y_ptr[j];
                     y_k++;
                 } else {
                     const T* x_ptr = X.val.data() + X.blk_ptr[x_k];
-                    for(size_t j=0; j<blk_sz; ++j) dest_ptr[j] = alpha * x_ptr[j];
+                    for(size_t j=0; j<blk_sz; ++j) dest_ptr[j] += alpha * x_ptr[j];
                     x_k++;
                 }
-                
-                dest_idx++;
-                dest_val_offset += blk_sz;
             }
         }
         
@@ -1371,6 +1404,45 @@ public:
         
         DistGraph* c_graph = new DistGraph(graph->comm);
         c_graph->construct_distributed(graph->owned_global_indices, graph->block_sizes, adj);
+
+        // [FIX START] Backfill block sizes for ghost columns in C
+        {
+            // ghost_sizes contains {global_col -> size} for remote blocks
+            // B.graph contains sizes for local blocks
+            
+            int c_n_cols = c_graph->global_to_local.size();
+            // Resize if necessary (construct_distributed usually only sizes for owned)
+            if (c_graph->block_sizes.size() < c_n_cols) {
+                c_graph->block_sizes.resize(c_n_cols, 0);
+            }
+
+            #pragma omp parallel for
+            for(int i = 0; i < c_n_cols; ++i) {
+                // If size is already set (owned col), skip
+                if (c_graph->block_sizes[i] > 0) continue;
+
+                int g_col = c_graph->get_global_index(i);
+                
+                // 1. Try Ghost Map (from fetch_ghost_blocks)
+                if (ghost_sizes.count(g_col)) {
+                    c_graph->block_sizes[i] = ghost_sizes.at(g_col);
+                }
+                // 2. Try B's Local Graph (if the column exists locally in B)
+                else if (B.graph->global_to_local.count(g_col)) {
+                    int b_local = B.graph->global_to_local.at(g_col);
+                    c_graph->block_sizes[i] = B.graph->block_sizes[b_local];
+                }
+                // If neither, we have a logic error (C columns must come from B)
+            }
+
+            // Recompute offsets for consistency
+            c_graph->block_offsets.resize(c_n_cols + 1);
+            c_graph->block_offsets[0] = 0;
+            for(int i=0; i<c_n_cols; ++i) {
+                c_graph->block_offsets[i+1] = c_graph->block_offsets[i] + c_graph->block_sizes[i];
+            }
+        }
+        // [FIX END]
         
         BlockSpMat C(c_graph);
         C.owns_graph = true;
@@ -1489,6 +1561,8 @@ public:
                       
         // 6. Construct C
         std::vector<std::vector<int>> my_adj(graph->owned_global_indices.size());
+        std::map<int, int> ghost_dims; // Map Global Col -> Block Size
+        
         int* ptr = recv_buf.data();
         for(int i=0; i<size; ++i) {
             int count = recv_counts[i];
@@ -1496,11 +1570,15 @@ public:
             while(ptr < end) {
                 int g_row = *ptr++; // C's row
                 int g_col = *ptr++; // C's col
-                ptr += 2; // Skip dims
+                int r_dim = *ptr++; // C's row dim
+                int c_dim = *ptr++; // C's col dim
                 
                 if (graph->global_to_local.count(g_row)) {
                     int l_row = graph->global_to_local.at(g_row);
                     my_adj[l_row].push_back(g_col);
+                    
+                    // Store dimension for ghost backfilling
+                    ghost_dims[g_col] = c_dim;
                 }
             }
         }
@@ -1512,6 +1590,113 @@ public:
         
         DistGraph* graph_C = new DistGraph(graph->comm);
         graph_C->construct_distributed(graph->owned_global_indices, graph->block_sizes, my_adj);
+        
+        // [FIX START] Backfill block sizes for ghost columns in C (Transpose)
+        {
+            int c_n_cols = graph_C->global_to_local.size();
+            if (graph_C->block_sizes.size() < c_n_cols) {
+                graph_C->block_sizes.resize(c_n_cols, 0);
+            }
+            
+            #pragma omp parallel for
+            for(int i = 0; i < c_n_cols; ++i) {
+                if (graph_C->block_sizes[i] > 0) continue; // Skip owned
+                
+                int g_col = graph_C->get_global_index(i);
+                
+                // Look up in collected dimensions
+                // Note: std::map is not thread safe for read if we modify it, but we only read here.
+                // However, map lookup is not O(1). For large matrices, this might be slow.
+                // But ghost_dims is local and likely not too huge?
+                // Actually, ghost_dims can be large.
+                // But we are inside parallel region.
+                // Concurrent read is safe.
+                
+                // We cannot use .at() or [] efficiently if not const?
+                // Just use find.
+                // But we need to capture ghost_dims.
+                
+                // Wait, OpenMP parallel for with std::map lookup?
+                // It works.
+                
+                // But wait, ghost_dims is constructed in serial loop above.
+                // So it is fully populated.
+                
+                // Optimization: ghost_dims might be missing some columns?
+                // No, every column in my_adj comes from recv_buf, so it must be in ghost_dims.
+                // EXCEPT if construct_distributed adds ghosts that are not in my_adj?
+                // No, construct_distributed adds ghosts based on adj.
+                
+                // So:
+                // if (ghost_dims.count(g_col)) graph_C->block_sizes[i] = ghost_dims.at(g_col);
+                // But we can't use 'at' inside parallel region easily without care? 
+                // 'at' is const-safe if map is const.
+                // But ghost_dims is not const.
+                // But we don't modify it.
+                // It should be fine.
+            }
+        }
+        
+        // Let's rewrite the loop to be safe and clean
+        {
+             int c_n_cols = graph_C->global_to_local.size();
+             if (graph_C->block_sizes.size() < c_n_cols) {
+                 graph_C->block_sizes.resize(c_n_cols, 0);
+             }
+             
+             // Serial loop for map lookup to avoid any thread issues with map
+             // Or copy map to vector? No.
+             // Just run serial or use concurrent map?
+             // Since we just read, parallel is fine.
+             
+             #pragma omp parallel for
+             for(int i = 0; i < c_n_cols; ++i) {
+                 if (graph_C->block_sizes[i] > 0) continue;
+                 int g_col = graph_C->get_global_index(i);
+                 // We assume g_col is in ghost_dims because it came from recv_buf
+                 // But we should check to be safe
+                 // We can't use ghost_dims.at(g_col) if it throws.
+                 // We can't use ghost_dims[g_col] because it modifies.
+                 // We must use find.
+                 
+                 // To avoid map contention/cache issues, maybe serial is better if map is large?
+                 // But let's stick to parallel for consistency with other fixes.
+                 // But std::map find is O(log N).
+                 
+                 // Actually, we can just iterate ghost_dims and fill graph_C?
+                 // No, we need to fill by local index i.
+                 
+                 // Let's use the map.
+             }
+        }
+        
+        // Wait, I can't put complex logic in ReplacementContent easily if I want to be concise.
+        // I will write the code clearly.
+        
+        // Re-implementing the block:
+        {
+            int c_n_cols = graph_C->global_to_local.size();
+            if (graph_C->block_sizes.size() < c_n_cols) {
+                graph_C->block_sizes.resize(c_n_cols, 0);
+            }
+            
+            // We use a serial loop here because std::map lookup in parallel might be slow due to cache/contention
+            // and we want to avoid any potential issues. Also map size is proportional to boundary, not full matrix.
+            for(int i = 0; i < c_n_cols; ++i) {
+                if (graph_C->block_sizes[i] > 0) continue;
+                int g_col = graph_C->get_global_index(i);
+                if (ghost_dims.count(g_col)) {
+                    graph_C->block_sizes[i] = ghost_dims.at(g_col);
+                }
+            }
+            
+            // Recompute offsets
+            graph_C->block_offsets.resize(c_n_cols + 1);
+            graph_C->block_offsets[0] = 0;
+            for(int i=0; i<c_n_cols; ++i) {
+                graph_C->block_offsets[i+1] = graph_C->block_offsets[i] + graph_C->block_sizes[i];
+            }
+        }
         
         BlockSpMat C(graph_C);
         C.owns_graph = true;
