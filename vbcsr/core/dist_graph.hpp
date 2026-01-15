@@ -164,7 +164,11 @@ public:
         std::vector<int> all_block_sizes;
         if (rank == 0) all_block_sizes = global_block_sizes;
         all_block_sizes.resize(n_global_blocks);
-        MPI_Bcast(all_block_sizes.data(), n_global_blocks, MPI_INT, 0, comm);
+        if (size > 1) {
+            MPI_Bcast(all_block_sizes.data(), n_global_blocks, MPI_INT, 0, comm);
+        } else {
+            // Serial case: already have it in rank 0
+        }
 
         // Scatter adjacency? 
         // Adjacency is a vector of vectors. Hard to scatter directly.
@@ -186,12 +190,16 @@ public:
         
         // Broadcast sizes
         int total_edges = flat_adj.size();
-        MPI_Bcast(&total_edges, 1, MPI_INT, 0, comm);
+        if (size > 1) {
+            MPI_Bcast(&total_edges, 1, MPI_INT, 0, comm);
+        }
         flat_adj.resize(total_edges);
         adj_offsets.resize(n_global_blocks + 1);
         
-        MPI_Bcast(flat_adj.data(), total_edges, MPI_INT, 0, comm);
-        MPI_Bcast(adj_offsets.data(), n_global_blocks + 1, MPI_INT, 0, comm);
+        if (size > 1) {
+            MPI_Bcast(flat_adj.data(), total_edges, MPI_INT, 0, comm);
+            MPI_Bcast(adj_offsets.data(), n_global_blocks + 1, MPI_INT, 0, comm);
+        }
         
         // 3. Build local graph and identify ghosts
         global_to_local.clear();
@@ -419,7 +427,11 @@ private:
         }
         
         std::vector<int> incoming_req_counts(size);
-        MPI_Alltoall(req_counts.data(), 1, MPI_INT, incoming_req_counts.data(), 1, MPI_INT, comm);
+        if (size > 1) {
+            MPI_Alltoall(req_counts.data(), 1, MPI_INT, incoming_req_counts.data(), 1, MPI_INT, comm);
+        } else {
+            incoming_req_counts = req_counts;
+        }
             // tasking the rank-th element and send to rank-th process
         
         // 3. Exchange the actual requests (which GIDs they want)
@@ -440,8 +452,12 @@ private:
         }
         
         std::vector<int> req_recv_buf(req_rdispls[size]);
-        MPI_Alltoallv(req_send_buf.data(), req_counts.data(), req_sdispls.data(), MPI_INT,
-                      req_recv_buf.data(), incoming_req_counts.data(), req_rdispls.data(), MPI_INT, comm);
+        if (size > 1) {
+            MPI_Alltoallv(req_send_buf.data(), req_counts.data(), req_sdispls.data(), MPI_INT,
+                          req_recv_buf.data(), incoming_req_counts.data(), req_rdispls.data(), MPI_INT, comm);
+        } else {
+            req_recv_buf = req_send_buf;
+        }
                       
         // 4. Build Send Lists (What I send to others)
         // req_recv_buf contains GIDs that others want from me
@@ -536,7 +552,11 @@ private:
         for (auto& kv : ghosts_by_rank) req_counts[kv.first] = kv.second.size();
         
         std::vector<int> incoming_req_counts(size);
-        MPI_Alltoall(req_counts.data(), 1, MPI_INT, incoming_req_counts.data(), 1, MPI_INT, comm);
+        if (size > 1) {
+            MPI_Alltoall(req_counts.data(), 1, MPI_INT, incoming_req_counts.data(), 1, MPI_INT, comm);
+        } else {
+            incoming_req_counts = req_counts;
+        }
         
         // 3. Exchange GIDs
         std::vector<int> req_sdispls(size + 1, 0), req_rdispls(size + 1, 0);
@@ -555,8 +575,12 @@ private:
         }
         
         std::vector<int> req_recv_buf(req_rdispls[size]);
-        MPI_Alltoallv(req_send_buf.data(), req_counts.data(), req_sdispls.data(), MPI_INT,
-                      req_recv_buf.data(), incoming_req_counts.data(), req_rdispls.data(), MPI_INT, comm);
+        if (size > 1) {
+            MPI_Alltoallv(req_send_buf.data(), req_counts.data(), req_sdispls.data(), MPI_INT,
+                          req_recv_buf.data(), incoming_req_counts.data(), req_rdispls.data(), MPI_INT, comm);
+        } else {
+            req_recv_buf = req_send_buf;
+        }
                       
         // 4. Prepare Block Sizes to send back
         std::vector<int> resp_send_buf(req_rdispls[size]);
@@ -570,8 +594,12 @@ private:
         // 5. Receive Block Sizes
         std::vector<int> resp_recv_buf(req_sdispls[size]);
         // Note: Send/Recv counts are swapped compared to request phase
-        MPI_Alltoallv(resp_send_buf.data(), incoming_req_counts.data(), req_rdispls.data(), MPI_INT,
-                      resp_recv_buf.data(), req_counts.data(), req_sdispls.data(), MPI_INT, comm);
+        if (size > 1) {
+            MPI_Alltoallv(resp_send_buf.data(), incoming_req_counts.data(), req_rdispls.data(), MPI_INT,
+                          resp_recv_buf.data(), req_counts.data(), req_sdispls.data(), MPI_INT, comm);
+        } else {
+            resp_recv_buf = resp_send_buf;
+        }
                       
         // 6. Fill ghost block sizes
         offset = 0;

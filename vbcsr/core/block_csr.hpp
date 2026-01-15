@@ -2378,7 +2378,11 @@ public:
         
         // Exchange Requests (Counts)
         std::vector<size_t> recv_counts(graph->size);
-        MPI_Alltoall(send_counts.data(), sizeof(size_t), MPI_BYTE, recv_counts.data(), sizeof(size_t), MPI_BYTE, graph->comm);
+        if (graph->size > 1) {
+            MPI_Alltoall(send_counts.data(), sizeof(size_t), MPI_BYTE, recv_counts.data(), sizeof(size_t), MPI_BYTE, graph->comm);
+        } else {
+            recv_counts = send_counts;
+        }
         
         std::vector<size_t> sdispls(graph->size + 1, 0);
         std::vector<size_t> rdispls(graph->size + 1, 0);
@@ -2394,8 +2398,12 @@ public:
         }
         
         std::vector<char> recv_blob(rdispls[graph->size]);
-        safe_alltoallv(send_blob.data(), send_counts, sdispls, MPI_BYTE,
-                      recv_blob.data(), recv_counts, rdispls, MPI_BYTE, graph->comm);
+        if (graph->size > 1) {
+            safe_alltoallv(send_blob.data(), send_counts, sdispls, MPI_BYTE,
+                          recv_blob.data(), recv_counts, rdispls, MPI_BYTE, graph->comm);
+        } else {
+            recv_blob = send_blob;
+        }
                       
         // Process Incoming Requests (Serve others)
         std::vector<std::vector<char>> resp_buffers(graph->size);
@@ -2475,7 +2483,11 @@ public:
         
         // Exchange Responses
         std::vector<size_t> resp_recv_counts(graph->size);
-        MPI_Alltoall(resp_send_counts.data(), sizeof(size_t), MPI_BYTE, resp_recv_counts.data(), sizeof(size_t), MPI_BYTE, graph->comm);
+        if (graph->size > 1) {
+            MPI_Alltoall(resp_send_counts.data(), sizeof(size_t), MPI_BYTE, resp_recv_counts.data(), sizeof(size_t), MPI_BYTE, graph->comm);
+        } else {
+            resp_recv_counts = resp_send_counts;
+        }
         
         std::vector<size_t> resp_sdispls(graph->size + 1, 0);
         std::vector<size_t> resp_rdispls(graph->size + 1, 0);
@@ -2492,8 +2504,12 @@ public:
         }
         
         std::vector<char> resp_recv_blob(resp_rdispls[graph->size]);
-        safe_alltoallv(resp_send_blob.data(), resp_send_counts, resp_sdispls, MPI_BYTE,
-                      resp_recv_blob.data(), resp_recv_counts, resp_rdispls, MPI_BYTE, graph->comm);
+        if (graph->size > 1) {
+            safe_alltoallv(resp_send_blob.data(), resp_send_counts, resp_sdispls, MPI_BYTE,
+                          resp_recv_blob.data(), resp_recv_counts, resp_rdispls, MPI_BYTE, graph->comm);
+        } else {
+            resp_recv_blob = resp_send_blob;
+        }
                       
         // Process Received Data
         for(int i=0; i<graph->size; ++i) {
