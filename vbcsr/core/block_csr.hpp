@@ -1670,8 +1670,8 @@ public:
         int rank = graph->rank;
         
         // 1. Counting pass
-        std::vector<int> send_counts(size, 0);
-        std::vector<int> send_data_counts(size, 0);
+        std::vector<size_t> send_counts(size, 0);
+        std::vector<size_t> send_data_counts(size, 0);
         
         int n_rows = row_ptr.size() - 1;
         for (int i = 0; i < n_rows; ++i) {
@@ -1684,24 +1684,24 @@ public:
                 int c_dim = graph->block_sizes[col_ind[k]];
                 
                 send_counts[owner] += 4; // g_row, g_col, r_dim, c_dim
-                send_data_counts[owner] += r_dim * c_dim;
+                send_data_counts[owner] += (size_t)r_dim * c_dim;
             }
         }
         
         // 2. Exchange counts
-        std::vector<int> recv_counts(size);
-        std::vector<int> recv_data_counts(size);
+        std::vector<size_t> recv_counts(size);
+        std::vector<size_t> recv_data_counts(size);
         if (graph->size > 1) {
-            MPI_Alltoall(send_counts.data(), 1, MPI_INT, recv_counts.data(), 1, MPI_INT, graph->comm);
-            MPI_Alltoall(send_data_counts.data(), 1, MPI_INT, recv_data_counts.data(), 1, MPI_INT, graph->comm);
+            MPI_Alltoall(send_counts.data(), sizeof(size_t), MPI_BYTE, recv_counts.data(), sizeof(size_t), MPI_BYTE, graph->comm);
+            MPI_Alltoall(send_data_counts.data(), sizeof(size_t), MPI_BYTE, recv_data_counts.data(), sizeof(size_t), MPI_BYTE, graph->comm);
         } else {
             recv_counts = send_counts;
             recv_data_counts = send_data_counts;
         }
         
         // 3. Setup displacements
-        std::vector<int> sdispls(size + 1, 0), rdispls(size + 1, 0);
-        std::vector<int> sdispls_data(size + 1, 0), rdispls_data(size + 1, 0);
+        std::vector<size_t> sdispls(size + 1, 0), rdispls(size + 1, 0);
+        std::vector<size_t> sdispls_data(size + 1, 0), rdispls_data(size + 1, 0);
         for(int i=0; i<size; ++i) {
             sdispls[i+1] = sdispls[i] + send_counts[i];
             rdispls[i+1] = rdispls[i] + recv_counts[i];
@@ -1712,8 +1712,8 @@ public:
         // 4. Pack flat buffers
         std::vector<int> send_buf(sdispls[size]);
         std::vector<T> send_val(sdispls_data[size]);
-        std::vector<int> current_counts(size, 0);
-        std::vector<int> current_data_counts(size, 0);
+        std::vector<size_t> current_counts(size, 0);
+        std::vector<size_t> current_data_counts(size, 0);
         
         for (int i = 0; i < n_rows; ++i) {
             int g_row = graph->owned_global_indices[i];
@@ -1732,8 +1732,7 @@ public:
                 meta_ptr[3] = r_dim;
                 current_counts[owner] += 4;
                 
-                // long long offset = blk_ptr[k];
-                size_t count = r_dim * c_dim;
+                size_t count = (size_t)r_dim * c_dim;
                 std::memcpy(send_val.data() + sdispls_data[owner] + current_data_counts[owner], arena.get_ptr(blk_handles[k]), count * sizeof(T));
                 current_data_counts[owner] += count;
             }
@@ -1742,14 +1741,14 @@ public:
         // 5. Exchange data
         std::vector<int> recv_buf(rdispls[size]);
         if (graph->size > 1) {
-            MPI_Alltoallv(send_buf.data(), send_counts.data(), sdispls.data(), MPI_INT,
-                          recv_buf.data(), recv_counts.data(), rdispls.data(), MPI_INT, graph->comm);
+            safe_alltoallv(send_buf.data(), send_counts, sdispls, MPI_INT,
+                          recv_buf.data(), recv_counts, rdispls, MPI_INT, graph->comm);
         } else {
             recv_buf = send_buf;
         }
                       
         std::vector<T> recv_val(rdispls_data[size]);
-        std::vector<int> send_data_bytes(size), recv_data_bytes(size), sdispls_data_bytes(size + 1), rdispls_data_bytes(size + 1);
+        std::vector<size_t> send_data_bytes(size), recv_data_bytes(size), sdispls_data_bytes(size + 1), rdispls_data_bytes(size + 1);
         for(int i=0; i<size; ++i) {
             send_data_bytes[i] = send_data_counts[i] * sizeof(T);
             recv_data_bytes[i] = recv_data_counts[i] * sizeof(T);
@@ -1760,8 +1759,8 @@ public:
         rdispls_data_bytes[size] = rdispls_data[size] * sizeof(T);
 
         if (graph->size > 1) {
-            MPI_Alltoallv(send_val.data(), send_data_bytes.data(), sdispls_data_bytes.data(), MPI_BYTE,
-                          recv_val.data(), recv_data_bytes.data(), rdispls_data_bytes.data(), MPI_BYTE, graph->comm);
+            safe_alltoallv(send_val.data(), send_data_bytes, sdispls_data_bytes, MPI_BYTE,
+                          recv_val.data(), recv_data_bytes, rdispls_data_bytes, MPI_BYTE, graph->comm);
         } else {
             recv_val = send_val;
         }
@@ -1772,7 +1771,7 @@ public:
         
         int* ptr = recv_buf.data();
         for(int i=0; i<size; ++i) {
-            int count = recv_counts[i];
+            size_t count = recv_counts[i];
             int* end = ptr + count;
             while(ptr < end) {
                 int g_row = *ptr++; // C's row
@@ -1834,14 +1833,14 @@ public:
         ptr = recv_buf.data();
         T* val_ptr = recv_val.data();
         for(int i=0; i<size; ++i) {
-            int count = recv_counts[i];
+            size_t count = recv_counts[i];
             int* end = ptr + count;
             while(ptr < end) {
                 int g_row = *ptr++; 
                 int g_col = *ptr++; 
                 int r_dim = *ptr++; 
                 int c_dim = *ptr++; 
-                int n_elem = r_dim * c_dim;
+                size_t n_elem = (size_t)r_dim * c_dim;
                 
                 std::vector<T> block(n_elem);
                 int rows_A = c_dim; 
