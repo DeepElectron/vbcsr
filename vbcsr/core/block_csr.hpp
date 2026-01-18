@@ -362,6 +362,10 @@ public:
 
     // Finalize assembly by exchanging remote blocks
     void assemble() {
+        if (graph->size == 1 && remote_blocks.empty()) {
+            norms_valid = false;
+            return;
+        }
         int size = graph->size;
         
         // 1. Counting pass
@@ -945,7 +949,11 @@ public:
         
         int local_subset = x_is_subset ? 1 : 0;
         int global_subset = 0;
-        MPI_Allreduce(&local_subset, &global_subset, 1, MPI_INT, MPI_MIN, this->graph->comm);
+        if (this->graph->size > 1) {
+            MPI_Allreduce(&local_subset, &global_subset, 1, MPI_INT, MPI_MIN, this->graph->comm);
+        } else {
+            global_subset = local_subset;
+        }
         x_is_subset = (global_subset == 1);
         
         if (x_is_subset) {
@@ -977,7 +985,11 @@ public:
             // Check globally if we can use the fast path (subset)
             int local_ss = sparsity_subset ? 1 : 0;
             int global_ss = 0;
-            MPI_Allreduce(&local_ss, &global_ss, 1, MPI_INT, MPI_MIN, this->graph->comm);
+            if (this->graph->size > 1) {
+                MPI_Allreduce(&local_ss, &global_ss, 1, MPI_INT, MPI_MIN, this->graph->comm);
+            } else {
+                global_ss = local_ss;
+            }
             // TODO: optimizable, seems we can merge if the local_ss is 1, and for mismatched case, we only need to reallocate locally
             // this is very tricky.
             if (global_ss == 1) {
@@ -1668,7 +1680,80 @@ public:
     BlockSpMat transpose() const {
         int size = graph->size;
         int rank = graph->rank;
-        
+
+        // Optimization for Serial Execution
+        if (size == 1) {
+            // Direct construction without buffer packing
+            int n_rows = row_ptr.size() - 1;
+            
+            // 1. Count entries per column (which become rows in C)
+            // Since size=1, all columns are local.
+            // However, we need to know the number of columns to size C's row_ptr.
+            // graph->block_offsets.size() - 1 is the total number of local columns.
+            int n_cols = graph->block_offsets.size() - 1;
+            
+            // Construct adjacency for C
+            std::vector<std::vector<int>> c_adj(n_cols);
+            for (int i = 0; i < n_rows; ++i) {
+                int start = row_ptr[i];
+                int end = row_ptr[i+1];
+                int g_row = graph->get_global_index(i);
+                for (int k = start; k < end; ++k) {
+                    int col = col_ind[k];
+                    c_adj[col].push_back(g_row);
+                }
+            }
+            
+            // Construct C graph
+            std::vector<int> c_owned_globals(n_cols);
+            std::vector<int> c_block_sizes(n_cols);
+            for(int i=0; i<n_cols; ++i) {
+                c_owned_globals[i] = graph->get_global_index(i); 
+                c_block_sizes[i] = graph->block_sizes[i];
+            }
+            
+            DistGraph* graph_C = new DistGraph(graph->comm);
+            graph_C->construct_distributed(c_owned_globals, c_block_sizes, c_adj);
+            
+            // This constructor calls allocate_from_graph(), which sets up row_ptr, col_ind, blk_handles, blk_sizes, and arena.
+            BlockSpMat C(graph_C);
+            C.owns_graph = true;
+            
+            // We need to fill in column-major order of A (which is row-major of C)
+            // But we iterate A in row-major. So we need offsets.
+            std::vector<int> current_pos = C.row_ptr; // Copy starting positions
+            
+            // Fill Data
+            // We iterate A and scatter to C
+            #pragma omp parallel for
+            for (int i = 0; i < n_rows; ++i) {
+                int r_dim = graph->block_sizes[i];
+                int start = row_ptr[i];
+                int end = row_ptr[i+1];
+                for (int k = start; k < end; ++k) {
+                    int col = col_ind[k];
+                    int c_dim = graph->block_sizes[col];
+                    
+                    int dest_idx;
+                    #pragma omp atomic capture
+                    dest_idx = current_pos[col]++;
+                    
+                    // Copy and Transpose Data
+                    const T* a_data = arena.get_ptr(blk_handles[k]);
+                    T* c_data = C.arena.get_ptr(C.blk_handles[dest_idx]);
+                    
+                    for(int c=0; c<c_dim; ++c) {
+                        for(int r=0; r<r_dim; ++r) {
+                            T val = a_data[c * r_dim + r];
+                            c_data[r * c_dim + c] = ConjHelper<T>::apply(val);
+                        }
+                    }
+                }
+            }
+            C.norms_valid = false;
+            return C;
+        }
+
         // 1. Counting pass
         std::vector<size_t> send_counts(size, 0);
         std::vector<size_t> send_data_counts(size, 0);
@@ -1951,6 +2036,7 @@ public:
 
     // SpMM Phase 1: Metadata Exchange
     GhostMetadata exchange_ghost_metadata(const BlockSpMat& B) const {
+        if (graph->size == 1) return {};
         GhostMetadata metadata;
         int size = graph->size;
         int rank = graph->rank;
@@ -2232,6 +2318,7 @@ public:
 
     // SpMM Phase 3: Fetch Ghost Blocks
     std::pair<GhostBlockData, GhostSizes> fetch_ghost_blocks(const std::vector<BlockID>& required_blocks) const {
+        if (graph->size == 1) return {{}, {}};
         GhostBlockData ghost_data;
         GhostSizes ghost_sizes;
         int size = graph->size;
@@ -3011,7 +3098,11 @@ public:
         long long local_nnz = col_ind.size();
         long long global_nnz = 0;
         
-        MPI_Allreduce(&local_nnz, &global_nnz, 1, MPI_LONG_LONG, MPI_SUM, graph->comm);
+        if (graph->size > 1) {
+            MPI_Allreduce(&local_nnz, &global_nnz, 1, MPI_LONG_LONG, MPI_SUM, graph->comm);
+        } else {
+            global_nnz = local_nnz;
+        }
         
         // Total global blocks N
         // graph->block_displs is size+1, last element is total blocks
