@@ -1665,17 +1665,6 @@ public:
         norms_valid = false;
     }
 
-    void fill(double val) {
-        #pragma omp parallel for
-        for (int i = 0; i < col_ind.size(); ++i) {
-            uint64_t handle = blk_handles[i];
-            T* data = arena.get_ptr(handle);
-            size_t size = blk_sizes[i];
-            std::fill(data, data + size, T(val));
-        }
-        norms_valid = false;
-    }
-
     BlockSpMat transpose() const {
         int size = graph->size;
         int rank = graph->rank;
