@@ -1158,6 +1158,29 @@ public:
         // opt: How to reuse the available memory without reallocating for them all?
         arena.reserve(row_val_offset_new.back());
         
+        // Helper Lambda for Canonical Comparison (Owned < Ghosts; Ghosts by Owner)
+        auto is_less = [](int col_local, DistGraph* graph, int col_other_local, DistGraph* graph_other) -> bool {
+            int n_owned = graph->owned_global_indices.size();
+            int n_owned_other = graph_other->owned_global_indices.size();
+            
+            bool ghost = col_local >= n_owned;
+            bool ghost_other = col_other_local >= n_owned_other;
+            
+            if (ghost != ghost_other) return !ghost; // Owned < Ghost
+            
+            int gid = graph->get_global_index(col_local);
+            int gid_other = graph_other->get_global_index(col_other_local);
+            
+            if (!ghost) return gid < gid_other; // Both Owned: Compare GID
+            
+            // Both Ghosts: Compare Owner, then GID
+            int owner = graph->find_owner(gid);
+            int owner_other = graph_other->find_owner(gid_other);
+            
+            if (owner != owner_other) return owner < owner_other;
+            return gid < gid_other;
+        };
+
         // Pass 1: Map existing handles and mark new ones (Parallel)
         #pragma omp parallel for
         for (int i = 0; i < n_rows; ++i) {
@@ -1175,27 +1198,20 @@ public:
                 int c_dim = new_graph->block_sizes[col];
                 new_blk_sizes[k] = r_dim * c_dim;
                 
-                int g_col_new = new_graph->get_global_index(col);
-                
-                // Advance tk to find match or go past
-                // Both sequences are sorted by global column index
-                while (tk < this_end) {
-                    int this_col = this->col_ind[tk];
-                    int g_col_old = this->graph->get_global_index(this_col);
-                    if (g_col_old < g_col_new) {
-                        tk++;
-                    } else {
-                        break;
-                    }
+                // Advance tk to match col using Canonical Order
+                while (tk < this_end && is_less(this->col_ind[tk], this->graph, col, new_graph)) {
+                    tk++;
                 }
                 
                 bool found = false;
                 if (tk < this_end) {
-                    int this_col = this->col_ind[tk];
-                    int g_col_old = this->graph->get_global_index(this_col);
-                    if (g_col_old == g_col_new) {
-                        new_blk_handles[k] = this->blk_handles[tk];
-                        found = true;
+                    // Check for equality: !(A < B) AND !(B < A) => A == B
+                    // We already know !(this[tk] < col) from the while loop.
+                    // So we just need to check !(col < this[tk]).
+                    if (!is_less(col, new_graph, this->col_ind[tk], this->graph)) {
+                         // Match found!
+                         new_blk_handles[k] = this->blk_handles[tk];
+                         found = true;
                     }
                 }
                 
@@ -1212,14 +1228,7 @@ public:
             }
         }
         
-        // 5. Populate Values
-        // We must respect the structure of new_graph (new_col_ind).
-        // The merge loop below iterates in Global Index Order (or whatever order inputs are in).
-        // We need to map each merged block to its correct position in new_val.
-        
-        // Initialize new_val to 0 because we might accumulate (e.g. if inputs have duplicate global cols)
-        // std::fill(new_val.begin(), new_val.end(), T(0));
-        
+        // Pass 3: Populate Values (Parallel)
         #pragma omp parallel for
         for (int i = 0; i < n_rows; ++i) {
             int y_start = this->row_ptr[i];
@@ -1227,74 +1236,54 @@ public:
             int x_start = X.row_ptr[i];
             int x_end = X.row_ptr[i+1];
             
-            int dest_start = new_row_ptr[i];
-            int dest_end = new_row_ptr[i+1];
-            
-            // Build a lookup map: Global Col -> Index k in new_col_ind
-            // Since block count per row is small, a simple vector of pairs is efficient.
-            std::vector<std::pair<int, int>> col_map;
-            col_map.reserve(dest_end - dest_start);
-            for (int k = dest_start; k < dest_end; ++k) {
-                int local_col = new_col_ind[k];
-                int global_col = new_graph->get_global_index(local_col);
-                col_map.push_back({global_col, k});
-            }
-            // Sort for binary search (or just linear scan if very small)
-            std::sort(col_map.begin(), col_map.end());
+            int start = new_row_ptr[i];
+            int end = new_row_ptr[i+1];
             
             int y_k = y_start;
             int x_k = x_start;
             
-            while (y_k < y_end || x_k < x_end) {
-                int col_global = -1;
-                bool use_y = false;
-                bool use_x = false;
+            for(int k=start; k<end; ++k) {
+                int col = new_col_ind[k];
                 
-                // Determine next column to process
-                if (y_k < y_end && x_k < x_end) {
-                    int y_col_global = this->graph->get_global_index(this->col_ind[y_k]);
-                    int x_col_global = X.graph->get_global_index(X.col_ind[x_k]);
+                // Advance y_k
+                while (y_k < y_end && is_less(this->col_ind[y_k], this->graph, col, new_graph)) y_k++;
+                bool in_y = (y_k < y_end && !is_less(col, new_graph, this->col_ind[y_k], this->graph));
+                
+                // Advance x_k
+                while (x_k < x_end && is_less(X.col_ind[x_k], X.graph, col, new_graph)) x_k++;
+                bool in_x = (x_k < x_end && !is_less(col, new_graph, X.col_ind[x_k], X.graph));
+                
+                T* dest_ptr = arena.get_ptr(new_blk_handles[k]);
+                size_t sz = new_blk_sizes[k];
+                
+                if (in_y) {
+                    // dest_ptr points to existing data (from Y)
+                    // Actually new_blk_handles[k] IS this->blk_handles[y_k] if in_y is true.
                     
-                    if (y_col_global < x_col_global) {
-                        col_global = y_col_global; use_y = true;
-                    } else if (x_col_global < y_col_global) {
-                        col_global = x_col_global; use_x = true;
+                    if (in_x) {
+                        // y = beta * y + alpha * x
+                        const T* x_ptr = X.arena.get_ptr(X.blk_handles[x_k]);
+                        for(size_t j=0; j<sz; ++j) {
+                            dest_ptr[j] = alpha * x_ptr[j] + beta * dest_ptr[j];
+                        }
                     } else {
-                        col_global = y_col_global; use_y = true; use_x = true;
+                        // y = beta * y
+                        if (beta != T(1)) {
+                            for(size_t j=0; j<sz; ++j) dest_ptr[j] *= beta;
+                        }
                     }
-                } else if (y_k < y_end) {
-                    col_global = this->graph->get_global_index(this->col_ind[y_k]); use_y = true;
                 } else {
-                    col_global = X.graph->get_global_index(X.col_ind[x_k]); use_x = true;
-                }
-                
-                // Find target index k in new_val
-                auto it = std::lower_bound(col_map.begin(), col_map.end(), std::make_pair(col_global, -1));
-                if (it == col_map.end() || it->first != col_global) {
-                     // This implies the column exists in inputs but not in the graph?
-                     // This shouldn't happen if graph construction was correct.
-                     // But if it does, we skip to avoid crash.
-                     if (use_y) y_k++;
-                     if (use_x) x_k++;
-                     continue;
-                }
-                
-                int k = it->second;
-                size_t blk_sz = new_blk_sizes[k];
-                
-                T* y_ptr = arena.get_ptr(new_blk_handles[k]);
-                
-                if (use_y && use_x) {
-                    const T* x_ptr = X.arena.get_ptr(X.blk_handles[x_k]);
-                    for(size_t j=0; j<blk_sz; ++j) y_ptr[j] = alpha * x_ptr[j] + beta * y_ptr[j];
-                    y_k++; x_k++;
-                } else if (use_y) {
-                    for(size_t j=0; j<blk_sz; ++j) y_ptr[j] = beta * y_ptr[j];
-                    y_k++;
-                } else {
-                    const T* x_ptr = X.arena.get_ptr(X.blk_handles[x_k]);
-                    for(size_t j=0; j<blk_sz; ++j) y_ptr[j] = alpha * x_ptr[j];
-                    x_k++;
+                    // dest_ptr is new memory
+                    if (in_x) {
+                        // y = alpha * x
+                        const T* x_ptr = X.arena.get_ptr(X.blk_handles[x_k]);
+                        for(size_t j=0; j<sz; ++j) {
+                            dest_ptr[j] = alpha * x_ptr[j];
+                        }
+                    } else {
+                        // Should not happen
+                        std::memset(dest_ptr, 0, sz * sizeof(T));
+                    }
                 }
             }
         }
