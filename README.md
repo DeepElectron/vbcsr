@@ -15,7 +15,7 @@ Variable Block Compressed Sparse Row (VBCSR) Matrix library for high-performance
 
 First, please ensure your environment have compilers for c and fortran, also BLAS (OpenBLAS, MKL) and OpenMP are installed. The code also need mpi. You can install them using: 
 ```bash
-conda install -c conda-forge openblas/mkl mkl-include openmp openmpi compilers
+conda install -c conda-forge openblas/mkl mkl-include openmp openmpi mpi4py compilers
 ```
 or
 ```bash
