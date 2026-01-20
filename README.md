@@ -1,4 +1,6 @@
-<img src="./doc/logo.png" alt="Logo" width="300">
+<img src="doc/logo.png" alt="Logo" width="350">
+
+___
 
 Variable Block Compressed Sparse Row (VBCSR) Matrix library for high-performance distributed sparse matrix operations. It combines the speed of optimized C++ kernels with the flexibility of Python.
 
