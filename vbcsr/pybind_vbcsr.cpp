@@ -20,10 +20,13 @@ MPI_Comm get_mpi_comm(py::object comm_obj) {
     if (comm_obj.is_none()) return MPI_COMM_WORLD;
     // Try to get 'py2f' method if it's an mpi4py communicator
     if (py::hasattr(comm_obj, "py2f")) {
-        return (MPI_Comm)comm_obj.attr("py2f")().cast<intptr_t>();
+        MPI_Fint f_handle = (MPI_Fint)comm_obj.attr("py2f")().cast<intptr_t>();
+        return MPI_Comm_f2c(f_handle);
     }
-    // Assume it's an integer handle
-    return (MPI_Comm)comm_obj.cast<intptr_t>();
+    // Assume it's an integer handle (legacy fallback, maybe also needs f2c if it's a Fortran handle)
+    // Given mpi4py context, it's likely F handle.
+    MPI_Fint f_handle = (MPI_Fint)comm_obj.cast<intptr_t>();
+    return MPI_Comm_f2c(f_handle);
 }
 
 template<typename T>
