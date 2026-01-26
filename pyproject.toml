@@ -38,3 +38,12 @@ logging.level = "INFO"
 
 [tool.cibuildwheel]
 build-verbosity = 1
+# Skip 32-bit builds and musllinux (MPI is harder to set up there)
+skip = ["*-manylinux_i686", "*-musllinux_*"]
+
+[tool.cibuildwheel.linux]
+before-all = "yum install -y openmpi-devel openblas-devel"
+environment = { PATH="/usr/lib64/openmpi/bin:$PATH", LD_LIBRARY_PATH="/usr/lib64/openmpi/lib:$LD_LIBRARY_PATH" }
+# Ensure CMake finds the right MPI
+config-settings = "cmake.define.VBCSR_ENABLE_TESTS=OFF"
+
