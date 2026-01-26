@@ -23,7 +23,7 @@ with patch.dict(sys.modules, {'mpi4py': None}):
         global_blocks = n_blocks * size
         
         # Use create_random for simplicity
-        mat = VBCSR.create_random(comm, global_blocks, block_size, block_size, density=0.1, seed=42)
+        mat = VBCSR.create_random(global_blocks, block_size, block_size, density=0.1, seed=42, comm=comm)
         
         print(f"Matrix created: {mat}")
         
