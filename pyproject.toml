@@ -38,12 +38,15 @@ logging.level = "INFO"
 
 [tool.cibuildwheel]
 build-verbosity = 1
-# Skip 32-bit builds and musllinux (MPI is harder to set up there)
+# Skip 32-bit builds and musllinux
 skip = ["*-manylinux_i686", "*-musllinux_*"]
+# Use manylinux_2_28 (AlmaLinux 8) to avoid CentOS 7 EOL issues
+manylinux-x86_64-image = "manylinux_2_28"
 
 [tool.cibuildwheel.linux]
-before-all = "yum install -y openmpi-devel openblas-devel"
-environment = { PATH="/usr/lib64/openmpi/bin:$PATH", LD_LIBRARY_PATH="/usr/lib64/openmpi/lib:$LD_LIBRARY_PATH" }
+before-all = "dnf install -y openmpi-devel openblas-devel"
+environment = { PATH="/usr/lib64/openmpi/bin:$PATH", LD_LIBRARY_PATH="/usr/lib64/openmpi/lib:$LD_LIBRARY_PATH", PKG_CONFIG_PATH="/usr/lib64/openmpi/lib/pkgconfig:$PKG_CONFIG_PATH" }
 # Ensure CMake finds the right MPI
 config-settings = "cmake.define.VBCSR_ENABLE_TESTS=OFF"
+
 
