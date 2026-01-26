@@ -167,6 +167,15 @@ class DistMultiVector:
             raise TypeError("bdot expects DistMultiVector")
 
     # Operators
+
+    def __neg__(self) -> 'DistMultiVector':
+        res = self.duplicate()
+        res._core.scale(-1.0)
+        return res
+
+    def __pos__(self) -> 'DistMultiVector':
+        return self
+    
     def __add__(self, other: Union['DistMultiVector', float, complex, int, np.ndarray]) -> 'DistMultiVector':
         res = self.duplicate()
         res += other
@@ -178,6 +187,21 @@ class DistMultiVector:
         elif np.isscalar(other) or isinstance(other, np.ndarray):
             buf = np.array(self._core, copy=False)
             buf[:self.local_rows, :] += other
+        else:
+            return NotImplemented
+        return self
+
+    def __sub__(self, other: Union['DistMultiVector', float, complex, int, np.ndarray]) -> 'DistMultiVector':
+        res = self.duplicate()
+        res -= other
+        return res
+
+    def __isub__(self, other: Union['DistMultiVector', float, complex, int, np.ndarray]) -> 'DistMultiVector':
+        if isinstance(other, DistMultiVector):
+            self._core.axpy(-1.0, other._core)
+        elif np.isscalar(other) or isinstance(other, np.ndarray):
+            buf = np.array(self._core, copy=False)
+            buf[:self.local_rows, :] -= other
         else:
             return NotImplemented
         return self
@@ -197,6 +221,27 @@ class DistMultiVector:
         elif isinstance(other, np.ndarray):
             buf = np.array(self._core, copy=False)
             buf[:self.local_rows, :] *= other
+        else:
+            return NotImplemented
+        return self
+
+    def __truediv__(self, other: Union['DistMultiVector', DistVector, float, complex, int, np.ndarray]) -> 'DistMultiVector':
+        res = self.duplicate()
+        res /= other
+        return res
+
+    def __itruediv__(self, other: Union['DistMultiVector', DistVector, float, complex, int, np.ndarray]) -> 'DistMultiVector':
+        if np.isscalar(other):
+            self._core.scale(1.0 / other)
+        elif isinstance(other, DistMultiVector):
+            buf = np.array(self._core, copy=False)
+            buf[:self.local_rows, :] /= np.array(other._core, copy=False)
+        elif isinstance(other, DistVector):
+            buf = np.array(self._core, copy=False)
+            buf[:self.local_rows, :] /= np.array(other._core, copy=False)
+        elif isinstance(other, np.ndarray):
+            buf = np.array(self._core, copy=False)
+            buf[:self.local_rows, :] /= other
         else:
             return NotImplemented
         return self

@@ -1,7 +1,10 @@
 import time
 import numpy as np
 import vbcsr
-from mpi4py import MPI
+try:
+    from mpi4py import MPI
+except ImportError:
+    MPI = None
 import argparse
 import scipy.sparse
 

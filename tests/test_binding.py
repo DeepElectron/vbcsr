@@ -1,13 +1,23 @@
 import numpy as np
 import vbcsr
-from mpi4py import MPI
+try:
+    from mpi4py import MPI
+except ImportError:
+    MPI = None
 import scipy.sparse.linalg
 import sys
 
 def test_serial():
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    size = comm.Get_size()
+    if MPI:
+        comm = MPI.COMM_WORLD
+        rank = comm.Get_rank()
+        size = comm.Get_size()
+    else:
+        import vbcsr_core
+        g = vbcsr_core.DistGraph(None)
+        comm = None
+        rank = g.rank
+        size = g.size
 
     if size > 1:
         print("Skipping serial test in parallel run")
@@ -24,7 +34,7 @@ def test_serial():
     block_sizes = [2, 2]
     adj = [[0, 1], [0, 1]]
     
-    mat = vbcsr.VBCSR.create_serial(comm, global_blocks, block_sizes, adj, dtype=np.float64)
+    mat = vbcsr.VBCSR.create_serial(global_blocks, block_sizes, adj, dtype=np.float64, comm=comm)
     
     # Fill diagonal blocks with identity, off-diagonal with 0.5
     # Block 0,0
@@ -98,9 +108,16 @@ def test_serial():
         sys.exit(1)
 
 def test_parallel():
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    size = comm.Get_size()
+    if MPI:
+        comm = MPI.COMM_WORLD
+        rank = comm.Get_rank()
+        size = comm.Get_size()
+    else:
+        import vbcsr_core
+        g = vbcsr_core.DistGraph(None)
+        comm = None
+        rank = g.rank
+        size = g.size
     
     if size < 2:
         print("Skipping parallel test (run with -np 2)")
@@ -121,7 +138,7 @@ def test_parallel():
         my_block_sizes = [2]
         my_adj = [[0, 1]] # Block 1 connects to 0 and 1
         
-    mat = vbcsr.VBCSR.create_distributed(comm, owned_indices, my_block_sizes, my_adj, dtype=np.float64)
+    mat = vbcsr.VBCSR.create_distributed(owned_indices, my_block_sizes, my_adj, dtype=np.float64, comm=comm)
     
     # Add blocks
     # Everyone adds their own blocks (or any blocks, really, but let's do local)

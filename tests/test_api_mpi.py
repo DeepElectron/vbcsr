@@ -1,12 +1,22 @@
 import numpy as np
-from mpi4py import MPI
+try:
+    from mpi4py import MPI
+except ImportError:
+    MPI = None
 import vbcsr
 from vbcsr import VBCSR, DistVector, DistMultiVector
 
 def test_api_mpi():
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    size = comm.Get_size()
+    if MPI:
+        comm = MPI.COMM_WORLD
+        rank = comm.Get_rank()
+        size = comm.Get_size()
+    else:
+        import vbcsr_core
+        g = vbcsr_core.DistGraph(None)
+        comm = None
+        rank = g.rank
+        size = g.size
     
     # Create matrix
     n_blocks = 4
@@ -14,7 +24,7 @@ def test_api_mpi():
     global_blocks = n_blocks * size
     
     # Use create_random for simplicity
-    mat = VBCSR.create_random(comm, global_blocks, block_size, block_size, density=0.1, seed=42)
+    mat = VBCSR.create_random(global_blocks, block_size, block_size, density=0.1, seed=42, comm=comm)
     
     if rank == 0:
         print(f"Matrix created: {mat}")

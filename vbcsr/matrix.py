@@ -112,6 +112,9 @@ class VBCSR(LinearOperator):
             return self.add(other, alpha=1.0, beta=-1.0)
         return NotImplemented
 
+    def __pos__(self) -> 'VBCSR':
+        return self
+
     def __getitem__(self, key):
         if isinstance(key, tuple) and len(key) == 2:
             row, col = key
@@ -148,16 +151,16 @@ class VBCSR(LinearOperator):
         return f"<{shape_str} VBCSR matrix of type {self.dtype} with {self.nnz} stored elements>"
 
     @classmethod
-    def create_serial(cls, comm: Any, global_blocks: int, block_sizes: List[int], adjacency: List[List[int]], dtype: type = np.float64) -> 'VBCSR':
+    def create_serial(cls, global_blocks: int, block_sizes: List[int], adjacency: List[List[int]], dtype: type = np.float64, comm: Any = None) -> 'VBCSR':
         """
         Create a VBCSR matrix using serial graph construction (Rank 0 distributes).
         
         Args:
-            comm: MPI communicator (mpi4py or integer handle).
             global_blocks (int): Total number of blocks.
             block_sizes (List[int]): Size of each block.
             adjacency (List[List[int]]): Adjacency list (list of neighbors for each block).
             dtype: Data type.
+            comm: MPI communicator (mpi4py or integer handle).
             
         Returns:
             VBCSR: The initialized matrix.
@@ -173,16 +176,16 @@ class VBCSR(LinearOperator):
         return obj
 
     @classmethod
-    def create_distributed(cls, comm: Any, owned_indices: List[int], block_sizes: List[int], adjacency: List[List[int]], dtype: type = np.float64) -> 'VBCSR':
+    def create_distributed(cls, owned_indices: List[int], block_sizes: List[int], adjacency: List[List[int]], dtype: type = np.float64, comm: Any = None) -> 'VBCSR':
         """
         Create a VBCSR matrix using distributed graph construction.
         
         Args:
-            comm: MPI communicator.
             owned_indices (List[int]): Global indices of blocks owned by this rank.
             block_sizes (List[int]): Sizes of owned blocks.
             adjacency (List[List[int]]): Adjacency list for owned blocks.
             dtype: Data type.
+            comm: MPI communicator.
             
         Returns:
             VBCSR: The initialized matrix.
@@ -204,18 +207,18 @@ class VBCSR(LinearOperator):
         return obj
 
     @classmethod
-    def create_random(cls, comm: Any, global_blocks: int, block_size_min: int, block_size_max: int, density: float = 0.01, dtype: type = np.float64, seed: int = 42) -> 'VBCSR':
+    def create_random(cls, global_blocks: int, block_size_min: int, block_size_max: int, density: float = 0.01, dtype: type = np.float64, seed: int = 42, comm: Any = None) -> 'VBCSR':
         """
         Create a random connected VBCSR matrix for benchmarking.
         
         Args:
-            comm: MPI communicator.
             global_blocks (int): Total number of blocks.
             block_size_min (int): Minimum block size.
             block_size_max (int): Maximum block size.
             density (float): Sparsity density (approximate fraction of non-zero blocks).
             dtype: Data type.
             seed (int): Random seed.
+            comm: MPI communicator.
             
         Returns:
             VBCSR: The initialized matrix with random structure and data.
@@ -276,7 +279,7 @@ class VBCSR(LinearOperator):
             my_adj.append(sorted(list(neighbors)))
             
         # 4. Create Matrix
-        mat = cls.create_distributed(comm, owned_indices, my_block_sizes, my_adj, dtype)
+        mat = cls.create_distributed(owned_indices, my_block_sizes, my_adj, dtype, comm)
         
         # 5. Fill with random data
         # We iterate over owned blocks and their neighbors
@@ -527,7 +530,7 @@ class VBCSR(LinearOperator):
         obj.dtype = self.dtype
         obj._core = core_C
         obj.comm = self.comm
-        obj.shape = (None, None)
+        obj.shape = (self.shape[0], B.shape[1])
         obj._global_nnz = None
         return obj
 
@@ -538,7 +541,7 @@ class VBCSR(LinearOperator):
         obj.dtype = self.dtype
         obj._core = core_C
         obj.comm = self.comm
-        obj.shape = (None, None)
+        obj.shape = (self.shape[0], self.shape[1])
         obj._global_nnz = None
         return obj
 
@@ -614,7 +617,7 @@ class VBCSR(LinearOperator):
         self._core.from_dense(data)
 
     @classmethod
-    def from_scipy(cls, spmat: Any, comm=None) -> 'VBCSR':
+    def from_scipy(cls, spmat: Any) -> 'VBCSR':
         """
         Create a VBCSR matrix from a SciPy sparse matrix.
         
@@ -627,8 +630,6 @@ class VBCSR(LinearOperator):
         """
         import scipy.sparse as sp
         
-        rank = comm.Get_rank() if comm else 0
-        
         # Ensure spmat is available (at least on rank 0)
         # If passed as None on other ranks, we handle it.
         
@@ -640,18 +641,9 @@ class VBCSR(LinearOperator):
         block_sizes = []
         adj = []
         
-        # Data for filling
-        # We need to broadcast structure if only rank 0 has it.
-        # For simplicity, we assume spmat is provided on Rank 0 and we use create_serial logic
-        # which expects arguments on all ranks (or at least rank 0 to distribute).
-        # But create_serial implementation in python currently expects arguments on all ranks?
-        # Let's check create_serial:
-        # "Create a VBCSR matrix using serial graph construction (Rank 0 distributes)."
-        # It calls graph.construct_serial.
-        # graph.construct_serial implementation in C++:
-        # "If rank 0 has data, scatter." -> It expects data on Rank 0.
+        # Default to serial construction
         
-        if rank == 0:
+        if spmat is not None:
             if sp.isspmatrix_bsr(spmat):
                 # BSR Matrix
                 R, C = spmat.blocksize
@@ -680,9 +672,21 @@ class VBCSR(LinearOperator):
                     start = spmat_csr.indptr[i]
                     end = spmat_csr.indptr[i+1]
                     adj.append(spmat_csr.indices[start:end].tolist())
+        else:
+            # Rank != 0 might pass None
+            n_blocks = 0
+            block_sizes = []
+            adj = []
         
         # Create Matrix (Distributes structure)
-        mat = cls.create_serial(comm, n_blocks, block_sizes, adj, spmat.dtype)
+        # Note: create_serial expects global info on Rank 0.
+        # If spmat is None on other ranks, create_serial handles broadcasting if implemented correctly.
+        # But create_serial takes global_blocks, block_sizes, adj.
+        # If we pass 0/empty on other ranks, create_serial might fail if it expects consistency or only rank 0 to pass info.
+        # create_serial doc says "Rank 0 distributes". So Rank 0 must pass valid info. Others can pass None/Empty?
+        # Let's check create_serial implementation. It calls graph.construct_serial.
+        # construct_serial usually broadcasts from root.
+        mat = cls.create_serial(n_blocks, block_sizes, adj, spmat.dtype if spmat is not None else np.float64)
         
         # Fill Data
         # We iterate over blocks on Rank 0 and add them.
@@ -692,26 +696,25 @@ class VBCSR(LinearOperator):
         # Ideally we should scatter data.
         # But for "adapter", correctness first.
         
-        if rank == 0:
-            if sp.isspmatrix_bsr(spmat):
-                R, C = spmat.blocksize
-                for i in range(n_blocks):
-                    start = spmat.indptr[i]
-                    end = spmat.indptr[i+1]
-                    for k in range(start, end):
-                        j = spmat.indices[k]
-                        data_blk = spmat.data[k] # Shape (R, C)
-                        mat.add_block(i, j, data_blk)
-            else:
-                spmat_csr = spmat.tocsr()
-                for i in range(n_blocks):
-                    start = spmat_csr.indptr[i]
-                    end = spmat_csr.indptr[i+1]
-                    for k in range(start, end):
-                        j = spmat_csr.indices[k]
-                        val = spmat_csr.data[k]
-                        # 1x1 block
-                        mat.add_block(i, j, np.array([[val]], dtype=spmat.dtype))
+        if sp.isspmatrix_bsr(spmat):
+            R, C = spmat.blocksize
+            for i in range(n_blocks):
+                start = spmat.indptr[i]
+                end = spmat.indptr[i+1]
+                for k in range(start, end):
+                    j = spmat.indices[k]
+                    data_blk = spmat.data[k] # Shape (R, C)
+                    mat.add_block(i, j, data_blk)
+        else:
+            spmat_csr = spmat.tocsr()
+            for i in range(n_blocks):
+                start = spmat_csr.indptr[i]
+                end = spmat_csr.indptr[i+1]
+                for k in range(start, end):
+                    j = spmat_csr.indices[k]
+                    val = spmat_csr.data[k]
+                    # 1x1 block
+                    mat.add_block(i, j, np.array([[val]], dtype=spmat.dtype))
                         
         mat.assemble()
         return mat

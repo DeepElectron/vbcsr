@@ -1,5 +1,8 @@
 import numpy as np
-from mpi4py import MPI
+try:
+    from mpi4py import MPI
+except ImportError:
+    MPI = None
 from vbcsr import VBCSR, DistVector, DistMultiVector, HAS_MPI, MPI
 
 def test_api_compliance():

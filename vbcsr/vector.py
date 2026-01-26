@@ -250,6 +250,14 @@ class DistVector:
             return NotImplemented
         return self
 
+    def __neg__(self) -> 'DistVector':
+        res = self.duplicate()
+        res._core.scale(-1.0)
+        return res
+
+    def __pos__(self) -> 'DistVector':
+        return self
+
     def __mul__(self, other: Union['DistVector', float, complex, int, np.ndarray]) -> 'DistVector':
         res = self.duplicate()
         res *= other
@@ -269,3 +277,22 @@ class DistVector:
 
     def __rmul__(self, other: Union[float, complex, int]) -> 'DistVector':
         return self.__mul__(other)
+
+    def __truediv__(self, other: Union['DistVector', float, complex, int, np.ndarray]) -> 'DistVector':
+        res = self.duplicate()
+        res /= other
+        return res
+
+    def __itruediv__(self, other: Union['DistVector', float, complex, int, np.ndarray]) -> 'DistVector':
+        if np.isscalar(other):
+            self._core.scale(1.0 / other)
+        elif isinstance(other, DistVector):
+            buf = np.array(self._core, copy=False)
+            buf[:self.local_size] /= np.array(other._core, copy=False)
+        elif isinstance(other, np.ndarray):
+            buf = np.array(self._core, copy=False)
+            buf[:self.local_size] /= other
+        else:
+            return NotImplemented
+        return self
+    

@@ -1,33 +1,64 @@
 import unittest
 import numpy as np
 import vbcsr
-from mpi4py import MPI
+try:
+    from mpi4py import MPI
+except ImportError:
+    MPI = None
 import sys
 
 class TestVBCSR(unittest.TestCase):
     def setUp(self):
-        self.comm = MPI.COMM_WORLD
-        self.rank = self.comm.Get_rank()
-        self.size = self.comm.Get_size()
+        self.comm = MPI.COMM_WORLD if MPI else None
+        if self.comm:
+            self.rank = self.comm.Get_rank()
+            self.size = self.comm.Get_size()
+        else:
+            try:
+                import vbcsr_core
+                g = vbcsr_core.DistGraph(None)
+                self.rank = g.rank
+                self.size = g.size
+            except ImportError:
+                self.rank = 0
+                self.size = 1
         
+        # Determine mode
+        import os
+        mode = os.environ.get("VBCSR_TEST_MODE", "auto")
+        
+        if mode == "serial":
+            self.use_distributed = False
+            self.comm = None
+            self.rank = 0
+            self.size = 1
+        elif mode == "distributed":
+            self.use_distributed = True
+        else:
+            self.use_distributed = (self.size > 1)
+
         # Define a simple 4x4 system with 2 blocks of size 2
         self.global_blocks = 2
         self.block_sizes = [2, 2]
         self.adj = [[0, 1], [0, 1]] # Dense block structure
         
-        if self.size == 1:
-            self.mat = vbcsr.VBCSR.create_serial(self.comm, self.global_blocks, self.block_sizes, self.adj)
+        if not self.use_distributed:
+            self.owned = [0, 1]
+            self.mat = vbcsr.VBCSR.create_serial(self.global_blocks, self.block_sizes, self.adj, comm=self.comm)
         else:
-            # Distributed: Rank 0 owns block 0, Rank 1 owns block 1 (assuming np=2)
-            if self.rank == 0:
-                owned = [0]
-                sizes = [2]
-                adj = [[0, 1]]
-            else:
-                owned = [1]
-                sizes = [2]
-                adj = [[0, 1]]
-            self.mat = vbcsr.VBCSR.create_distributed(self.comm, owned, sizes, adj)
+            # Distributed: Generic partitioning
+            blocks_per_rank = self.global_blocks // self.size
+            remainder = self.global_blocks % self.size
+            
+            start = self.rank * blocks_per_rank + min(self.rank, remainder)
+            count = blocks_per_rank + (1 if self.rank < remainder else 0)
+            self.owned = list(range(start, start + count))
+            
+            # Local sizes and adj
+            sizes = [self.block_sizes[i] for i in self.owned]
+            local_adj = [self.adj[i] for i in self.owned]
+            
+            self.mat = vbcsr.VBCSR.create_distributed(self.owned, sizes, local_adj, comm=self.comm)
 
         # Fill matrix
         # Block 0,0: I
@@ -35,24 +66,16 @@ class TestVBCSR(unittest.TestCase):
         # Block 0,1: 0.5
         # Block 1,0: 0.5
         
-        # In distributed mode, each rank adds its own blocks (or any blocks)
-        # Let's have everyone add everything they know about to be safe/simple, 
-        # or strictly local.
-        # Serial: Add all.
-        # Distributed: Rank 0 adds row 0 blocks, Rank 1 adds row 1 blocks.
+        # We iterate over owned blocks and add what we own.
+        # Note: add_block can add remote blocks if supported, but let's stick to local or neighbors.
+        # In this simple case, everyone knows everything, so we can just add based on global indices.
         
-        if self.size == 1:
-            self.mat.add_block(0, 0, np.eye(2))
-            self.mat.add_block(1, 1, np.eye(2))
-            self.mat.add_block(0, 1, np.full((2,2), 0.5))
-            self.mat.add_block(1, 0, np.full((2,2), 0.5))
-        else:
-            if self.rank == 0:
-                self.mat.add_block(0, 0, np.eye(2))
-                self.mat.add_block(0, 1, np.full((2,2), 0.5))
-            elif self.rank == 1:
-                self.mat.add_block(1, 1, np.eye(2))
-                self.mat.add_block(1, 0, np.full((2,2), 0.5))
+        for row in self.owned:
+            # Add diagonal
+            self.mat.add_block(row, row, np.eye(2))
+            # Add off-diagonal (neighbor is the other block)
+            neighbor = 1 - row # 0->1, 1->0
+            self.mat.add_block(row, neighbor, np.full((2,2), 0.5))
                 
         self.mat.assemble()
 
@@ -159,4 +182,4 @@ class TestVBCSR(unittest.TestCase):
 
 if __name__ == '__main__':
     # Filter args for unittest
-    unittest.main(argv=[sys.argv[0]])
+    unittest.main()

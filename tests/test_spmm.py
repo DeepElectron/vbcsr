@@ -1,15 +1,51 @@
 import unittest
 import numpy as np
 import vbcsr
-from mpi4py import MPI
+try:
+    from mpi4py import MPI
+except ImportError:
+    MPI = None
 import sys
+
+# the code still have some logical problem when mpi4py is not available.
+# TODO: fix it.
 
 class TestSpMM(unittest.TestCase):
     def setUp(self):
-        self.comm = MPI.COMM_WORLD
-        self.rank = self.comm.Get_rank()
-        self.size = self.comm.Get_size()
+        self.comm = MPI.COMM_WORLD if MPI else None
+        if self.comm:
+            self.rank = self.comm.Get_rank()
+            self.size = self.comm.Get_size()
+        else:
+            # Fallback: use VBCSR to detect MPI environment
+            # This handles the case where mpi4py is missing but mpirun is used
+            try:
+                import vbcsr_core
+                temp_graph = vbcsr_core.DistGraph(None)
+                self.rank = temp_graph.rank
+                self.size = temp_graph.size
+            except ImportError:
+                self.rank = 0
+                self.size = 1
         
+        # Determine mode
+        import os
+        mode = os.environ.get("VBCSR_TEST_MODE", "auto")
+        
+        if mode == "serial":
+            self.use_distributed = False
+            # Force serial behavior even if MPI is present
+            self.comm = None
+            self.rank = 0
+            self.size = 1
+        elif mode == "distributed":
+            self.use_distributed = True
+        else:
+            # Auto: Distributed if size > 1, else Serial
+            self.use_distributed = (self.size > 1)
+            
+
+
         # Define a system
         # 4 global blocks. 2x2 each.
         self.global_blocks = 4
@@ -22,24 +58,26 @@ class TestSpMM(unittest.TestCase):
         # 3: 3, 0
         self.adj = [[0, 1], [1, 2], [2, 3], [3, 0]]
         
-        # Distribution
-        # Rank 0: 0, 1
-        # Rank 1: 2, 3
-        if self.size == 1:
+        if not self.use_distributed:
+            # Serial Construction
             self.owned = [0, 1, 2, 3]
             self.local_sizes = [2, 2, 2, 2]
             self.local_adj = self.adj
-            self.mat = vbcsr.VBCSR.create_serial(self.comm, self.global_blocks, self.block_sizes, self.adj)
+            self.mat = vbcsr.VBCSR.create_serial(self.global_blocks, self.block_sizes, self.adj, comm=self.comm)
         else:
-            if self.rank == 0:
-                self.owned = [0, 1]
-                self.local_sizes = [2, 2]
-                self.local_adj = [self.adj[0], self.adj[1]]
-            else:
-                self.owned = [2, 3]
-                self.local_sizes = [2, 2]
-                self.local_adj = [self.adj[2], self.adj[3]]
-            self.mat = vbcsr.VBCSR.create_distributed(self.comm, self.owned, self.local_sizes, self.local_adj)
+            # Distributed Construction
+            # Generic partitioning for any size
+            blocks_per_rank = self.global_blocks // self.size
+            remainder = self.global_blocks % self.size
+            
+            start = self.rank * blocks_per_rank + min(self.rank, remainder)
+            count = blocks_per_rank + (1 if self.rank < remainder else 0)
+            self.owned = list(range(start, start + count))
+            
+            self.local_sizes = [self.block_sizes[i] for i in self.owned]
+            self.local_adj = [self.adj[i] for i in self.owned]
+            
+            self.mat = vbcsr.VBCSR.create_distributed(self.owned, self.local_sizes, self.local_adj, comm=self.comm)
             
         # Fill A
         # Diagonal = Identity
@@ -58,15 +96,13 @@ class TestSpMM(unittest.TestCase):
     def test_spmm_identity(self):
         # C = A * I
         # Create I
-        if self.size == 1:
+        if not self.use_distributed:
             adj_I = [[0], [1], [2], [3]]
-            matI = vbcsr.VBCSR.create_serial(self.comm, self.global_blocks, self.block_sizes, adj_I)
+            matI = vbcsr.VBCSR.create_serial(self.global_blocks, self.block_sizes, adj_I, comm=self.comm)
         else:
-            if self.rank == 0:
-                adj_I = [[0], [1]]
-            else:
-                adj_I = [[2], [3]]
-            matI = vbcsr.VBCSR.create_distributed(self.comm, self.owned, self.local_sizes, adj_I)
+            # Distributed Identity
+            local_adj_I = [[row] for row in self.owned]
+            matI = vbcsr.VBCSR.create_distributed(self.owned, self.local_sizes, local_adj_I, comm=self.comm)
             
         for row in self.owned:
             matI.add_block(row, row, np.eye(2))
@@ -159,10 +195,24 @@ class TestSpMM(unittest.TestCase):
 
 class TestSpMMDiverse(unittest.TestCase):
     def setUp(self):
-        self.comm = MPI.COMM_WORLD
-        self.rank = self.comm.Get_rank()
-        self.size = self.comm.Get_size()
+        self.comm = MPI.COMM_WORLD if MPI else None
+        self.rank = self.comm.Get_rank() if self.comm else 0
+        self.size = self.comm.Get_size() if self.comm else 1
         
+        # Determine mode
+        import os
+        mode = os.environ.get("VBCSR_TEST_MODE", "auto")
+        
+        if mode == "serial":
+            self.use_distributed = False
+            self.comm = None
+            self.rank = 0
+            self.size = 1
+        elif mode == "distributed":
+            self.use_distributed = True
+        else:
+            self.use_distributed = (self.size > 1)
+
         # Larger system for diverse connectivity
         self.n_blocks = 20
         self.block_size = 4
@@ -173,12 +223,18 @@ class TestSpMMDiverse(unittest.TestCase):
         np.random.seed(42)
         importance = np.random.uniform(0.1, 1.0, self.n_blocks)
         
-        # Distribution
-        blocks_per_rank = self.n_blocks // self.size
-        remainder = self.n_blocks % self.size
-        self.start = self.rank * blocks_per_rank + min(self.rank, remainder)
-        self.count = blocks_per_rank + (1 if self.rank < remainder else 0)
-        self.owned = list(range(self.start, self.start + self.count))
+        if not self.use_distributed:
+            # Serial Construction
+            self.owned = list(range(self.n_blocks))
+            self.count = self.n_blocks
+            self.start = 0
+        else:
+            # Distributed Partitioning
+            blocks_per_rank = self.n_blocks // self.size
+            remainder = self.n_blocks % self.size
+            self.start = self.rank * blocks_per_rank + min(self.rank, remainder)
+            self.count = blocks_per_rank + (1 if self.rank < remainder else 0)
+            self.owned = list(range(self.start, self.start + self.count))
         
         # Adjacency
         self.local_adj = []
@@ -191,7 +247,10 @@ class TestSpMMDiverse(unittest.TestCase):
                     row_adj.append(j)
             self.local_adj.append(row_adj)
             
-        self.mat = vbcsr.VBCSR.create_distributed(self.comm, self.owned, [self.block_size]*self.count, self.local_adj)
+        if not self.use_distributed:
+            self.mat = vbcsr.VBCSR.create_serial(self.n_blocks, self.block_sizes, self.local_adj, comm=self.comm)
+        else:
+            self.mat = vbcsr.VBCSR.create_distributed(self.owned, [self.block_size]*self.count, self.local_adj, comm=self.comm)
         
         # Fill with random values
         for i, row in enumerate(self.owned):
@@ -215,9 +274,23 @@ class TestSpMMDiverse(unittest.TestCase):
 
 class TestSpMMDiverseComplex(unittest.TestCase):
     def setUp(self):
-        self.comm = MPI.COMM_WORLD
-        self.rank = self.comm.Get_rank()
-        self.size = self.comm.Get_size()
+        self.comm = MPI.COMM_WORLD if MPI else None
+        self.rank = self.comm.Get_rank() if self.comm else 0
+        self.size = self.comm.Get_size() if self.comm else 1
+        
+        # Determine mode
+        import os
+        mode = os.environ.get("VBCSR_TEST_MODE", "auto")
+        
+        if mode == "serial":
+            self.use_distributed = False
+            self.comm = None
+            self.rank = 0
+            self.size = 1
+        elif mode == "distributed":
+            self.use_distributed = True
+        else:
+            self.use_distributed = (self.size > 1)
         
         # System for diverse connectivity
         self.n_blocks = 15
@@ -228,12 +301,18 @@ class TestSpMMDiverseComplex(unittest.TestCase):
         np.random.seed(123)
         importance = np.random.uniform(0.1, 1.0, self.n_blocks)
         
-        # Distribution
-        blocks_per_rank = self.n_blocks // self.size
-        remainder = self.n_blocks % self.size
-        self.start = self.rank * blocks_per_rank + min(self.rank, remainder)
-        self.count = blocks_per_rank + (1 if self.rank < remainder else 0)
-        self.owned = list(range(self.start, self.start + self.count))
+        if not self.use_distributed:
+            # Serial Construction
+            self.owned = list(range(self.n_blocks))
+            self.count = self.n_blocks
+            self.start = 0
+        else:
+            # Distributed Partitioning
+            blocks_per_rank = self.n_blocks // self.size
+            remainder = self.n_blocks % self.size
+            self.start = self.rank * blocks_per_rank + min(self.rank, remainder)
+            self.count = blocks_per_rank + (1 if self.rank < remainder else 0)
+            self.owned = list(range(self.start, self.start + self.count))
         
         # Adjacency
         self.local_adj = []
@@ -245,7 +324,10 @@ class TestSpMMDiverseComplex(unittest.TestCase):
                     row_adj.append(j)
             self.local_adj.append(row_adj)
             
-        self.mat = vbcsr.VBCSR.create_distributed(self.comm, self.owned, [self.block_size]*self.count, self.local_adj, dtype=np.complex128)
+        if not self.use_distributed:
+            self.mat = vbcsr.VBCSR.create_serial(self.n_blocks, self.block_sizes, self.local_adj, dtype=np.complex128, comm=self.comm)
+        else:
+            self.mat = vbcsr.VBCSR.create_distributed(self.owned, [self.block_size]*self.count, self.local_adj, dtype=np.complex128, comm=self.comm)
         
         # Fill with random complex values
         for i, row in enumerate(self.owned):
@@ -269,4 +351,4 @@ class TestSpMMDiverseComplex(unittest.TestCase):
         self.assertTrue(np.allclose(res_direct, res_sequential, atol=1e-10))
 
 if __name__ == '__main__':
-    unittest.main(argv=[sys.argv[0]])
+    unittest.main()

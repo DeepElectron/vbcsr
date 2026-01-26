@@ -2,7 +2,7 @@
 
 ___
 
-Variable Block Compressed Sparse Row (VBCSR) Matrix library for high-performance distributed sparse matrix operations. It combines the speed of optimized C++ kernels with the flexibility of Python.
+Distributed variable-block sparse matrices with fast block kernels + thresholded SpMM. Python-first, MPI-scalable, designed for localized-orbital Hamiltonians and multi-DOF PDE systems.
 
 **Why VBCSR?**
 - **Hardware-Accelerated Performance**: Leveraging SIMD (AVX/AVX2) instructions, precaching and threading, VBCSR delivers state-of-the-art performance for block-sparse matrix operations.

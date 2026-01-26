@@ -1,10 +1,13 @@
 import numpy as np
 import vbcsr
-from mpi4py import MPI
+try:
+    from mpi4py import MPI
+except ImportError:
+    MPI = None
 
 def main():
-    comm = MPI.COMM_WORLD
-    if comm.Get_size() > 1:
+    comm = MPI.COMM_WORLD if MPI else None
+    if comm and comm.Get_size() > 1:
         print("This example is meant for serial execution (np=1).")
         return
 
@@ -20,7 +23,7 @@ def main():
     block_sizes = [2, 2]
     adjacency = [[0, 1], [0, 1]] # Block 0 connects to 0,1; Block 1 connects to 0,1
     
-    mat = vbcsr.VBCSR.create_serial(comm, global_blocks, block_sizes, adjacency)
+    mat = vbcsr.VBCSR.create_serial(global_blocks, block_sizes, adjacency)
     
     # 2. Fill matrix
     # B00 = Identity

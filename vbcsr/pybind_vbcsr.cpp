@@ -43,6 +43,15 @@ MPI_Comm get_mpi_comm(py::object comm_obj) {
     return MPI_Comm_f2c(f_handle);
 }
 
+void finalize_mpi() {
+    int initialized, finalized;
+    MPI_Initialized(&initialized);
+    MPI_Finalized(&finalized);
+    if (initialized && !finalized) {
+        MPI_Finalize();
+    }
+}
+
 template<typename T>
 void bind_dist_vector(py::module& m, const std::string& name) {
     py::class_<DistVector<T>>(m, name.c_str(), py::buffer_protocol())
@@ -242,6 +251,8 @@ PYBIND11_MODULE(vbcsr_core, m) {
         .value("INSERT", AssemblyMode::INSERT)
         .value("ADD", AssemblyMode::ADD)
         .export_values();
+
+    m.def("finalize_mpi", &finalize_mpi, "Finalize MPI if initialized");
 
     py::class_<DistGraph>(m, "DistGraph")
         .def(py::init([](py::object comm_obj) {
