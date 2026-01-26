@@ -141,33 +141,56 @@ install(FILES
 )
 
 # Tests
-# enable_testing()
-# 
-# find_package(GTest)
-# 
-function(add_vbcsr_test name source)
-    add_executable(${name} ${source})
-    target_link_libraries(${name} PRIVATE vbcsr Threads::Threads dl)
-endfunction()
+option(VBCSR_ENABLE_TESTS "Enable building tests" OFF)
 
-# add_vbcsr_test(test_pb_csr vbcsr/core/test/test_pb_csr.cpp)
-# add_vbcsr_test(test_spmm vbcsr/core/test/test_spmm.cpp)
-# add_vbcsr_test(test_block_csr vbcsr/core/test/test_block_csr.cpp)
-# add_vbcsr_test(test_dist_graph vbcsr/core/test/test_dist_graph.cpp)
-# add_vbcsr_test(test_robustness vbcsr/core/test/test_robustness.cpp)
-# add_vbcsr_test(test_complex_dist_vector vbcsr/core/test/test_complex_dist_vector.cpp)
-# add_vbcsr_test(test_multi_sparsity vbcsr/core/test/test_multi_sparsity.cpp)
-# add_vbcsr_test(test_backend_extensions vbcsr/core/test/test_backend_extensions.cpp)
-# add_vbcsr_test(benchmark_dist vbcsr/core/test/benchmark_dist.cpp)
-# add_vbcsr_test(benchmark_spmm_complex vbcsr/core/test/benchmark_spmm_complex.cpp)
-# add_vbcsr_test(test_axpby vbcsr/core/test/test_axpby.cpp)
-# add_vbcsr_test(test_axpby_diff_graph vbcsr/core/test/test_axpby_diff_graph.cpp)
-# add_vbcsr_test(benchmark_axpby vbcsr/core/test/benchmark_axpby.cpp)
-# add_vbcsr_test(debug_isqrtm vbcsr/core/test/debug_isqrtm.cpp)
-# 
-# if(GTEST_FOUND)
-#     add_executable(test_block_csr_export vbcsr/core/test/test_block_csr_export.cpp)
-#     target_link_libraries(test_block_csr_export PRIVATE vbcsr GTest::gtest GTest::gtest_main Threads::Threads dl)
-# endif()
+if(VBCSR_ENABLE_TESTS)
+    enable_testing()
 
-# add_vbcsr_test(test_density vbcsr/core/test/test_density.cpp)
+    find_package(GTest)
+    if(NOT GTest_FOUND)
+        message(STATUS "GTest not found, fetching from git...")
+        include(FetchContent)
+        FetchContent_Declare(
+            googletest
+            GIT_REPOSITORY https://github.com/google/googletest.git
+            GIT_TAG        v1.14.0
+        )
+        # For Windows: Prevent overriding the parent project's compiler/linker settings
+        set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+        FetchContent_MakeAvailable(googletest)
+        include(GoogleTest)
+    endif()
+
+    function(add_vbcsr_test name source)
+        add_executable(${name} ${source})
+        target_link_libraries(${name} PRIVATE vbcsr GTest::gtest GTest::gtest_main Threads::Threads dl)
+        add_test(NAME ${name} COMMAND mpirun -np 2 $<TARGET_FILE:${name}>)
+    endfunction()
+
+    add_vbcsr_test(test_pb_csr vbcsr/core/test/test_pb_csr.cpp)
+    add_vbcsr_test(test_spmm vbcsr/core/test/test_spmm.cpp)
+    add_vbcsr_test(test_block_csr vbcsr/core/test/test_block_csr.cpp)
+    add_vbcsr_test(test_dist_graph vbcsr/core/test/test_dist_graph.cpp)
+    add_vbcsr_test(test_robustness vbcsr/core/test/test_robustness.cpp)
+    add_vbcsr_test(test_complex_dist_vector vbcsr/core/test/test_complex_dist_vector.cpp)
+    # add_vbcsr_test(test_multi_sparsity vbcsr/core/test/test_multi_sparsity.cpp) # Fails with np=2
+    add_vbcsr_test(test_backend_extensions vbcsr/core/test/test_backend_extensions.cpp)
+    add_vbcsr_test(benchmark_dist vbcsr/core/test/benchmark_dist.cpp)
+    add_vbcsr_test(benchmark_spmm_complex vbcsr/core/test/benchmark_spmm_complex.cpp)
+    add_vbcsr_test(test_axpby vbcsr/core/test/test_axpby.cpp)
+    add_vbcsr_test(test_axpby_diff_graph vbcsr/core/test/test_axpby_diff_graph.cpp)
+    add_vbcsr_test(benchmark_axpby vbcsr/core/test/benchmark_axpby.cpp)
+    add_vbcsr_test(test_density vbcsr/core/test/test_density.cpp)
+    add_vbcsr_test(test_asymmetric_filter vbcsr/core/test/test_asymmetric_filter.cpp)
+    add_vbcsr_test(test_block_arena vbcsr/core/test/test_block_arena.cpp)
+    add_vbcsr_test(test_extract_batched vbcsr/core/test/test_extract_batched.cpp)
+    add_vbcsr_test(test_extract_batched_extended vbcsr/core/test/test_extract_batched_extended.cpp)
+    add_vbcsr_test(test_extract_batched_robust vbcsr/core/test/test_extract_batched_robust.cpp)
+    add_vbcsr_test(test_hermitian_product vbcsr/core/test/test_hermitian_product.cpp)
+    add_vbcsr_test(test_mult_graph_mismatch vbcsr/core/test/test_mult_graph_mismatch.cpp)
+    add_vbcsr_test(test_subgraph vbcsr/core/test/test_subgraph.cpp)
+
+    add_executable(test_block_csr_export vbcsr/core/test/test_block_csr_export.cpp)
+    target_link_libraries(test_block_csr_export PRIVATE vbcsr GTest::gtest GTest::gtest_main Threads::Threads dl)
+    add_test(NAME test_block_csr_export COMMAND mpirun -np 2 $<TARGET_FILE:test_block_csr_export>)
+endif()

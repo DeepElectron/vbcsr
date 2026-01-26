@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y openmpi-bin libopenmpi-dev libopenblas-dev liblapack-dev libgtest-dev cmake ninja-build
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Configure CMake (C++ Tests)
+      run: cmake -B build -G Ninja -DVBCSR_ENABLE_TESTS=ON
+
+    - name: Build C++ Tests
+      run: cmake --build build
+
+    - name: Run C++ Tests
+      run: ctest --test-dir build --output-on-failure
+
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install .[mpi]
+        pip install pytest
+
+    - name: Run Python Tests
+      run: |
+        # Run tests that don't require MPI or handle it internally
+        pytest tests/test_api_serial.py tests/test_scipy_adapter.py
+        
+        # Run MPI tests
+        mpirun -np 2 pytest tests/test_api_mpi.py tests/test_spmm.py tests/test_vbcsr.py
