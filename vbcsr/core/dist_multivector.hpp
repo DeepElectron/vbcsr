@@ -379,7 +379,6 @@ public:
         }
     }
 
-private:
     MPI_Datatype get_mpi_type() const;
 };
 
