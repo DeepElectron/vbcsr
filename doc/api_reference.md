@@ -1,6 +1,6 @@
 # VBCSR API Reference
 
-This document provides detailed documentation for the classes and methods in the `vbcsr` package.
+This document provides detailed documentation for the classes and methods in the `vbcsr` library.
 
 ## Table of Contents
 1. [VBCSR (Matrix)](#vbcsr-matrix)
@@ -13,11 +13,15 @@ This document provides detailed documentation for the classes and methods in the
 
 The `VBCSR` class represents a distributed block-sparse matrix. It inherits from `scipy.sparse.linalg.LinearOperator`.
 
-### Constructor
-```python
-VBCSR(graph: Any, dtype: type = np.float64)
-```
-Initializes the matrix from a `DistGraph`. The user should avoid touching this logic. Typically, you should use the factory methods `create_serial` or `create_distributed` instead.
+### Properties
+
+- **`shape`**: `Tuple[int, int]` - Global shape of the matrix `(rows, cols)`.
+- **`ndim`**: `int` - Number of dimensions (always 2).
+- **`nnz`**: `int` - Global number of non-zero elements.
+- **`dtype`**: `np.dtype` - Data type of the matrix elements (`np.float64` or `np.complex128`).
+- **`T`**: `VBCSR` - Transpose of the matrix (returns a new object).
+- **`real`**: `VBCSR` - Real part of the matrix (returns a new object).
+- **`imag`**: `VBCSR` - Imaginary part of the matrix (returns a new object).
 
 ### Factory Methods
 
@@ -27,9 +31,9 @@ Initializes the matrix from a `DistGraph`. The user should avoid touching this l
 create_serial(cls, comm: Any, global_blocks: int, block_sizes: List[int], adjacency: List[List[int]], dtype: type = np.float64) -> 'VBCSR'
 ```
 Creates a matrix using serial graph construction. Rank 0 defines the entire structure, which is then distributed.
-- **comm**: MPI communicator.
+- **comm**: MPI communicator (or `None` for serial).
 - **global_blocks**: Total number of blocks.
-- **block_sizes**: List of block sizes (length `global_blocks`).
+- **block_sizes**: List of block sizes.
 - **adjacency**: Adjacency list (list of lists of neighbors).
 
 #### `create_distributed`
@@ -39,8 +43,6 @@ create_distributed(cls, comm: Any, owned_indices: List[int], block_sizes: List[i
 ```
 Creates a matrix using distributed graph construction. Each rank defines only its owned blocks.
 - **owned_indices**: Global indices of blocks owned by this rank.
-- **block_sizes**: Sizes of owned blocks.
-- **adjacency**: Adjacency list for owned blocks.
 
 #### `create_random`
 ```python
@@ -49,6 +51,14 @@ create_random(cls, comm: Any, global_blocks: int, block_size_min: int, block_siz
 ```
 Creates a random connected matrix for benchmarking purposes.
 
+#### `from_scipy`
+```python
+@classmethod
+from_scipy(cls, spmat: Any, comm=None) -> 'VBCSR'
+```
+Creates a VBCSR matrix from a SciPy sparse matrix.
+- **spmat**: SciPy sparse matrix (assumed to be on Rank 0).
+
 ### Methods
 
 #### `add_block`
@@ -56,82 +66,69 @@ Creates a random connected matrix for benchmarking purposes.
 add_block(self, g_row: int, g_col: int, data: np.ndarray, mode: AssemblyMode = AssemblyMode.ADD) -> None
 ```
 Adds or inserts a dense block into the matrix.
-- **g_row**, **g_col**: Global block indices.
-- **data**: 2D numpy array.
 
 #### `assemble`
 ```python
 assemble(self) -> None
 ```
-Finalizes matrix assembly. Must be called after adding blocks and before multiplication.
+Finalizes matrix assembly. Must be called after adding blocks.
 
-#### `extract_submatrix`
+#### `transpose`
 ```python
-extract_submatrix(self, global_indices: List[int]) -> 'VBCSR'
+transpose(self) -> 'VBCSR'
 ```
-Extracts a submatrix corresponding to the specified global block indices.
-- **global_indices**: List of global block indices to extract.
-- **Returns**: A new `VBCSR` matrix containing the submatrix.
+Returns a new transposed matrix.
 
-#### `insert_submatrix`
+#### `transpose_`
 ```python
-insert_submatrix(self, sub_mat: 'VBCSR', global_indices: List[int]) -> None
+transpose_(self) -> None
 ```
-Inserts a submatrix back into the original matrix at the specified global block indices.
-- **sub_mat**: The submatrix to insert (must be a `VBCSR` object).
-- **global_indices**: List of global block indices corresponding to the submatrix rows/cols.
+In-place transpose. More memory efficient.
 
-#### `to_dense`
+#### `conj` / `conjugate`
 ```python
-to_dense(self) -> np.ndarray
+conj(self) -> 'VBCSR'
 ```
-Converts the locally owned part of the matrix to a dense 2D NumPy array.
-- **Returns**: 2D numpy array of shape `(owned_rows, all_local_cols)`.
+Returns a new conjugated matrix.
 
-#### `from_dense`
+#### `conj_`
 ```python
-from_dense(self, dense_matrix: np.ndarray) -> None
+conj_(self) -> None
 ```
-Fills the matrix with values from a dense 2D NumPy array. The elements outside the sparsity pattern will be ignored.
-- **dense_matrix**: 2D numpy array containing the values.
+In-place conjugate.
 
-#### `mult`
+#### `copy` / `duplicate`
 ```python
-mult(self, x: Union[DistVector, DistMultiVector, np.ndarray], y: Optional[Union[DistVector, DistMultiVector]] = None) -> Union[DistVector, DistMultiVector]
+copy(self) -> 'VBCSR'
 ```
-Performs matrix multiplication $y = A \times x$.
-- **x**: Input vector/multivector or numpy array (local part).
-- **y**: Optional output vector.
+Returns a deep copy of the matrix.
+
+#### `dot` / `@`
+```python
+dot(self, other: Union['VBCSR', DistVector, DistMultiVector, np.ndarray]) -> Union['VBCSR', DistVector, DistMultiVector]
+```
+Performs matrix multiplication.
+- If `other` is `VBCSR`: Sparse Matrix-Matrix Multiplication (SpMM).
+- If `other` is `DistVector`/`DistMultiVector`: Matrix-Vector Multiplication (SpMV).
 
 #### `spmm`
 ```python
 spmm(self, B: 'VBCSR', threshold: float = 0.0, transA: bool = False, transB: bool = False) -> 'VBCSR'
 ```
-Sparse Matrix-Matrix Multiplication: $C = op(A) \times op(B)$.
-- **B**: The matrix to multiply with.
-- **threshold**: Threshold for dropping small blocks.
-- **transA**, **transB**: If True, use transpose/conjugate transpose.
+Sparse Matrix-Matrix Multiplication with filtering options.
+- **threshold**: Drop blocks with Frobenius norm less than threshold.
 
-#### `@` Operator
-The `@` operator is supported for both matrix-vector and matrix-matrix multiplication:
+#### `spmm_self`
 ```python
-y = A @ x  # Matrix-Vector
-C = A @ B  # SpMM (no filtering)
+spmm_self(self, threshold: float = 0.0, transA: bool = False) -> 'VBCSR'
 ```
-> [!NOTE]
-> The `@` operator performs standard SpMM without filtering (`threshold=0.0`). If you need to filter small blocks, use the `spmm` method directly.
+Computes $A \times A$ (or $A^T \times A$) efficiently.
 
-#### `create_vector`
+#### `add`
 ```python
-create_vector(self) -> DistVector
+add(self, B: 'VBCSR', alpha: float = 1.0, beta: float = 1.0) -> 'VBCSR'
 ```
-Creates a `DistVector` compatible with this matrix.
-
-#### `create_multivector`
-```python
-create_multivector(self, k: int) -> DistMultiVector
-```
-Creates a `DistMultiVector` with `k` columns compatible with this matrix.
+Computes $C = \alpha A + \beta B$.
 
 #### `scale`
 ```python
@@ -143,13 +140,68 @@ Scales the matrix in-place by `alpha`.
 ```python
 shift(self, alpha: Union[float, complex, int]) -> None
 ```
-Adds `alpha` to the diagonal elements (scalar shift).
+Adds `alpha` to diagonal elements.
 
 #### `add_diagonal`
 ```python
 add_diagonal(self, v: Union[DistVector, np.ndarray]) -> None
 ```
-Adds a vector `v` to the diagonal elements ($A_{ii} += v_i$).
+Adds vector `v` to diagonal elements ($A_{ii} += v_i$).
+
+#### `extract_submatrix`
+```python
+extract_submatrix(self, global_indices: List[int]) -> 'VBCSR'
+```
+Extracts a submatrix corresponding to given global block indices.
+
+#### `insert_submatrix`
+```python
+insert_submatrix(self, submat: 'VBCSR', global_indices: List[int]) -> None
+```
+Inserts a submatrix back into the matrix.
+
+#### `to_dense`
+```python
+to_dense(self) -> np.ndarray
+```
+Converts locally owned part to dense NumPy array.
+
+#### `from_dense`
+```python
+from_dense(self, data: np.ndarray) -> None
+```
+Updates locally owned part from dense NumPy array.
+
+#### `to_scipy`
+```python
+to_scipy(self, format: Optional[str] = None) -> Any
+```
+Converts locally owned part to SciPy sparse matrix (`bsr` or `csr`).
+
+#### `create_vector`
+```python
+create_vector(self) -> DistVector
+```
+Creates a compatible `DistVector`.
+
+#### `create_multivector`
+```python
+create_multivector(self, k: int) -> DistMultiVector
+```
+Creates a compatible `DistMultiVector` with `k` columns.
+
+#### `__getitem__`
+```python
+__getitem__(self, key: Tuple[int, int]) -> Scalar
+```
+Access individual elements (e.g., `A[0, 0]`). Note: Slow, for debugging.
+
+### Operators
+- `+`, `-`: Matrix addition/subtraction.
+- `*`: Scalar multiplication.
+- `@`: Matrix multiplication.
+- `+=`, `-=`, `*=`: In-place operators.
+- `-A`: Negation.
 
 ---
 
@@ -157,14 +209,34 @@ Adds a vector `v` to the diagonal elements ($A_{ii} += v_i$).
 
 Represents a distributed 1D vector.
 
+### Properties
+- **`shape`**: `Tuple[int]` - Global shape `(size,)`.
+- **`ndim`**: `int` - Number of dimensions (1).
+- **`size`**: `int` - Global size.
+- **`local_size`**: `int` - Number of locally owned elements.
+- **`ghost_size`**: `int` - Number of ghost elements.
+- **`full_size`**: `int` - Total local size (owned + ghost).
+- **`T`**: `DistVector` - Returns self.
+
 ### Methods
 
-#### `to_numpy` / `from_numpy`
+#### `copy` / `duplicate`
+```python
+copy(self) -> 'DistVector'
+```
+Returns a deep copy.
+
+#### `to_numpy`
 ```python
 to_numpy(self) -> np.ndarray
+```
+Returns locally owned part as NumPy array.
+
+#### `from_numpy`
+```python
 from_numpy(self, arr: np.ndarray) -> None
 ```
-Convert between the **locally owned** part of the vector and a NumPy array.
+Updates locally owned part from NumPy array.
 
 #### `set_constant`
 ```python
@@ -176,25 +248,49 @@ Sets all local elements to `val`.
 ```python
 scale(self, alpha: Union[float, complex, int]) -> None
 ```
-Scales the vector in-place.
+Scales vector in-place.
 
 #### `axpy`
 ```python
-axpy(self, alpha: Union[float, complex, int], x: 'DistVector') -> None
+axpy(self, alpha: Scalar, x: 'DistVector') -> None
 ```
 Computes $y = \alpha x + y$ in-place.
 
-#### `dot`
+#### `axpby`
 ```python
-dot(self, other: 'DistVector') -> Union[float, complex]
+axpby(self, alpha: Scalar, x: 'DistVector', beta: Scalar) -> None
 ```
-Computes the global dot product $\sum \bar{x}_i y_i$.
+Computes $y = \alpha x + \beta y$ in-place.
 
 #### `pointwise_mult`
 ```python
 pointwise_mult(self, other: 'DistVector') -> None
 ```
-Element-wise multiplication $y_i = y_i * x_i$.
+Element-wise multiplication $y_i *= x_i$.
+
+#### `dot`
+```python
+dot(self, other: 'DistVector') -> Scalar
+```
+Computes global dot product $\sum \bar{x}_i y_i$.
+
+#### `sync_ghosts`
+```python
+sync_ghosts(self) -> None
+```
+Synchronizes ghost elements from their owners.
+
+#### `reduce_ghosts`
+```python
+reduce_ghosts(self) -> None
+```
+Reduces (sums) ghost elements back to their owners.
+
+### Operators
+- `+`, `-`: Vector addition/subtraction (supports scalar broadcast).
+- `*`: Element-wise multiplication (supports scalar).
+- `@`: Dot product.
+- `+=`, `-=`, `*=`: In-place operators.
 
 ---
 
@@ -202,13 +298,62 @@ Element-wise multiplication $y_i = y_i * x_i$.
 
 Represents a distributed collection of vectors (2D, column-major).
 
+### Properties
+- **`shape`**: `Tuple[int, int]` - Global shape `(rows, cols)`.
+- **`ndim`**: `int` - Number of dimensions (2).
+- **`size`**: `int` - Total elements.
+- **`local_rows`**: `int` - Number of locally owned rows.
+- **`num_vectors`**: `int` - Number of columns.
+
 ### Methods
 
-#### `to_numpy` / `from_numpy`
-Convert between locally owned rows and a 2D NumPy array.
+#### `copy` / `duplicate`
+```python
+copy(self) -> 'DistMultiVector'
+```
+Returns a deep copy.
 
-#### `num_vectors`
-Returns the number of columns.
+#### `to_numpy`
+```python
+to_numpy(self) -> np.ndarray
+```
+Returns locally owned part as 2D NumPy array.
+
+#### `from_numpy`
+```python
+from_numpy(self, arr: np.ndarray) -> None
+```
+Updates locally owned part from 2D NumPy array.
+
+#### `set_constant`
+```python
+set_constant(self, val: Union[float, complex, int]) -> None
+```
+Sets all elements to `val`.
+
+#### `scale`
+```python
+scale(self, alpha: Union[float, complex, int]) -> None
+```
+Scales all elements in-place.
+
+#### `axpy`
+```python
+axpy(self, alpha: Scalar, x: 'DistMultiVector') -> None
+```
+Computes $Y = \alpha X + Y$ in-place.
+
+#### `axpby`
+```python
+axpby(self, alpha: Scalar, x: 'DistMultiVector', beta: Scalar) -> None
+```
+Computes $Y = \alpha X + \beta Y$ in-place.
+
+#### `pointwise_mult`
+```python
+pointwise_mult(self, other: Union['DistMultiVector', DistVector]) -> None
+```
+Element-wise multiplication. Supports broadcasting if `other` is a `DistVector`.
 
 #### `bdot`
 ```python
@@ -216,8 +361,13 @@ bdot(self, other: 'DistMultiVector') -> list
 ```
 Computes batch dot products (one for each column).
 
-#### `pointwise_mult`
+#### `sync_ghosts`
 ```python
-pointwise_mult(self, other: Union['DistMultiVector', DistVector]) -> None
+sync_ghosts(self) -> None
 ```
-Element-wise multiplication. If `other` is a `DistVector`, it is broadcast across all columns.
+Synchronizes ghost elements.
+
+### Operators
+- `+`, `-`: Addition/subtraction.
+- `*`: Element-wise multiplication.
+- `+=`, `-=`, `*=`: In-place operators.

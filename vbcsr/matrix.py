@@ -14,7 +14,7 @@ class VBCSR(LinearOperator):
     It supports distributed matrix operations using MPI.
     """
     
-    def __init__(self, graph: Any, dtype: type = np.float64):
+    def __init__(self, graph: Any, dtype: type = np.float64, comm: Any = None):
         """
         Initialize VBCSR matrix from a DistGraph.
         
@@ -24,6 +24,8 @@ class VBCSR(LinearOperator):
         """
         self.graph = graph
         self.dtype = np.dtype(dtype)
+        self.comm = comm
+        self._global_nnz = None
         
         # Calculate global size
         local_size = len(graph.owned_global_indices)
@@ -40,6 +42,110 @@ class VBCSR(LinearOperator):
             self._core = vbcsr_core.BlockSpMat_Double(graph)
         else:
             self._core = vbcsr_core.BlockSpMat_Complex(graph)
+
+    @property
+    def ndim(self) -> int:
+        return 2
+
+    @property
+    def nnz(self) -> int:
+        """Global number of non-zero elements."""
+        if self._global_nnz is not None:
+            return self._global_nnz
+        return self._core.local_nnz
+
+    @property
+    def T(self) -> 'VBCSR':
+        return self.transpose()
+
+    def transpose(self) -> 'VBCSR':
+        core_T = self._core.transpose()
+        obj = VBCSR(core_T.graph, self.dtype, self.comm)
+        obj._core = core_T
+        if self.shape[0] is not None and self.shape[1] is not None:
+            obj.shape = (self.shape[1], self.shape[0])
+        return obj
+
+    def transpose_(self) -> None:
+        """In-place transpose."""
+        core_T = self._core.transpose()
+        self._core = core_T
+        self.graph = core_T.graph
+        if self.shape[0] is not None and self.shape[1] is not None:
+            self.shape = (self.shape[1], self.shape[0])
+
+    def conj_(self) -> None:
+        """In-place conjugate."""
+        self._core.conjugate()
+
+    def conj(self) -> 'VBCSR':
+        obj = self.duplicate()
+        obj.conj_()
+        return obj
+
+    def conjugate(self) -> 'VBCSR':
+        return self.conj()
+
+    @property
+    def real(self) -> 'VBCSR':
+        """Return the real part of the matrix."""
+        core_real = self._core.real()
+        obj = VBCSR(core_real.graph, np.float64, self.comm)
+        obj._core = core_real
+        obj.shape = self.shape
+        return obj
+
+    @property
+    def imag(self) -> 'VBCSR':
+        """Return the imaginary part of the matrix."""
+        core_imag = self._core.imag()
+        obj = VBCSR(core_imag.graph, np.float64, self.comm)
+        obj._core = core_imag
+        obj.shape = self.shape
+        return obj
+
+    def __neg__(self) -> 'VBCSR':
+        return self * -1
+
+    def __sub__(self, other: 'VBCSR') -> 'VBCSR':
+        if isinstance(other, VBCSR):
+            return self.add(other, alpha=1.0, beta=-1.0)
+        return NotImplemented
+
+    def __getitem__(self, key):
+        if isinstance(key, tuple) and len(key) == 2:
+            row, col = key
+            if isinstance(row, int) and isinstance(col, int):
+                # Scalar access
+                # This is slow and requires finding the block.
+                # We need to map global row/col to block row/col and offset.
+                # This is hard without full metadata on Python side.
+                # For now, let's raise NotImplementedError or try to implement if possible.
+                # Actually, get_values returns all values.
+                # We can use extract_submatrix for a single element?
+                # extract_submatrix takes global indices of blocks? No, vertices.
+                # Let's check extract_submatrix signature.
+                # "Extract a submatrix corresponding to the given global indices."
+                # It returns a VBCSR.
+                # If we extract row i, we get row i.
+                # But we want scalar.
+                raise NotImplementedError("Scalar indexing not yet efficiently implemented.")
+        raise NotImplementedError("Slicing not implemented.")
+
+    def dot(self, other: Union['VBCSR', DistVector, DistMultiVector, np.ndarray]) -> Union['VBCSR', DistVector, DistMultiVector]:
+        return self @ other
+
+    def copy(self) -> 'VBCSR':
+        return self.duplicate()
+
+    def __len__(self) -> int:
+        if self.shape[0] is not None:
+            return self.shape[0]
+        return 0
+
+    def __repr__(self):
+        shape_str = f"{self.shape[0]}x{self.shape[1]}" if self.shape[0] is not None else "Unknown shape"
+        return f"<{shape_str} VBCSR matrix of type {self.dtype} with {self.nnz} stored elements>"
 
     @classmethod
     def create_serial(cls, comm: Any, global_blocks: int, block_sizes: List[int], adjacency: List[List[int]], dtype: type = np.float64) -> 'VBCSR':
@@ -59,7 +165,7 @@ class VBCSR(LinearOperator):
         graph = vbcsr_core.DistGraph(comm)
         graph.construct_serial(global_blocks, block_sizes, adjacency)
         
-        obj = cls(graph, dtype)
+        obj = cls(graph, dtype, comm)
         
         # Compute shape for serial (rank 0 knows all)
         total_rows = sum(block_sizes)
@@ -84,12 +190,15 @@ class VBCSR(LinearOperator):
         graph = vbcsr_core.DistGraph(comm)
         graph.construct_distributed(owned_indices, block_sizes, adjacency)
         
-        obj = cls(graph, dtype)
+        obj = cls(graph, dtype, comm)
         
         # Compute shape using MPI allreduce if possible
-        if hasattr(comm, "allreduce"):
+        if comm is not None and hasattr(comm, "allreduce"):
             local_rows = sum(block_sizes)
             total_rows = comm.allreduce(local_rows)
+            obj.shape = (total_rows, total_rows)
+        elif comm is None:
+            total_rows = sum(block_sizes)
             obj.shape = (total_rows, total_rows)
         
         return obj
@@ -111,8 +220,12 @@ class VBCSR(LinearOperator):
         Returns:
             VBCSR: The initialized matrix with random structure and data.
         """
-        rank = comm.Get_rank()
-        size = comm.Get_size()
+        if comm is None:
+            rank = 0
+            size = 1
+        else:
+            rank = comm.Get_rank()
+            size = comm.Get_size()
         
         np.random.seed(seed)
         
@@ -191,7 +304,7 @@ class VBCSR(LinearOperator):
             core_vec = vbcsr_core.DistVector_Double(self.graph)
         else:
             core_vec = vbcsr_core.DistVector_Complex(self.graph)
-        return DistVector(core_vec)
+        return DistVector(core_vec, self.comm)
 
     def create_multivector(self, k: int) -> DistMultiVector:
         """
@@ -204,7 +317,7 @@ class VBCSR(LinearOperator):
             core_vec = vbcsr_core.DistMultiVector_Double(self.graph, k)
         else:
             core_vec = vbcsr_core.DistMultiVector_Complex(self.graph, k)
-        return DistMultiVector(core_vec)
+        return DistMultiVector(core_vec, self.comm)
 
     def add_block(self, g_row: int, g_col: int, data: np.ndarray, mode: AssemblyMode = AssemblyMode.ADD) -> None:
         """
@@ -221,6 +334,14 @@ class VBCSR(LinearOperator):
     def assemble(self) -> None:
         """Finalize matrix assembly (exchange remote blocks)."""
         self._core.assemble()
+        local_nnz = self._core.local_nnz
+        if self.comm:
+            try:
+                self._global_nnz = self.comm.allreduce(local_nnz)
+            except:
+                self._global_nnz = local_nnz
+        else:
+            self._global_nnz = local_nnz
 
     def mult(self, x: Union[DistVector, DistMultiVector, np.ndarray], y: Optional[Union[DistVector, DistMultiVector]] = None) -> Union[DistVector, DistMultiVector]:
         """
@@ -316,9 +437,10 @@ class VBCSR(LinearOperator):
 
     def duplicate(self) -> 'VBCSR':
         """Create a deep copy of the matrix."""
-        new_obj = VBCSR(self.graph, self.dtype)
+        new_obj = VBCSR(self.graph, self.dtype, self.comm)
         new_obj._core = self._core.duplicate(False) # Share graph
         new_obj.shape = self.shape
+        new_obj._global_nnz = self._global_nnz
         return new_obj
 
     # Operators
@@ -404,7 +526,9 @@ class VBCSR(LinearOperator):
         obj.graph = core_C.graph
         obj.dtype = self.dtype
         obj._core = core_C
+        obj.comm = self.comm
         obj.shape = (None, None)
+        obj._global_nnz = None
         return obj
 
     def spmm_self(self, threshold: float = 0.0, transA: bool = False) -> 'VBCSR':
@@ -413,7 +537,9 @@ class VBCSR(LinearOperator):
         obj.graph = core_C.graph
         obj.dtype = self.dtype
         obj._core = core_C
+        obj.comm = self.comm
         obj.shape = (None, None)
+        obj._global_nnz = None
         return obj
 
     def add(self, B: 'VBCSR', alpha: float = 1.0, beta: float = 1.0) -> 'VBCSR':
@@ -424,7 +550,9 @@ class VBCSR(LinearOperator):
         obj.graph = core_C.graph
         obj.dtype = self.dtype
         obj._core = core_C
+        obj.comm = self.comm
         obj.shape = self.shape
+        obj._global_nnz = None
         return obj
 
     def extract_submatrix(self, global_indices: List[int]) -> 'VBCSR':
@@ -443,6 +571,7 @@ class VBCSR(LinearOperator):
         obj.graph = core_sub.graph
         obj.dtype = self.dtype
         obj._core = core_sub
+        obj.comm = None # Extracted submatrix is serial/local
         # Shape is (M, M) where M = len(global_indices)
         # But let's let the core handle it or compute it.
         # Since it's serial, we can compute it if needed, but for now (None, None) is safe or we can query graph.
@@ -450,6 +579,7 @@ class VBCSR(LinearOperator):
         # The core binding doesn't expose block sizes easily unless we query graph.
         # Let's leave as None for now or improve later.
         obj.shape = (None, None)
+        obj._global_nnz = None
         return obj
 
     def insert_submatrix(self, submat: 'VBCSR', global_indices: List[int]) -> None:

@@ -781,6 +781,18 @@ public:
         }
     }
 
+    void conjugate() {
+        if constexpr (std::is_same<T, std::complex<double>>::value || std::is_same<T, std::complex<float>>::value) {
+            #pragma omp parallel for
+            for (size_t i = 0; i < blk_handles.size(); ++i) {
+                T* block = arena.get_ptr(blk_handles[i]);
+                for (size_t j = 0; j < blk_sizes[i]; ++j) {
+                    block[j] = std::conj(block[j]);
+                }
+            }
+        }
+    }
+
     void copy_from(const BlockSpMat<T, Kernel>& other) {
         // this is used for copying the data from other blocks with the same graph
         // If graphs are different, we should at least check compatibility
@@ -803,6 +815,75 @@ public:
             }
         }
         norms_valid = false;
+    }
+    
+
+    // Return real part as a new matrix (Double)
+    // Only valid if T is complex, otherwise returns copy?
+    // Actually we need to return BlockSpMat<RealType>
+    auto get_real() const {
+        using RealT = typename ScalarTraits<T>::real_type;
+        BlockSpMat<RealT, DefaultKernel<RealT>> res(graph);
+        res.owns_graph = false; // Share graph
+        
+        // Copy structure
+        res.row_ptr = row_ptr;
+        res.col_ind = col_ind;
+        res.blk_sizes = blk_sizes;
+        
+        // Allocate arena
+        size_t total_sz = 0;
+        for(auto s : blk_sizes) total_sz += s;
+        res.arena.reserve(total_sz);
+        
+        res.blk_handles.resize(blk_handles.size());
+        
+        // Copy and cast data
+        #pragma omp parallel for
+        for (size_t i = 0; i < blk_handles.size(); ++i) {
+             res.blk_handles[i] = res.arena.allocate(blk_sizes[i]);
+             RealT* dest = res.arena.get_ptr(res.blk_handles[i]);
+             const T* src = arena.get_ptr(blk_handles[i]);
+             for(size_t j=0; j<blk_sizes[i]; ++j) {
+                 if constexpr (std::is_same<T, std::complex<double>>::value || std::is_same<T, std::complex<float>>::value) {
+                     dest[j] = src[j].real();
+                 } else {
+                     dest[j] = src[j];
+                 }
+             }
+        }
+        return res;
+    }
+
+    auto get_imag() const {
+        using RealT = typename ScalarTraits<T>::real_type;
+        BlockSpMat<RealT, DefaultKernel<RealT>> res(graph);
+        res.owns_graph = false;
+        
+        res.row_ptr = row_ptr;
+        res.col_ind = col_ind;
+        res.blk_sizes = blk_sizes;
+        
+        size_t total_sz = 0;
+        for(auto s : blk_sizes) total_sz += s;
+        res.arena.reserve(total_sz);
+        
+        res.blk_handles.resize(blk_handles.size());
+        
+        #pragma omp parallel for
+        for (size_t i = 0; i < blk_handles.size(); ++i) {
+             res.blk_handles[i] = res.arena.allocate(blk_sizes[i]);
+             RealT* dest = res.arena.get_ptr(res.blk_handles[i]);
+             const T* src = arena.get_ptr(blk_handles[i]);
+             for(size_t j=0; j<blk_sizes[i]; ++j) {
+                 if constexpr (std::is_same<T, std::complex<double>>::value || std::is_same<T, std::complex<float>>::value) {
+                     dest[j] = src[j].imag();
+                 } else {
+                     dest[j] = 0;
+                 }
+             }
+        }
+        return res;
     }
 
     // Get a specific block (copy)

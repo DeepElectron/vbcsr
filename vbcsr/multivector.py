@@ -11,15 +11,25 @@ class DistMultiVector:
     Stored in column-major format.
     """
     
-    def __init__(self, core_obj: Any):
+    def __init__(self, core_obj: Any, comm: Any = None):
         """
         Initialize the DistMultiVector.
         
         Args:
             core_obj: The underlying C++ DistMultiVector object.
+            comm: MPI communicator.
         """
         self._core = core_obj
         self.dtype = np.complex128 if "Complex" in core_obj.__class__.__name__ else np.float64
+        self.comm = comm
+        self._global_rows = None
+        if self.comm:
+            try:
+                self._global_rows = self.comm.allreduce(self.local_rows)
+            except:
+                pass
+        else:
+            self._global_rows = self.local_rows
 
     @property
     def local_rows(self) -> int:
@@ -30,6 +40,37 @@ class DistMultiVector:
     def num_vectors(self) -> int:
         """Returns the number of vectors (columns)."""
         return self._core.num_vectors
+
+    @property
+    def ndim(self) -> int:
+        return 2
+
+    @property
+    def shape(self):
+        if self._global_rows is not None:
+            return (self._global_rows, self.num_vectors)
+        return (None, self.num_vectors)
+
+    @property
+    def size(self) -> int:
+        s = self.shape
+        if s[0] is not None:
+            return s[0] * s[1]
+        return 0
+
+    def copy(self) -> 'DistMultiVector':
+        obj = self.duplicate()
+        obj.comm = self.comm
+        return obj
+
+    def __len__(self) -> int:
+        s = self.shape[0]
+        return s if s is not None else 0
+
+    def __repr__(self):
+        s = self.shape
+        shape_str = f"({s[0]}, {s[1]})" if s[0] is not None else f"(Unknown, {s[1]})"
+        return f"<DistMultiVector of shape {shape_str}, dtype={self.dtype}>"
 
     def to_numpy(self) -> np.ndarray:
         """
@@ -72,7 +113,7 @@ class DistMultiVector:
         Returns:
             DistMultiVector: A new multivector with same structure and data.
         """
-        return DistMultiVector(self._core.duplicate())
+        return DistMultiVector(self._core.duplicate(), self.comm)
 
     def set_constant(self, val: Union[float, complex, int]) -> None:
         """Set all elements to a constant value."""

@@ -24,7 +24,7 @@ def test_serial():
     block_sizes = [2, 2]
     adj = [[0, 1], [0, 1]]
     
-    mat = vbcsr.BlockCSR.create_serial(comm, global_blocks, block_sizes, adj, dtype=np.float64)
+    mat = vbcsr.VBCSR.create_serial(comm, global_blocks, block_sizes, adj, dtype=np.float64)
     
     # Fill diagonal blocks with identity, off-diagonal with 0.5
     # Block 0,0
@@ -121,7 +121,7 @@ def test_parallel():
         my_block_sizes = [2]
         my_adj = [[0, 1]] # Block 1 connects to 0 and 1
         
-    mat = vbcsr.BlockCSR.create_distributed(comm, owned_indices, my_block_sizes, my_adj, dtype=np.float64)
+    mat = vbcsr.VBCSR.create_distributed(comm, owned_indices, my_block_sizes, my_adj, dtype=np.float64)
     
     # Add blocks
     # Everyone adds their own blocks (or any blocks, really, but let's do local)

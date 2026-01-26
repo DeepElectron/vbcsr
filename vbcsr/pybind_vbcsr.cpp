@@ -17,6 +17,20 @@ using namespace vbcsr;
 // mpi4py passes MPI_Comm as an integer (on some platforms) or a PyObject.
 // A robust way requires mpi4py headers, but for simplicity we can accept an integer (intptr_t).
 MPI_Comm get_mpi_comm(py::object comm_obj) {
+    // Ensure MPI is initialized
+    int initialized;
+    MPI_Initialized(&initialized);
+    if (!initialized) {
+        // Initialize with thread support if possible, or just basic
+        // We assume this is a serial fallback or user forgot to init.
+        // If mpi4py is not used, we must init.
+        int provided;
+        MPI_Init_thread(NULL, NULL, MPI_THREAD_MULTIPLE, &provided);
+        // Register finalize? Or let OS handle it?
+        // Ideally we should register a cleanup, but pybind11 module unload is tricky.
+        // For now, we just init.
+    }
+
     if (comm_obj.is_none()) return MPI_COMM_WORLD;
     // Try to get 'py2f' method if it's an mpi4py communicator
     if (py::hasattr(comm_obj, "py2f")) {
@@ -122,6 +136,9 @@ void bind_block_spmat(py::module& m, const std::string& name) {
         .def("mult_adjoint", &BlockSpMat<T>::mult_adjoint)
         .def("mult_dense_adjoint", &BlockSpMat<T>::mult_dense_adjoint)
         .def("scale", &BlockSpMat<T>::scale)
+        .def("conjugate", &BlockSpMat<T>::conjugate)
+        .def("real", &BlockSpMat<T>::get_real)
+        .def("imag", &BlockSpMat<T>::get_imag)
         .def("shift", &BlockSpMat<T>::shift)
         .def("add_diagonal", &BlockSpMat<T>::add_diagonal)
         .def("axpy", &BlockSpMat<T>::axpy)
@@ -154,6 +171,11 @@ void bind_block_spmat(py::module& m, const std::string& name) {
                 { sizeof(T) },
                 vec.data()
             );
+        })
+        .def_property_readonly("local_nnz", [](const BlockSpMat<T>& self) {
+            size_t nnz = 0;
+            for (size_t s : self.blk_sizes) nnz += s;
+            return nnz;
         })
         .def("to_dense", [](const BlockSpMat<T>& self) {
             // Return 2D numpy array

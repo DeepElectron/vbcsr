@@ -47,60 +47,65 @@ int main(int argc, char** argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
     
-    if (size < 2) {
-        if (rank == 0) std::cout << "This test requires at least 2 ranks." << std::endl;
-        MPI_Finalize();
-        return 0;
-    }
+    // if (size < 2) {
+    //     if (rank == 0) std::cout << "This test requires at least 2 ranks." << std::endl;
+    //     MPI_Finalize();
+    //     return 0;
+    // }
 
     // Scenario:
     // Rank 0 owns row 0.
     // Graph A: Row 0 connected to Col 0 (local 0) and Col 1 (local 1).
     // Graph B: Row 0 connected to Col 0 (local 0) and Col 2 (local 1).
-    // Note: Col 1 and Col 2 must be owned by other ranks to be ghosts.
-    // Let's say Rank 1 owns Col 1 and Col 2.
     
     int n_blocks = 3;
     std::vector<int> block_sizes = {1, 1, 1}; // 1x1 blocks for simplicity
-    
-    // Graph A Adjacency
-    // Rank 0: 0->0, 0->1
-    // Rank 1: 1->1, 2->2 (dummy)
-    std::vector<std::vector<int>> adj_A(1);
-    if (rank == 0) {
-        adj_A[0] = {0, 1};
-    } else {
-        // Rank 1 owns 1, 2. But we only care about what Rank 0 sees.
-        // To construct distributed, we need valid input for all.
-        // Let's use construct_serial for simplicity if possible, but we need specific ghost mapping.
-        // construct_serial might assign ghosts deterministically.
-        // Let's use construct_distributed.
-    }
-    
-    // Let's manually build graphs to ensure collision.
-    // We need Rank 0 to have:
-    // Graph A: local 0 -> global 0, local 1 -> global 1
-    // Graph B: local 0 -> global 0, local 1 -> global 2
     
     std::vector<int> owned_indices;
     std::vector<int> my_sizes;
     std::vector<std::vector<int>> my_adj;
     
-    if (rank == 0) {
-        owned_indices = {0};
-        my_sizes = {1};
-        my_adj = {{0, 1}}; // Graph A connects to 0 and 1
+    if (size == 1) {
+        // Serial case: Rank 0 owns everything {0, 1, 2} (Sorted)
+        // GID 0 -> LID 0
+        // GID 1 -> LID 1
+        // GID 2 -> LID 2
+        
+        // Graph A: 0->{0, 1}
+        // Graph B: 0->{0, 2}
+        owned_indices = {0, 1, 2};
+        my_sizes = {1, 1, 1};
+        my_adj.resize(3);
+        
+        // LID 0 (GID 0) connects to 0, 1
+        my_adj[0] = {0, 1}; 
+        
+        // LID 1 (GID 1) connects to 1
+        my_adj[1] = {1};    
+        
+        // LID 2 (GID 2) connects to 2
+        my_adj[2] = {2};    
     } else {
-        owned_indices = {1, 2};
-        my_sizes = {1, 1};
-        my_adj = {{1}, {2}};
+        if (rank == 0) {
+            owned_indices = {0};
+            my_sizes = {1};
+            my_adj = {{0, 1}}; // Graph A connects to 0 and 1
+        } else {
+            owned_indices = {1, 2};
+            my_sizes = {1, 1};
+            my_adj = {{1}, {2}};
+        }
     }
     
     DistGraph graph_A(MPI_COMM_WORLD);
     graph_A.construct_distributed(owned_indices, my_sizes, my_adj);
     
-    if (rank == 0) {
-        my_adj = {{0, 2}}; // Graph B connects to 0 and 2
+    if (size == 1) {
+        my_adj[0] = {0, 2}; // Graph B: Row GID 0 (LID 0) connects to 0, 2
+    } else {
+        if (rank == 0) {
+            my_adj = {{0, 2}}; // Graph B connects to 0 and 2
+        }
     }
     DistGraph graph_B(MPI_COMM_WORLD);
     graph_B.construct_distributed(owned_indices, my_sizes, my_adj);

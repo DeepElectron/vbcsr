@@ -23,7 +23,8 @@ Welcome to the VBCSR User Guide. This document provides a comprehensive overview
 - **Block-Sparse Structure**: Optimized for matrices with block structures (common in physics and engineering).
 - **Distributed Memory**: Built on MPI to scale across multiple nodes.
 - **Hardware Acceleration**: Uses AVX/AVX2 instructions and OpenMP threading.
-- **Pythonic Interface**: Supports standard Python operators (`+`, `*`, `+=`) and NumPy arrays.
+- **Pythonic Interface**: Supports standard Python operators (`+`, `*`, `+=`, `@`) and NumPy arrays.
+- **Flexible Deployment**: Works in both distributed (MPI) and serial (no-MPI) environments.
 
 ---
 
@@ -59,17 +60,15 @@ The matrix structure is defined by a `DistGraph`, which manages:
 ## Creating Matrices
 
 ### 1. Serial Creation (Simple)
-Best for small matrices or when the structure is known on a single rank. Rank 0 defines the structure, and it is automatically distributed.
+Best for small matrices or when the structure is known on a single rank. If `comm` is `None`, it runs in serial mode.
 
 ```python
 import numpy as np
 import vbcsr
-from mpi4py import MPI
 
-comm = MPI.COMM_WORLD
-# Define 2 blocks of size 2x2
+# Serial mode (no MPI)
 mat = vbcsr.VBCSR.create_serial(
-    comm=comm, 
+    comm=None, 
     global_blocks=2, 
     block_sizes=[2, 2], 
     adjacency=[[0, 1], [0, 1]] # Full connectivity
@@ -80,13 +79,23 @@ mat = vbcsr.VBCSR.create_serial(
 For large problems, each rank defines only its owned rows.
 
 ```python
+from mpi4py import MPI
+comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
+
 # Each rank owns 1 block of size 100
 owned_indices = [rank] 
 block_sizes = [100]
 adjacency = [[rank, (rank+1)%size]] # Connect to self and next rank
 
 mat = vbcsr.VBCSR.create_distributed(comm, owned_indices, block_sizes, adjacency)
+```
+
+### 3. Random Creation (Benchmarking)
+Useful for testing and benchmarking.
+
+```python
+mat = vbcsr.VBCSR.create_random(comm, global_blocks=1000, block_size_min=10, block_size_max=20)
 ```
 
 ---
@@ -102,14 +111,34 @@ mat.add_block(0, 0, np.eye(2))
 mat.assemble() # Finalize communication
 ```
 
-### Arithmetic
-VBCSR supports natural Python operators.
+### Arithmetic & Properties
+VBCSR supports natural Python operators and properties.
 
 ```python
+# Properties
+print(mat.shape)
+print(mat.nnz)
+print(mat.real)   # Real part
+print(mat.imag)   # Imaginary part
+
+# Arithmetic
 B = mat * 2.0       # Scalar multiplication
 C = mat + B         # Matrix addition
+D = -mat            # Negation
+E = mat - B         # Subtraction
+
+# In-place Operations (Memory Efficient)
 mat += C            # In-place addition
 mat.scale(0.5)      # In-place scaling
+mat.transpose_()    # In-place transpose
+mat.conj_()         # In-place conjugate
+```
+
+### Scalar Access
+You can access individual elements (slow, for debugging).
+
+```python
+val = mat[0, 0]
 ```
 
 ---
@@ -128,7 +157,7 @@ v_np = np.array([1.0, 2.0])
 v.from_numpy(v_np)
 
 # Arithmetic
-w = mat * v         # Matrix-Vector Multiplication (SpMV)
+w = mat @ v         # Matrix-Vector Multiplication (SpMV)
 z = v + w           # Vector addition
 dot = v.dot(w)      # Dot product
 ```
@@ -162,11 +191,11 @@ import numpy as np
 
 # Matrix-Vector Multiplication with NumPy input
 x_np = np.random.rand(100)  # Local numpy array
-y = mat * x_np              # Returns a DistVector (y = A * x)
+y = mat @ x_np              # Returns a DistVector (y = A * x)
 
 # Matrix-Matrix Multiplication (SpMM)
 X_np = np.random.rand(100, 5) # 5 columns
-Y = mat * X_np                # Returns a DistMultiVector
+Y = mat @ X_np                # Returns a DistMultiVector
 
 # Vector Operations
 v = mat.create_vector()

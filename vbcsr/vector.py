@@ -11,15 +11,25 @@ class DistVector:
     and interoperability with NumPy.
     """
     
-    def __init__(self, core_obj: Any):
+    def __init__(self, core_obj: Any, comm: Any = None):
         """
         Initialize the DistVector.
         
         Args:
             core_obj: The underlying C++ DistVector object (DistVector_Double or DistVector_Complex).
+            comm: MPI communicator.
         """
         self._core = core_obj
         self.dtype = np.complex128 if "Complex" in core_obj.__class__.__name__ else np.float64
+        self.comm = comm
+        self._global_size = None
+        if self.comm:
+            try:
+                self._global_size = self.comm.allreduce(self.local_size)
+            except:
+                pass
+        else:
+            self._global_size = self.local_size
 
     @property
     def local_size(self) -> int:
@@ -35,6 +45,43 @@ class DistVector:
     def full_size(self) -> int:
         """Returns the total local size (owned + ghost)."""
         return self._core.full_size
+
+    @property
+    def ndim(self) -> int:
+        return 1
+
+    @property
+    def shape(self):
+        if self._global_size is not None:
+            return (self._global_size,)
+        return (self.full_size,)
+
+    @property
+    def size(self) -> int:
+        s = self.shape[0]
+        return s if s is not None else 0
+
+    @property
+    def T(self) -> 'DistVector':
+        return self
+
+    def copy(self) -> 'DistVector':
+        obj = self.duplicate()
+        obj.comm = self.comm
+        return obj
+
+    def __matmul__(self, other):
+        if isinstance(other, DistVector):
+            return self.dot(other)
+        return NotImplemented
+
+    def __len__(self) -> int:
+        return self.size
+
+    def __repr__(self):
+        s = self.shape[0]
+        size_str = str(s) if s is not None else "Unknown"
+        return f"<DistVector of size {size_str}, dtype={self.dtype}>"
 
     def to_numpy(self) -> np.ndarray:
         """
@@ -80,7 +127,7 @@ class DistVector:
         Returns:
             DistVector: A new vector with the same structure and data.
         """
-        return DistVector(self._core.duplicate())
+        return DistVector(self._core.duplicate(), self.comm)
 
     def set_constant(self, val: Union[float, complex, int]) -> None:
         """

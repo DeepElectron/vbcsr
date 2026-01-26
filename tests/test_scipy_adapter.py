@@ -28,7 +28,7 @@ class TestScipyAdapter(unittest.TestCase):
         else:
             bsr = None
             
-        mat = VBCSR.from_scipy(self.comm, bsr)
+        mat = VBCSR.from_scipy(bsr, self.comm)
         
         # Verify structure
         # Total blocks should be 2
@@ -66,7 +66,7 @@ class TestScipyAdapter(unittest.TestCase):
         else:
             csr = None
             
-        mat = VBCSR.from_scipy(self.comm, csr)
+        mat = VBCSR.from_scipy(csr, self.comm)
         
         if self.size == 1:
             dense = mat.to_dense()
@@ -156,7 +156,7 @@ class TestScipyAdapter(unittest.TestCase):
             bsr = None
             
         # Create VBCSR from SciPy
-        mat_scipy = VBCSR.from_scipy(self.comm, bsr)
+        mat_scipy = VBCSR.from_scipy(bsr, self.comm)
         
         # Verify Mult
         x_np = np.random.rand(8)
@@ -200,7 +200,7 @@ class TestScipyAdapter(unittest.TestCase):
             bsr = None
             
         # 1. SciPy -> VBCSR
-        mat = VBCSR.from_scipy(self.comm, bsr)
+        mat = VBCSR.from_scipy(bsr, self.comm)
         
         # 2. VBCSR -> SciPy (Roundtrip)
         # Only rank 0 gets the full result if we gather? 
