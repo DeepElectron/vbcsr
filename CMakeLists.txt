@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Find dependencies
-find_package(MPI REQUIRED COMPONENTS C)
+find_package(MPI REQUIRED COMPONENTS C CXX)
 find_package(OpenMP REQUIRED)
 find_package(Threads REQUIRED)
 
@@ -76,7 +76,7 @@ add_library(vbcsr INTERFACE)
 add_library(vbcsr::vbcsr ALIAS vbcsr)
 
 # Link dependencies
-target_link_libraries(vbcsr INTERFACE MPI::MPI_C OpenMP::OpenMP_CXX ${BLAS_LIBRARIES})
+target_link_libraries(vbcsr INTERFACE MPI::MPI_C MPI::MPI_CXX OpenMP::OpenMP_CXX ${BLAS_LIBRARIES})
 
 # Include directories
 target_include_directories(vbcsr INTERFACE
