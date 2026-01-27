@@ -42,16 +42,16 @@ test:
     - python -m pytest --pyargs vbcsr
 
 about:
-  home: https://github.com/yourusername/vbcsr
-  license: MIT
+  home: https://github.com/floatingCatty/vbcsr
+  license: AGPL-3.0
   license_file: LICENSE
   summary: 'Variable Block Compressed Sparse Row (VBCSR) library with MPI support'
   description: |
     VBCSR is a high-performance sparse matrix library that supports variable block sizes
     and distributed memory parallelism via MPI.
-  doc_url: https://github.com/yourusername/vbcsr
-  dev_url: https://github.com/yourusername/vbcsr
+  doc_url: https://github.com/floatingCatty/vbcsr
+  dev_url: https://github.com/floatingCatty/vbcsr
 
 extra:
   recipe-maintainers:
-    - yourusername
+    - zhanghao
