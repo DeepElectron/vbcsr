@@ -138,6 +138,10 @@ class DistVector:
         """
         self._core.set_constant(val)
 
+    def set_random_normal(self, normalize: bool = False) -> None:
+        """Set all elements to random normal values."""
+        self._core.set_random_normal(normalize)
+
     def scale(self, alpha: Union[float, complex, int]) -> None:
         """
         Scale the vector by a scalar.
