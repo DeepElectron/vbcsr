@@ -205,6 +205,7 @@ if(VBCSR_ENABLE_TESTS)
     add_vbcsr_test(test_mult_graph_mismatch vbcsr/core/test/test_mult_graph_mismatch.cpp)
     add_vbcsr_test(test_subgraph vbcsr/core/test/test_subgraph.cpp)
     add_vbcsr_test(test_graphmf vbcsr/core/test/test_graphmf.cpp)
+    add_vbcsr_test(test_dist_csr vbcsr/core/test/test_dist_csr.cpp)
 
     add_executable(test_block_csr_export vbcsr/core/test/test_block_csr_export.cpp)
     target_link_libraries(test_block_csr_export PRIVATE vbcsr GTest::gtest GTest::gtest_main Threads::Threads dl)
