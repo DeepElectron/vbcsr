@@ -12,12 +12,11 @@ inline MPI_Comm get_mpi_comm(py::object comm_obj) {
 
     if (comm_obj.is_none()) {
         if (initialized) return MPI_COMM_WORLD;
-        
-        // If not initialized, we initialize it to support serial execution (size=1)
-        // or execution where mpi4py is not used but MPI is needed by C++.
-        int provided;
-        MPI_Init_thread(NULL, NULL, MPI_THREAD_MULTIPLE, &provided);
-        return MPI_COMM_WORLD;
+
+        // MPI not initialized and no communicator requested → serial mode.
+        // Do NOT call MPI_Init_thread here — if the system MPI is absent or
+        // misconfigured (e.g. conda env without openmpi), it would crash.
+        return MPI_COMM_NULL;
     }
 
     // If a communicator is provided, we MUST be initialized
