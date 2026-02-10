@@ -35,10 +35,16 @@ template <typename T, typename Kernel>
 DistCSR<T> convert_to_csr(const BlockSpMat<T, Kernel>& mat) {
     DistCSR<T> csr;
     csr.comm = mat.graph->comm;
-    
+    int initialized = 0;
+    MPI_Initialized(&initialized);
     int rank, size;
-    MPI_Comm_rank(csr.comm, &rank);
-    MPI_Comm_size(csr.comm, &size);
+    if (initialized) {
+        MPI_Comm_rank(csr.comm, &rank);
+        MPI_Comm_size(csr.comm, &size);
+    } else {
+        rank = 0;
+        size = 1;
+    }
     
     // 1. Calculate local scalar sizes and offsets
     const auto& block_sizes = mat.graph->block_sizes; // Contains owned + ghost sizes
@@ -59,7 +65,11 @@ DistCSR<T> convert_to_csr(const BlockSpMat<T, Kernel>& mat) {
     std::vector<int> rank_global_offsets(size + 1, 0);
     std::vector<int> all_local_rows(size);
     
-    MPI_Allgather(&my_local_rows, 1, MPI_INT, all_local_rows.data(), 1, MPI_INT, csr.comm);
+    if (initialized) {
+        MPI_Allgather(&my_local_rows, 1, MPI_INT, all_local_rows.data(), 1, MPI_INT, csr.comm);
+    } else {
+        all_local_rows[0] = my_local_rows;
+    }
     
     for (int i = 0; i < size; ++i) {
         rank_global_offsets[i+1] = rank_global_offsets[i] + all_local_rows[i];
@@ -91,7 +101,11 @@ DistCSR<T> convert_to_csr(const BlockSpMat<T, Kernel>& mat) {
     for (const auto& kv : ghosts_by_rank) req_counts[kv.first] = kv.second.size();
     
     std::vector<int> incom_req_counts(size);
-    MPI_Alltoall(req_counts.data(), 1, MPI_INT, incom_req_counts.data(), 1, MPI_INT, csr.comm);
+    if (initialized) {
+        MPI_Alltoall(req_counts.data(), 1, MPI_INT, incom_req_counts.data(), 1, MPI_INT, csr.comm);
+    } else {
+        incom_req_counts[0] = req_counts[0];
+    }
     
     // 3.3 Exchange GIDs
     // Prepare Send Buffers
@@ -111,8 +125,12 @@ DistCSR<T> convert_to_csr(const BlockSpMat<T, Kernel>& mat) {
     }
     
     std::vector<int> req_recv_buf(rdispls[size]);
-    MPI_Alltoallv(req_send_buf.data(), req_counts.data(), sdispls.data(), MPI_INT,
-                  req_recv_buf.data(), incom_req_counts.data(), rdispls.data(), MPI_INT, csr.comm);
+    if (initialized) {
+        MPI_Alltoallv(req_send_buf.data(), req_counts.data(), sdispls.data(), MPI_INT,
+                      req_recv_buf.data(), incom_req_counts.data(), rdispls.data(), MPI_INT, csr.comm);
+    } else {
+        std::copy(req_send_buf.begin(), req_send_buf.end(), req_recv_buf.begin());
+    }
                   
     // 3.4 Lookup Local Offsets for requested GIDs
     std::vector<int> resp_send_buf(rdispls[size]); // Responding with offsets
@@ -132,8 +150,12 @@ DistCSR<T> convert_to_csr(const BlockSpMat<T, Kernel>& mat) {
     
     // 3.5 Receive Local Offsets
     std::vector<int> resp_recv_buf(sdispls[size]);
-    MPI_Alltoallv(resp_send_buf.data(), incom_req_counts.data(), rdispls.data(), MPI_INT,
-                  resp_recv_buf.data(), req_counts.data(), sdispls.data(), MPI_INT, csr.comm);
+    if (initialized) {
+        MPI_Alltoallv(resp_send_buf.data(), incom_req_counts.data(), rdispls.data(), MPI_INT,
+                      resp_recv_buf.data(), req_counts.data(), sdispls.data(), MPI_INT, csr.comm);
+    } else {
+        std::copy(resp_send_buf.begin(), resp_send_buf.end(), resp_recv_buf.begin());
+    }
                   
     // 3.6 Map Ghost LID -> Global Scalar Start Index
     // LID is relative to n_owned_blocks

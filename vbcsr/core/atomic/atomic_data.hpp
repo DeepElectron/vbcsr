@@ -68,8 +68,15 @@ private:
 public:
     AtomicData(DistGraph* g) : graph(g), own_graph(false) {
         comm = graph->comm;
-        MPI_Comm_rank(comm, &rank);
-        MPI_Comm_size(comm, &size);
+        int initialized = 0;
+        MPI_Initialized(&initialized);
+        if (initialized) {
+            MPI_Comm_rank(comm, &rank);
+            MPI_Comm_size(comm, &size);
+        } else {
+            rank = 0;
+            size = 1;
+        }
         compute_offsets();
     }
 
@@ -82,8 +89,15 @@ public:
       MPI_Comm comm_
     ) : atom_offset(atom_offset_), n_atom(n_atom_), N_atom(N_atom_), n_edge(n_edge_), N_edge(N_edge_), comm(comm_), own_graph(true) {
         
-        MPI_Comm_rank(comm, &rank);
-        MPI_Comm_size(comm, &size);
+        int initialized = 0;
+        MPI_Initialized(&initialized);
+        if (initialized) {
+            MPI_Comm_rank(comm, &rank);
+            MPI_Comm_size(comm, &size);
+        } else {
+            rank = 0;
+            size = 1;
+        }
 
         // 1. Setup Graph
         // Prepare adjacency for DistGraph (remove duplicates/R)
@@ -96,7 +110,11 @@ public:
         for(size_t i=0; i<n_atom; ++i) max_type = std::max(max_type, atom_type_in[i]);
         int my_max_type = max_type;
         int global_max_type;
-        MPI_Allreduce(&my_max_type, &global_max_type, 1, MPI_INT, MPI_MAX, comm);
+        if (initialized) {
+            MPI_Allreduce(&my_max_type, &global_max_type, 1, MPI_INT, MPI_MAX, comm);
+        } else {
+            global_max_type = my_max_type;
+        }
         type_norb.assign(type_norb_in, type_norb_in + global_max_type + 1);
 
         for(int i=0; i<n_atom; ++i) {
@@ -183,8 +201,15 @@ public:
                                    const std::vector<double>& r_max_per_type, const std::vector<int>& type_norb_in, 
                                    MPI_Comm comm) {
         int rank, size;
-        MPI_Comm_rank(comm, &rank);
-        MPI_Comm_size(comm, &size);
+        int initialized = 0;
+        MPI_Initialized(&initialized);
+        if (initialized) {
+            MPI_Comm_rank(comm, &rank);
+            MPI_Comm_size(comm, &size);
+        } else {
+            rank = 0;
+            size = 1;
+        }
 
         // 1. Rank 0: Process Input & Initial Partition
         std::vector<int> type_norb = type_norb_in;
@@ -204,8 +229,9 @@ public:
                                 send_counts, send_displs, edges_to_send);
         }
 
-        
-        MPI_Bcast(&n_global, 1, MPI_INT, 0, comm);
+        if (initialized) {
+            MPI_Bcast(&n_global, 1, MPI_INT, 0, comm);
+        }
 
         if (n_global == 0) {
             return new AtomicData(comm);
@@ -257,12 +283,20 @@ public:
         
         // 6. Re-map IDs to be contiguous on each rank
         std::vector<int> all_recv_counts(size);
-        MPI_Allgather(&total_recv, 1, MPI_INT, all_recv_counts.data(), 1, MPI_INT, comm);
+        if (initialized) {
+            MPI_Allgather(&total_recv, 1, MPI_INT, all_recv_counts.data(), 1, MPI_INT, comm);
+        } else {
+            all_recv_counts[0] = total_recv;
+        }
         std::vector<int> all_recv_displs(size + 1, 0);
         for(int i=0; i<size; ++i) all_recv_displs[i+1] = all_recv_displs[i] + all_recv_counts[i];
         
         std::vector<int> all_r_inter_indices(n_global);
-        MPI_Allgatherv(r_inter_indices.data(), total_recv, MPI_INT, all_r_inter_indices.data(), all_recv_counts.data(), all_recv_displs.data(), MPI_INT, comm);
+        if (initialized) {
+            MPI_Allgatherv(r_inter_indices.data(), total_recv, MPI_INT, all_r_inter_indices.data(), all_recv_counts.data(), all_recv_displs.data(), MPI_INT, comm);
+        } else {
+            std::copy(r_inter_indices.begin(), r_inter_indices.end(), all_r_inter_indices.begin());
+        }
         
         std::vector<int> inter_to_final(n_global);
         for(int i=0; i<n_global; ++i) {
@@ -281,7 +315,13 @@ public:
     
     static AtomicData* from_file(const std::string& filename, const std::vector<double>& r_max_per_type, std::vector<int> type_norb, MPI_Comm comm, const std::string& format="") {
         int rank;
-        MPI_Comm_rank(comm, &rank);
+        int initialized = 0;
+        MPI_Initialized(&initialized);
+        if (initialized) {
+            MPI_Comm_rank(comm, &rank);
+        } else {
+            rank = 0;
+        }
         
         std::vector<double> pos;
         std::vector<int> z;
@@ -402,7 +442,11 @@ public:
         }
 
         long long rank_global_start = 0;
-        MPI_Exscan(&my_owned_elements, &rank_global_start, 1, MPI_LONG_LONG, MPI_SUM, comm);
+        int initialized = 0;
+        MPI_Initialized(&initialized);
+        if (initialized) {
+            MPI_Exscan(&my_owned_elements, &rank_global_start, 1, MPI_LONG_LONG, MPI_SUM, comm);
+        }
         if (rank == 0) rank_global_start = 0;
 
         // Fill owned
@@ -419,8 +463,10 @@ public:
 
         std::vector<long long> recv_buf(graph->recv_indices.size());
         
-        MPI_Alltoallv(send_buf.data(), graph->send_counts.data(), graph->send_displs.data(), MPI_LONG_LONG,
-                      recv_buf.data(), graph->recv_counts.data(), graph->recv_displs.data(), MPI_LONG_LONG, comm);
+        if (initialized) {
+            MPI_Alltoallv(send_buf.data(), graph->send_counts.data(), graph->send_displs.data(), MPI_LONG_LONG,
+                        recv_buf.data(), graph->recv_counts.data(), graph->recv_displs.data(), MPI_LONG_LONG, comm);
+        }
 
         for(size_t i=0; i<graph->recv_indices.size(); ++i) {
             int lid = graph->recv_indices[i];
@@ -478,7 +524,11 @@ public:
             local_norb += type_norb[atom_type[i]];
         }
         int global_norb = 0;
-        MPI_Allreduce(&local_norb, &global_norb, 1, MPI_INT, MPI_SUM, comm);
+        if (size > 1) {
+            MPI_Allreduce(&local_norb, &global_norb, 1, MPI_INT, MPI_SUM, comm);
+        } else {
+            global_norb = local_norb;
+        }
         return global_norb;
     }
 
@@ -503,6 +553,8 @@ public:
     DistGraph* get_graph3b(const std::vector<double>& r_max_left, const std::vector<double>& r_max_right) {
         // 1. Build reduced connectivity (riconn)
         std::vector<std::vector<int>> riconn(atom_type.size());
+        int initialized = 0;
+        MPI_Initialized(&initialized);
         
         for(int i=0; i<n_atom; ++i) {
             for(int edge_idx : iconn[i]) {
@@ -550,7 +602,11 @@ public:
         for(auto& kv : send_map) send_counts[kv.first] = kv.second.size() * 2;
         
         std::vector<int> recv_counts(size);
-        MPI_Alltoall(send_counts.data(), 1, MPI_INT, recv_counts.data(), 1, MPI_INT, comm);
+        if (initialized) {
+            MPI_Alltoall(send_counts.data(), 1, MPI_INT, recv_counts.data(), 1, MPI_INT, comm);
+        } else {
+            std::copy(send_counts.begin(), send_counts.end(), recv_counts.begin());
+        }
         
         std::vector<int> sdispls(size + 1, 0), rdispls(size + 1, 0);
         for(int i=0; i<size; ++i) {
@@ -568,8 +624,12 @@ public:
         }
         
         std::vector<int> recv_buf(rdispls[size]);
-        MPI_Alltoallv(send_buf.data(), send_counts.data(), sdispls.data(), MPI_INT,
-                      recv_buf.data(), recv_counts.data(), rdispls.data(), MPI_INT, comm);
+        if (initialized) {
+            MPI_Alltoallv(send_buf.data(), send_counts.data(), sdispls.data(), MPI_INT,
+                          recv_buf.data(), recv_counts.data(), rdispls.data(), MPI_INT, comm);
+        } else {
+            std::copy(send_buf.begin(), send_buf.end(), recv_buf.begin());
+        }
                       
         std::vector<std::vector<int>> matrix_adj(n_atom);
         
@@ -617,6 +677,9 @@ public:
 private:
     template<typename T>
     void exchange_attribute(std::vector<T>& data) {
+        int initialized = 0;
+        MPI_Initialized(&initialized);
+        
         std::vector<T> send_buf(graph->send_indices.size());
         for(size_t i=0; i<graph->send_indices.size(); ++i) {
             send_buf[i] = data[graph->send_indices[i]];
@@ -637,8 +700,12 @@ private:
             rdispls_bytes[i] = graph->recv_displs[i] * type_size;
         }
         
-        MPI_Alltoallv(send_buf.data(), send_counts_bytes.data(), sdispls_bytes.data(), MPI_BYTE,
-                      recv_buf.data(), recv_counts_bytes.data(), rdispls_bytes.data(), MPI_BYTE, comm);
+        if (initialized) {
+            MPI_Alltoallv(send_buf.data(), send_counts_bytes.data(), sdispls_bytes.data(), MPI_BYTE,
+                          recv_buf.data(), recv_counts_bytes.data(), rdispls_bytes.data(), MPI_BYTE, comm);
+        } else {
+            std::copy(send_buf.begin(), send_buf.end(), recv_buf.begin());
+        }
                       
         for(size_t i=0; i<graph->recv_indices.size(); ++i) {
             data[graph->recv_indices[i]] = recv_buf[i];
@@ -686,8 +753,15 @@ private:
 #else
         // Hilbert Curve Fallback Implementation
         int rank, size;
-        MPI_Comm_rank(comm, &rank);
-        MPI_Comm_size(comm, &size);
+        int initialized = 0;
+        MPI_Initialized(&initialized);
+        if (initialized) {
+            MPI_Comm_rank(comm, &rank);
+            MPI_Comm_size(comm, &size);
+        } else {
+            rank = 0;
+            size = 1;
+        }
         
         if (n_global == 0) return;
         
@@ -705,8 +779,13 @@ private:
         }
         
         double global_min[3], global_max[3];
-        MPI_Allreduce(min_val, global_min, 3, MPI_DOUBLE, MPI_MIN, comm);
-        MPI_Allreduce(max_val, global_max, 3, MPI_DOUBLE, MPI_MAX, comm);
+        if (initialized) {
+            MPI_Allreduce(min_val, global_min, 3, MPI_DOUBLE, MPI_MIN, comm);
+            MPI_Allreduce(max_val, global_max, 3, MPI_DOUBLE, MPI_MAX, comm);
+        } else {
+            std::copy(min_val, min_val+3, global_min);
+            std::copy(max_val, max_val+3, global_max);
+        }
         
         // 2. Compute Local Morton Codes
         struct AtomInfo {
@@ -748,7 +827,11 @@ private:
         
         std::vector<int> recv_counts(size);
         int local_bytes = my_n_atom * sizeof(AtomInfo);
-        MPI_Gather(&local_bytes, 1, MPI_INT, recv_counts.data(), 1, MPI_INT, 0, comm);
+        if (initialized) {
+            MPI_Gather(&local_bytes, 1, MPI_INT, recv_counts.data(), 1, MPI_INT, 0, comm);
+        } else {
+            recv_counts[0] = local_bytes;
+        }
         
         std::vector<int> displs(size + 1, 0);
         std::vector<char> recv_buf;
@@ -758,8 +841,12 @@ private:
             recv_buf.resize(displs[size]);
         }
         
-        MPI_Gatherv((char*)local_infos.data(), local_bytes, MPI_BYTE,
-                    recv_buf.data(), recv_counts.data(), displs.data(), MPI_BYTE, 0, comm);
+        if (initialized) {
+            MPI_Gatherv((char*)local_infos.data(), local_bytes, MPI_BYTE,
+                        recv_buf.data(), recv_counts.data(), displs.data(), MPI_BYTE, 0, comm);
+        } else {
+            std::copy((char*)local_infos.data(), (char*)local_infos.data() + local_bytes, recv_buf.data());
+        }
                     
         // 4. Sort and Assign (Rank 0)
         std::vector<std::vector<int>> assignments; // [target_rank] -> vector of assignements (but need order)
@@ -830,8 +917,12 @@ private:
         }
         
         // Recv buffer is `part`
-        MPI_Scatterv(send_parts_flat.data(), parts_counts.data(), parts_displs.data(), MPI_INT,
-                     part.data(), my_n_atom, MPI_INT, 0, comm);
+        if (initialized) {
+            MPI_Scatterv(send_parts_flat.data(), parts_counts.data(), parts_displs.data(), MPI_INT,
+                         part.data(), my_n_atom, MPI_INT, 0, comm);
+        } else {
+            std::copy(send_parts_flat.begin(), send_parts_flat.end(), part.begin());
+        }
         
 #endif
     }
@@ -976,13 +1067,26 @@ private:
         std::vector<int>& my_indices,
         std::vector<int>& my_edges_flat
     ) {
-        MPI_Bcast(&n_global, 1, MPI_INT, 0, comm);
-        int n_types = type_norb.size();
-        MPI_Bcast(&n_types, 1, MPI_INT, 0, comm);
-        if (rank != 0) type_norb.resize(n_types);
-        MPI_Bcast(type_norb.data(), n_types, MPI_INT, 0, comm);
+        int initialized = 0;
+        MPI_Initialized(&initialized);
         
-        MPI_Scatter(send_counts.data(), 1, MPI_INT, &my_n_atom, 1, MPI_INT, 0, comm);
+        if (initialized) {
+            MPI_Bcast(&n_global, 1, MPI_INT, 0, comm);
+        }
+        int n_types = type_norb.size();
+        if (initialized) {
+            MPI_Bcast(&n_types, 1, MPI_INT, 0, comm);
+        }
+        if (rank != 0) type_norb.resize(n_types);
+        if (initialized) {
+            MPI_Bcast(type_norb.data(), n_types, MPI_INT, 0, comm);
+        }
+        
+        if (initialized) {
+            MPI_Scatter(send_counts.data(), 1, MPI_INT, &my_n_atom, 1, MPI_INT, 0, comm);
+        } else {
+            my_n_atom = send_counts[0];
+        }
         
         my_pos.resize(my_n_atom * 3);
         my_z.resize(my_n_atom);
@@ -998,14 +1102,21 @@ private:
             send_displs_3[size] = send_displs[size] * 3;
         }
         
-        MPI_Scatterv(pos_sorted.data(), send_counts_3.data(), send_displs_3.data(), MPI_DOUBLE,
-                     my_pos.data(), my_n_atom * 3, MPI_DOUBLE, 0, comm);
-        MPI_Scatterv(z_sorted.data(), send_counts.data(), send_displs.data(), MPI_INT,
-                     my_z.data(), my_n_atom, MPI_INT, 0, comm);
-        MPI_Scatterv(types_sorted.data(), send_counts.data(), send_displs.data(), MPI_INT,
-                     my_types.data(), my_n_atom, MPI_INT, 0, comm);
-        MPI_Scatterv(indices_sorted.data(), send_counts.data(), send_displs.data(), MPI_INT,
-                     my_indices.data(), my_n_atom, MPI_INT, 0, comm);
+        if (initialized) {
+            MPI_Scatterv(pos_sorted.data(), send_counts_3.data(), send_displs_3.data(), MPI_DOUBLE,
+                         my_pos.data(), my_n_atom * 3, MPI_DOUBLE, 0, comm);
+            MPI_Scatterv(z_sorted.data(), send_counts.data(), send_displs.data(), MPI_INT,
+                         my_z.data(), my_n_atom, MPI_INT, 0, comm);
+            MPI_Scatterv(types_sorted.data(), send_counts.data(), send_displs.data(), MPI_INT,
+                         my_types.data(), my_n_atom, MPI_INT, 0, comm);
+            MPI_Scatterv(indices_sorted.data(), send_counts.data(), send_displs.data(), MPI_INT,
+                         my_indices.data(), my_n_atom, MPI_INT, 0, comm);
+        } else {
+            std::copy(pos_sorted.begin(), pos_sorted.begin() + my_n_atom * 3, my_pos.begin());
+            std::copy(z_sorted.begin(), z_sorted.begin() + my_n_atom, my_z.begin());
+            std::copy(types_sorted.begin(), types_sorted.begin() + my_n_atom, my_types.begin());
+            std::copy(indices_sorted.begin(), indices_sorted.begin() + my_n_atom, my_indices.begin());
+        }
 
         // Scatter Edges
         int my_n_edge_tuples;
@@ -1013,7 +1124,11 @@ private:
         if (rank == 0) {
             for(int i=0; i<size; ++i) edge_send_counts[i] = edges_to_send[i].size() * 5; 
         }
-        MPI_Scatter(edge_send_counts.data(), 1, MPI_INT, &my_n_edge_tuples, 1, MPI_INT, 0, comm);
+        if (initialized) {
+            MPI_Scatter(edge_send_counts.data(), 1, MPI_INT, &my_n_edge_tuples, 1, MPI_INT, 0, comm);
+        } else {
+            my_n_edge_tuples = edge_send_counts[0];
+        }
         
         my_edges_flat.resize(my_n_edge_tuples);
         std::vector<int> edge_displs(size + 1, 0);
@@ -1032,8 +1147,12 @@ private:
                 }
             }
         }
-        MPI_Scatterv(all_edges_flat.data(), edge_send_counts.data(), edge_displs.data(), MPI_INT,
-                     my_edges_flat.data(), my_n_edge_tuples, MPI_INT, 0, comm);
+        if (initialized) {
+            MPI_Scatterv(all_edges_flat.data(), edge_send_counts.data(), edge_displs.data(), MPI_INT,
+                         my_edges_flat.data(), my_n_edge_tuples, MPI_INT, 0, comm);
+        } else {
+            std::copy(all_edges_flat.begin(), all_edges_flat.begin() + my_n_edge_tuples, my_edges_flat.begin());
+        }
     }
 
     static void build_parmetis_graph(
@@ -1044,8 +1163,15 @@ private:
         std::vector<int>& adjncy,
         int& my_start
     ) {
+        int initialized = 0;
+        MPI_Initialized(&initialized);
+        
         std::vector<int> my_vtxdist(size);
-        MPI_Allgather(&my_n_atom, 1, MPI_INT, my_vtxdist.data(), 1, MPI_INT, comm);
+        if (initialized) {
+            MPI_Allgather(&my_n_atom, 1, MPI_INT, my_vtxdist.data(), 1, MPI_INT, comm);
+        } else {
+            std::fill(my_vtxdist.begin(), my_vtxdist.end(), my_n_atom);
+        }
         vtxdist.assign(size + 1, 0);
         for(int i=0; i<size; ++i) vtxdist[i+1] = vtxdist[i] + my_vtxdist[i];
         
@@ -1092,7 +1218,13 @@ private:
         
         std::vector<int> send_cnts(size), recv_cnts(size);
         for(int i=0; i<size; ++i) send_cnts[i] = atoms_to_send[i].size();
-        MPI_Alltoall(send_cnts.data(), 1, MPI_INT, recv_cnts.data(), 1, MPI_INT, comm);
+        int initialized = 0;
+        MPI_Initialized(&initialized);
+        if (initialized) {
+            MPI_Alltoall(send_cnts.data(), 1, MPI_INT, recv_cnts.data(), 1, MPI_INT, comm);
+        } else {
+            std::fill(recv_cnts.begin(), recv_cnts.end(), send_cnts[0]);
+        }
         
         std::vector<int> sdispls(size + 1, 0), rdispls(size + 1, 0);
         for(int i=0; i<size; ++i) {
@@ -1138,16 +1270,24 @@ private:
         sdispls_3[size] = sdispls[size] * 3;
         rdispls_3[size] = rdispls[size] * 3;
         
-        MPI_Alltoallv(s_pos.data(), send_cnts_3.data(), sdispls_3.data(), MPI_DOUBLE,
-                      r_pos.data(), recv_cnts_3.data(), rdispls_3.data(), MPI_DOUBLE, comm);
-        MPI_Alltoallv(s_z.data(), send_cnts.data(), sdispls.data(), MPI_INT,
-                      r_z.data(), recv_cnts.data(), rdispls.data(), MPI_INT, comm);
-        MPI_Alltoallv(s_types.data(), send_cnts.data(), sdispls.data(), MPI_INT,
-                      r_types.data(), recv_cnts.data(), rdispls.data(), MPI_INT, comm);
-        MPI_Alltoallv(s_indices.data(), send_cnts.data(), sdispls.data(), MPI_INT,
-                      r_indices.data(), recv_cnts.data(), rdispls.data(), MPI_INT, comm);
-        MPI_Alltoallv(s_inter_indices.data(), send_cnts.data(), sdispls.data(), MPI_INT,
-                      r_inter_indices.data(), recv_cnts.data(), rdispls.data(), MPI_INT, comm);
+        if (initialized) {
+            MPI_Alltoallv(s_pos.data(), send_cnts_3.data(), sdispls_3.data(), MPI_DOUBLE,
+                          r_pos.data(), recv_cnts_3.data(), rdispls_3.data(), MPI_DOUBLE, comm);
+            MPI_Alltoallv(s_z.data(), send_cnts.data(), sdispls.data(), MPI_INT,
+                          r_z.data(), recv_cnts.data(), rdispls.data(), MPI_INT, comm);
+            MPI_Alltoallv(s_types.data(), send_cnts.data(), sdispls.data(), MPI_INT,
+                          r_types.data(), recv_cnts.data(), rdispls.data(), MPI_INT, comm);
+            MPI_Alltoallv(s_indices.data(), send_cnts.data(), sdispls.data(), MPI_INT,
+                          r_indices.data(), recv_cnts.data(), rdispls.data(), MPI_INT, comm);
+            MPI_Alltoallv(s_inter_indices.data(), send_cnts.data(), sdispls.data(), MPI_INT,
+                          r_inter_indices.data(), recv_cnts.data(), rdispls.data(), MPI_INT, comm);
+        } else {
+            std::copy(s_pos.begin(), s_pos.end(), r_pos.begin());
+            std::copy(s_z.begin(), s_z.end(), r_z.begin());
+            std::copy(s_types.begin(), s_types.end(), r_types.begin());
+            std::copy(s_indices.begin(), s_indices.end(), r_indices.begin());
+            std::copy(s_inter_indices.begin(), s_inter_indices.end(), r_inter_indices.begin());
+        }
     }
 
     static void redistribute_edges(
@@ -1158,6 +1298,8 @@ private:
     ) {
         std::vector<std::vector<int>> edges_to_send_final(size);
         std::vector<int> lid_to_rank = part;
+        int initialized;
+        MPI_Initialized(&initialized);
         
         int n_edges = my_edges_flat.size() / 5;
         for(int k=0; k<n_edges; ++k) {
@@ -1179,7 +1321,12 @@ private:
         
         std::vector<int> e_send_cnts(size), e_recv_cnts(size);
         for(int i=0; i<size; ++i) e_send_cnts[i] = edges_to_send_final[i].size();
-        MPI_Alltoall(e_send_cnts.data(), 1, MPI_INT, e_recv_cnts.data(), 1, MPI_INT, comm);
+
+        if (initialized) {
+            MPI_Alltoall(e_send_cnts.data(), 1, MPI_INT, e_recv_cnts.data(), 1, MPI_INT, comm);
+        } else {
+            std::copy(e_send_cnts.begin(), e_send_cnts.end(), e_recv_cnts.begin());
+        }
         
         std::vector<int> e_sdispls(size + 1, 0), e_rdispls(size + 1, 0);
         for(int i=0; i<size; ++i) {
@@ -1195,8 +1342,12 @@ private:
         }
         
         r_edges.resize(e_rdispls[size]);
-        MPI_Alltoallv(s_edges.data(), e_send_cnts.data(), e_sdispls.data(), MPI_INT,
-                      r_edges.data(), e_recv_cnts.data(), e_rdispls.data(), MPI_INT, comm);
+        if (initialized) {
+            MPI_Alltoallv(s_edges.data(), e_send_cnts.data(), e_sdispls.data(), MPI_INT,
+                          r_edges.data(), e_recv_cnts.data(), e_rdispls.data(), MPI_INT, comm);
+        } else {
+            std::copy(s_edges.begin(), s_edges.end(), r_edges.begin());
+        }
     }
 
     static AtomicData* construct_final_object(
@@ -1210,11 +1361,20 @@ private:
         const std::vector<int>& type_norb
     ) {
         if (cell.empty()) cell.resize(9);
-        MPI_Bcast(cell.data(), 9, MPI_DOUBLE, 0, comm);
+        int initialized;
+        MPI_Initialized(&initialized);
+        
+        if (initialized) {
+            MPI_Bcast(cell.data(), 9, MPI_DOUBLE, 0, comm);
+        }
         
         int my_final_n = total_recv;
         std::vector<int> final_counts(size);
-        MPI_Allgather(&my_final_n, 1, MPI_INT, final_counts.data(), 1, MPI_INT, comm);
+        if (initialized) {
+            MPI_Allgather(&my_final_n, 1, MPI_INT, final_counts.data(), 1, MPI_INT, comm);
+        } else {
+            final_counts[0] = my_final_n;
+        }
         
         int my_final_offset = 0;
         for(int i=0; i<rank; ++i) my_final_offset += final_counts[i];
@@ -1224,7 +1384,11 @@ private:
         
         int my_final_n_edge = r_edges.size() / 5;
         int total_edges_global = 0;
-        MPI_Allreduce(&my_final_n_edge, &total_edges_global, 1, MPI_INT, MPI_SUM, comm);
+        if (initialized) {
+            MPI_Allreduce(&my_final_n_edge, &total_edges_global, 1, MPI_INT, MPI_SUM, comm);
+        } else {
+            total_edges_global = my_final_n_edge;
+        }
         
         std::vector<int> edge_indices(my_final_n_edge * 2);
         std::vector<int> edge_shifts(my_final_n_edge * 3);

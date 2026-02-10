@@ -109,17 +109,27 @@ public:
             local_Rs.push_back(kv.first[2]);
         }
         
-        // 1.2 Allgather Rs
+        // 1.2 Allgather Rs across all ranks
         int size = atom_data->size;
-        std::vector<int> recv_counts(size);
         int my_count = local_Rs.size();
-        MPI_Allgather(&my_count, 1, MPI_INT, recv_counts.data(), 1, MPI_INT, atom_data->comm);
+        std::vector<int> all_Rs;
         
-        std::vector<int> displs(size + 1, 0);
-        for (int i = 0; i < size; ++i) displs[i+1] = displs[i] + recv_counts[i];
+        int initialized = 0;
+        MPI_Initialized(&initialized);
         
-        std::vector<int> all_Rs(displs[size]);
-        MPI_Allgatherv(local_Rs.data(), my_count, MPI_INT, all_Rs.data(), recv_counts.data(), displs.data(), MPI_INT, atom_data->comm);
+        if (initialized && size > 1) {
+            std::vector<int> recv_counts(size);
+            MPI_Allgather(&my_count, 1, MPI_INT, recv_counts.data(), 1, MPI_INT, atom_data->comm);
+            
+            std::vector<int> displs(size + 1, 0);
+            for (int i = 0; i < size; ++i) displs[i+1] = displs[i] + recv_counts[i];
+            
+            all_Rs.resize(displs[size]);
+            MPI_Allgatherv(local_Rs.data(), my_count, MPI_INT, all_Rs.data(), recv_counts.data(), displs.data(), MPI_INT, atom_data->comm);
+        } else {
+            // Serial: local Rs are the complete set
+            all_Rs = local_Rs;
+        }
         
         // 1.3 Unique Rs
         std::vector<std::vector<int>> unique_Rs;
