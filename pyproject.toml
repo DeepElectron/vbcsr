@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "vbcsr"
-version = "0.2.1"
+version = "0.2.0"
 description = "Variable Block Compressed Sparse Row Matrix with MPI support"
 readme = "README.md"
 requires-python = ">=3.8"
