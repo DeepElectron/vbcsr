@@ -12,6 +12,21 @@ find_package(MPI REQUIRED COMPONENTS C CXX)
 find_package(OpenMP REQUIRED)
 find_package(Threads REQUIRED)
 
+# ParMETIS/METIS
+find_library(PARMETIS_LIB NAMES parmetis HINTS $ENV{CONDA_PREFIX}/lib)
+find_library(METIS_LIB NAMES metis HINTS $ENV{CONDA_PREFIX}/lib)
+find_path(PARMETIS_INCLUDE_DIR NAMES parmetis.h HINTS $ENV{CONDA_PREFIX}/include)
+find_path(METIS_INCLUDE_DIR NAMES metis.h HINTS $ENV{CONDA_PREFIX}/include)
+
+if(PARMETIS_LIB AND METIS_LIB AND PARMETIS_INCLUDE_DIR AND METIS_INCLUDE_DIR)
+    set(VBCSR_HAVE_PARMETIS ON)
+    message(STATUS "Found ParMETIS: ${PARMETIS_LIB}")
+    message(STATUS "Found METIS: ${METIS_LIB}")
+    message(STATUS "Found ParMETIS includes: ${PARMETIS_INCLUDE_DIR}")
+else()
+    message(STATUS "ParMETIS or METIS not found. Will use Hilbert curve fallback.")
+endif()
+
 # Add cmake module path
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
@@ -78,6 +93,11 @@ add_library(vbcsr::vbcsr ALIAS vbcsr)
 
 # Link dependencies
 target_link_libraries(vbcsr INTERFACE MPI::MPI_C MPI::MPI_CXX OpenMP::OpenMP_CXX ${BLAS_LIBRARIES})
+if(VBCSR_HAVE_PARMETIS)
+    target_link_libraries(vbcsr INTERFACE ${PARMETIS_LIB} ${METIS_LIB})
+    target_include_directories(vbcsr INTERFACE ${PARMETIS_INCLUDE_DIR} ${METIS_INCLUDE_DIR})
+    target_compile_definitions(vbcsr INTERFACE VBCSR_HAVE_PARMETIS)
+endif()
 
 # Include directories
 target_include_directories(vbcsr INTERFACE
@@ -102,6 +122,7 @@ endif()
 # Source files for Python binding
 set(SOURCES
     vbcsr/pybind_vbcsr.cpp
+    vbcsr/pybind_atomic.cpp
 )
 
 # Create the extension module
@@ -206,6 +227,28 @@ if(VBCSR_ENABLE_TESTS)
     add_vbcsr_test(test_subgraph vbcsr/core/test/test_subgraph.cpp)
     add_vbcsr_test(test_graphmf vbcsr/core/test/test_graphmf.cpp)
     add_vbcsr_test(test_dist_csr vbcsr/core/test/test_dist_csr.cpp)
+
+    # Atomic Module Tests
+    # Atomic Module Tests
+    # ParMETIS detection moved to top-level
+
+    if(PARMETIS_LIB AND METIS_LIB AND PARMETIS_INCLUDE_DIR AND METIS_INCLUDE_DIR)
+        add_vbcsr_test(test_atomic_data vbcsr/core/atomic/test/test_atomic_data.cpp)
+        target_link_libraries(test_atomic_data PRIVATE ${PARMETIS_LIB} ${METIS_LIB})
+        target_include_directories(test_atomic_data PRIVATE ${PARMETIS_INCLUDE_DIR} ${METIS_INCLUDE_DIR})
+
+        add_vbcsr_test(test_image_container vbcsr/core/atomic/test/test_image_container.cpp)
+        target_link_libraries(test_image_container PRIVATE ${PARMETIS_LIB} ${METIS_LIB})
+        target_include_directories(test_image_container PRIVATE ${PARMETIS_INCLUDE_DIR} ${METIS_INCLUDE_DIR})
+    else()
+        # Compile tests without ParMETIS linking (testing fallback)
+        add_vbcsr_test(test_atomic_data vbcsr/core/atomic/test/test_atomic_data.cpp)
+        
+        add_vbcsr_test(test_image_container vbcsr/core/atomic/test/test_image_container.cpp)
+    endif()
+
+    add_vbcsr_test(test_neighbourlist vbcsr/core/atomic/test/test_neighbourlist.cpp)
+    add_vbcsr_test(test_neighbourlist_repro vbcsr/core/atomic/test/test_neighbourlist_repro.cpp)
 
     add_executable(test_block_csr_export vbcsr/core/test/test_block_csr_export.cpp)
     target_link_libraries(test_block_csr_export PRIVATE vbcsr GTest::gtest GTest::gtest_main Threads::Threads dl)
