@@ -1,6 +1,7 @@
 from . import vbcsr_core
 from vbcsr_core import AssemblyMode, PhaseConvention
 import numpy as np
+from .matrix import VBCSR
 
 _MODE_MAP = {
     "add": AssemblyMode.ADD,
@@ -35,9 +36,9 @@ def _resolve_convention(convention):
     return convention
 
 
-class ImageContainer(vbcsr_core.ImageContainer):
+class ImageContainer:
     """
-    Pythonic wrapper for vbcsr_core.ImageContainer.
+    Pythonic wrapper for vbcsr_core.ImageContainer (Double or Complex).
 
     Provides:
       - ``add_block``  - single block, optional *R*, string *mode*
@@ -46,12 +47,19 @@ class ImageContainer(vbcsr_core.ImageContainer):
       - ``sample_k``   - Fourier transform to k-space
     """
 
-    def __init__(self, atomic_data):
-        super().__init__(atomic_data)
+    def __init__(self, atomic_data, dtype=np.float64):
+        self.atomic_data = atomic_data
+        self.dtype = np.dtype(dtype)
+        
+        if self.dtype == np.float64:
+             # Depending on how pybind exposes it, atomic_data might need to be passed as pointer
+             # But pybind handles object conversion if `AtomicData` is bound.
+             self._core = vbcsr_core.ImageContainer(atomic_data)
+        elif self.dtype == np.complex128:
+             self._core = vbcsr_core.ImageContainer_Complex(atomic_data)
+        else:
+             raise ValueError("Unsupported dtype. Use float64 or complex128.")
 
-    # ------------------------------------------------------------------ #
-    #  add_block
-    # ------------------------------------------------------------------ #
     def add_block(self, g_row, g_col, data, R=None, mode="add"):
         """
         Add a single dense block.
@@ -70,13 +78,11 @@ class ImageContainer(vbcsr_core.ImageContainer):
             if len(R) != 3:
                 raise ValueError("R must have exactly 3 elements")
 
-        super().add_block(R, g_row, g_col,
-                          np.asarray(data, dtype=np.float64),
-                          _resolve_mode(mode))
+        # Cast data to correct dtype
+        data_arr = np.asarray(data, dtype=self.dtype)
+        
+        self._core.add_block(R, g_row, g_col, data_arr, _resolve_mode(mode))
 
-    # ------------------------------------------------------------------ #
-    #  add_blocks  (parallel batch)
-    # ------------------------------------------------------------------ #
     def add_blocks(self, g_rows, g_cols, data_list, R_list=None, mode="add"):
         """
         Add multiple blocks in parallel (OpenMP on the C++ side).
@@ -96,22 +102,17 @@ class ImageContainer(vbcsr_core.ImageContainer):
         else:
             R_list = [[int(x) for x in r] for r in R_list]
 
-        data_list = [np.asarray(d, dtype=np.float64) for d in data_list]
+        # Cast all data blocks
+        data_list = [np.asarray(d, dtype=self.dtype) for d in data_list]
 
-        super().add_blocks(R_list, list(g_rows), list(g_cols),
-                           data_list, _resolve_mode(mode))
+        self._core.add_blocks(R_list, list(g_rows), list(g_cols),
+                              data_list, _resolve_mode(mode))
 
-    # ------------------------------------------------------------------ #
-    #  assemble
-    # ------------------------------------------------------------------ #
     def assemble(self):
         """Finalize assembly - exchange remote blocks between MPI ranks."""
-        super().assemble()
+        self._core.assemble()
 
-    # ------------------------------------------------------------------ #
-    #  sample_k
-    # ------------------------------------------------------------------ #
-    def sample_k(self, k_point, convention="R"):
+    def sample_k(self, k_point, convention="R", symm=False):
         """
         Fourier-transform real-space blocks to a single k-point.
 
@@ -122,21 +123,23 @@ class ImageContainer(vbcsr_core.ImageContainer):
         Returns:
             VBCSR: Complex-valued block-sparse matrix at this k-point.
         """
-        from .matrix import VBCSR
-
         k_point = np.asarray(k_point, dtype=np.float64).ravel()
         if k_point.size != 3:
             raise ValueError("k_point must have exactly 3 elements")
 
-        core_result = super().sample_k(k_point, _resolve_convention(convention))
+        core_result = self._core.sample_k(k_point, _resolve_convention(convention))
 
         # Wrap in VBCSR (same pattern as spmm / transpose in matrix.py)
         obj = VBCSR.__new__(VBCSR)
         obj.graph = core_result.graph
         obj.dtype = np.complex128
         obj._core = core_result
-        obj.comm = None
-        obj.shape = (None, None)
+        obj.comm = self.atomic_data.comm if hasattr(self.atomic_data, 'comm') else None
+        norb = self.atomic_data.norb()
+        obj.shape = (norb, norb)
         obj._global_nnz = None
-        return obj
 
+        if symm:
+            obj = obj + obj.T
+            obj /= 2.0
+        return obj

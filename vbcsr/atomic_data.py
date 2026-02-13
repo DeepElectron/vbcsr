@@ -101,6 +101,49 @@ class AtomicData(vbcsr_core.AtomicData):
         # C++ binding expects: pos, z, cell, pbc, r_max_vec (list), type_norb_vec (list), comm
         return super().from_points(pos, z, cell, pbc, r_max_vec, type_norb_vec, comm)
 
+    @classmethod
+    def from_distributed(cls, n_atom, N_atom, atom_offset, n_edge, N_edge,
+                         atom_index, atom_type, edge_index, type_norb,
+                         edge_shift, cell, pos, comm=None):
+        """
+        Create AtomicData from pre-computed distributed atomic graph data.
+
+        This mirrors the C++ constructor that directly takes distributed graph
+        information. Useful when the user already has edge lists and atom
+        assignments (e.g. from DFT tight-binding codes).
+
+        Args:
+            n_atom: int, number of atoms owned by this rank.
+            N_atom: int, total number of atoms globally.
+            atom_offset: int, global index offset of the first owned atom.
+            n_edge: int, number of edges owned by this rank.
+            N_edge: int, total number of edges globally.
+            atom_index: (n_atom,) int array, original atom IDs.
+            atom_type: (n_atom,) int array, atom type indices.
+            edge_index: (n_edge, 2) int array, [src_gid, dst_gid] per edge.
+            type_norb: (n_types,) int array, number of orbitals per type.
+            edge_shift: (n_edge, 3) int array, lattice shift vectors [Rx,Ry,Rz].
+            cell: (3, 3) float array, unit cell vectors.
+            pos: (n_atom, 3) float array, atom positions.
+            comm: MPI communicator (mpi4py). Defaults to MPI.COMM_WORLD if available.
+        """
+        if comm is None and MPI is not None:
+            comm = MPI.COMM_WORLD
+
+        atom_index = np.asarray(atom_index, dtype=np.int32).ravel()
+        atom_type = np.asarray(atom_type, dtype=np.int32).ravel()
+        edge_index = np.ascontiguousarray(np.asarray(edge_index, dtype=np.int32).reshape(-1, 2))
+        type_norb = np.asarray(type_norb, dtype=np.int32).ravel()
+        edge_shift = np.ascontiguousarray(np.asarray(edge_shift, dtype=np.int32).reshape(-1, 3))
+        cell = np.ascontiguousarray(np.asarray(cell, dtype=np.float64).reshape(3, 3))
+        pos = np.ascontiguousarray(np.asarray(pos, dtype=np.float64).reshape(-1, 3))
+
+        return super().from_distributed(
+            int(n_atom), int(N_atom), int(atom_offset), int(n_edge), int(N_edge),
+            atom_index, atom_type, edge_index, type_norb, edge_shift,
+            cell, pos, comm
+        )
+
 
     @classmethod
     def from_ase(cls, atoms, r_max, type_norb=1, comm=None):
