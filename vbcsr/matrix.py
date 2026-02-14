@@ -514,6 +514,17 @@ class VBCSR(LinearOperator):
     def __rmul__(self, other: Union[float, complex, int]) -> 'VBCSR':
         return self.__mul__(other)
 
+    def __truediv__(self, other: Union[float, complex, int]) -> 'VBCSR':
+        if np.isscalar(other):
+            return self.__mul__(1.0 / other)
+        return NotImplemented
+
+    def __itruediv__(self, other: Union[float, complex, int]) -> 'VBCSR':
+        if np.isscalar(other):
+            self.scale(1.0 / other)
+            return self
+        return NotImplemented
+
     def __matmul__(self, other: Union['VBCSR', DistVector, DistMultiVector, np.ndarray]) -> Union['VBCSR', DistVector, DistMultiVector]:
         """
         Support for the @ operator.

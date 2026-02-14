@@ -141,5 +141,5 @@ class ImageContainer:
 
         if symm:
             obj = obj + obj.T
-            obj /= 2.0
+            obj *= 0.5
         return obj
