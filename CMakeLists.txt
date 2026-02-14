@@ -56,6 +56,19 @@ if(BLAS_FOUND)
     if(BLAS_LIBRARIES_LOWER MATCHES "mkl" OR BLAS_LIBRARIES_LOWER MATCHES "intel")
         set(VBCSR_HAS_MKL ON)
         message(STATUS "MKL detected in BLAS libraries.")
+        # Prefer mkl_rt (Single Dynamic Library) over individual MKL libraries.
+        # When multiple MKL consumers coexist (e.g. vbcsr + PARDISO wrapper),
+        # linking separate libs (mkl_intel_lp64 + mkl_intel_thread + mkl_core)
+        # causes PARDISO dispatcher conflicts. mkl_rt avoids this by providing
+        # a single entry point with consistent internal state.
+        find_library(MKL_RT_LIB NAMES mkl_rt HINTS $ENV{CONDA_PREFIX}/lib $ENV{MKLROOT}/lib)
+        if(MKL_RT_LIB)
+            message(STATUS "Swapping to MKL SDL (mkl_rt): ${MKL_RT_LIB}")
+            set(BLAS_LIBRARIES ${MKL_RT_LIB})
+        else()
+            message(WARNING "mkl_rt not found, using individual MKL libraries. "
+                            "This may cause conflicts with other MKL consumers (e.g. PARDISO).")
+        endif()
     elseif(BLAS_LIBRARIES_LOWER MATCHES "openblas")
         set(VBCSR_HAS_OPENBLAS ON)
         message(STATUS "OpenBLAS detected.")
