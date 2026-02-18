@@ -35,6 +35,8 @@ def main():
     parser.add_argument("--complex", action="store_true", help="Use complex numbers")
     parser.add_argument("--scipy", action="store_true", help="Compare with SciPy (Serial only)")
     parser.add_argument("--mkl", action="store_true", help="Compare with MKL (Serial only)")
+    parser.add_argument("--mode", type=str, default="spmv", choices=["spmv", "spmm", "spgemm"], help="Benchmark mode")
+    parser.add_argument("--num-vecs", type=int, default=32, help="Number of vectors for SpMM (K)")
     args = parser.parse_args()
 
     if args.mkl:
@@ -44,19 +46,27 @@ def main():
             print("Error: sparse_dot_mkl not found. Please install it to use --mkl.")
             return
 
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    size = comm.Get_size()
-
+    if MPI is not None:
+        comm = MPI.COMM_WORLD
+        rank = comm.Get_rank()
+        size = comm.Get_size()
+    else:
+        comm = None
+        rank = 0
+        size = 1
+    
     dtype = np.complex128 if args.complex else np.float64
     
     if rank == 0:
         print(f"=== VBCSR Benchmark ===")
+        print(f"Mode: {args.mode}")
         print(f"Ranks: {size}")
         print(f"Blocks: {args.blocks}")
         print(f"Block Size Range: [{args.min_block}, {args.max_block}]")
         print(f"Density: {args.density}")
         print(f"Dtype: {dtype}")
+        if args.mode == "spmm":
+            print(f"Num Vecs: {args.num_vecs}")
         print("Generating structure...", flush=True)
 
     # Generate structure on rank 0 and broadcast (or just replicate for simplicity)
@@ -79,7 +89,13 @@ def main():
         print("Building VBCSR...", flush=True)
     
     t0 = time.time()
-    mat = vbcsr.VBCSR.create_distributed(comm, owned_indices, my_block_sizes, my_adj, dtype)
+    mat = vbcsr.VBCSR.create_distributed(
+        owned_indices=owned_indices, 
+        block_sizes=my_block_sizes, 
+        adjacency=my_adj, 
+        dtype=dtype, 
+        comm=comm
+    )
     
     # Generate data and fill
     # We also collect data for SciPy/MKL if needed
@@ -135,33 +151,72 @@ def main():
         print(f"VBCSR Generation Time: {t_gen:.4f} s")
         print(f"Matrix Shape: {mat.shape}")
 
-    # VBCSR Benchmark
-    v = mat.create_vector()
-    v.set_constant(1.0)
-    mat.mult(v) # Warmup
+    # Prepare Inputs
+    x_vbcsr = None
+    x_np = None
     
-    if rank == 0:
-        print("Benchmarking VBCSR SpMV...", flush=True)
-        
-    comm.Barrier()
-    t_start = time.perf_counter()
-    n_iter = 0
-    while time.perf_counter() - t_start < 1.0 or n_iter < 10:
-        mat.mult(v)
-        n_iter += 1
-    comm.Barrier()
-    t_vbcsr = (time.perf_counter() - t_start) / n_iter
-    
-    if rank == 0:
-        print(f"VBCSR Average SpMV Time: {t_vbcsr:.6f} s ({n_iter} iterations)")
+    if args.mode == "spmv":
+        x_vbcsr = mat.create_vector()
+        x_vbcsr.set_constant(1.0)
+        x_np = x_vbcsr.to_numpy() if size == 1 else None
+    elif args.mode == "spmm":
+        x_vbcsr = mat.create_multivector(args.num_vecs)
+        x_vbcsr.set_constant(1.0) # Actually sets all to 1.0
+        # Randomize content
+        if dtype == np.float64:
+            x_local_data = np.random.rand(x_vbcsr.local_rows, args.num_vecs)
+        else:
+            x_local_data = np.random.rand(x_vbcsr.local_rows, args.num_vecs) + 1j * np.random.rand(x_vbcsr.local_rows, args.num_vecs)
+        x_vbcsr.from_numpy(x_local_data)
+        x_np = x_vbcsr.to_numpy() if size == 1 else None # Full dense matrix
+    elif args.mode == "spgemm":
+        # For SpGEMM, let's just square the matrix: A * A
+        # Or A * A.T
+        x_vbcsr = mat # B = A
+        # For SciPy, we need the matrix itself
+        pass
 
-    # SciPy/MKL Matrix Construction
+    # Function to run benchmark loop
+    def benchmark_op(op_func, name):
+        if rank == 0:
+            print(f"Benchmarking {name}...", flush=True)
+            
+        comm.Barrier()
+        # Warmup
+        op_func()
+        comm.Barrier()
+        
+        t_start = time.perf_counter()
+        n_iter = 0
+        while time.perf_counter() - t_start < 1.0 or n_iter < 5:
+            op_func()
+            n_iter += 1
+        comm.Barrier()
+        t_avg = (time.perf_counter() - t_start) / n_iter
+        
+        if rank == 0:
+            print(f"{name} Average Time: {t_avg:.6f} s ({n_iter} iterations)")
+        return t_avg
+
+    # 1. VBCSR Benchmark
+    t_vbcsr = 0.0
+    if args.mode == "spmv":
+        t_vbcsr = benchmark_op(lambda: mat.mult(x_vbcsr), "VBCSR SpMV")
+    elif args.mode == "spmm":
+        t_vbcsr = benchmark_op(lambda: mat.mult(x_vbcsr), "VBCSR SpMM")
+    elif args.mode == "spgemm":
+        # spmm_self computes A * A if transA=False. 
+        # Actually spmm_self might compute A * A^T or A^T * A. Check matrix.py
+        # matrix.py: spmm_self(threshold, transA) -> C
+        # If transA=False, it computes A * A? (Need to check doc/implementation)
+        # Using general spmm: A.spmm(A)
+        t_vbcsr = benchmark_op(lambda: mat.spmm(mat), "VBCSR SpGEMM")
+
+    # 2. SciPy/MKL Comparison (Serial Only)
     sp_mat = None
-    v_np = None
     if (args.scipy or args.mkl) and size == 1:
         print("Building SciPy CSR...", flush=True)
         t0 = time.perf_counter()
-        # Flatten lists
         if scipy_rows:
             all_rows = np.concatenate(scipy_rows)
             all_cols = np.concatenate(scipy_cols)
@@ -169,54 +224,75 @@ def main():
             sp_mat = scipy.sparse.csr_matrix((all_data, (all_rows, all_cols)), shape=mat.shape)
         else:
             sp_mat = scipy.sparse.csr_matrix(mat.shape, dtype=dtype)
-        t_sp_gen = time.perf_counter() - t0
-        print(f"SciPy Generation Time: {t_sp_gen:.4f} s")
-        
-        v_np = v.to_numpy()
+        print(f"SciPy Generation Time: {time.perf_counter() - t0:.4f} s")
 
-    # SciPy Comparison
     if args.scipy and size == 1:
-        print("Benchmarking SciPy SpMV...", flush=True)
-        t_start = time.perf_counter()
-        n_iter_sp = 0
-        while time.perf_counter() - t_start < 1.0 or n_iter_sp < 10:
-            sp_mat.dot(v_np)
-            n_iter_sp += 1
-        t_scipy = (time.perf_counter() - t_start) / n_iter_sp
-        print(f"SciPy Average SpMV Time: {t_scipy:.6f} s ({n_iter_sp} iterations)")
+        if args.mode == "spmv":
+            t_scipy = benchmark_op(lambda: sp_mat.dot(x_np), "SciPy SpMV")
+        elif args.mode == "spmm":
+             t_scipy = benchmark_op(lambda: sp_mat.dot(x_np), "SciPy SpMM")
+        elif args.mode == "spgemm":
+             t_scipy = benchmark_op(lambda: sp_mat.dot(sp_mat), "SciPy SpGEMM")
         
         print(f"Speedup (SciPy / VBCSR): {t_scipy / t_vbcsr:.2f}x")
-        
-        # Verify correctness
-        res = mat.mult(v)
-        res_sp = sp_mat.dot(v_np)
-        diff = np.linalg.norm(res.to_numpy() - res_sp) / np.linalg.norm(res_sp)
-        print(f"Relative Difference (SciPy): {diff:.2e}")
 
-    # MKL Comparison
     if args.mkl and size == 1:
-        print("Benchmarking MKL SpMV...", flush=True)
+        # Check MKL support for SpMM/SpGEMM
+        # sparse_dot_mkl mainly supports SpMV (dot_product_mkl) and SpGEMM (gram_matrix_mkl for A^T*A, or dot_product_mkl with sparse B?)
+        # dot_product_mkl(matrix_a, matrix_b, ...)
+        # If matrix_b is dense, it's SpMM.
+        # If matrix_b is sparse, it's SpGEMM.
         
-        # Ensure matrix is in CSR format and sorted indices for MKL if needed, 
-        # but sparse_dot_mkl handles CSR.
-        # sparse_dot_mkl might need float32 or float64 specifically, check support.
-        # It supports float32, float64, complex64, complex128.
+        op_mkl = None
+        if args.mode == "spmv":
+            op_mkl = lambda: sparse_dot_mkl.dot_product_mkl(sp_mat, x_np)
+            t_mkl = benchmark_op(op_mkl, "MKL SpMV")
+        elif args.mode == "spmm":
+            # Check if sparse_dot_mkl supports dense matrix B
+            # It usually does.
+            try:
+                # sparse_dot_mkl might need F-contiguous dense matrix or specific layout
+                # Force F-contiguous to avoid MKL looping over columns
+                x_np_mkl = np.asfortranarray(x_np)
+                op_mkl = lambda: sparse_dot_mkl.dot_product_mkl(sp_mat, x_np_mkl)
+                t_mkl = benchmark_op(op_mkl, "MKL SpMM")
+            except Exception as e:
+                print(f"MKL SpMM failed or not supported: {e}")
+                t_mkl = float('inf')
+        elif args.mode == "spgemm":
+            try:
+                op_mkl = lambda: sparse_dot_mkl.dot_product_mkl(sp_mat, sp_mat)
+                t_mkl = benchmark_op(op_mkl, "MKL SpGEMM")
+            except Exception as e:
+                print(f"MKL SpGEMM failed: {e}")
+                t_mkl = float('inf')
+
+        if t_mkl != float('inf'):
+            print(f"Speedup (MKL / VBCSR): {t_mkl / t_vbcsr:.2f}x")
+            if args.mode == 'spmm' and (t_mkl / t_vbcsr > 10.0):
+                 print(f"Note: High speedup might indicate MKL bottleneck (e.g. layout or looping).")
+            
+    # Correctness Check
+    if (args.scipy) and size == 1:
+        print("Verifying correctness...", flush=True)
+        res_vbcsr = None
+        res_scipy = None
         
-        t_start = time.perf_counter()
-        n_iter_mkl = 0
-        while time.perf_counter() - t_start < 1.0 or n_iter_mkl < 10:
-            sparse_dot_mkl.dot_product_mkl(sp_mat, v_np)
-            n_iter_mkl += 1
-        t_mkl = (time.perf_counter() - t_start) / n_iter_mkl
-        print(f"MKL Average SpMV Time: {t_mkl:.6f} s ({n_iter_mkl} iterations)")
-        
-        print(f"Speedup (MKL / VBCSR): {t_mkl / t_vbcsr:.2f}x")
-        
-        # Verify correctness
-        res = mat.mult(v)
-        res_mkl = sparse_dot_mkl.dot_product_mkl(sp_mat, v_np)
-        diff = np.linalg.norm(res.to_numpy() - res_mkl) / np.linalg.norm(res_mkl)
-        print(f"Relative Difference (MKL): {diff:.2e}")
+        if args.mode == "spmv":
+            res_vbcsr = mat.mult(x_vbcsr).to_numpy()
+            res_scipy = sp_mat.dot(x_np)
+        elif args.mode == "spmm":
+            res_vbcsr = mat.mult(x_vbcsr).to_numpy()
+            res_scipy = sp_mat.dot(x_np)
+        elif args.mode == "spgemm":
+            res_vbcsr = mat.spmm(mat).to_scipy().toarray() # Convert VBCSR to SciPy/Array
+            res_scipy = sp_mat.dot(sp_mat).toarray()
+            
+        if res_vbcsr is not None and res_scipy is not None:
+            # For SpGEMM, struct might be slightly different zero pattern if logic differs, 
+            # but comparing dense should work.
+            diff = np.linalg.norm(res_vbcsr - res_scipy) / (np.linalg.norm(res_scipy) + 1e-10)
+            print(f"Relative Difference (SciPy): {diff:.2e}")
 
 if __name__ == "__main__":
     main()
