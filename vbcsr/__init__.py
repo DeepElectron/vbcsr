@@ -22,7 +22,7 @@ if not HAS_MPI:
     import atexit
     atexit.register(vbcsr_core.finalize_mpi)
 
-__version__ = "0.1.1"
+__version__ = "0.2.2"
 
 __all__ = ["VBCSR", "DistVector", "DistMultiVector", "AssemblyMode", "HAS_MPI", "MPI", 
            "AtomicData", "ImageContainer"]
