@@ -33,6 +33,7 @@ public:
     // Global info
     std::vector<int> type_norb={};
     std::vector<double> cell={}; // 9 elements
+    std::vector<bool> pbc={false, false, false};
     
     // Edge storage
     // We store edges as provided in input, mapped to local indices.
@@ -86,7 +87,8 @@ public:
       size_t n_atom_, size_t N_atom_, size_t atom_offset_, size_t n_edge_, size_t N_edge_,
       const int *atom_index_in, const int *atom_type_in, const int *edge_index_in, const int *type_norb_in, const int *edge_shift_vec_in,
       const double *cell_in, const double *pos_in,
-      MPI_Comm comm_
+      MPI_Comm comm_,
+      const std::vector<bool>& pbc_in = std::vector<bool>{}
     ) : atom_offset(atom_offset_), n_atom(n_atom_), N_atom(N_atom_), n_edge(n_edge_), N_edge(N_edge_), comm(comm_), own_graph(true) {
         
         int initialized = 0;
@@ -97,6 +99,13 @@ public:
         } else {
             rank = 0;
             size = 1;
+        }
+
+        pbc = pbc_in.empty() ? infer_pbc_from_edge_shifts(n_edge, edge_shift_vec_in, initialized, comm)
+                             : pbc_in;
+
+        if (pbc.size() != 3) {
+            throw std::runtime_error("pbc must have exactly 3 elements");
         }
 
         // 1. Setup Graph
@@ -310,7 +319,7 @@ public:
         }
                       
         // 7. Construct AtomicData
-        return construct_final_object(comm, rank, size, cell, total_recv, r_indices, r_types, r_pos, r_edges, type_norb);
+        return construct_final_object(comm, rank, size, cell, pbc, total_recv, r_indices, r_types, r_pos, r_edges, type_norb);
     }
     
     static AtomicData* from_file(const std::string& filename, const std::vector<double>& r_max_per_type, std::vector<int> type_norb, MPI_Comm comm, const std::string& format="") {
@@ -675,6 +684,27 @@ public:
     }
 
 private:
+    static std::vector<bool> infer_pbc_from_edge_shifts(size_t n_edge, const int *edge_shift_vec_in, int initialized, MPI_Comm comm) {
+        int local_flags[3] = {0, 0, 0};
+        for (size_t k = 0; k < n_edge; ++k) {
+            if (edge_shift_vec_in[3*k] != 0) local_flags[0] = 1;
+            if (edge_shift_vec_in[3*k+1] != 0) local_flags[1] = 1;
+            if (edge_shift_vec_in[3*k+2] != 0) local_flags[2] = 1;
+            if (local_flags[0] && local_flags[1] && local_flags[2]) break;
+        }
+
+        int global_flags[3] = {local_flags[0], local_flags[1], local_flags[2]};
+        if (initialized) {
+            MPI_Allreduce(local_flags, global_flags, 3, MPI_INT, MPI_MAX, comm);
+        }
+
+        return {
+            global_flags[0] != 0,
+            global_flags[1] != 0,
+            global_flags[2] != 0
+        };
+    }
+
     template<typename T>
     void exchange_attribute(std::vector<T>& data) {
         int initialized = 0;
@@ -1353,6 +1383,7 @@ private:
     static AtomicData* construct_final_object(
         MPI_Comm comm, int rank, int size,
         std::vector<double> cell,
+        const std::vector<bool>& pbc,
         int total_recv,
         const std::vector<int>& r_indices,
         const std::vector<int>& r_types,
@@ -1361,12 +1392,31 @@ private:
         const std::vector<int>& type_norb
     ) {
         if (cell.empty()) cell.resize(9);
+        std::vector<bool> final_pbc = pbc;
+        if (final_pbc.empty()) final_pbc = {false, false, false};
+        if (final_pbc.size() != 3) {
+            throw std::runtime_error("pbc must have exactly 3 elements");
+        }
         int initialized;
         MPI_Initialized(&initialized);
         
         if (initialized) {
             MPI_Bcast(cell.data(), 9, MPI_DOUBLE, 0, comm);
         }
+
+        int pbc_values[3] = {
+            final_pbc[0] ? 1 : 0,
+            final_pbc[1] ? 1 : 0,
+            final_pbc[2] ? 1 : 0
+        };
+        if (initialized) {
+            MPI_Bcast(pbc_values, 3, MPI_INT, 0, comm);
+        }
+        final_pbc = {
+            pbc_values[0] != 0,
+            pbc_values[1] != 0,
+            pbc_values[2] != 0
+        };
         
         int my_final_n = total_recv;
         std::vector<int> final_counts(size);
@@ -1403,7 +1453,7 @@ private:
         
         return new AtomicData(my_final_n, total_atoms, my_final_offset, my_final_n_edge, total_edges_global,
                               r_indices.data(), r_types.data(), edge_indices.data(), type_norb.data(), edge_shifts.data(),
-                              cell.data(), r_pos.data(), comm);
+                              cell.data(), r_pos.data(), comm, final_pbc);
     }
 
 };

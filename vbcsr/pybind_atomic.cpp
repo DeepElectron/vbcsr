@@ -21,6 +21,32 @@ std::vector<T> numpy_to_vector(py::array_t<T> array) {
     return vec;
 }
 
+inline std::vector<bool> parse_pbc(py::object pbc_obj) {
+    std::vector<bool> vec_pbc(3, false);
+    if (pbc_obj.is_none()) {
+        return vec_pbc;
+    }
+
+    if (py::isinstance<py::sequence>(pbc_obj)) {
+        auto seq = pbc_obj.cast<py::sequence>();
+        if (seq.size() == 3) {
+            for (int i = 0; i < 3; ++i) vec_pbc[i] = seq[i].cast<bool>();
+        } else if (seq.size() == 1) {
+            bool val = seq[0].cast<bool>();
+            std::fill(vec_pbc.begin(), vec_pbc.end(), val);
+        } else {
+            throw std::runtime_error("pbc must be a bool or a sequence of length 1 or 3");
+        }
+    } else if (py::isinstance<py::bool_>(pbc_obj)) {
+        bool val = pbc_obj.cast<bool>();
+        std::fill(vec_pbc.begin(), vec_pbc.end(), val);
+    } else {
+        throw std::runtime_error("pbc must be a bool or a sequence of length 1 or 3");
+    }
+
+    return vec_pbc;
+}
+
 template<typename T>
 void bind_image_container(py::module& m, const std::string& name) {
     py::class_<ImageContainer<T>>(m, name.c_str())
@@ -122,20 +148,7 @@ void bind_atomic_module(py::module& m) {
             std::vector<double> vec_pos = numpy_to_vector(pos);
             std::vector<int> vec_z = numpy_to_vector(z);
             std::vector<double> vec_cell_flat = numpy_to_vector(cell);
-
-            std::vector<bool> vec_pbc(3, false);
-            if (py::isinstance<py::sequence>(pbc_obj)) {
-                auto seq = pbc_obj.cast<py::sequence>();
-                if (seq.size() == 3) {
-                    for(int i=0; i<3; ++i) vec_pbc[i] = seq[i].cast<bool>();
-                } else if (seq.size() == 1) { 
-                   bool val = seq[0].cast<bool>();
-                   std::fill(vec_pbc.begin(), vec_pbc.end(), val);
-                } 
-            } else if (py::isinstance<py::bool_>(pbc_obj)) {
-                bool val = pbc_obj.cast<bool>();
-                std::fill(vec_pbc.begin(), vec_pbc.end(), val);
-            }
+            std::vector<bool> vec_pbc = parse_pbc(pbc_obj);
             
             // Assume r_max and type_norb are convertible to vectors
             // Python wrapper will handle logic to build them correctly
@@ -263,7 +276,7 @@ void bind_atomic_module(py::module& m) {
         })
         .def("norb", &AtomicData::norb)
         .def_property_readonly("pbc", [](const AtomicData& self) {
-             return py::none(); 
+             return std::vector<bool>(self.pbc.begin(), self.pbc.end());
         })
         
         .def_property_readonly("edge_index", [](const AtomicData& self) {
@@ -318,7 +331,7 @@ void bind_atomic_module(py::module& m) {
             return Atoms(py::arg("numbers")=numbers, 
                          py::arg("positions")=pos_arr, 
                          py::arg("cell")=cell, 
-                         py::arg("pbc")=true); 
+                         py::arg("pbc")=std::vector<bool>(self.pbc.begin(), self.pbc.end())); 
         })
         ;
         

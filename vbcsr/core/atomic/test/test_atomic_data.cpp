@@ -31,7 +31,7 @@ TEST_F(AtomicDataTest, FromPoints) {
     }
     
     std::vector<double> cell = {10.0, 0.0, 0.0,  0.0, 10.0, 0.0,  0.0, 0.0, 10.0};
-    std::vector<bool> pbc = {true, true, true};
+    std::vector<bool> pbc = {true, false, true};
     std::vector<double> r_max = {2.0, 2.0}; // For types 0 and 1
     std::vector<int> type_norb = {13, 13};
     
@@ -53,6 +53,11 @@ TEST_F(AtomicDataTest, FromPoints) {
         EXPECT_GT(total_edges, 0);
         EXPECT_EQ(total_edges, 2);
     }
+
+    ASSERT_EQ(ad->pbc.size(), 3);
+    EXPECT_EQ(ad->pbc[0], true);
+    EXPECT_EQ(ad->pbc[1], false);
+    EXPECT_EQ(ad->pbc[2], true);
     
     delete ad;
 }
@@ -555,6 +560,43 @@ TEST_F(AtomicDataTest, DistributedConstruction) {
     
     delete ad;
 }
+
+TEST_F(AtomicDataTest, DistributedConstructorInfersPBC) {
+    std::vector<int> atom_index = {0, 1};
+    std::vector<int> atom_type = {0, 0};
+    std::vector<int> edge_index = {
+        0, 1,
+        1, 0
+    };
+    std::vector<int> edge_shift = {
+        1, 0, -2,
+        0, 0, 0
+    };
+    std::vector<int> type_norb = {1};
+    std::vector<double> cell = {
+        4.0, 0.0, 0.0,
+        0.0, 5.0, 0.0,
+        0.0, 0.0, 6.0
+    };
+    std::vector<double> pos = {
+        0.0, 0.0, 0.0,
+        1.0, 1.0, 1.0
+    };
+
+    AtomicData* ad = new AtomicData(
+        2, 2, 0, 2, 2,
+        atom_index.data(), atom_type.data(), edge_index.data(), type_norb.data(), edge_shift.data(),
+        cell.data(), pos.data(), MPI_COMM_WORLD
+    );
+
+    ASSERT_EQ(ad->pbc.size(), 3);
+    EXPECT_EQ(ad->pbc[0], true);
+    EXPECT_EQ(ad->pbc[1], false);
+    EXPECT_EQ(ad->pbc[2], true);
+
+    delete ad;
+}
+
 TEST_F(AtomicDataTest, PressureTest_DenseGraph) {
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
