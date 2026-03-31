@@ -6,6 +6,8 @@
 #include <complex>
 #include <cmath>
 #include <iostream>
+#include <type_traits>
+#include <utility>
 
 namespace vbcsr {
 namespace atomic {
@@ -204,147 +206,129 @@ public:
         }
     }
 
-    // Sample K
-    // Returns a new BlockSpMat allocated on the base_graph
-    BlockSpMat<ResultT, ResultKernel>* sample_k(const std::vector<double>& K, PhaseConvention convention) {
-        // 1. Allocate result matrix on base_graph
-        // We need a BlockSpMat<ResultT> on base_graph.
-        // base_graph is shared, so we don't own it.
-        BlockSpMat<ResultT, ResultKernel>* result = new BlockSpMat<ResultT, ResultKernel>(base_graph);
-        
-        // 2. Iterate over all image blocks and accumulate
-        // result = sum_R ( H(R) * phase(R) )
-        
-        // We need a map: image_graph[R]->col_ind[k] (local col) -> Global Col -> base_graph local col.
-        
-        int n_owned = base_graph->owned_global_indices.size();
-        
-        for (auto& kv : image_blocks) {
-            const std::vector<int>& R_vec = kv.first;
-            BlockSpMat<T, Kernel>* mat_R = kv.second;
-            DistGraph* graph_R = mat_R->graph;
-            
-            double phase_R_val = -2.0 * M_PI * (K[0]*R_vec[0] + K[1]*R_vec[1] + K[2]*R_vec[2]);
-            std::complex<double> exp_iKR = std::exp(std::complex<double>(0, phase_R_val));
-            
-            // Precompute col map for this graph_R
-            // local_col_R -> local_col_Base
-            int n_col_R = graph_R->block_sizes.size(); // owned + ghosts
-            std::vector<int> col_map(n_col_R, -1);
-            
-            for (int lc = 0; lc < n_col_R; ++lc) {
-                int gid = graph_R->get_global_index(lc);
-                if (base_graph->global_to_local.count(gid)) {
-                    col_map[lc] = base_graph->global_to_local.at(gid);
-                } else {
-                    // This shouldn't happen if base_graph is superset
-                     throw std::runtime_error("Image graph column not found in base graph");
-                }
+    // Accumulate all image blocks onto a compatible reference graph using
+    // a per-image weight and an optional per-block correction factor.
+    template <typename ResultT, typename ResultKernel = DefaultKernel<ResultT>, typename ImageWeightFn, typename BlockWeightFn>
+    BlockSpMat<ResultT, ResultKernel>* accumulate_weighted_images(
+        DistGraph* reference_graph,
+        ImageWeightFn&& image_weight_fn,
+        BlockWeightFn&& block_weight_fn
+    ) {
+        static_assert(std::is_constructible<ResultT, T>::value,
+                      "ResultT must be constructible from the ImageContainer value type.");
+
+        if (reference_graph == nullptr) {
+            throw std::runtime_error("Reference graph must not be null.");
+        }
+
+        BlockSpMat<ResultT, ResultKernel>* result = new BlockSpMat<ResultT, ResultKernel>(reference_graph);
+        const int n_owned = static_cast<int>(reference_graph->owned_global_indices.size());
+
+        for (const auto& entry : image_blocks) {
+            const std::vector<int>& R_vec = entry.first;
+            auto* mat_r = entry.second;
+            auto* graph_r = mat_r->graph;
+
+            if (graph_r->owned_global_indices != reference_graph->owned_global_indices) {
+                throw std::runtime_error("Reference graph must share the same owned rows as the image graphs.");
             }
-            
-            // Iterate blocks
+
+            const ResultT image_weight = static_cast<ResultT>(image_weight_fn(R_vec));
+            if (std::abs(image_weight) <= 1e-12) {
+                continue;
+            }
+
+            const int n_col_r = static_cast<int>(graph_r->block_sizes.size());
+            std::vector<int> col_map(n_col_r, -1);
+            for (int local_col = 0; local_col < n_col_r; ++local_col) {
+                const int gid = graph_r->get_global_index(local_col);
+                auto it = reference_graph->global_to_local.find(gid);
+                if (it == reference_graph->global_to_local.end()) {
+                    throw std::runtime_error("Image graph column not found in reference graph.");
+                }
+                col_map[local_col] = it->second;
+            }
+
             #pragma omp parallel for
-            for (int i = 0; i < n_owned; ++i) {
-                int start = mat_R->row_ptr[i];
-                int end = mat_R->row_ptr[i+1];
-                
+            for (int local_row = 0; local_row < n_owned; ++local_row) {
+                const int start = mat_r->row_ptr[local_row];
+                const int end = mat_r->row_ptr[local_row + 1];
+                const int row_dim = graph_r->block_sizes[local_row];
+
                 for (int k = start; k < end; ++k) {
-                    int col_R = mat_R->col_ind[k];
-                    int col_Base = col_map[col_R];
-                    
-                    // Find block in result
-                    // result->update_local_block(i, col_Base, ...)
-                    // But update_local_block takes pointer to data.
-                    // We need to compute data first.
-                    
-                    int n_elem = mat_R->blk_sizes[k];
-                    int r_dim = mat_R->graph->block_sizes[i];
-                    int c_dim = mat_R->graph->block_sizes[col_R];
-                    const T* data_R = mat_R->arena.get_ptr(mat_R->blk_handles[k]);
-                    
-                    std::vector<ResultT> block_res(n_elem);
-                    
-                    if (convention == PhaseConvention::R_ONLY) {
-                        for (int e = 0; e < n_elem; ++e) {
-                            block_res[e] = static_cast<ResultT>(data_R[e]) * exp_iKR;
-                        }
-                    } else {
-                        // R_AND_POSITION
-                        
-                        // Get positions
-                        double ri[3], rj[3];
-                        atom_data->get_pos(i, &ri[0], &ri[1], &ri[2]); // i is local owned
-                        atom_data->get_pos(col_Base, &rj[0], &rj[1], &rj[2]);
-                        
-                        double dx = rj[0] - ri[0];
-                        double dy = rj[1] - ri[1];
-                        double dz = rj[2] - ri[2];
-                        
-                        // Convert to fractional
-                        double fdx = dx, fdy = dy, fdz = dz;
-                        atom_data->invert_cell(&fdx, &fdy, &fdz);
-                        
-                        double phase_pos = -2.0 * M_PI * (K[0]*fdx + K[1]*fdy + K[2]*fdz);
-                        std::complex<double> total_phase = exp_iKR * std::exp(std::complex<double>(0, phase_pos));
-                        
-                        for (int e = 0; e < n_elem; ++e) {
-                            block_res[e] = static_cast<ResultT>(data_R[e]) * total_phase;
-                        }
+                    const int local_col_r = mat_r->col_ind[k];
+                    const int local_col_ref = col_map[local_col_r];
+                    const ResultT block_weight =
+                        image_weight * static_cast<ResultT>(block_weight_fn(local_row, local_col_ref));
+
+                    if (std::abs(block_weight) <= 1e-12) {
+                        continue;
                     }
-                    
-                    // Add to result
-                    // We need a thread-safe way if multiple threads write to same block?
-                    // Parallel over rows (i). Each row is independent in CSR.
-                    // So it is thread safe for different i.
-                    // But we are iterating i.
-                    
-                    // However, result->update_local_block might not be thread safe if it reallocates?
-                    // No, update_local_block assumes structure exists.
-                    // Does result have the structure?
-                    // We initialized result(base_graph).
-                    // allocate_from_graph() allocates val with 0.
-                    // So structure is fixed.
-                    // Writing to val is safe if blocks don't overlap.
-                    // Since we iterate i, and for each i we iterate k (cols),
-                    // we are writing to block (i, col_Base).
-                    // Can multiple R's contribute to same (i, col_Base)?
-                    // YES.
-                    // Example: R=(0,0,0) connects 1->2. R=(1,0,0) connects 1->2 (periodic image).
-                    // In base_graph, these are DIFFERENT edges if they are distinct in input.
-                    // Wait.
-                    // AtomicData: "Remove duplicates/R".
-                    // "base graph actually corresponding to a summation of graph for all shifted vector R"
-                    // If 1->2 exists with R1 and R2.
-                    // In AtomicData, are they separate edges?
-                    // "edges[k] = {src, dst, rx, ry, rz}"
-                    // "iconn[src].push_back(k)"
-                    // DistGraph adjacency: "adj[src].push_back(dst)"
-                    // "Remove duplicates... unique"
-                    // So in DistGraph, if 1->2 exists for R1 and R2, it appears ONCE in adj list.
-                    // So there is ONE block (1, 2) in BlockSpMat.
-                    // But we have contributions from R1 and R2.
-                    // So we are summing into the SAME block.
-                    // Race condition!
-                    
-                    // We need atomic add or critical section.
-                    // Or accumulate locally and write once?
-                    // But the loop is over R (outer) or i (inner)?
-                    // I put loop over i inside loop over R.
-                    // So multiple threads (handling different i) are safe.
-                    // But different R loops run sequentially?
-                    // "for (auto& kv : image_blocks)" is serial.
-                    // So R1 loop finishes, then R2 loop starts.
-                    // Within R1 loop, i is parallel.
-                    // So no race condition between Rs.
-                    // No race condition between is.
-                    // Safe.
-                    
-                    result->update_local_block(i, col_Base, block_res.data(), r_dim, c_dim, AssemblyMode::ADD, MatrixLayout::ColMajor);
+
+                    const int col_dim = graph_r->block_sizes[local_col_r];
+                    const int n_elem = static_cast<int>(mat_r->blk_sizes[k]);
+                    const T* block_data = mat_r->arena.get_ptr(mat_r->blk_handles[k]);
+                    std::vector<ResultT> block_res(static_cast<size_t>(n_elem));
+
+                    for (int idx = 0; idx < n_elem; ++idx) {
+                        block_res[static_cast<size_t>(idx)] =
+                            static_cast<ResultT>(block_data[idx]) * block_weight;
+                    }
+
+                    result->update_local_block(
+                        local_row,
+                        local_col_ref,
+                        block_res.data(),
+                        row_dim,
+                        col_dim,
+                        AssemblyMode::ADD,
+                        MatrixLayout::ColMajor);
                 }
             }
         }
-        
+
         return result;
+    }
+
+    template <typename ResultT, typename ResultKernel = DefaultKernel<ResultT>, typename ImageWeightFn>
+    BlockSpMat<ResultT, ResultKernel>* accumulate_weighted_images(
+        DistGraph* reference_graph,
+        ImageWeightFn&& image_weight_fn
+    ) {
+        return accumulate_weighted_images<ResultT, ResultKernel>(
+            reference_graph,
+            std::forward<ImageWeightFn>(image_weight_fn),
+            [](int, int) { return ResultT(1.0); });
+    }
+
+    // Sample K
+    // Returns a new BlockSpMat allocated on the base_graph
+    BlockSpMat<ResultT, ResultKernel>* sample_k(const std::vector<double>& K, PhaseConvention convention) {
+        auto image_weight = [&](const std::vector<int>& R_vec) -> ResultT {
+            const double phase_r = -2.0 * M_PI * (K[0] * R_vec[0] + K[1] * R_vec[1] + K[2] * R_vec[2]);
+            return std::exp(std::complex<double>(0.0, phase_r));
+        };
+
+        if (convention == PhaseConvention::R_ONLY) {
+            return accumulate_weighted_images<ResultT, ResultKernel>(base_graph, image_weight);
+        }
+
+        return accumulate_weighted_images<ResultT, ResultKernel>(
+            base_graph,
+            image_weight,
+            [&](int local_row, int local_col_base) -> ResultT {
+                double ri[3], rj[3];
+                atom_data->get_pos(local_row, &ri[0], &ri[1], &ri[2]);
+                atom_data->get_pos(local_col_base, &rj[0], &rj[1], &rj[2]);
+
+                double dx = rj[0] - ri[0];
+                double dy = rj[1] - ri[1];
+                double dz = rj[2] - ri[2];
+                atom_data->invert_cell(&dx, &dy, &dz);
+
+                const double phase_pos = -2.0 * M_PI * (K[0] * dx + K[1] * dy + K[2] * dz);
+                return std::exp(std::complex<double>(0.0, phase_pos));
+            });
     }
 };
 

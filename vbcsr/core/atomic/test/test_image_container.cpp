@@ -141,6 +141,30 @@ void test_image_container() {
     }
     delete res0;
 
+    auto* weighted = img->accumulate_weighted_images<double>(
+        data->graph,
+        [](const std::vector<int>& R) -> double {
+            return static_cast<double>(R[0]);
+        });
+
+    if (rank == 0) {
+        int l_row = data->graph->global_to_local.at(0);
+        int l_col = data->graph->global_to_local.at(1);
+
+        bool found = false;
+        int start = weighted->row_ptr[l_row];
+        int end = weighted->row_ptr[l_row + 1];
+        for (int k = start; k < end; ++k) {
+            if (weighted->col_ind[k] == l_col) {
+                double val = weighted->arena.get_ptr(weighted->blk_handles[k])[0];
+                assert(std::abs(val - 2.0) < 1e-9);
+                found = true;
+            }
+        }
+        assert(found);
+    }
+    delete weighted;
+
     // K = (0.5, 0, 0) -> Phase R=1 is exp(i * 2pi * 0.5 * 1) = exp(i*pi) = -1
     // Result(0, 1) = 1.0 + 2.0 * (-1) = -1.0
     std::vector<double> K1 = {0.5, 0.0, 0.0};
