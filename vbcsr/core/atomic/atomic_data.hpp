@@ -749,6 +749,12 @@ private:
 
     static void partition_graph(const std::vector<int>& vtxdist, const std::vector<int>& xadj, const std::vector<int>& adjncy, 
                                 int nparts, std::vector<int>& part, MPI_Comm comm, const std::vector<double>& pos, int n_global) {
+        int initialized = 0;
+        MPI_Initialized(&initialized);
+        if (nparts <= 1 || !initialized || comm == MPI_COMM_NULL) {
+            std::fill(part.begin(), part.end(), 0);
+            return;
+        }
 #ifdef VBCSR_HAVE_PARMETIS
         // ParMETIS Implementation
         idx_t wgtflag = 0; 
@@ -783,8 +789,6 @@ private:
 #else
         // Hilbert Curve Fallback Implementation
         int rank, size;
-        int initialized = 0;
-        MPI_Initialized(&initialized);
         if (initialized) {
             MPI_Comm_rank(comm, &rank);
             MPI_Comm_size(comm, &size);

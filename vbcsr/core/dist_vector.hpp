@@ -244,6 +244,10 @@ public:
 
 private:
     void allreduce_sum(const T* send, T* recv, int count) const {
+        if (graph->size == 1 || graph->comm == MPI_COMM_NULL) {
+            std::copy(send, send + count, recv);
+            return;
+        }
         MPI_Datatype type = get_mpi_type();
         MPI_Allreduce(send, recv, count, type, MPI_SUM, graph->comm);
     }
