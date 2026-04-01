@@ -39,7 +39,7 @@ bool check_equal(const BlockSpMat<double, NaiveKernel<double>>& mat,
                 // Let's assume ref_data contains all non-zeros.
                 // Actually, if we merge, we might have explicit zeros.
                 // So we should check if values are small.
-                double* data = mat.arena.get_ptr(mat.blk_handles[k]);
+                const double* data = mat.block_data(k);
                 int r_dim = block_sizes[gid_r];
                 int c_dim = block_sizes[gid_c];
                 for(int j=0; j<r_dim*c_dim; ++j) {
@@ -50,7 +50,7 @@ bool check_equal(const BlockSpMat<double, NaiveKernel<double>>& mat,
                 }
             } else {
                 const auto& ref_block = ref_data.at({gid_r, gid_c});
-                double* data = mat.arena.get_ptr(mat.blk_handles[k]);
+                const double* data = mat.block_data(k);
                 int r_dim = block_sizes[gid_r];
                 int c_dim = block_sizes[gid_c];
                 for(int j=0; j<r_dim*c_dim; ++j) {
@@ -162,7 +162,7 @@ void run_test(int rank, int size) {
             int r = mat.graph->owned_global_indices[i];
             for(int k=mat.row_ptr[i]; k<mat.row_ptr[i+1]; ++k) {
                 int c = mat.graph->get_global_index(mat.col_ind[k]);
-                double* data_T = mat.arena.get_ptr(mat.blk_handles[k]);
+                const double* data_T = mat.block_data(k);
                 std::vector<double> blk(data_T, data_T + 4);
                 data[{r,c}] = blk;
             }

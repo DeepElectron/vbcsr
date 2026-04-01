@@ -174,7 +174,7 @@ void test_block_spmat(DistGraph& graph, int rank) {
             int lid_c = mat.col_ind[k];
             if (graph.get_global_index(lid_c) == gid) {
                 found_diag = true;
-                double* data = mat.arena.get_ptr(mat.blk_handles[k]);
+                const double* data = mat.block_data(k);
                 int dim = graph.block_sizes[i];
                 for(int j=0; j<dim; ++j) {
                     if (std::abs(data[j*dim + j] - 3.0) > 1e-12) {
@@ -229,13 +229,13 @@ void test_block_spmat(DistGraph& graph, int rank) {
             for (int k = start; k < end; ++k) {
                 int lid_c = C.col_ind[k];
                 if (graph.get_global_index(lid_c) == 1) {
-                    double* data = C.arena.get_ptr(C.blk_handles[k]);
+                    const double* data = C.block_data(k);
                     if (std::abs(data[0] - 1.0) > 1e-12) {
                          std::cerr << "BlockSpMat::commutator_diagonal failed for off-diag" << std::endl;
                          MPI_Abort(MPI_COMM_WORLD, 1);
                     }
                 } else if (graph.get_global_index(lid_c) == 0) {
-                    double* data = C.arena.get_ptr(C.blk_handles[k]);
+                    const double* data = C.block_data(k);
                     if (std::abs(data[0]) > 1e-12) {
                          std::cerr << "BlockSpMat::commutator_diagonal failed for diag" << std::endl;
                          MPI_Abort(MPI_COMM_WORLD, 1);

@@ -13,15 +13,16 @@
 
 - Preserve the current Python API shape and preserve the current high-level C++ method set on `BlockSpMat<T, Kernel>`: constructor from `DistGraph*`, `add_block`, `assemble`, `mult`, `mult_dense`, `mult_adjoint`, `mult_dense_adjoint`, `spmm`, `spmm_self`, `axpy`, `add`, `transpose`, `filter_blocks`, `duplicate`, `extract_submatrix`, `insert_submatrix`, `to_dense`, `from_dense`, `get_block`, and `get_values`.
 - Keep `vbcsr/core/block_csr.hpp` as the installed top-level C++ header and make it the facade header for all backend kinds.
+- Freeze the meaning of the `Kernel` template parameter early. After this refactor, `Kernel` is not the global execution policy for every backend. It should be interpreted as a dense-block microkernel policy / compatibility parameter that is relevant primarily to block backends, especially true `VBCSR`, while `CSR` may ignore it and `BSR` may use it only partially. Backend selection and high-level sparse algorithm selection remain separate from the `Kernel` template parameter.
 - Add one non-breaking inspector, `matrix_kind()` or `backend_kind()`, on both C++ and Python sides for debugging, tests, and benchmarks.
-- Keep `graph` plus logical block-structure views `row_ptr` and `col_ind` available from the facade so existing export/binding code still has a backend-neutral block-level structure.
+- Keep `graph` plus logical block-structure views `row_ptr` and `col_ind` available from the facade so existing export/binding code still has a backend-neutral block-level structure. The canonical logical block graph should live on `DistGraph` as `adj_ptr` / `adj_ind`; facade `row_ptr` / `col_ind` should be graph-backed views rather than duplicated steady-state ownership.
 - Treat raw storage members such as `blk_handles`, `blk_sizes`, and `arena` as internal-only going forward. Migrate pybind, tests, and internal helper code to facade accessors and backend-neutral iteration before enabling multiple backends.
 - Add one backend-neutral C++ iterator/helper such as `for_each_local_block(...)` for internal algorithms and advanced C++ use, so backend details never leak into user code.
 
 ## Backend Storage Architecture
 
-- Make storage separation the core architectural rule: logical sparsity lives on the `BlockSpMat` facade, while numeric payload lives in one native backend storage object chosen from `CSR`, `BSR`, or true `VBCSR`.
-- Keep the facade as the single owner of `DistGraph* graph`, `MatrixKind`, logical block `row_ptr`, logical block `col_ind`, and shared caches such as block norms. Backend storage objects own numeric payload plus only the backend-local storage metadata needed to reach that payload.
+- Make storage separation the core architectural rule: `BlockSpMat` preserves the unified logical interface, while each backend owns the native execution-form storage needed for its hot kernels.
+- Keep the facade as the single owner of `DistGraph* graph`, `MatrixKind`, and shared caches such as block norms. Logical structure views such as `row_ptr` and `col_ind` remain part of the facade interface, but their authoritative storage should come from `DistGraph::adj_ptr` / `DistGraph::adj_ind` so all backends reuse one canonical logical block graph.
 - Use paged linear storage as the general memory policy for large arrays across all backends. True `VBCSR` needs paging for dynamic block allocation, and `CSR`/`BSR` need paging as well to avoid single-allocation overflow and 32-bit array-length limits that would otherwise cap problem size.
 - Use one canonical dense-block memory layout across block backends, column-major, so block kernels and BLAS paths can operate directly without per-operation transpose/copy for layout matching.
 - Enforce a no-convert-for-kernel rule: every operation must read the source matrix in its native storage and, when a new matrix is created, write the result directly into the same backend family. Temporary format conversion and cross-backend result construction are not allowed on the critical path.
@@ -35,15 +36,15 @@
   - `DistGraph* graph`
   - `bool owns_graph`
   - `MatrixKind kind`
-  - logical block `row_ptr`
-  - logical block `col_ind`
+  - logical block-structure accessors such as `row_ptr()` and `col_ind()`
   - shared cache state such as `block_norms` and `norms_valid`
   - one closed-set backend handle such as a tagged union or `std::variant`
-- Keep `row_ptr` and `col_ind` simple unless proven otherwise. The default plan is to preserve the current vector-like logical interface and introduce paged index storage only if real size limits show up in practice; payload paging is the primary scalability requirement.
+- `Kernel` should not control backend dispatch. Backend dispatch is determined solely by `MatrixKind`. `Kernel` is carried through the public type for source compatibility and for dense-block execution policy where applicable.
+- Preserve the current vector-like `row_ptr` / `col_ind` interface, but treat it as a stable facade view over graph-owned logical adjacency rather than as separate steady-state matrix storage. Builders and symbolic phases may still use temporary `row_ptr` / `col_ind` buffers before committing a new `DistGraph`.
 - `BlockSpMat` should not retain steady-state backend-specific fields from the current monolithic implementation. In particular, `blk_handles`, `blk_sizes`, `arena`, and `thread_remote_blocks` should move out of the facade.
 - Backend objects own only what is necessary to execute kernels and expose block values in their native layout:
-  - `CSRMatrixBackend<T>` owns paged scalar `values`
-  - `BSRMatrixBackend<T>` owns uniform `bsz` plus paged packed-block `values`
+  - `CSRMatrixBackend<T>` owns paged scalar `values`, its authoritative execution-form structure where needed for paired page traversal, and may ignore `Kernel`
+  - `BSRMatrixBackend<T>` owns uniform `bsz`, paged packed-block `values`, and the authoritative execution-form block structure needed for paired page traversal; it may use `Kernel` only for dense block microkernel choices
   - `VBCSRMatrixBackend<T, Kernel>` owns the logical-slot-to-handle map, shape registry, page pools, and optional shape-kernel cache
 - Operation-scoped structures are not part of the steady-state matrix object:
   - symbolic slot maps from `(row, col)` to logical block position
@@ -52,13 +53,13 @@
   - thread-local hash accumulators
   - shape batch descriptor lists
 - Because the backend set is closed and known at compile time, the preferred representation is one top-level closed tagged union inside `BlockSpMat`, for example `std::variant`. Public methods dispatch once at the facade boundary; inner numeric kernels stay statically typed inside each backend implementation.
-- Add one internal `from_parts(...)` or equivalent factory that assembles a `BlockSpMat` from `graph`, `kind`, logical `row_ptr`, logical `col_ind`, and a committed backend object. Builders commit backend storage, not whole matrices.
+- Add one internal `from_parts(...)` or equivalent factory that assembles a `BlockSpMat` from `graph`, `kind`, facade-visible logical structure, and a committed backend object. Builders commit backend storage, not whole matrices.
 
 ### Native Storage by Backend
 
-- `CSR`: native scalar CSR that reuses the facade logical `row_ptr` and `col_ind` as its scalar sparsity structure and stores scalar values in paged linear slabs rather than one monolithic array. No handle indirection, no per-entry size metadata, and no block payload wrapper.
-- `BSR`: native uniform-block storage that reuses the facade logical `row_ptr` and `col_ind` as its block sparsity structure, stores one global `bsz`, and stores block values in paged slabs whose page-local layout remains canonical column-major.
-- `VBCSR`: native paged block storage, evolved from the current `BlockArena`, that reuses the facade logical `row_ptr` and `col_ind` plus backend-local handle metadata to reach page-local slots. Pages should be grouped by block-shape class `(r_dim, c_dim)` rather than only by raw element count so allocation, reuse, and kernel dispatch stay shape-aware.
+- `CSR`: native scalar CSR whose backend owns paged scalar payloads and any derived execution metadata, while reusing graph-owned logical adjacency for row/column structure.
+- `BSR`: native uniform-block storage whose backend owns one global `bsz`, paged block payloads, and any derived execution metadata, while reusing graph-owned logical adjacency for logical block slots.
+- `VBCSR`: native paged block storage, evolved from the current `BlockArena`, whose backend owns block handles, shape registry, and page-local payload organization, while the backend-neutral logical block graph continues to come from `DistGraph`.
 
 ### Cross-Backend Paged Linear Storage
 
@@ -253,7 +254,8 @@
 - `pages_with_free_slots` list or queue for O(1) allocation of non-full pages
 - `active_block_count`
 - `active_page_count`
-- Optional tuning metadata may include allocation/free counters, hotness statistics, preferred kernel kind, or a JIT cache handle, but those are optimization features rather than mandatory storage fields.
+- Optional tuning metadata may include allocation/free counters, hotness statistics, and preferred kernel kind, but those are optimization features rather than mandatory storage fields.
+- Compiled JIT kernels themselves should not be owned solely by one matrix or one `ShapeRegistryEntry`. They should live in a process-global or otherwise shared compiled-kernel cache keyed by properties such as dtype, shape, transpose/adjoint mode, and ISA. Matrix-local state may keep only the hotness information and the preferred execution path used to query that shared cache.
 - The registry entry is the place where shape-global policy lives: page sizing, batching thresholds, and preferred execution path.
 
 ### Batch View Metadata
@@ -299,6 +301,12 @@
   - `T* mutable_block(int logical_pos)` to return the native writable storage for one finalized logical block position
   - `void accumulate_block(int logical_pos, const T* src, T alpha = T{1})` to accumulate one dense block contribution into an existing logical slot
   - `CommittedBackend commit() &&` to transfer ownership of the finished native storage without a second materialization pass
+- Thread-safety must be explicit:
+  - builders are single-writer by default
+  - `mutable_block(...)` and `accumulate_block(...)` assume the caller has exclusive ownership of the addressed logical slot
+  - the preferred numeric-fill rule is row ownership or slot ownership, so each finalized logical slot has one owning thread during the hot path
+  - if a kernel wants more parallelism than row/slot ownership naturally provides, it should use thread-local scratch or backend-controlled batch reduction and flush once to the owned slot
+  - internal locking or atomic accumulation inside builders is not the default design and should be avoided on the hot path
 - Builders address blocks by finalized logical block position `logical_pos`, not by `(row, col)` insertion. Any coordinate-to-slot map belongs to the symbolic plan or `ResultAssemblyPlan`, not to the builder.
 - `CSRBuilder<T>` specializes the common contract by allocating exactly `nnz` scalars across paged value slabs and exposing each scalar as a `1 x 1` writable block through `mutable_block(logical_pos)`.
 - `BSRBuilder<T>` specializes the common contract by storing one `bsz`, allocating exactly `nnz_blocks * bsz * bsz` values across paged slabs, and exposing a contiguous `bsz x bsz` block for each logical position.
@@ -308,6 +316,23 @@
   - CSR: `for_each_page_view(fn)` yielding mutable `CSRPageView<T>`
   - BSR: `for_each_page_view(fn)` yielding mutable `BSRPageView<T>`
 - Builders must preserve the same paired-page policy at commit time. A CSR or BSR builder may grow by adding pages, but it must not reshuffle committed page-local order solely to chase larger contiguous regions.
+
+### Numeric Fill Ownership Rule
+
+- Structure-changing numeric phases must define output ownership before accumulation begins.
+- Preferred rule: partition work so each output row, block row, or finalized logical slot has exactly one owning thread for the duration of the hot numeric fill.
+- This implies:
+  - same-structure updates use the natural row or block-row partition whenever possible
+  - `spmm`, `transpose`, and graph-changing `axpby` should build symbolic slot maps first, then assign output ownership in terms of finalized logical slots
+  - page batches and shape batches may span many rows, but their partial outputs must still reduce to slots owned by one thread
+- Allowed fallback when batching cuts across ownership boundaries:
+  - accumulate into thread-local scratch buffers or per-thread temporary blocks
+  - flush once into the owned destination slot after the batch finishes
+- Disallowed as the normal design:
+  - builder-internal mutexes
+  - pervasive atomic updates to destination blocks
+  - ambiguous multi-writer use of `accumulate_block(...)`
+- Backend-specific controlled accumulation paths are allowed only if they still preserve explicit ownership or a bounded reduction stage outside the builder hot path.
 
 ### Example Lifecycle: Same-Backend `spmm`
 
@@ -328,10 +353,12 @@
    - the builder allocates exact native storage once and zero-initializes all logical output slots
 5. Run the numeric fill:
    - traverse the numeric product pairs `A(i, k) * B(k, j)`
+   - assign output ownership by row, block row, or finalized logical slot before parallel numeric work begins
    - resolve the output logical slot through the symbolic slot map
    - compute the dense block product in the backend's native kernel path
-   - accumulate the contribution with `builder.accumulate_block(logical_pos, product_ptr, alpha)`
-   - in true `VBCSR`, same-shape products may be grouped into batch views before kernel launch, but the numeric result still lands directly in builder-owned slots
+   - accumulate the contribution with `builder.accumulate_block(logical_pos, product_ptr, alpha)` only from the owning thread
+   - if batching crosses ownership boundaries, accumulate into thread-local scratch first and flush once to the owned slot
+   - in true `VBCSR`, same-shape products may be grouped into batch views before kernel launch, but the numeric result still lands directly in owned builder slots
 6. Commit the result storage:
    - finalize with `auto backend = std::move(builder).commit()`
    - attach the committed backend to the result shell
@@ -422,15 +449,16 @@
 ## Implementation Changes
 
 - Turn `BlockSpMat<T, Kernel>` into a unified facade owning shared matrix metadata plus an internal backend handle. Use one top-level dispatch per public operation; keep all hot loops entirely inside backend-specialized kernels.
-- Store shared metadata on the facade: `DistGraph* graph`, `MatrixKind`, logical block `row_ptr`, logical block `col_ind`, shape-relevant block sizes, and block-norm cache state.
+- Store shared metadata on the facade: `DistGraph* graph`, `MatrixKind`, graph-backed logical block views `row_ptr` / `col_ind`, shape-relevant block sizes, and block-norm cache state.
 - Add an internal `from_parts(...)` constructor/factory plus `attach_backend(...)`/swap helpers so structure-changing operations can assemble logical structure first and attach committed backend storage second.
 - Add one shared `PagedArray`/page-view utility layer that provides `PageSpan`, zipped page traversal, and backend-tunable page sizing policies.
 - Implement internal backends under `vbcsr::detail`: `CSRMatrixBackend<T>`, `BSRMatrixBackend<T>`, and `VBCSRMatrixBackend<T, Kernel>`. Do not expose these as public matrix types.
 - Binary and matrix-producing operations are same-family only. The facade dispatch layer must never attempt mixed-backend numeric execution such as `CSR + BSR` or `BSR spmm VBCSR`; those combinations are out of scope and should be rejected or prevented at construction/API boundaries.
-- `CSR backend`: native scalar CSR storage with paged scalar payloads and specialized kernels for `spmv`, multi-RHS `spmv`, adjoint `spmv`, transpose, `axpy`, and scalar `spmm`.
-- `BSR backend`: native uniform-block storage with paged block payloads plus fixed-block kernels for `spmv`, multi-RHS, adjoint, transpose, `axpy`, and block `spmm`; dispatch common block sizes `{2,4,8,16}` to compile-time microkernels and use BLAS fallback otherwise.
-- `VBCSR backend`: keep the current general block graph model only for mixed block sizes; optimize it with shape-aware paged storage, reusable thread-local workspaces, lower-overhead filtering, same-structure fast paths, and grouped kernel calls by repeated block-shape pairs.
+- `CSR backend`: native scalar CSR storage with paged scalar payloads and specialized kernels for `spmv`, multi-RHS `spmv`, adjoint `spmv`, transpose, `axpy`, and scalar `spmm`, reusing `DistGraph` adjacency as the canonical logical slot graph.
+- `BSR backend`: native uniform-block storage with paged block payloads plus fixed-block kernels for `spmv`, multi-RHS, adjoint, transpose, `axpy`, and block `spmm`; dispatch common block sizes `{2,4,8,16}` to compile-time microkernels and use BLAS fallback otherwise, again reusing `DistGraph` adjacency as the canonical logical slot graph.
+- `VBCSR backend`: keep the current general block graph model only for mixed block sizes; optimize it with shape-aware paged storage, reusable thread-local workspaces, lower-overhead filtering, same-structure fast paths, and grouped kernel calls by repeated block-shape pairs, while continuing to reuse `DistGraph` adjacency for backend-neutral logical structure.
 - Add a shape-kernel registry in the true `VBCSR` backend that maps hot shapes or hot `(r_dim, inner_dim, c_dim)` triples to the best available execution path: existing fixed kernels, batched BLAS kernels, or optional JIT kernels.
+- If JIT is enabled, compiled kernels should be obtained from a process-global shared cache rather than owned by one matrix object. Matrix-local registry state should keep hotness and execution preference, then query the shared cache by `(dtype, m, n, k, transpose-mode, ISA, ...)` or an equivalent key.
 - Keep backend determination at matrix-construction boundaries only. External constructors such as `from_scipy` choose the backend once; subsequent matrix operations preserve that backend family and do not trigger backend switching.
 - Add a backend-neutral block-value access layer for pybind, tests, and internal algorithms so they can inspect or export blocks without depending on `arena`, handles, or contiguous value slabs directly.
 - Make pybind bind only facade methods and facade inspection views, not backend storage internals. `vbcsr/matrix.py` continues to use the same uniform Python wrapper.
@@ -438,13 +466,14 @@
 
 ## Rollout
 
+- Prefer early validation over early completeness. After the facade/builder split lands, the next milestones should target the simpler `CSR` and `BSR` backends first so the architecture is proven on lower-risk implementations before redesigning true `VBCSR` storage.
 - Phase 0: Freeze benchmark and correctness baselines for three workload families: scalar CSR, uniform BSR, and irregular VBCSR.
-- Phase 1: Introduce the facade architecture, `MatrixKind`, backend-neutral inspectors, backend-native builder interfaces, one shared paged-linear-storage abstraction, and migrate pybind/tests/internal code off raw storage internals.
-- Phase 2: Refactor the current paged storage into a shape-aware `VBCSR` storage subsystem, extend the shared paged-storage foundation to CSR/BSR payload arrays, add the shape registry and per-shape iteration APIs, and remove redundant steady-state metadata such as `blk_sizes`.
-- Phase 3: Introduce distributed backend-consistency helpers plus backend-neutral row/payload exchange plans on top of `DistGraph`, starting by extracting and generalizing the current distributed `VBCSR spmm` exchange logic.
-- Phase 4: Land the `CSR` backend and route all all-ones block-size matrices to it.
-- Phase 5: Land the `BSR` backend and route all uniform `bsz > 1` matrices to it.
-- Phase 6: Slim the remaining generic engine into a true mixed-size `VBCSR` backend, then add shape-batched numeric paths and optional JIT specialization for hot true-`VBCSR` shapes.
+- Phase 1: Introduce the facade architecture, `MatrixKind`, backend-neutral inspectors, minimal backend-native builder interfaces, a shared paged-payload utility sufficient for `CSR`/`BSR`, and migrate pybind/tests/internal code off raw storage internals.
+- Phase 2: Land the `CSR` backend and route all all-ones block-size matrices to it. Use this phase to validate facade dispatch, builder commit/attach, and paged payload storage on the simplest backend.
+- Phase 3: Land the `BSR` backend and route all uniform `bsz > 1` matrices to it. Use this phase to validate fixed-block kernels, paged block payloads, and same-backend matrix-producing operations on a second backend family.
+- Phase 4: Introduce distributed backend-consistency helpers plus backend-neutral row/payload exchange plans on top of `DistGraph`, starting by extracting and generalizing the current distributed `VBCSR spmm` exchange logic.
+- Phase 5: Slim the remaining generic engine into a true mixed-size `VBCSR` backend, refactor the current paged storage into a shape-aware subsystem, add the shape registry and per-shape iteration APIs, and remove redundant steady-state metadata such as `blk_sizes`.
+- Phase 6: Add shape-batched numeric paths and optional JIT specialization for hot true-`VBCSR` shapes, then tune page-aware single-RHS and multi-RHS execution across all backends.
 - Phase 7: Update docs, benchmarks, and examples to describe the unified API plus automatic backend specialization.
  
 ## Test Plan
@@ -460,7 +489,9 @@
 - Add paged-storage tests for all backend families: CSR and BSR payloads cross page boundaries correctly, very large logical lengths can be represented without one monolithic allocation, and true `VBCSR` page reuse still behaves correctly.
 - Add page-aware traversal tests: page-local views enumerate the correct logical ranges, and row/block ranges that cross page boundaries are processed without dropped or duplicated entries.
 - Add builder-contract tests: builders consume finalized logical `row_ptr/col_ind`, numeric fill addresses slots by logical position rather than coordinate insertion, and `commit()` returns backend storage attachable through `from_parts(...)`.
+- Add numeric-fill ownership tests: structure-changing parallel kernels assign one owning thread per output slot or use thread-local scratch before flush, and builder hot paths do not rely on implicit internal locking or atomics.
 - Add true-`VBCSR` batching tests: same-shape batches are formed without payload repacking, batched execution produces identical results to block-by-block execution, and optional JIT kernels can be enabled or disabled without changing numerical results.
+- Add JIT-cache ownership tests if JIT is enabled: compiled kernels are shared across matrices through a process-global cache, while matrix-local state tracks only hotness and preferred execution path.
 - Add distributed-graph tests: constructor-time backend validation is collective when needed, ghost ordering remains owner-sorted, and backend-specific operations do not require any change to the `DistGraph` contract.
 - Add distributed exchange-plan tests: transpose redistribution, `spmm` metadata exchange, and remote block fetch all operate without transmitting local `shape_id` values.
 - Add API-contract tests: same-family binary ops are accepted, mixed-backend binary ops are rejected or impossible to construct through the supported API, and matrix-producing ops preserve backend family.

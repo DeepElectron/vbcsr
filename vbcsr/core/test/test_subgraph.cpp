@@ -171,7 +171,7 @@ int main(int argc, char** argv) {
         // Actually, let's verify.
         // We need to find offset of block (0,0).
         // It's likely the first block.
-        if (std::abs(A.arena.get_ptr(A.blk_handles[0])[0] - 1000.0) > 1e-9) std::cout << "FAILED: Rank 0 update mismatch. Got " << A.arena.get_ptr(A.blk_handles[0])[0] << std::endl;
+        if (std::abs(A.block_data(0)[0] - 1000.0) > 1e-9) std::cout << "FAILED: Rank 0 update mismatch. Got " << A.block_data(0)[0] << std::endl;
         else std::cout << "Rank 0 Update Verified." << std::endl;
     }
     
@@ -192,7 +192,7 @@ int main(int argc, char** argv) {
             if (A.graph->global_to_local.count(0)) {
                 int lid_0 = A.graph->global_to_local.at(0);
                 if (A.col_ind[k] == lid_0) {
-                    double* data = A.arena.get_ptr(A.blk_handles[k]);
+                    const double* data = A.block_data(k);
                     if (std::abs(data[0] - 1020.0) > 1e-9) { // Original 20.0 + 1000
                             std::cout << "FAILED: Rank 1 update mismatch. Got " << data[0] << " Expected 1020.0" << std::endl;
                     } else {
@@ -307,7 +307,7 @@ int main(int argc, char** argv) {
             if (A.graph->global_to_local.count(2)) {
                  int lid_2 = A.graph->global_to_local.at(2);
                  if (A.col_ind[k] == lid_2) {
-                     double* data = A.arena.get_ptr(A.blk_handles[k]);
+                     const double* data = A.block_data(k);
                      if (std::abs(data[0] - 6022.0) > 1e-9) {
                          std::cout << "FAILED: Global (2,2) update mismatch. Got " << data[0] << " Expected 6022.0" << std::endl;
                      } else {
@@ -376,7 +376,7 @@ int main(int argc, char** argv) {
         bool found = false;
         for(int k=start; k<end; ++k) {
             if (S.col_ind[k] == 1) { // Local col 1 is global 1
-                double* data = S.arena.get_ptr(S.blk_handles[k]);
+                const double* data = S.block_data(k);
                 if (std::abs(data[0] - 11.0) > 1e-9) {
                     std::cout << "Rank " << rank << " FAILED: Serial update mismatch. Got " << data[0] << std::endl;
                 }

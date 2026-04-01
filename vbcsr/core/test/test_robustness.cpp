@@ -121,7 +121,7 @@ bool run_test(int rank, int block_size, double range_min, double range_max) {
         int start = mat.row_ptr[i];
         int end = mat.row_ptr[i+1];
         for (int k = start; k < end; ++k) {
-            double* data = mat.arena.get_ptr(mat.blk_handles[k]);
+            double* data = mat.mutable_block_data(k);
             for (int j = 0; j < block_size * block_size; ++j) {
                 data[j] = dist(gen);
             }
@@ -155,7 +155,7 @@ bool run_test(int rank, int block_size, double range_min, double range_max) {
         
         for (int k = start; k < end; ++k) {
             int col = mat.col_ind[k];
-            const double* block_val = mat.arena.get_ptr(mat.blk_handles[k]);
+            const double* block_val = mat.block_data(k);
             const double* x_block = x_full + mat.graph->block_offsets[col];
             
             // Naive accumulation
@@ -188,7 +188,7 @@ bool run_test(int rank, int block_size, double range_min, double range_max) {
         
         for (int k = start; k < end; ++k) {
             int col = mat.col_ind[k];
-            const double* block_val = mat.arena.get_ptr(mat.blk_handles[k]);
+            const double* block_val = mat.block_data(k);
             
             // Construct packed B for this block (K x N)
             std::vector<double> B_packed(block_size * n_vecs);
@@ -239,7 +239,7 @@ bool run_test(int rank, int block_size, double range_min, double range_max) {
         
         for (int k = start; k < end; ++k) {
             int col = mat.col_ind[k];
-            const double* block_val = mat.arena.get_ptr(mat.blk_handles[k]);
+            const double* block_val = mat.block_data(k);
             
             // y[col] += A^T * x[row]
             // We only check local y.
@@ -288,7 +288,7 @@ bool run_test(int rank, int block_size, double range_min, double range_max) {
         int end = mat.row_ptr[i+1];
         for (int k = start; k < end; ++k) {
             int col = mat.col_ind[k];
-            const double* block_val = mat.arena.get_ptr(mat.blk_handles[k]);
+            const double* block_val = mat.block_data(k);
             double* y_target = y_ref_adj.data() + mat.graph->block_offsets[col];
             naive_gemv_trans(block_size, block_size, 1.0, block_val, x_row, 1.0, y_target);
         }
@@ -411,7 +411,7 @@ bool run_test_complex(int rank, int block_size, double range_min, double range_m
         int start = mat.row_ptr[i];
         int end = mat.row_ptr[i+1];
         for(int k=start; k<end; ++k) {
-            std::complex<double>* data = mat.arena.get_ptr(mat.blk_handles[k]);
+            std::complex<double>* data = mat.mutable_block_data(k);
             for(int j=0; j<block_size*block_size; ++j) {
                 data[j] = std::complex<double>(dist(gen), dist(gen));
             }
@@ -437,7 +437,7 @@ bool run_test_complex(int rank, int block_size, double range_min, double range_m
         
         for(int k=start; k<end; ++k) {
             int col = mat.col_ind[k];
-            const T* block_val = mat.arena.get_ptr(mat.blk_handles[k]);
+            const T* block_val = mat.block_data(k);
             const T* x_block = x_full + mat.graph->block_offsets[col];
             naive_gemv(block_size, block_size, T(1), block_val, x_block, T(1), y_ref.data());
         }
@@ -466,7 +466,7 @@ bool run_test_complex(int rank, int block_size, double range_min, double range_m
         
         for(int k=start; k<end; ++k) {
             int col = mat.col_ind[k];
-            const T* block_val = mat.arena.get_ptr(mat.blk_handles[k]);
+            const T* block_val = mat.block_data(k);
             
             std::vector<T> B_packed(block_size * n_vecs);
             for(int v=0; v<n_vecs; ++v) {
@@ -504,7 +504,7 @@ bool run_test_complex(int rank, int block_size, double range_min, double range_m
         for(int k=start; k<end; ++k) {
             int col = mat.col_ind[k];
             if (col == i) { // Local index match
-                const T* block_val = mat.arena.get_ptr(mat.blk_handles[k]);
+                const T* block_val = mat.block_data(k);
                 const T* x_row = x_adj_ptr + i*block_size;
                 
                 std::vector<T> y_ref(block_size, T(0));

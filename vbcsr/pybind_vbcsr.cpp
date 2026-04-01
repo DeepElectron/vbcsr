@@ -15,6 +15,35 @@ using namespace vbcsr;
 
 #include "pybind_common.hpp"
 
+template <typename T>
+py::array_t<T> make_owned_array_1d(const T* data, py::ssize_t count) {
+    auto* heap_data = new T[static_cast<size_t>(count)];
+    std::memcpy(heap_data, data, static_cast<size_t>(count) * sizeof(T));
+    py::capsule owner(heap_data, [](void* ptr) {
+        delete[] static_cast<T*>(ptr);
+    });
+    return py::array_t<T>({count}, {static_cast<py::ssize_t>(sizeof(T))}, heap_data, owner);
+}
+
+template <typename T>
+py::array_t<T> make_owned_array_1d(const std::vector<T>& data) {
+    return make_owned_array_1d(data.data(), static_cast<py::ssize_t>(data.size()));
+}
+
+template <typename T>
+py::array_t<T> make_owned_array_2d_row_major(const std::vector<T>& data, py::ssize_t rows, py::ssize_t cols) {
+    auto* heap_data = new T[data.size()];
+    std::memcpy(heap_data, data.data(), data.size() * sizeof(T));
+    py::capsule owner(heap_data, [](void* ptr) {
+        delete[] static_cast<T*>(ptr);
+    });
+    return py::array_t<T>(
+        {rows, cols},
+        {cols * static_cast<py::ssize_t>(sizeof(T)), static_cast<py::ssize_t>(sizeof(T))},
+        heap_data,
+        owner);
+}
+
 // Forward declaration for atomic module binding
 void bind_atomic_module(py::module& m);
 
@@ -155,29 +184,20 @@ void bind_block_spmat(py::module& m, const std::string& name) {
             std::vector<T> vec = self.get_block(row, col);
             if (vec.empty()) return py::array_t<T>(); // Return empty array or None? Empty array is safer.
             
-            int r_dim = self.graph->block_sizes[row];
-            int c_dim = self.graph->block_sizes[col];
-            
-            return py::array_t<T>(
-                {r_dim, c_dim},
-                {c_dim * sizeof(T), sizeof(T)}, // RowMajor
-                vec.data()
-            );
+            int r_dim = self.block_row_dim(row);
+            int c_dim = self.block_col_dim(col);
+            return make_owned_array_2d_row_major(vec, r_dim, c_dim);
         }, py::arg("row"), py::arg("col"))
         .def("get_values", [](const BlockSpMat<T>& self) {
-            std::vector<T> vec = self.get_values();
-            return py::array_t<T>(
-                { (py::ssize_t)vec.size() },
-                { sizeof(T) },
-                vec.data()
-            );
+            return make_owned_array_1d(self.get_values(MatrixLayout::RowMajor));
         })
         .def("get_block_density", &BlockSpMat<T>::get_block_density)
         .def("filter_blocks", &BlockSpMat<T>::filter_blocks)
+        .def_property_readonly("matrix_kind", [](const BlockSpMat<T>& self) {
+            return self.matrix_kind_string();
+        })
         .def_property_readonly("local_nnz", [](const BlockSpMat<T>& self) {
-            size_t nnz = 0;
-            for (size_t s : self.blk_sizes) nnz += s;
-            return nnz;
+            return self.local_scalar_nnz();
         })
         .def("to_dense", [](const BlockSpMat<T>& self) {
             // Return 2D numpy array
@@ -187,14 +207,7 @@ void bind_block_spmat(py::module& m, const std::string& name) {
             int n_owned = self.graph->owned_global_indices.size();
             int my_rows = self.graph->block_offsets[n_owned];
             int my_cols = self.graph->block_offsets.back();
-            
-            // Create numpy array with shape (rows, cols)
-            // We let pybind11 copy the data to manage lifetime safely and simply
-            return py::array_t<T>(
-                {my_rows, my_cols}, // shape
-                {my_cols * sizeof(T), sizeof(T)}, // strides (RowMajor)
-                vec.data() // data pointer
-            );
+            return make_owned_array_2d_row_major(vec, my_rows, my_cols);
         })
         .def("from_dense", [](BlockSpMat<T>& self, py::array_t<T> array) {
             // Check dimensions
@@ -230,10 +243,10 @@ void bind_block_spmat(py::module& m, const std::string& name) {
         }, py::arg("array"))
         .def("spmf", &py_graph_matrix_function<T>, py::arg("func_name"), py::arg("method") = "lanczos", py::arg("verbose") = false)
         .def_property_readonly("row_ptr", [](const BlockSpMat<T>& self) {
-            return py::array_t<int>(self.row_ptr.size(), self.row_ptr.data());
+            return make_owned_array_1d(self.logical_row_ptr());
         })
         .def_property_readonly("col_ind", [](const BlockSpMat<T>& self) {
-            return py::array_t<int>(self.col_ind.size(), self.col_ind.data());
+            return make_owned_array_1d(self.logical_col_ind());
         })
         ;
 }

@@ -55,6 +55,10 @@ class VBCSR(LinearOperator):
         return self._core.local_nnz
 
     @property
+    def matrix_kind(self) -> str:
+        return self._core.matrix_kind
+
+    @property
     def T(self) -> 'VBCSR':
         return self.transpose()
 
@@ -798,16 +802,16 @@ class VBCSR(LinearOperator):
         import scipy.sparse as sp
         # 1. Get Packed Values
         # Layout: RowMajor for easy numpy/scipy compatibility
-        values = self._core.get_values() # 1D array
+        values = np.asarray(self._core.get_values(), dtype=self.dtype) # 1D array
         
         # 2. Get Structure
-        row_ptr = self._core.row_ptr
-        col_ind = self._core.col_ind
+        row_ptr = np.asarray(self._core.row_ptr, dtype=np.int32)
+        col_ind = np.asarray(self._core.col_ind, dtype=np.int32)
         
         # 3. Check Uniformity
-        # We need block sizes.
         block_sizes = self.graph.block_sizes
-        
+        matrix_kind = self.matrix_kind
+
         # Check uniformity
         is_uniform = False
         uniform_size = 0
@@ -816,10 +820,10 @@ class VBCSR(LinearOperator):
             if all(s == first_size for s in block_sizes):
                 is_uniform = True
                 uniform_size = first_size
-        
+
         target_format = format
         if target_format is None:
-            target_format = 'bsr' if is_uniform else 'csr'
+            target_format = 'bsr' if matrix_kind in ('csr', 'bsr') else 'csr'
             
         if target_format == 'bsr':
             if not is_uniform:
@@ -921,5 +925,3 @@ class VBCSR(LinearOperator):
             
         else:
             raise ValueError(f"Unknown format: {target_format}")
-
-

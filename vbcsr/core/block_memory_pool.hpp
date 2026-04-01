@@ -11,6 +11,13 @@
 namespace vbcsr {
 
 template <typename T>
+struct PayloadPageView {
+    T* data = nullptr;
+    size_t size = 0;
+    size_t page_index = 0;
+};
+
+template <typename T>
 class BlockArena {
 public:
     // Default page size: 1M elements (approx 8MB for double)
@@ -131,6 +138,38 @@ public:
             total += page.size * sizeof(T);
         }
         return total;
+    }
+
+    size_t page_count() const {
+        return pages.size();
+    }
+
+    PayloadPageView<T> page_view(size_t page_idx) {
+        if (page_idx >= pages.size()) {
+            throw std::out_of_range("BlockArena::page_view index out of range");
+        }
+        return PayloadPageView<T>{pages[page_idx].data.get(), pages[page_idx].size, page_idx};
+    }
+
+    PayloadPageView<const T> page_view(size_t page_idx) const {
+        if (page_idx >= pages.size()) {
+            throw std::out_of_range("BlockArena::page_view index out of range");
+        }
+        return PayloadPageView<const T>{pages[page_idx].data.get(), pages[page_idx].size, page_idx};
+    }
+
+    template <typename Fn>
+    void for_each_page(Fn&& fn) {
+        for (size_t page_idx = 0; page_idx < pages.size(); ++page_idx) {
+            fn(page_view(page_idx));
+        }
+    }
+
+    template <typename Fn>
+    void for_each_page(Fn&& fn) const {
+        for (size_t page_idx = 0; page_idx < pages.size(); ++page_idx) {
+            fn(page_view(page_idx));
+        }
     }
 
 private:

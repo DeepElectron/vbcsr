@@ -192,9 +192,7 @@ DistCSR<T> convert_to_csr(const BlockSpMat<T, Kernel>& mat) {
         for (int k = blk_start; k < blk_end; ++k) {
             int col_blk = mat.col_ind[k]; // local index of block
             int c_dim = block_sizes[col_blk];
-            
-            uint64_t handle = mat.blk_handles[k];
-            const T* data = mat.arena.get_ptr(handle);
+            const T* data = mat.block_data(k);
             
             // Check non-zeros in block
             // Assume dense blocks are fully non-zero for now, OR check explicit zeros?
@@ -257,7 +255,7 @@ DistCSR<T> convert_to_csr(const BlockSpMat<T, Kernel>& mat) {
                 global_col_start = ghost_scalar_starts[col_blk - n_owned_blocks];
             }
             
-            row_blocks.push_back({col_blk, global_col_start, mat.arena.get_ptr(mat.blk_handles[k]), c_dim});
+            row_blocks.push_back({col_blk, global_col_start, mat.block_data(k), c_dim});
         }
         
         // Sort by global column start

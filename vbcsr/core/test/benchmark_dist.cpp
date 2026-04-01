@@ -91,7 +91,7 @@ int main(int argc, char** argv) {
         int start = mat.row_ptr[i];
         int end = mat.row_ptr[i+1];
         for (int k = start; k < end; ++k) {
-            double* data = mat.arena.get_ptr(mat.blk_handles[k]);
+            double* data = mat.mutable_block_data(k);
             int lid_c = mat.col_ind[k];
             
             // Resolve GID for column

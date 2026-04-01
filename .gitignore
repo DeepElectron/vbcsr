@@ -46,3 +46,6 @@ _deps/
 # Benchmarks
 benchmark_performance.png
 benchmark_report.md
+phase0*
+*.txt
+*.pdf

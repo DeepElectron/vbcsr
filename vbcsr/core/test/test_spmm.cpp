@@ -44,7 +44,7 @@ std::vector<T> gather_dense(BlockSpMat<T, SmartKernel<T>>& A, int global_rows, i
             int gid_col_start = block_offsets[gid_col_blk];
             int c_dim = A.graph->block_sizes[lid_col];
             
-            const T* val = A.arena.get_ptr(A.blk_handles[k]);
+            const T* val = A.block_data(k);
             
             for(int r=0; r<r_dim; ++r) {
                 for(int c=0; c<c_dim; ++c) {
@@ -179,8 +179,8 @@ void test_random_spmm(int n_block_rows, double density, int min_blk, int max_blk
         int start = A.row_ptr[i];
         int end = A.row_ptr[i+1];
         for(int k=start; k<end; ++k) {
-            T* data = A.arena.get_ptr(A.blk_handles[k]);
-            for(size_t n=0; n<A.blk_sizes[k]; ++n) {
+            T* data = A.mutable_block_data(k);
+            for(size_t n=0; n<A.block_size_elements(k); ++n) {
                 if constexpr (std::is_same<T, std::complex<double>>::value) {
                     data[n] = std::complex<double>(dis_val(gen), dis_val(gen));
                 } else {
@@ -326,8 +326,8 @@ void test_diverse_spmm(int n_block_rows, double base_density, int min_blk, int m
         int start = A.row_ptr[i];
         int end = A.row_ptr[i+1];
         for(int k=start; k<end; ++k) {
-            T* data = A.arena.get_ptr(A.blk_handles[k]);
-            for(size_t n=0; n<A.blk_sizes[k]; ++n) {
+            T* data = A.mutable_block_data(k);
+            for(size_t n=0; n<A.block_size_elements(k); ++n) {
                 if constexpr (std::is_same_v<T, std::complex<double>>) {
                     data[n] = std::complex<double>(dis_val(gen), dis_val(gen));
                 } else {

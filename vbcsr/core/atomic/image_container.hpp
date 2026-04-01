@@ -266,8 +266,8 @@ public:
                     }
 
                     const int col_dim = graph_r->block_sizes[local_col_r];
-                    const int n_elem = static_cast<int>(mat_r->blk_sizes[k]);
-                    const T* block_data = mat_r->arena.get_ptr(mat_r->blk_handles[k]);
+                    const int n_elem = static_cast<int>(mat_r->block_size_elements(k));
+                    const T* block_data = mat_r->block_data(k);
                     std::vector<ResultT> block_res(static_cast<size_t>(n_elem));
 
                     for (int idx = 0; idx < n_elem; ++idx) {
