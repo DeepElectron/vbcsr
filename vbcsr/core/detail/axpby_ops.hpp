@@ -24,9 +24,9 @@ struct CSRAxpbyExecutor {
         const bool same_structure = (same_structure_flag == 1);
         if (same_structure) {
             #pragma omp parallel for
-            for (size_t slot = 0; slot < self.blk_handles.size(); ++slot) {
-                T* dest = self.arena.get_ptr(self.blk_handles[slot]);
-                const T* src = X.arena.get_ptr(X.blk_handles[slot]);
+            for (size_t slot = 0; slot < self.local_block_nnz(); ++slot) {
+                T* dest = self.mutable_block_data(static_cast<int>(slot));
+                const T* src = X.block_data(static_cast<int>(slot));
                 *dest = alpha * (*src) + beta * (*dest);
             }
             self.norms_valid = false;
@@ -37,7 +37,7 @@ struct CSRAxpbyExecutor {
             DistGraph* new_graph = X.graph->duplicate();
             CSRResultBuilder<T> builder(new_graph);
             #pragma omp parallel for
-            for (size_t slot = 0; slot < X.blk_handles.size(); ++slot) {
+            for (size_t slot = 0; slot < X.local_block_nnz(); ++slot) {
                 *builder.slot_data(static_cast<int>(slot)) = alpha * (*X.block_data(static_cast<int>(slot)));
             }
             self.replace_with_csr_builder(new_graph, true, std::move(builder));
@@ -102,10 +102,10 @@ struct BSRAxpbyExecutor {
         const bool same_structure = (same_structure_flag == 1);
         if (same_structure) {
             #pragma omp parallel for
-            for (size_t slot = 0; slot < self.blk_handles.size(); ++slot) {
-                T* dest = self.arena.get_ptr(self.blk_handles[slot]);
-                const T* src = X.arena.get_ptr(X.blk_handles[slot]);
-                const size_t size = self.blk_sizes[slot];
+            for (size_t slot = 0; slot < self.local_block_nnz(); ++slot) {
+                T* dest = self.mutable_block_data(static_cast<int>(slot));
+                const T* src = X.block_data(static_cast<int>(slot));
+                const size_t size = self.block_size_elements(static_cast<int>(slot));
                 for (size_t idx = 0; idx < size; ++idx) {
                     dest[idx] = alpha * src[idx] + beta * dest[idx];
                 }
@@ -118,10 +118,10 @@ struct BSRAxpbyExecutor {
             DistGraph* new_graph = X.graph->duplicate();
             BSRResultBuilder<T> builder(new_graph);
             #pragma omp parallel for
-            for (size_t slot = 0; slot < X.blk_handles.size(); ++slot) {
+            for (size_t slot = 0; slot < X.local_block_nnz(); ++slot) {
                 T* dest = builder.slot_data(static_cast<int>(slot));
                 const T* src = X.block_data(static_cast<int>(slot));
-                const size_t size = X.blk_sizes[slot];
+                const size_t size = X.block_size_elements(static_cast<int>(slot));
                 for (size_t idx = 0; idx < size; ++idx) {
                     dest[idx] = alpha * src[idx];
                 }
@@ -160,7 +160,7 @@ struct BSRAxpbyExecutor {
                 const int dest_slot = builder.find_slot(row, local_col);
                 T* dest = builder.slot_data(dest_slot);
                 const T* src = self.block_data(slot);
-                const size_t size = self.blk_sizes[slot];
+                const size_t size = self.block_size_elements(slot);
                 for (size_t idx = 0; idx < size; ++idx) {
                     dest[idx] = beta * src[idx];
                 }
@@ -171,7 +171,7 @@ struct BSRAxpbyExecutor {
                 const int dest_slot = builder.find_slot(row, local_col);
                 T* dest = builder.slot_data(dest_slot);
                 const T* src = X.block_data(slot);
-                const size_t size = X.blk_sizes[slot];
+                const size_t size = X.block_size_elements(slot);
                 for (size_t idx = 0; idx < size; ++idx) {
                     dest[idx] += alpha * src[idx];
                 }
@@ -183,7 +183,7 @@ struct BSRAxpbyExecutor {
 };
 
 template <typename Matrix>
-struct LegacyAxpbyExecutor {
+struct VBCSRAxpbyExecutor {
     using T = typename Matrix::value_type;
 
     static void run(Matrix& self, const Matrix& X, T alpha, T beta) {
@@ -216,10 +216,11 @@ struct LegacyAxpbyExecutor {
 
         if (same_structure) {
             #pragma omp parallel for
-            for (size_t i = 0; i < self.blk_handles.size(); ++i) {
-                T* block = self.arena.get_ptr(self.blk_handles[i]);
-                const T* block_x = X.arena.get_ptr(X.blk_handles[i]);
-                for (size_t j = 0; j < self.blk_sizes[i]; ++j) {
+            for (size_t i = 0; i < self.local_block_nnz(); ++i) {
+                T* block = self.mutable_block_data(static_cast<int>(i));
+                const T* block_x = X.block_data(static_cast<int>(i));
+                const size_t size = self.block_size_elements(static_cast<int>(i));
+                for (size_t j = 0; j < size; ++j) {
                     block[j] = alpha * block_x[j] + beta * block[j];
                 }
             }
@@ -316,9 +317,9 @@ struct LegacyAxpbyExecutor {
                         while (y_k < y_end && self.col_ind[y_k] < target_col) {
                             ++y_k;
                         }
-                        T* y_ptr = self.arena.get_ptr(self.blk_handles[y_k]);
-                        const T* x_ptr = X.arena.get_ptr(X.blk_handles[x_k]);
-                        const int size = static_cast<int>(self.blk_sizes[y_k]);
+                        T* y_ptr = self.mutable_block_data(y_k);
+                        const T* x_ptr = X.block_data(x_k);
+                        const int size = static_cast<int>(self.block_size_elements(y_k));
 
                         for (int j = 0; j < size; ++j) {
                             y_ptr[j] += alpha * x_ptr[j];
@@ -377,70 +378,7 @@ struct LegacyAxpbyExecutor {
         std::vector<int> new_row_ptr;
         std::vector<int> new_col_ind;
         new_graph->get_matrix_structure(new_row_ptr, new_col_ind);
-
-        const int total_blocks_new = static_cast<int>(new_col_ind.size());
-        std::vector<uint64_t> new_blk_handles(total_blocks_new);
-        std::vector<size_t> new_blk_sizes(total_blocks_new);
-
-        std::vector<size_t> row_val_size_new(n_rows);
-        #pragma omp parallel for
-        for (int row = 0; row < n_rows; ++row) {
-            const int start = new_row_ptr[row];
-            const int end = new_row_ptr[row + 1];
-            size_t sz = 0;
-            const int r_dim = new_graph->block_sizes[row];
-            for (int slot = start; slot < end; ++slot) {
-                const int col = new_col_ind[slot];
-                const int c_dim = new_graph->block_sizes[col];
-                sz += static_cast<size_t>(r_dim) * c_dim;
-            }
-            row_val_size_new[row] = sz;
-        }
-
-        std::vector<long long> row_val_offset_new(n_rows + 1);
-        row_val_offset_new[0] = 0;
-        for (int row = 0; row < n_rows; ++row) {
-            row_val_offset_new[row + 1] = row_val_offset_new[row] + static_cast<long long>(row_val_size_new[row]);
-        }
-        self.arena.reserve(row_val_offset_new.back());
-
-        #pragma omp parallel for
-        for (int row = 0; row < n_rows; ++row) {
-            const int start = new_row_ptr[row];
-            const int end = new_row_ptr[row + 1];
-            const int this_start = self.row_ptr[row];
-            const int this_end = self.row_ptr[row + 1];
-
-            int tk = this_start;
-            const int r_dim = new_graph->block_sizes[row];
-            for (int slot = start; slot < end; ++slot) {
-                const int col = new_col_ind[slot];
-                const int c_dim = new_graph->block_sizes[col];
-                new_blk_sizes[slot] = static_cast<size_t>(r_dim) * c_dim;
-
-                while (tk < this_end && canonical_less(self.col_ind[tk], self.graph, col, new_graph)) {
-                    ++tk;
-                }
-
-                bool found = false;
-                if (tk < this_end) {
-                    if (!canonical_less(col, new_graph, self.col_ind[tk], self.graph)) {
-                        new_blk_handles[slot] = self.blk_handles[tk];
-                        found = true;
-                    }
-                }
-
-                if (!found) {
-                    new_blk_handles[slot] = UINT64_MAX;
-                }
-            }
-        }
-
-        for (size_t slot = 0; slot < new_blk_handles.size(); ++slot) {
-            if (new_blk_handles[slot] == UINT64_MAX) {
-                new_blk_handles[slot] = self.arena.allocate(new_blk_sizes[slot]);
-            }
-        }
+        VBCSRResultBuilder<T, typename Matrix::KernelType> builder(new_graph);
 
         #pragma omp parallel for
         for (int row = 0; row < n_rows; ++row) {
@@ -467,22 +405,27 @@ struct LegacyAxpbyExecutor {
                 }
                 const bool in_x = (x_k < x_end && !canonical_less(col, new_graph, X.col_ind[x_k], X.graph));
 
-                T* dest_ptr = self.arena.get_ptr(new_blk_handles[slot]);
-                const size_t sz = new_blk_sizes[slot];
+                T* dest_ptr = builder.slot_data(slot);
+                const size_t sz = static_cast<size_t>(new_graph->block_sizes[row]) *
+                                  static_cast<size_t>(new_graph->block_sizes[col]);
 
                 if (in_y) {
-                    if (in_x) {
-                        const T* x_ptr = X.arena.get_ptr(X.blk_handles[x_k]);
+                    const T* y_ptr = self.block_data(y_k);
+                    if (beta == T(1)) {
+                        std::memcpy(dest_ptr, y_ptr, sz * sizeof(T));
+                    } else {
                         for (size_t j = 0; j < sz; ++j) {
-                            dest_ptr[j] = alpha * x_ptr[j] + beta * dest_ptr[j];
+                            dest_ptr[j] = beta * y_ptr[j];
                         }
-                    } else if (beta != T(1)) {
+                    }
+                    if (in_x) {
+                        const T* x_ptr = X.block_data(x_k);
                         for (size_t j = 0; j < sz; ++j) {
-                            dest_ptr[j] *= beta;
+                            dest_ptr[j] += alpha * x_ptr[j];
                         }
                     }
                 } else if (in_x) {
-                    const T* x_ptr = X.arena.get_ptr(X.blk_handles[x_k]);
+                    const T* x_ptr = X.block_data(x_k);
                     for (size_t j = 0; j < sz; ++j) {
                         dest_ptr[j] = alpha * x_ptr[j];
                     }
@@ -492,44 +435,17 @@ struct LegacyAxpbyExecutor {
             }
         }
 
-        const MatrixKind new_kind = Matrix::detect_matrix_kind(new_graph);
-        typename Matrix::CommittedBackendStorage new_backend;
-        if (new_kind == MatrixKind::CSR) {
-            typename Matrix::CSRBackendStorage csr_backend;
-            csr_backend.blk_handles = std::move(new_blk_handles);
-            csr_backend.blk_sizes = std::move(new_blk_sizes);
-            csr_backend.arena = std::move(static_cast<BlockArena<T>&>(self.arena));
-            new_backend = std::move(csr_backend);
-        } else if (new_kind == MatrixKind::BSR) {
-            typename Matrix::BSRBackendStorage bsr_backend;
-            bsr_backend.block_size = BSRResultBuilder<T>::infer_block_size(new_graph);
-            bsr_backend.blk_handles = std::move(new_blk_handles);
-            bsr_backend.blk_sizes = std::move(new_blk_sizes);
-            bsr_backend.arena = std::move(static_cast<BlockArena<T>&>(self.arena));
-            new_backend = std::move(bsr_backend);
-        } else {
-            typename Matrix::LegacyBackendStorage legacy_backend;
-            legacy_backend.blk_handles = std::move(new_blk_handles);
-            legacy_backend.blk_sizes = std::move(new_blk_sizes);
-            legacy_backend.arena = std::move(static_cast<BlockArena<T>&>(self.arena));
-            new_backend = std::move(legacy_backend);
-        }
-        self.replace_with_parts(
-            new_graph,
-            true,
-            new_kind,
-            std::move(new_row_ptr),
-            std::move(new_col_ind),
-            std::move(new_backend));
+        self.replace_with_vbcsr_builder(new_graph, true, std::move(builder));
     }
 
 private:
     static void copy_scaled_structure(Matrix& self, const Matrix& X, T alpha) {
         #pragma omp parallel for
-        for (size_t i = 0; i < self.blk_handles.size(); ++i) {
-            T* block = self.arena.get_ptr(self.blk_handles[i]);
-            const T* block_x = X.arena.get_ptr(X.blk_handles[i]);
-            for (size_t j = 0; j < self.blk_sizes[i]; ++j) {
+        for (size_t i = 0; i < self.local_block_nnz(); ++i) {
+            T* block = self.mutable_block_data(static_cast<int>(i));
+            const T* block_x = X.block_data(static_cast<int>(i));
+            const size_t size = self.block_size_elements(static_cast<int>(i));
+            for (size_t j = 0; j < size; ++j) {
                 block[j] = alpha * block_x[j];
             }
         }

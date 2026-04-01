@@ -1,6 +1,7 @@
 import sys
 import numpy as np
 from unittest.mock import patch
+import _workspace_bootstrap
 
 # Mock mpi4py to simulate it not being installed
 # We must do this BEFORE importing vbcsr
@@ -31,6 +32,7 @@ with patch.dict(sys.modules, {'mpi4py': None}):
         assert mat.ndim == 2
         assert mat.shape == (global_blocks * block_size, global_blocks * block_size)
         assert mat.nnz >= 0
+        assert mat.matrix_kind == "bsr"
         assert len(mat) == mat.shape[0]
         
         print("Matrix assertions passed")

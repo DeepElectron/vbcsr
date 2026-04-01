@@ -6,6 +6,37 @@ from typing import Union, Optional, List, Any, Tuple
 from .vector import DistVector
 from .multivector import DistMultiVector
 
+
+def _owned_block_count(graph: Any) -> int:
+    return len(graph.owned_global_indices)
+
+
+def _owned_scalar_rows(graph: Any) -> int:
+    if hasattr(graph, "owned_scalar_rows"):
+        return int(graph.owned_scalar_rows)
+    owned_blocks = _owned_block_count(graph)
+    return int(sum(graph.block_sizes[:owned_blocks]))
+
+
+def _global_scalar_rows(graph: Any, comm: Any) -> int:
+    if hasattr(graph, "global_scalar_rows"):
+        return int(graph.global_scalar_rows)
+
+    local_rows = _owned_scalar_rows(graph)
+    if comm is not None and hasattr(comm, "allreduce"):
+        try:
+            return int(comm.allreduce(local_rows))
+        except Exception:
+            pass
+    return local_rows
+
+
+def _local_scalar_cols(graph: Any) -> int:
+    if hasattr(graph, "local_scalar_cols"):
+        return int(graph.local_scalar_cols)
+    return int(sum(graph.block_sizes))
+
+
 class VBCSR(LinearOperator):
     """
     Variable Block Compressed Sparse Row (VBCSR) Matrix.
@@ -26,22 +57,38 @@ class VBCSR(LinearOperator):
         self.dtype = np.dtype(dtype)
         self.comm = comm
         self._global_nnz = None
+        self.shape = self._infer_square_shape(graph, comm)
         
-        # Calculate global size
-        local_size = len(graph.owned_global_indices)
-        # We need to sum block sizes to get matrix dimension (number of orbitals)
-        # block_sizes contains sizes for owned blocks
-        # Note: This assumes graph.block_sizes is accessible and correct
-        # For distributed graph, block_sizes might contain ghosts too, but owned_global_indices
-        # maps to the first N entries.
-        
-        # Compute shape placeholder. Ideally this should be set by factory methods.
-        self.shape = (None, None) 
-        
-        if dtype == np.float64:
+        if self.dtype == np.dtype(np.float64):
             self._core = vbcsr_core.BlockSpMat_Double(graph)
         else:
             self._core = vbcsr_core.BlockSpMat_Complex(graph)
+
+    @staticmethod
+    def _infer_square_shape(graph: Any, comm: Any) -> Tuple[int, int]:
+        total_rows = _global_scalar_rows(graph, comm)
+        return (total_rows, total_rows)
+
+    @classmethod
+    def _wrap_core(
+        cls,
+        core: Any,
+        dtype: type,
+        comm: Any,
+        shape: Optional[Tuple[int, int]] = None,
+        global_nnz: Optional[int] = None,
+    ) -> 'VBCSR':
+        obj = cls.__new__(cls)
+        obj.graph = core.graph
+        obj.dtype = np.dtype(dtype)
+        obj.comm = comm
+        obj._core = core
+        obj.shape = shape if shape is not None else cls._infer_square_shape(core.graph, comm)
+        obj._global_nnz = global_nnz
+        return obj
+
+    def _invalidate_nnz(self) -> None:
+        self._global_nnz = None
 
     @property
     def ndim(self) -> int:
@@ -51,8 +98,22 @@ class VBCSR(LinearOperator):
     def nnz(self) -> int:
         """Global number of non-zero elements."""
         if self._global_nnz is not None:
+            return int(self._global_nnz)
+
+        if hasattr(self._core, "global_nnz"):
+            self._global_nnz = int(self._core.global_nnz)
             return self._global_nnz
-        return self._core.local_nnz
+
+        local_nnz = int(self._core.local_nnz)
+        if self.comm is not None and hasattr(self.comm, "allreduce"):
+            try:
+                self._global_nnz = int(self.comm.allreduce(local_nnz))
+                return self._global_nnz
+            except Exception:
+                pass
+
+        self._global_nnz = local_nnz
+        return self._global_nnz
 
     @property
     def matrix_kind(self) -> str:
@@ -64,11 +125,10 @@ class VBCSR(LinearOperator):
 
     def transpose(self) -> 'VBCSR':
         core_T = self._core.transpose()
-        obj = VBCSR(core_T.graph, self.dtype, self.comm)
-        obj._core = core_T
+        shape = None
         if self.shape[0] is not None and self.shape[1] is not None:
-            obj.shape = (self.shape[1], self.shape[0])
-        return obj
+            shape = (self.shape[1], self.shape[0])
+        return self._wrap_core(core_T, self.dtype, self.comm, shape=shape, global_nnz=self._global_nnz)
 
     def transpose_(self) -> None:
         """In-place transpose."""
@@ -77,6 +137,8 @@ class VBCSR(LinearOperator):
         self.graph = core_T.graph
         if self.shape[0] is not None and self.shape[1] is not None:
             self.shape = (self.shape[1], self.shape[0])
+        else:
+            self.shape = self._infer_square_shape(self.graph, self.comm)
 
     def conj_(self) -> None:
         """In-place conjugate."""
@@ -94,19 +156,13 @@ class VBCSR(LinearOperator):
     def real(self) -> 'VBCSR':
         """Return the real part of the matrix."""
         core_real = self._core.real()
-        obj = VBCSR(core_real.graph, np.float64, self.comm)
-        obj._core = core_real
-        obj.shape = self.shape
-        return obj
+        return self._wrap_core(core_real, np.float64, self.comm, shape=self.shape, global_nnz=self._global_nnz)
 
     @property
     def imag(self) -> 'VBCSR':
         """Return the imaginary part of the matrix."""
         core_imag = self._core.imag()
-        obj = VBCSR(core_imag.graph, np.float64, self.comm)
-        obj._core = core_imag
-        obj.shape = self.shape
-        return obj
+        return self._wrap_core(core_imag, np.float64, self.comm, shape=self.shape, global_nnz=self._global_nnz)
 
     def __neg__(self) -> 'VBCSR':
         return self * -1
@@ -123,21 +179,8 @@ class VBCSR(LinearOperator):
         if isinstance(key, tuple) and len(key) == 2:
             row, col = key
             if isinstance(row, int) and isinstance(col, int):
-                # Scalar access
-                # This is slow and requires finding the block.
-                # We need to map global row/col to block row/col and offset.
-                # This is hard without full metadata on Python side.
-                # For now, let's raise NotImplementedError or try to implement if possible.
-                # Actually, get_values returns all values.
-                # We can use extract_submatrix for a single element?
-                # extract_submatrix takes global indices of blocks? No, vertices.
-                # Let's check extract_submatrix signature.
-                # "Extract a submatrix corresponding to the given global indices."
-                # It returns a VBCSR.
-                # If we extract row i, we get row i.
-                # But we want scalar.
-                raise NotImplementedError("Scalar indexing not yet efficiently implemented.")
-        raise NotImplementedError("Slicing not implemented.")
+                raise NotImplementedError("Scalar indexing is not supported; use get_block(...) for block access.")
+        raise NotImplementedError("Slicing is not supported on VBCSR matrices.")
 
     def dot(self, other: Union['VBCSR', DistVector, DistMultiVector, np.ndarray]) -> Union['VBCSR', DistVector, DistMultiVector]:
         return self @ other
@@ -171,13 +214,7 @@ class VBCSR(LinearOperator):
         """
         graph = vbcsr_core.DistGraph(comm)
         graph.construct_serial(global_blocks, block_sizes, adjacency)
-        
-        obj = cls(graph, dtype, comm)
-        
-        # Compute shape for serial (rank 0 knows all)
-        total_rows = sum(block_sizes)
-        obj.shape = (total_rows, total_rows)
-        return obj
+        return cls(graph, dtype, comm)
 
     @classmethod
     def create_distributed(cls, owned_indices: List[int], block_sizes: List[int], adjacency: List[List[int]], dtype: type = np.float64, comm: Any = None) -> 'VBCSR':
@@ -196,19 +233,7 @@ class VBCSR(LinearOperator):
         """
         graph = vbcsr_core.DistGraph(comm)
         graph.construct_distributed(owned_indices, block_sizes, adjacency)
-        
-        obj = cls(graph, dtype, comm)
-        
-        # Compute shape using MPI allreduce if possible
-        if comm is not None and hasattr(comm, "allreduce"):
-            local_rows = sum(block_sizes)
-            total_rows = comm.allreduce(local_rows)
-            obj.shape = (total_rows, total_rows)
-        elif comm is None:
-            total_rows = sum(block_sizes)
-            obj.shape = (total_rows, total_rows)
-        
-        return obj
+        return cls(graph, dtype, comm)
 
     @classmethod
     def create_random(cls, global_blocks: int = 100, block_size_min: int = 1, block_size_max: int = 4, density: float = 0.01, dtype: type = np.float64, seed: int = 42, comm: Any = None) -> 'VBCSR':
@@ -227,6 +252,8 @@ class VBCSR(LinearOperator):
         Returns:
             VBCSR: The initialized matrix with random structure and data.
         """
+        dtype = np.dtype(dtype)
+
         if comm is None:
             rank = 0
             size = 1
@@ -295,7 +322,7 @@ class VBCSR(LinearOperator):
                 c_dim = all_block_sizes[global_j]
                 
                 # Generate random block
-                if dtype == np.float64:
+                if dtype == np.dtype(np.float64):
                     data = np.random.rand(r_dim, c_dim)
                 else:
                     data = np.random.rand(r_dim, c_dim) + 1j * np.random.rand(r_dim, c_dim)
@@ -307,7 +334,7 @@ class VBCSR(LinearOperator):
 
     def create_vector(self) -> DistVector:
         """Create a DistVector compatible with this matrix."""
-        if self.dtype == np.float64:
+        if self.dtype == np.dtype(np.float64):
             core_vec = vbcsr_core.DistVector_Double(self.graph)
         else:
             core_vec = vbcsr_core.DistVector_Complex(self.graph)
@@ -320,7 +347,7 @@ class VBCSR(LinearOperator):
         Args:
             k (int): Number of vectors (columns).
         """
-        if self.dtype == np.float64:
+        if self.dtype == np.dtype(np.float64):
             core_vec = vbcsr_core.DistMultiVector_Double(self.graph, k)
         else:
             core_vec = vbcsr_core.DistMultiVector_Complex(self.graph, k)
@@ -336,6 +363,7 @@ class VBCSR(LinearOperator):
             data (np.ndarray): Block data (2D array).
             mode (AssemblyMode): INSERT or ADD.
         """
+        self._invalidate_nnz()
         self._core.add_block(g_row, g_col, data, mode)
 
     def get_block(self, g_row: int, g_col: int) -> Optional[np.ndarray]:
@@ -366,14 +394,8 @@ class VBCSR(LinearOperator):
     def assemble(self) -> None:
         """Finalize matrix assembly (exchange remote blocks)."""
         self._core.assemble()
-        local_nnz = self._core.local_nnz
-        if self.comm:
-            try:
-                self._global_nnz = self.comm.allreduce(local_nnz)
-            except:
-                self._global_nnz = local_nnz
-        else:
-            self._global_nnz = local_nnz
+        self._invalidate_nnz()
+        _ = self.nnz
 
     def mult(self, x: Union[DistVector, DistMultiVector, np.ndarray], y: Optional[Union[DistVector, DistMultiVector]] = None) -> Union[DistVector, DistMultiVector]:
         """
@@ -469,11 +491,13 @@ class VBCSR(LinearOperator):
 
     def duplicate(self) -> 'VBCSR':
         """Create a deep copy of the matrix."""
-        new_obj = VBCSR(self.graph, self.dtype, self.comm)
-        new_obj._core = self._core.duplicate(False) # Share graph
-        new_obj.shape = self.shape
-        new_obj._global_nnz = self._global_nnz
-        return new_obj
+        return self._wrap_core(
+            self._core.duplicate(False),
+            self.dtype,
+            self.comm,
+            shape=self.shape,
+            global_nnz=self._global_nnz,
+        )
 
     # Operators
     def __add__(self, other: 'VBCSR') -> 'VBCSR':
@@ -493,12 +517,14 @@ class VBCSR(LinearOperator):
     def __isub__(self, other: 'VBCSR') -> 'VBCSR':
         if isinstance(other, VBCSR):
             self._core.axpy(-1.0, other._core)
+            self._invalidate_nnz()
             return self
         return NotImplemented
 
     def __iadd__(self, other: 'VBCSR') -> 'VBCSR':
         if isinstance(other, VBCSR):
             self._core.axpy(1.0, other._core)
+            self._invalidate_nnz()
             return self
         return NotImplemented
 
@@ -563,46 +589,27 @@ class VBCSR(LinearOperator):
             raise TypeError("A and B must have the same dtype")
             
         core_C = self._core.spmm(B._core, threshold, transA, transB)
-        
-        # Wrap result
-        obj = VBCSR.__new__(VBCSR)
-        obj.graph = core_C.graph
-        obj.dtype = self.dtype
-        obj._core = core_C
-        obj.comm = self.comm
-        obj.shape = (self.shape[0], B.shape[1])
-        obj._global_nnz = None
-        return obj
+        shape = None
+        if self.shape[0] is not None and B.shape[1] is not None:
+            shape = (self.shape[0], B.shape[1])
+        return self._wrap_core(core_C, self.dtype, self.comm, shape=shape)
 
     def spmm_self(self, threshold: float = 0.0, transA: bool = False) -> 'VBCSR':
         core_C = self._core.spmm_self(threshold, transA)
-        obj = VBCSR.__new__(VBCSR)
-        obj.graph = core_C.graph
-        obj.dtype = self.dtype
-        obj._core = core_C
-        obj.comm = self.comm
-        obj.shape = (self.shape[0], self.shape[1])
-        obj._global_nnz = None
-        return obj
+        return self._wrap_core(core_C, self.dtype, self.comm, shape=self.shape)
 
     def get_block_density(self) -> float:
         return self._core.get_block_density()
 
     def filter_blocks(self, threshold: float = 0.0):
         self._core.filter_blocks(threshold)
+        self._invalidate_nnz()
 
     def add(self, B: 'VBCSR', alpha: float = 1.0, beta: float = 1.0) -> 'VBCSR':
         if not isinstance(B, VBCSR):
             raise TypeError("B must be a VBCSR matrix")
         core_C = self._core.add(B._core, alpha, beta)
-        obj = VBCSR.__new__(VBCSR)
-        obj.graph = core_C.graph
-        obj.dtype = self.dtype
-        obj._core = core_C
-        obj.comm = self.comm
-        obj.shape = self.shape
-        obj._global_nnz = None
-        return obj
+        return self._wrap_core(core_C, self.dtype, self.comm, shape=self.shape)
 
     def extract_submatrix(self, global_indices: List[int]) -> 'VBCSR':
         """
@@ -615,21 +622,7 @@ class VBCSR(LinearOperator):
             VBCSR: A serial VBCSR matrix containing the submatrix.
         """
         core_sub = self._core.extract_submatrix(global_indices)
-        
-        obj = VBCSR.__new__(VBCSR)
-        obj.graph = core_sub.graph
-        obj.dtype = self.dtype
-        obj._core = core_sub
-        obj.comm = None # Extracted submatrix is serial/local
-        # Shape is (M, M) where M = len(global_indices)
-        # But let's let the core handle it or compute it.
-        # Since it's serial, we can compute it if needed, but for now (None, None) is safe or we can query graph.
-        # Actually, for serial submatrix, we might want to know the shape.
-        # The core binding doesn't expose block sizes easily unless we query graph.
-        # Let's leave as None for now or improve later.
-        obj.shape = (None, None)
-        obj._global_nnz = None
-        return obj
+        return self._wrap_core(core_sub, self.dtype, None)
 
     def insert_submatrix(self, submat: 'VBCSR', global_indices: List[int]) -> None:
         """
@@ -643,6 +636,7 @@ class VBCSR(LinearOperator):
             raise TypeError("submat must be a VBCSR matrix")
         
         self._core.insert_submatrix(submat._core, global_indices)
+        self._invalidate_nnz()
 
     def spmf(self, func_name: str, method: str = "lanczos", verbose: bool = False) -> 'VBCSR':
         """
@@ -657,15 +651,7 @@ class VBCSR(LinearOperator):
             VBCSR: The computed matrix function.
         """
         core_res = self._core.spmf(func_name, method, verbose)
-        
-        obj = VBCSR.__new__(VBCSR)
-        obj.graph = core_res.graph
-        obj.dtype = self.dtype
-        obj._core = core_res
-        obj.comm = self.comm
-        obj.shape = self.shape
-        obj._global_nnz = None
-        return obj
+        return self._wrap_core(core_res, self.dtype, self.comm, shape=self.shape)
 
     def to_dense(self) -> np.ndarray:
         """
@@ -684,109 +670,123 @@ class VBCSR(LinearOperator):
             data (np.ndarray): 2D array of shape (owned_rows, all_local_cols).
         """
         self._core.from_dense(data)
+        self._invalidate_nnz()
 
     @classmethod
-    def from_scipy(cls, spmat: Any) -> 'VBCSR':
+    def from_scipy(cls, spmat: Any, comm: Any = None, root: int = 0) -> 'VBCSR':
         """
         Create a VBCSR matrix from a SciPy sparse matrix.
         
         Args:
             spmat: SciPy sparse matrix (bsr_matrix, csr_matrix, etc.).
-                   Assumed to be on Rank 0 (or all ranks).
+                   In MPI mode, provide it on `root` and pass `None` on other ranks.
+            comm: Optional MPI communicator. If omitted, distributed usage is rejected.
+            root: Root rank that owns the SciPy input when `comm` is distributed.
                    
         Returns:
             VBCSR: The initialized matrix.
         """
         import scipy.sparse as sp
-        
-        # Ensure spmat is available (at least on rank 0)
-        # If passed as None on other ranks, we handle it.
-        
-        # Convert to BSR or CSR
-        # If it's BSR, we use its block structure.
-        # If not, we convert to CSR and treat as 1x1 blocks.
-        
-        global_blocks = 0
-        block_sizes = []
-        adj = []
-        
-        # Default to serial construction
-        
-        if spmat is not None:
+
+        rank = 0
+        size = 1
+        if comm is not None:
+            rank = comm.Get_rank()
+            size = comm.Get_size()
+        else:
+            world_graph = vbcsr_core.DistGraph(None)
+            if world_graph.size > 1:
+                raise ValueError(
+                    "from_scipy is ambiguous in MPI without an explicit communicator. "
+                    "Pass `comm` and call collectively with the SciPy matrix on the root rank only."
+                )
+
+        if size > 1:
+            if rank == root and spmat is None:
+                raise ValueError("from_scipy requires a SciPy matrix on the root rank.")
+            if rank != root and spmat is not None:
+                raise ValueError(
+                    "from_scipy expects `spmat=None` on non-root MPI ranks to avoid ambiguous replicated input."
+                )
+        elif spmat is None:
+            raise ValueError("from_scipy requires a SciPy sparse matrix in serial mode.")
+
+        root_dtype = None
+        if rank == root and spmat is not None:
+            if spmat.shape[0] != spmat.shape[1]:
+                raise ValueError("VBCSR.from_scipy requires a square sparse matrix.")
+            root_dtype = str(np.dtype(spmat.dtype))
+
+        if comm is not None and size > 1:
+            dtype = np.dtype(comm.bcast(root_dtype, root=root))
+        else:
+            dtype = np.dtype(root_dtype)
+
+        if rank == root and spmat is not None:
             if sp.isspmatrix_bsr(spmat):
-                # BSR Matrix
                 R, C = spmat.blocksize
                 if R != C:
                     raise ValueError("VBCSR requires square blocks (R == C) for BSR input.")
-                
+                if spmat.shape[0] % R != 0:
+                    raise ValueError("BSR input dimensions must be divisible by the block size.")
+
                 n_blocks = spmat.shape[0] // R
                 block_sizes = [R] * n_blocks
-                
-                # Adjacency
-                # spmat.indptr, spmat.indices
                 adj = []
                 for i in range(n_blocks):
                     start = spmat.indptr[i]
-                    end = spmat.indptr[i+1]
+                    end = spmat.indptr[i + 1]
                     adj.append(spmat.indices[start:end].tolist())
-                    
             else:
-                # Treat as CSR (1x1 blocks)
-                spmat_csr = spmat.tocsr()
-                n_blocks = spmat_csr.shape[0]
+                spmat = spmat.tocsr()
+                n_blocks = spmat.shape[0]
                 block_sizes = [1] * n_blocks
-                
                 adj = []
                 for i in range(n_blocks):
-                    start = spmat_csr.indptr[i]
-                    end = spmat_csr.indptr[i+1]
-                    adj.append(spmat_csr.indices[start:end].tolist())
+                    start = spmat.indptr[i]
+                    end = spmat.indptr[i + 1]
+                    adj.append(spmat.indices[start:end].tolist())
         else:
-            # Rank != 0 might pass None
             n_blocks = 0
             block_sizes = []
             adj = []
-        
-        # Create Matrix (Distributes structure)
-        # Note: create_serial expects global info on Rank 0.
-        # If spmat is None on other ranks, create_serial handles broadcasting if implemented correctly.
-        # But create_serial takes global_blocks, block_sizes, adj.
-        # If we pass 0/empty on other ranks, create_serial might fail if it expects consistency or only rank 0 to pass info.
-        # create_serial doc says "Rank 0 distributes". So Rank 0 must pass valid info. Others can pass None/Empty?
-        # Let's check create_serial implementation. It calls graph.construct_serial.
-        # construct_serial usually broadcasts from root.
-        mat = cls.create_serial(n_blocks, block_sizes, adj, spmat.dtype if spmat is not None else np.float64)
-        
-        # Fill Data
-        # We iterate over blocks on Rank 0 and add them.
-        # Since create_serial distributes ownership, Rank 0 might not own everything.
-        # But add_block handles remote owners (if implemented with MPI).
-        # However, sending every block individually is slow.
-        # Ideally we should scatter data.
-        # But for "adapter", correctness first.
-        
-        if sp.isspmatrix_bsr(spmat):
-            R, C = spmat.blocksize
-            for i in range(n_blocks):
-                start = spmat.indptr[i]
-                end = spmat.indptr[i+1]
-                for k in range(start, end):
-                    j = spmat.indices[k]
-                    data_blk = spmat.data[k] # Shape (R, C)
-                    mat.add_block(i, j, data_blk)
-        else:
-            spmat_csr = spmat.tocsr()
-            for i in range(n_blocks):
-                start = spmat_csr.indptr[i]
-                end = spmat_csr.indptr[i+1]
-                for k in range(start, end):
-                    j = spmat_csr.indices[k]
-                    val = spmat_csr.data[k]
-                    # 1x1 block
-                    mat.add_block(i, j, np.array([[val]], dtype=spmat.dtype))
-                        
+
+        mat = cls.create_serial(n_blocks, block_sizes, adj, dtype=dtype, comm=comm)
+
+        if rank == root and spmat is not None:
+            if sp.isspmatrix_bsr(spmat):
+                for i in range(n_blocks):
+                    start = spmat.indptr[i]
+                    end = spmat.indptr[i + 1]
+                    for k in range(start, end):
+                        j = spmat.indices[k]
+                        mat.add_block(i, j, spmat.data[k])
+            else:
+                spmat_csr = spmat.tocsr()
+                for i in range(n_blocks):
+                    start = spmat_csr.indptr[i]
+                    end = spmat_csr.indptr[i + 1]
+                    for k in range(start, end):
+                        j = spmat_csr.indices[k]
+                        val = spmat_csr.data[k]
+                        mat.add_block(i, j, np.array([[val]], dtype=dtype))
+
         mat.assemble()
         return mat
+
+    @property
+    def row_ptr(self) -> np.ndarray:
+        return np.asarray(self._core.row_ptr, dtype=np.int32)
+
+    @property
+    def col_ind(self) -> np.ndarray:
+        return np.asarray(self._core.col_ind, dtype=np.int32)
+
+    def get_values(self) -> np.ndarray:
+        return np.asarray(self._core.get_values(), dtype=self.dtype)
+
+    def save_matrix_market(self, filename: Union[str, bytes]) -> None:
+        self._core.save_matrix_market(str(filename))
 
     def to_scipy(self, format: Optional[str] = None) -> Any:
         """
@@ -805,8 +805,8 @@ class VBCSR(LinearOperator):
         values = np.asarray(self._core.get_values(), dtype=self.dtype) # 1D array
         
         # 2. Get Structure
-        row_ptr = np.asarray(self._core.row_ptr, dtype=np.int32)
-        col_ind = np.asarray(self._core.col_ind, dtype=np.int32)
+        row_ptr = self.row_ptr
+        col_ind = self.col_ind
         
         # 3. Check Uniformity
         block_sizes = self.graph.block_sizes

@@ -3,6 +3,7 @@
 
 #include "bsr_kernels.hpp"
 #include "bsr_result_builder.hpp"
+#include "distributed_plans.hpp"
 #include "distributed_result_graph.hpp"
 #include "spmm_exchange.hpp"
 
@@ -23,44 +24,20 @@ struct BSRSpMMExecutor {
             throw std::runtime_error("BSR SpMM requires matching uniform block sizes");
         }
 
-        auto meta = A.exchange_ghost_metadata(B);
+        auto metadata_plan = RowMetadataExchangePlan<Matrix, Matrix>::build(A, B);
+        auto sym = symbolic_multiply_filtered(A, B, metadata_plan.metadata(), threshold);
+        auto payload_plan = BlockPayloadExchangePlan<Matrix>::fetch_required(B, sym.required_blocks);
+        auto assembly_plan = ResultAssemblyPlan<Matrix>::for_spmm(
+            A,
+            sym,
+            metadata_plan.metadata(),
+            std::move(payload_plan));
 
         const auto& A_norms = A.get_block_norms();
         const auto& B_local_norms = B.get_block_norms();
 
-        auto sym = A.symbolic_multiply_filtered(B, meta, threshold);
-        auto [ghost_data_map, ghost_sizes] = B.fetch_ghost_blocks(sym.required_blocks);
-
-        std::map<int, std::vector<GhostBlockRef<T>>> ghost_rows;
-        for (const auto& [bid, data] : ghost_data_map) {
-            double norm = 0.0;
-            auto meta_it = meta.find(bid.row);
-            if (meta_it != meta.end()) {
-                for (const auto& block_meta : meta_it->second) {
-                    if (block_meta.col == bid.col) {
-                        norm = block_meta.norm;
-                        break;
-                    }
-                }
-            }
-            ghost_rows[bid.row].push_back({bid.col, data.data(), ghost_sizes.at(bid.col), norm});
-        }
-
-        std::vector<std::vector<int>> adj(A.graph->owned_global_indices.size());
         const int n_rows = static_cast<int>(A.row_ptr.size()) - 1;
-        for (int row = 0; row < n_rows; ++row) {
-            for (int slot = sym.c_row_ptr[row]; slot < sym.c_row_ptr[row + 1]; ++slot) {
-                adj[row].push_back(sym.c_col_ind[slot]);
-            }
-        }
-
-        DistGraph* c_graph = construct_result_graph(
-            A.graph->comm,
-            A.graph->owned_global_indices,
-            owned_block_sizes(*A.graph),
-            adj,
-            ghost_sizes,
-            "spmm");
+        DistGraph* c_graph = assembly_plan.construct_result_graph(A, "spmm");
 
         BSRResultBuilder<T> builder(c_graph);
         const int block_size = builder.block_size();
@@ -125,8 +102,8 @@ struct BSRSpMMExecutor {
                             block_size);
                     }
                 } else {
-                    auto ghost_it = ghost_rows.find(global_inner);
-                    if (ghost_it == ghost_rows.end()) {
+                    auto ghost_it = assembly_plan.ghost_rows().find(global_inner);
+                    if (ghost_it == assembly_plan.ghost_rows().end()) {
                         continue;
                     }
                     for (const auto& block : ghost_it->second) {

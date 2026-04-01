@@ -1,13 +1,21 @@
-#ifndef VBCSR_DETAIL_LEGACY_SPMM_HPP
-#define VBCSR_DETAIL_LEGACY_SPMM_HPP
+#ifndef VBCSR_DETAIL_VBCSR_SPMM_HPP
+#define VBCSR_DETAIL_VBCSR_SPMM_HPP
+
+#include "distributed_plans.hpp"
+#include "vbcsr_result_builder.hpp"
 
 #include <map>
+#include <tuple>
 #include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace detail {
 
 template <typename Matrix>
-struct LegacySpMMExecutor {
+struct VBCSRSpMMExecutor {
     using T = typename Matrix::value_type;
     using Kernel = typename Matrix::KernelType;
     using GhostBlockRef = typename Matrix::GhostBlockRef;
@@ -19,54 +27,42 @@ private:
         int tag;
     };
 
-public:
+    struct ProductBatchKey {
+        int row_dim = 0;
+        int inner_dim = 0;
+        int col_dim = 0;
 
+        bool operator<(const ProductBatchKey& other) const {
+            return std::tie(row_dim, inner_dim, col_dim) <
+                   std::tie(other.row_dim, other.inner_dim, other.col_dim);
+        }
+    };
+
+    struct ProductTask {
+        const T* a_ptr = nullptr;
+        const T* b_ptr = nullptr;
+        T* c_ptr = nullptr;
+    };
+
+public:
     static Matrix run(const Matrix& A, const Matrix& B, double threshold) {
-        auto meta = A.exchange_ghost_metadata(B);
+        auto metadata_plan = RowMetadataExchangePlan<Matrix, Matrix>::build(A, B);
+        auto sym = symbolic_multiply_filtered(A, B, metadata_plan.metadata(), threshold);
+        auto payload_plan = BlockPayloadExchangePlan<Matrix>::fetch_required(B, sym.required_blocks);
+        auto assembly_plan = ResultAssemblyPlan<Matrix>::for_spmm(
+            A,
+            sym,
+            metadata_plan.metadata(),
+            std::move(payload_plan));
 
         const auto& A_norms = A.get_block_norms();
         const auto& B_local_norms = B.get_block_norms();
 
-        auto sym = A.symbolic_multiply_filtered(B, meta, threshold);
-        auto [ghost_data_map, ghost_sizes] = B.fetch_ghost_blocks(sym.required_blocks);
+        DistGraph* c_graph = assembly_plan.construct_result_graph(A, "spmm");
+        VBCSRResultBuilder<T, Kernel> builder(c_graph);
+        Matrix C = Matrix::from_vbcsr_builder(c_graph, true, std::move(builder));
 
-        std::map<int, std::vector<GhostBlockRef>> ghost_rows;
-        for (const auto& [bid, data] : ghost_data_map) {
-            const int c_dim = ghost_sizes.at(bid.col);
-
-            double norm = 0.0;
-            if (meta.count(bid.row)) {
-                for (const auto& m : meta.at(bid.row)) {
-                    if (m.col == bid.col) {
-                        norm = m.norm;
-                        break;
-                    }
-                }
-            }
-
-            ghost_rows[bid.row].push_back({bid.col, data.data(), c_dim, norm});
-        }
-
-        std::vector<std::vector<int>> adj(A.graph->owned_global_indices.size());
-        const int n_rows = static_cast<int>(A.row_ptr.size()) - 1;
-        for (int row = 0; row < n_rows; ++row) {
-            for (int slot = sym.c_row_ptr[row]; slot < sym.c_row_ptr[row + 1]; ++slot) {
-                adj[row].push_back(sym.c_col_ind[slot]);
-            }
-        }
-
-        DistGraph* c_graph = construct_result_graph(
-            A.graph->comm,
-            A.graph->owned_global_indices,
-            owned_block_sizes(*A.graph),
-            adj,
-            ghost_sizes,
-            "spmm");
-
-        LegacyMatrixBuilder<T, Kernel> builder(c_graph, true);
-        Matrix C = builder.materialize();
-
-        numeric_multiply(A, B, ghost_rows, C, threshold, A_norms, B_local_norms);
+        numeric_multiply(A, B, assembly_plan.ghost_rows(), C, threshold, A_norms, B_local_norms);
         C.filter_blocks(threshold);
         return C;
     }
@@ -91,6 +87,7 @@ private:
         double threshold,
         const std::vector<double>& A_norms,
         const std::vector<double>& B_local_norms) {
+        using ExecutionKind = typename Matrix::VBCSRBackendStorage::ExecutionKind;
         const int n_rows = static_cast<int>(A.row_ptr.size()) - 1;
 
         const int max_threads = omp_get_max_threads();
@@ -107,6 +104,7 @@ private:
             const int tid = omp_get_thread_num();
             auto& table = thread_tables[tid];
             int& tag = thread_tags[tid];
+            std::map<ProductBatchKey, std::vector<ProductTask>> product_batches;
 
             #pragma omp for
             for (int row = 0; row < n_rows; ++row) {
@@ -129,7 +127,7 @@ private:
                     while (table[h].tag == tag) {
                         h = (h + 1) & HASH_MASK;
                         if (++count > HASH_SIZE) {
-                            throw std::runtime_error("Hash table is full during SpMM population");
+                            throw std::runtime_error("Hash table is full during VBCSR SpMM population");
                         }
                     }
                     table[h] = {global_col, slot, tag};
@@ -171,19 +169,8 @@ private:
                                 HASH_SIZE,
                                 global_col_B,
                                 [&](int c_slot) {
-                                    T* c_val = C.mutable_block_data(c_slot);
-                                    SmartKernel<T>::gemm(
-                                        r_dim,
-                                        c_dim,
-                                        inner_dim,
-                                        T(1),
-                                        a_val,
-                                        r_dim,
-                                        b_val,
-                                        inner_dim,
-                                        T(1),
-                                        c_val,
-                                        r_dim);
+                                    product_batches[ProductBatchKey{r_dim, inner_dim, c_dim}].push_back(
+                                        ProductTask{a_val, b_val, C.mutable_block_data(c_slot)});
                                 },
                                 "local");
                         }
@@ -204,23 +191,30 @@ private:
                                 HASH_SIZE,
                                 block.col,
                                 [&](int c_slot) {
-                                    T* c_val = C.mutable_block_data(c_slot);
-                                    SmartKernel<T>::gemm(
-                                        r_dim,
-                                        block.c_dim,
-                                        inner_dim,
-                                        T(1),
-                                        a_val,
-                                        r_dim,
-                                        block.data,
-                                        inner_dim,
-                                        T(1),
-                                        c_val,
-                                        r_dim);
+                                    product_batches[ProductBatchKey{r_dim, inner_dim, block.c_dim}].push_back(
+                                        ProductTask{a_val, block.data, C.mutable_block_data(c_slot)});
                                 },
                                 "ghost");
                         }
                     }
+                }
+            }
+
+            for (auto& [key, tasks] : product_batches) {
+                A.active_vbcsr_backend().record_spmm_batch(
+                    key.row_dim,
+                    key.inner_dim,
+                    key.col_dim,
+                    tasks.size());
+                switch (A.active_vbcsr_backend().execution_kind_for_spmm_triple(
+                    key.row_dim,
+                    key.inner_dim,
+                    key.col_dim)) {
+                    case ExecutionKind::StaticFallback:
+                    case ExecutionKind::BatchedFallback:
+                    case ExecutionKind::JIT:
+                        run_product_batch(key, tasks);
+                        break;
                 }
             }
         }
@@ -245,12 +239,29 @@ private:
             h = (h + 1) & hash_mask;
             if (++count > hash_size) {
                 throw std::runtime_error(
-                    std::string("Hash table infinite loop detected during SpMM numeric phase (") + phase + ")");
+                    std::string("Hash table infinite loop detected during VBCSR SpMM numeric phase (") + phase + ")");
             }
+        }
+    }
+
+    static void run_product_batch(const ProductBatchKey& key, const std::vector<ProductTask>& tasks) {
+        for (const auto& task : tasks) {
+            SmartKernel<T>::gemm(
+                key.row_dim,
+                key.col_dim,
+                key.inner_dim,
+                T(1),
+                task.a_ptr,
+                key.row_dim,
+                task.b_ptr,
+                key.inner_dim,
+                T(1),
+                task.c_ptr,
+                key.row_dim);
         }
     }
 };
 
 } // namespace detail
 
-#endif // VBCSR_DETAIL_LEGACY_SPMM_HPP
+#endif // VBCSR_DETAIL_VBCSR_SPMM_HPP

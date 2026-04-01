@@ -13,26 +13,23 @@ namespace vbcsr::detail {
 template <typename T>
 class CSRResultBuilder {
 public:
-    explicit CSRResultBuilder(DistGraph* graph) : graph_(graph) {
+    explicit CSRResultBuilder(DistGraph* graph, uint32_t nnz_per_page = 0) : graph_(graph) {
         if (graph_ == nullptr) {
             return;
         }
-
-        const size_t nnz = graph_->adj_ind.size();
-        blk_handles_.resize(nnz);
-        blk_sizes_.assign(nnz, 1);
-        arena_.reserve(nnz);
-        for (size_t slot = 0; slot < nnz; ++slot) {
-            blk_handles_[slot] = arena_.allocate(1);
-        }
+        backend_.initialize_structure(graph_->adj_ind, nnz_per_page);
     }
 
-    T* slot_data(int slot) {
-        return arena_.get_ptr(blk_handles_[slot]);
+    T* mutable_block(int slot) {
+        return backend_.value_ptr(slot);
     }
 
-    const T* slot_data(int slot) const {
-        return arena_.get_ptr(blk_handles_[slot]);
+    const T* mutable_block(int slot) const {
+        return backend_.value_ptr(slot);
+    }
+
+    void accumulate_block(int slot, const T* src, T alpha = T(1)) {
+        *backend_.value_ptr(slot) += alpha * (*src);
     }
 
     int find_slot(int local_row, int local_col) const {
@@ -47,19 +44,25 @@ public:
         return static_cast<int>(std::distance(graph_->adj_ind.begin(), it));
     }
 
+    CSRMatrixBackend<T> commit() && {
+        return std::move(backend_);
+    }
+
+    T* slot_data(int slot) {
+        return mutable_block(slot);
+    }
+
+    const T* slot_data(int slot) const {
+        return mutable_block(slot);
+    }
+
     CSRMatrixBackend<T> commit_backend() && {
-        CSRMatrixBackend<T> backend;
-        backend.blk_handles = std::move(blk_handles_);
-        backend.blk_sizes = std::move(blk_sizes_);
-        backend.arena = std::move(arena_);
-        return backend;
+        return std::move(*this).commit();
     }
 
 private:
     DistGraph* graph_ = nullptr;
-    std::vector<uint64_t> blk_handles_;
-    std::vector<size_t> blk_sizes_;
-    BlockArena<T> arena_;
+    CSRMatrixBackend<T> backend_;
 };
 
 } // namespace vbcsr::detail

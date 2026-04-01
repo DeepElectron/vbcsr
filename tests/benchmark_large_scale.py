@@ -1,43 +1,167 @@
+import argparse
+import json
+import os
+import shlex
+import subprocess
+import sys
 import time
+
 import numpy as np
+import scipy.sparse
+import _workspace_bootstrap
 import vbcsr
+import vbcsr_core
+
 try:
     from mpi4py import MPI
 except ImportError:
     MPI = None
-import argparse
-import scipy.sparse
 
-def generate_random_structure(global_blocks, block_size_min, block_size_max, density, seed=42):
-    np.random.seed(seed)
-    block_sizes = np.random.randint(block_size_min, block_size_max + 1, size=global_blocks).tolist()
-    
+
+PRESET_PROFILES = {
+    "small": {"blocks": 32, "density": 0.15, "num_vecs": 4},
+    "medium": {"blocks": 192, "density": 0.04, "num_vecs": 16},
+}
+
+VBCSR_SHAPES = np.array([9, 13, 15, 20], dtype=np.int32)
+
+MODE_ALIASES = {
+    "mult": "mult",
+    "spmv": "mult",
+    "mult_dense": "mult_dense",
+    "spmm": "spmm",
+    "spgemm": "spmm",
+}
+
+
+def try_get_git_commit() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+def apply_profile_defaults(args: argparse.Namespace) -> None:
+    if args.profile == "custom":
+        args.blocks = 1000 if args.blocks is None else args.blocks
+        args.density = 0.01 if args.density is None else args.density
+        args.num_vecs = 32 if args.num_vecs is None else args.num_vecs
+    else:
+        defaults = PRESET_PROFILES[args.profile]
+        args.blocks = defaults["blocks"] if args.blocks is None else args.blocks
+        args.density = defaults["density"] if args.density is None else args.density
+        args.num_vecs = defaults["num_vecs"] if args.num_vecs is None else args.num_vecs
+
+    if args.family == "csr":
+        args.min_block = 1
+        args.max_block = 1
+    elif args.family == "bsr":
+        args.min_block = 8
+        args.max_block = 8
+    elif args.family == "vbcsr":
+        args.min_block = int(VBCSR_SHAPES.min())
+        args.max_block = int(VBCSR_SHAPES.max())
+    else:
+        args.min_block = 10 if args.min_block is None else args.min_block
+        args.max_block = 50 if args.max_block is None else args.max_block
+
+
+def normalize_mode(mode: str) -> str:
+    try:
+        return MODE_ALIASES[mode]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported benchmark mode: {mode}") from exc
+
+
+def generate_block_sizes(global_blocks: int, family: str, block_size_min: int, block_size_max: int, seed: int = 42) -> list[int]:
+    rng = np.random.default_rng(seed)
+    if family == "csr":
+        return [1] * global_blocks
+    if family == "bsr":
+        return [8] * global_blocks
+    if family == "vbcsr":
+        return rng.choice(VBCSR_SHAPES, size=global_blocks, replace=True).astype(int).tolist()
+    return rng.integers(block_size_min, block_size_max + 1, size=global_blocks).astype(int).tolist()
+
+
+def generate_random_structure(global_blocks: int, block_sizes: list[int], density: float, seed: int = 42) -> tuple[list[int], list[list[int]]]:
+    rng = np.random.default_rng(seed)
     adj = []
     for i in range(global_blocks):
-        neighbors = set()
-        neighbors.add((i - 1) % global_blocks)
-        neighbors.add((i + 1) % global_blocks)
-        neighbors.add(i)
-        
+        neighbors = {(i - 1) % global_blocks, i, (i + 1) % global_blocks}
         n_random = max(0, int(global_blocks * density) - 2)
         if n_random > 0:
-            random_neighbors = np.random.choice(global_blocks, size=n_random, replace=False)
-            neighbors.update(random_neighbors)
-        adj.append(sorted(list(neighbors)))
+            random_neighbors = rng.choice(global_blocks, size=min(n_random, global_blocks), replace=False)
+            neighbors.update(int(idx) for idx in random_neighbors)
+        adj.append(sorted(neighbors))
     return block_sizes, adj
 
+
+def make_snapshot(args: argparse.Namespace, rank_count: int, dtype: np.dtype, mat, timings: dict[str, float], extra: dict[str, object]) -> dict[str, object]:
+    snapshot = {
+        "preset": args.label or f"{args.family}:{args.profile}",
+        "family": args.family,
+        "profile": args.profile,
+        "mode": args.mode,
+        "env": os.environ.get("CONDA_DEFAULT_ENV", "unknown"),
+        "git_commit": try_get_git_commit(),
+        "command": shlex.join(sys.argv),
+        "python": sys.executable,
+        "vbcsr_core": getattr(vbcsr_core, "__file__", "unknown"),
+        "rank_count": rank_count,
+        "dtype": str(dtype),
+        "matrix_kind": mat.matrix_kind,
+        "structure": {
+            "blocks": args.blocks,
+            "density": args.density,
+            "min_block": args.min_block,
+            "max_block": args.max_block,
+            "unique_block_sizes": sorted({int(size) for size in mat.graph.block_sizes}),
+        },
+        "timings": timings,
+    }
+    snapshot.update(extra)
+    return snapshot
+
+
+def write_snapshot(path: str, snapshot: dict[str, object]) -> None:
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(snapshot, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="VBCSR Large Scale Benchmark")
-    parser.add_argument("--blocks", type=int, default=1000, help="Total number of blocks")
-    parser.add_argument("--min-block", type=int, default=10, help="Min block size")
-    parser.add_argument("--max-block", type=int, default=50, help="Max block size")
-    parser.add_argument("--density", type=float, default=0.01, help="Sparsity density")
+    parser = argparse.ArgumentParser(description="VBCSR phase 0 benchmark and baseline runner")
+    parser.add_argument("--family", type=str, default="random", choices=["random", "csr", "bsr", "vbcsr"], help="Matrix family preset")
+    parser.add_argument("--profile", type=str, default="custom", choices=["custom", "small", "medium"], help="Preset profile")
+    parser.add_argument("--label", type=str, default=None, help="Optional snapshot label override")
+    parser.add_argument("--snapshot-out", type=str, default=None, help="Write a JSON snapshot to this path")
+    parser.add_argument("--blocks", type=int, default=None, help="Total number of blocks")
+    parser.add_argument("--min-block", type=int, default=None, help="Min block size")
+    parser.add_argument("--max-block", type=int, default=None, help="Max block size")
+    parser.add_argument("--density", type=float, default=None, help="Sparsity density")
     parser.add_argument("--complex", action="store_true", help="Use complex numbers")
-    parser.add_argument("--scipy", action="store_true", help="Compare with SciPy (Serial only)")
-    parser.add_argument("--mkl", action="store_true", help="Compare with MKL (Serial only)")
-    parser.add_argument("--mode", type=str, default="spmv", choices=["spmv", "spmm", "spgemm"], help="Benchmark mode")
-    parser.add_argument("--num-vecs", type=int, default=32, help="Number of vectors for SpMM (K)")
+    parser.add_argument("--scipy", action="store_true", help="Compare with SciPy (serial only)")
+    parser.add_argument("--mkl", action="store_true", help="Compare with MKL (serial only)")
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="mult",
+        choices=sorted(MODE_ALIASES),
+        help="Benchmark mode (`mult`, `mult_dense`, `spmm`) plus legacy aliases",
+    )
+    parser.add_argument("--num-vecs", type=int, default=None, help="Number of vectors for mult_dense")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--min-seconds", type=float, default=1.0, help="Minimum benchmark loop duration")
+    parser.add_argument("--min-iterations", type=int, default=5, help="Minimum benchmark iterations")
     args = parser.parse_args()
+
+    apply_profile_defaults(args)
+    args.mode = normalize_mode(args.mode)
 
     if args.mkl:
         try:
@@ -45,6 +169,8 @@ def main():
         except ImportError:
             print("Error: sparse_dot_mkl not found. Please install it to use --mkl.")
             return
+    else:
+        sparse_dot_mkl = None
 
     if MPI is not None:
         comm = MPI.COMM_WORLD
@@ -54,27 +180,25 @@ def main():
         comm = None
         rank = 0
         size = 1
-    
+
     dtype = np.complex128 if args.complex else np.float64
-    
+
     if rank == 0:
-        print(f"=== VBCSR Benchmark ===")
+        print("=== VBCSR Benchmark ===")
+        print(f"Preset: {args.label or f'{args.family}:{args.profile}'}")
         print(f"Mode: {args.mode}")
         print(f"Ranks: {size}")
         print(f"Blocks: {args.blocks}")
         print(f"Block Size Range: [{args.min_block}, {args.max_block}]")
         print(f"Density: {args.density}")
         print(f"Dtype: {dtype}")
-        if args.mode == "spmm":
+        if args.mode == "mult_dense":
             print(f"Num Vecs: {args.num_vecs}")
         print("Generating structure...", flush=True)
 
-    # Generate structure on rank 0 and broadcast (or just replicate for simplicity)
-    # For true large scale, we should distribute generation, but for comparison we need exact match.
-    # Replicating generation is easiest for now.
-    block_sizes, adj = generate_random_structure(args.blocks, args.min_block, args.max_block, args.density)
-    
-    # Partition for VBCSR
+    block_sizes = generate_block_sizes(args.blocks, args.family, args.min_block, args.max_block, seed=args.seed)
+    _, adj = generate_random_structure(args.blocks, block_sizes, args.density, seed=args.seed)
+
     blocks_per_rank = args.blocks // size
     remainder = args.blocks % size
     start_block = rank * blocks_per_rank + min(rank, remainder)
@@ -84,138 +208,124 @@ def main():
     my_block_sizes = block_sizes[start_block:end_block]
     my_adj = adj[start_block:end_block]
 
-    # Build VBCSR
     if rank == 0:
         print("Building VBCSR...", flush=True)
-    
-    t0 = time.time()
+
+    t0 = time.perf_counter()
     mat = vbcsr.VBCSR.create_distributed(
-        owned_indices=owned_indices, 
-        block_sizes=my_block_sizes, 
-        adjacency=my_adj, 
-        dtype=dtype, 
-        comm=comm
+        owned_indices=owned_indices,
+        block_sizes=my_block_sizes,
+        adjacency=my_adj,
+        dtype=dtype,
+        comm=comm,
     )
-    
-    # Generate data and fill
-    # We also collect data for SciPy/MKL if needed
+
     scipy_rows = []
     scipy_cols = []
     scipy_data = []
-    
-    # Pre-calculate offsets for SciPy/MKL
+
     if (args.scipy or args.mkl) and rank == 0:
         row_offsets = np.zeros(args.blocks + 1, dtype=int)
         np.cumsum(block_sizes, out=row_offsets[1:])
-    
-    np.random.seed(42 + rank) # Different seed per rank for data
-    
+
+    rng = np.random.default_rng(args.seed + rank)
     for local_i, global_i in enumerate(owned_indices):
         r_dim = my_block_sizes[local_i]
         neighbors = my_adj[local_i]
-        
-        # Row offset for this block
-        r_start = 0
-        if args.scipy or args.mkl:
-            # This is slow for distributed, but we assume --scipy/--mkl is used mostly in serial
-            # or we only collect on rank 0. 
-            # Actually, constructing SciPy matrix in parallel is hard.
-            # We will only support SciPy/MKL comparison in serial (size=1).
-            if size == 1:
-                r_start = row_offsets[global_i]
+        r_start = row_offsets[global_i] if (args.scipy or args.mkl) and size == 1 else 0
 
         for global_j in neighbors:
             c_dim = block_sizes[global_j]
             if dtype == np.float64:
-                data = np.random.rand(r_dim, c_dim)
+                data = rng.random((r_dim, c_dim))
             else:
-                data = np.random.rand(r_dim, c_dim) + 1j * np.random.rand(r_dim, c_dim)
-            
+                data = rng.random((r_dim, c_dim)) + 1j * rng.random((r_dim, c_dim))
+
             mat.add_block(global_i, global_j, data)
-            
+
             if (args.scipy or args.mkl) and size == 1:
                 c_start = row_offsets[global_j]
-                # Expand block to COO
-                # This is heavy loop in python, might be slow for generation
-                # Optimize: create meshgrid
                 r_idx, c_idx = np.indices((r_dim, c_dim))
-                scipy_rows.append((r_idx + r_start).flatten())
-                scipy_cols.append((c_idx + c_start).flatten())
-                scipy_data.append(data.flatten())
+                scipy_rows.append((r_idx + r_start).ravel())
+                scipy_cols.append((c_idx + c_start).ravel())
+                scipy_data.append(data.ravel())
 
     mat.assemble()
-    comm.Barrier()
-    t_gen = time.time() - t0
-    
+    if comm is not None:
+        comm.Barrier()
+    t_gen = time.perf_counter() - t0
+
     if rank == 0:
         print(f"VBCSR Generation Time: {t_gen:.4f} s")
         print(f"Matrix Shape: {mat.shape}")
+        print(f"Matrix Kind: {mat.matrix_kind}")
 
-    # Prepare Inputs
     x_vbcsr = None
+    y_vbcsr = None
     x_np = None
-    
-    if args.mode == "spmv":
+    if args.mode == "mult":
         x_vbcsr = mat.create_vector()
+        y_vbcsr = mat.create_vector()
         x_vbcsr.set_constant(1.0)
         x_np = x_vbcsr.to_numpy() if size == 1 else None
-    elif args.mode == "spmm":
+    elif args.mode == "mult_dense":
         x_vbcsr = mat.create_multivector(args.num_vecs)
-        x_vbcsr.set_constant(1.0) # Actually sets all to 1.0
-        # Randomize content
+        y_vbcsr = mat.create_multivector(args.num_vecs)
+        x_vbcsr.set_constant(1.0)
         if dtype == np.float64:
-            x_local_data = np.random.rand(x_vbcsr.local_rows, args.num_vecs)
+            x_local_data = rng.random((x_vbcsr.local_rows, args.num_vecs))
         else:
-            x_local_data = np.random.rand(x_vbcsr.local_rows, args.num_vecs) + 1j * np.random.rand(x_vbcsr.local_rows, args.num_vecs)
+            x_local_data = rng.random((x_vbcsr.local_rows, args.num_vecs)) + 1j * rng.random((x_vbcsr.local_rows, args.num_vecs))
         x_vbcsr.from_numpy(x_local_data)
-        x_np = x_vbcsr.to_numpy() if size == 1 else None # Full dense matrix
+        x_np = x_vbcsr.to_numpy() if size == 1 else None
     elif args.mode == "spgemm":
-        # For SpGEMM, let's just square the matrix: A * A
-        # Or A * A.T
-        x_vbcsr = mat # B = A
-        # For SciPy, we need the matrix itself
-        pass
+        x_vbcsr = mat
 
-    # Function to run benchmark loop
     def benchmark_op(op_func, name):
         if rank == 0:
             print(f"Benchmarking {name}...", flush=True)
-            
-        comm.Barrier()
-        # Warmup
+        if comm is not None:
+            comm.Barrier()
         op_func()
-        comm.Barrier()
-        
+        if comm is not None:
+            comm.Barrier()
+
         t_start = time.perf_counter()
         n_iter = 0
-        while time.perf_counter() - t_start < 1.0 or n_iter < 5:
+        while True:
             op_func()
             n_iter += 1
-        comm.Barrier()
-        t_avg = (time.perf_counter() - t_start) / n_iter
-        
+            local_elapsed = time.perf_counter() - t_start
+            keep_going = local_elapsed < args.min_seconds or n_iter < args.min_iterations
+            if comm is not None:
+                keep_going = bool(comm.allreduce(int(keep_going), op=MPI.MAX))
+            if not keep_going:
+                break
+        if comm is not None:
+            comm.Barrier()
+            total_elapsed = comm.allreduce(time.perf_counter() - t_start, op=MPI.MAX)
+        else:
+            total_elapsed = time.perf_counter() - t_start
+        t_avg = total_elapsed / n_iter
         if rank == 0:
             print(f"{name} Average Time: {t_avg:.6f} s ({n_iter} iterations)")
         return t_avg
 
-    # 1. VBCSR Benchmark
-    t_vbcsr = 0.0
-    if args.mode == "spmv":
-        t_vbcsr = benchmark_op(lambda: mat.mult(x_vbcsr), "VBCSR SpMV")
-    elif args.mode == "spmm":
-        t_vbcsr = benchmark_op(lambda: mat.mult(x_vbcsr), "VBCSR SpMM")
-    elif args.mode == "spgemm":
-        # spmm_self computes A * A if transA=False. 
-        # Actually spmm_self might compute A * A^T or A^T * A. Check matrix.py
-        # matrix.py: spmm_self(threshold, transA) -> C
-        # If transA=False, it computes A * A? (Need to check doc/implementation)
-        # Using general spmm: A.spmm(A)
-        t_vbcsr = benchmark_op(lambda: mat.spmm(mat), "VBCSR SpGEMM")
+    timings: dict[str, float] = {"generation": t_gen}
+    comparisons: dict[str, object] = {}
 
-    # 2. SciPy/MKL Comparison (Serial Only)
+    if args.mode == "mult":
+        t_vbcsr = benchmark_op(lambda: mat.mult(x_vbcsr, y_vbcsr), "VBCSR Mult")
+    elif args.mode == "mult_dense":
+        t_vbcsr = benchmark_op(lambda: mat.mult(x_vbcsr, y_vbcsr), "VBCSR MultDense")
+    else:
+        t_vbcsr = benchmark_op(lambda: mat.spmm(mat), "VBCSR SpMM")
+    timings["vbcsr"] = t_vbcsr
+
     sp_mat = None
     if (args.scipy or args.mkl) and size == 1:
-        print("Building SciPy CSR...", flush=True)
+        if rank == 0:
+            print("Building SciPy CSR...", flush=True)
         t0 = time.perf_counter()
         if scipy_rows:
             all_rows = np.concatenate(scipy_rows)
@@ -224,75 +334,67 @@ def main():
             sp_mat = scipy.sparse.csr_matrix((all_data, (all_rows, all_cols)), shape=mat.shape)
         else:
             sp_mat = scipy.sparse.csr_matrix(mat.shape, dtype=dtype)
-        print(f"SciPy Generation Time: {time.perf_counter() - t0:.4f} s")
+        timings["scipy_build"] = time.perf_counter() - t0
+        if rank == 0:
+            print(f"SciPy Generation Time: {timings['scipy_build']:.4f} s")
 
-    if args.scipy and size == 1:
-        if args.mode == "spmv":
-            t_scipy = benchmark_op(lambda: sp_mat.dot(x_np), "SciPy SpMV")
-        elif args.mode == "spmm":
-             t_scipy = benchmark_op(lambda: sp_mat.dot(x_np), "SciPy SpMM")
-        elif args.mode == "spgemm":
-             t_scipy = benchmark_op(lambda: sp_mat.dot(sp_mat), "SciPy SpGEMM")
-        
-        print(f"Speedup (SciPy / VBCSR): {t_scipy / t_vbcsr:.2f}x")
+    if args.scipy and size == 1 and sp_mat is not None:
+        if args.mode == "mult":
+            t_scipy = benchmark_op(lambda: sp_mat.dot(x_np), "SciPy Mult")
+        elif args.mode == "mult_dense":
+            t_scipy = benchmark_op(lambda: sp_mat.dot(x_np), "SciPy MultDense")
+        else:
+            t_scipy = benchmark_op(lambda: sp_mat.dot(sp_mat), "SciPy SpMM")
+        timings["scipy"] = t_scipy
+        comparisons["scipy_speedup"] = t_scipy / t_vbcsr
+        if rank == 0:
+            print(f"Speedup (SciPy / VBCSR): {comparisons['scipy_speedup']:.2f}x")
 
-    if args.mkl and size == 1:
-        # Check MKL support for SpMM/SpGEMM
-        # sparse_dot_mkl mainly supports SpMV (dot_product_mkl) and SpGEMM (gram_matrix_mkl for A^T*A, or dot_product_mkl with sparse B?)
-        # dot_product_mkl(matrix_a, matrix_b, ...)
-        # If matrix_b is dense, it's SpMM.
-        # If matrix_b is sparse, it's SpGEMM.
-        
-        op_mkl = None
-        if args.mode == "spmv":
+    if args.mkl and size == 1 and sp_mat is not None and sparse_dot_mkl is not None:
+        if args.mode == "mult":
             op_mkl = lambda: sparse_dot_mkl.dot_product_mkl(sp_mat, x_np)
-            t_mkl = benchmark_op(op_mkl, "MKL SpMV")
-        elif args.mode == "spmm":
-            # Check if sparse_dot_mkl supports dense matrix B
-            # It usually does.
-            try:
-                # sparse_dot_mkl might need F-contiguous dense matrix or specific layout
-                # Force F-contiguous to avoid MKL looping over columns
-                x_np_mkl = np.asfortranarray(x_np)
-                op_mkl = lambda: sparse_dot_mkl.dot_product_mkl(sp_mat, x_np_mkl)
-                t_mkl = benchmark_op(op_mkl, "MKL SpMM")
-            except Exception as e:
-                print(f"MKL SpMM failed or not supported: {e}")
-                t_mkl = float('inf')
-        elif args.mode == "spgemm":
-            try:
-                op_mkl = lambda: sparse_dot_mkl.dot_product_mkl(sp_mat, sp_mat)
-                t_mkl = benchmark_op(op_mkl, "MKL SpGEMM")
-            except Exception as e:
-                print(f"MKL SpGEMM failed: {e}")
-                t_mkl = float('inf')
+        elif args.mode == "mult_dense":
+            x_np_mkl = np.asfortranarray(x_np)
+            op_mkl = lambda: sparse_dot_mkl.dot_product_mkl(sp_mat, x_np_mkl)
+        else:
+            op_mkl = lambda: sparse_dot_mkl.dot_product_mkl(sp_mat, sp_mat)
 
-        if t_mkl != float('inf'):
-            print(f"Speedup (MKL / VBCSR): {t_mkl / t_vbcsr:.2f}x")
-            if args.mode == 'spmm' and (t_mkl / t_vbcsr > 10.0):
-                 print(f"Note: High speedup might indicate MKL bottleneck (e.g. layout or looping).")
-            
-    # Correctness Check
-    if (args.scipy) and size == 1:
-        print("Verifying correctness...", flush=True)
-        res_vbcsr = None
-        res_scipy = None
-        
-        if args.mode == "spmv":
-            res_vbcsr = mat.mult(x_vbcsr).to_numpy()
+        try:
+            t_mkl = benchmark_op(op_mkl, f"MKL {args.mode}")
+            timings["mkl"] = t_mkl
+            comparisons["mkl_speedup"] = t_mkl / t_vbcsr
+            if rank == 0:
+                print(f"Speedup (MKL / VBCSR): {comparisons['mkl_speedup']:.2f}x")
+        except Exception as exc:
+            comparisons["mkl_error"] = str(exc)
+            if rank == 0:
+                print(f"MKL benchmark failed: {exc}")
+
+    if args.scipy and size == 1 and sp_mat is not None:
+        if rank == 0:
+            print("Verifying correctness...", flush=True)
+        if args.mode == "mult":
+            mat.mult(x_vbcsr, y_vbcsr)
+            res_vbcsr = y_vbcsr.to_numpy()
             res_scipy = sp_mat.dot(x_np)
-        elif args.mode == "spmm":
-            res_vbcsr = mat.mult(x_vbcsr).to_numpy()
+        elif args.mode == "mult_dense":
+            mat.mult(x_vbcsr, y_vbcsr)
+            res_vbcsr = y_vbcsr.to_numpy()
             res_scipy = sp_mat.dot(x_np)
-        elif args.mode == "spgemm":
-            res_vbcsr = mat.spmm(mat).to_scipy().toarray() # Convert VBCSR to SciPy/Array
+        else:
+            res_vbcsr = mat.spmm(mat).to_scipy().toarray()
             res_scipy = sp_mat.dot(sp_mat).toarray()
-            
-        if res_vbcsr is not None and res_scipy is not None:
-            # For SpGEMM, struct might be slightly different zero pattern if logic differs, 
-            # but comparing dense should work.
-            diff = np.linalg.norm(res_vbcsr - res_scipy) / (np.linalg.norm(res_scipy) + 1e-10)
+
+        diff = np.linalg.norm(res_vbcsr - res_scipy) / (np.linalg.norm(res_scipy) + 1e-10)
+        comparisons["relative_difference"] = float(diff)
+        if rank == 0:
             print(f"Relative Difference (SciPy): {diff:.2e}")
+
+    if rank == 0 and args.snapshot_out:
+        snapshot = make_snapshot(args, size, np.dtype(dtype), mat, timings, {"comparisons": comparisons})
+        write_snapshot(args.snapshot_out, snapshot)
+        print(f"Wrote snapshot to {args.snapshot_out}")
+
 
 if __name__ == "__main__":
     main()

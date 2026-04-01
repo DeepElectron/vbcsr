@@ -1,4 +1,5 @@
 import numpy as np
+import _workspace_bootstrap
 try:
     from mpi4py import MPI
 except ImportError:
@@ -21,7 +22,7 @@ def test_api_compliance():
     global_blocks = n_blocks * size
     
     # Use create_random for simplicity
-    mat = VBCSR.create_random(comm, global_blocks, block_size, block_size, density=0.1, seed=42)
+    mat = VBCSR.create_random(global_blocks, block_size, block_size, density=0.1, seed=42, comm=comm)
     
     if rank == 0:
         print(f"Matrix created: {mat}")
@@ -30,6 +31,7 @@ def test_api_compliance():
     assert mat.ndim == 2
     assert mat.shape == (global_blocks * block_size, global_blocks * block_size)
     assert mat.nnz >= 0
+    assert mat.matrix_kind == "bsr"
     assert len(mat) == mat.shape[0]
     
     if rank == 0:

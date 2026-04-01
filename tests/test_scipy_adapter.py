@@ -1,6 +1,7 @@
 import unittest
 import numpy as np
 import scipy.sparse as sp
+import _workspace_bootstrap
 try:
     from mpi4py import MPI
 except ImportError:

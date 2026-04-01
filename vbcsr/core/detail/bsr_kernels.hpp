@@ -122,7 +122,6 @@ void bsr_mult(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistVector<T
     x.sync_ghosts();
 
     const auto& row_ptr = graph->adj_ptr;
-    const auto& col_ind = graph->adj_ind;
     const int n_rows = row_ptr.empty() ? 0 : static_cast<int>(row_ptr.size()) - 1;
     const int block_size = backend.block_size;
 
@@ -131,17 +130,14 @@ void bsr_mult(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistVector<T
         for (int row = 0; row < n_rows; ++row) {
             T* y_block = y.local_data() + graph->block_offsets[row];
             std::memset(y_block, 0, sizeof(T) * block_size);
-            for (int slot = row_ptr[row]; slot < row_ptr[row + 1]; ++slot) {
-                if (slot + 1 < row_ptr[row + 1]) {
-                    _mm_prefetch(reinterpret_cast<const char*>(backend.arena.get_ptr(backend.blk_handles[slot + 1])), _MM_HINT_T0);
-                    const int next_col = col_ind[slot + 1];
-                    _mm_prefetch(reinterpret_cast<const char*>(x.data.data() + graph->block_offsets[next_col]), _MM_HINT_T0);
+            backend.for_each_row_segment(row_ptr, row, [&](auto page, auto) {
+                for (uint32_t idx = 0; idx < page.nblocks; ++idx) {
+                    const int col = page.cols[idx];
+                    const T* block = page.vals + static_cast<size_t>(idx) * page.block_elems;
+                    const T* x_block = x.data.data() + graph->block_offsets[col];
+                    SmartKernel<T>::gemv(block_size, block_size, T(1), block, block_size, x_block, 1, T(1), y_block, 1);
                 }
-                const int col = col_ind[slot];
-                const T* block = backend.arena.get_ptr(backend.blk_handles[slot]);
-                const T* x_block = x.data.data() + graph->block_offsets[col];
-                SmartKernel<T>::gemv(block_size, block_size, T(1), block, block_size, x_block, 1, T(1), y_block, 1);
-            }
+            });
         }
     };
 
@@ -151,17 +147,14 @@ void bsr_mult(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistVector<T
         for (int row = 0; row < n_rows; ++row) {
             T* y_block = y.local_data() + graph->block_offsets[row];
             std::memset(y_block, 0, sizeof(T) * BlockSize);
-            for (int slot = row_ptr[row]; slot < row_ptr[row + 1]; ++slot) {
-                if (slot + 1 < row_ptr[row + 1]) {
-                    _mm_prefetch(reinterpret_cast<const char*>(backend.arena.get_ptr(backend.blk_handles[slot + 1])), _MM_HINT_T0);
-                    const int next_col = col_ind[slot + 1];
-                    _mm_prefetch(reinterpret_cast<const char*>(x.data.data() + graph->block_offsets[next_col]), _MM_HINT_T0);
+            backend.for_each_row_segment(row_ptr, row, [&](auto page, auto) {
+                for (uint32_t idx = 0; idx < page.nblocks; ++idx) {
+                    const int col = page.cols[idx];
+                    const T* block = page.vals + static_cast<size_t>(idx) * page.block_elems;
+                    const T* x_block = x.data.data() + graph->block_offsets[col];
+                    FixedBlockKernel<T, BlockSize, BlockSize>::gemv(block, x_block, y_block, T(1), T(1));
                 }
-                const int col = col_ind[slot];
-                const T* block = backend.arena.get_ptr(backend.blk_handles[slot]);
-                const T* x_block = x.data.data() + graph->block_offsets[col];
-                FixedBlockKernel<T, BlockSize, BlockSize>::gemv(block, x_block, y_block, T(1), T(1));
-            }
+            });
         }
     };
 
@@ -191,7 +184,6 @@ void bsr_mult_dense(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistMu
     x.sync_ghosts();
 
     const auto& row_ptr = graph->adj_ptr;
-    const auto& col_ind = graph->adj_ind;
     const int n_rows = row_ptr.empty() ? 0 : static_cast<int>(row_ptr.size()) - 1;
     const int block_size = backend.block_size;
     const int num_vecs = x.num_vectors;
@@ -203,18 +195,26 @@ void bsr_mult_dense(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistMu
         for (int row = 0; row < n_rows; ++row) {
             T* y_block = &y(graph->block_offsets[row], 0);
             bool first = true;
-            for (int slot = row_ptr[row]; slot < row_ptr[row + 1]; ++slot) {
-                if (slot + 1 < row_ptr[row + 1]) {
-                    _mm_prefetch(reinterpret_cast<const char*>(backend.arena.get_ptr(backend.blk_handles[slot + 1])), _MM_HINT_T0);
-                    const int next_col = col_ind[slot + 1];
-                    _mm_prefetch(reinterpret_cast<const char*>(&x(graph->block_offsets[next_col], 0)), _MM_HINT_T0);
+            backend.for_each_row_segment(row_ptr, row, [&](auto page, auto) {
+                for (uint32_t idx = 0; idx < page.nblocks; ++idx) {
+                    const int col = page.cols[idx];
+                    const T* block = page.vals + static_cast<size_t>(idx) * page.block_elems;
+                    const T* x_block = &x(graph->block_offsets[col], 0);
+                    SmartKernel<T>::gemm(
+                        block_size,
+                        num_vecs,
+                        block_size,
+                        T(1),
+                        block,
+                        block_size,
+                        x_block,
+                        x_ld,
+                        first ? T(0) : T(1),
+                        y_block,
+                        y_ld);
+                    first = false;
                 }
-                const int col = col_ind[slot];
-                const T* block = backend.arena.get_ptr(backend.blk_handles[slot]);
-                const T* x_block = &x(graph->block_offsets[col], 0);
-                SmartKernel<T>::gemm(block_size, num_vecs, block_size, T(1), block, block_size, x_block, x_ld, first ? T(0) : T(1), y_block, y_ld);
-                first = false;
-            }
+            });
             if (first) {
                 for (int vec = 0; vec < num_vecs; ++vec) {
                     std::memset(y_block + vec * y_ld, 0, sizeof(T) * block_size);
@@ -229,18 +229,24 @@ void bsr_mult_dense(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistMu
         for (int row = 0; row < n_rows; ++row) {
             T* y_block = &y(graph->block_offsets[row], 0);
             bool first = true;
-            for (int slot = row_ptr[row]; slot < row_ptr[row + 1]; ++slot) {
-                if (slot + 1 < row_ptr[row + 1]) {
-                    _mm_prefetch(reinterpret_cast<const char*>(backend.arena.get_ptr(backend.blk_handles[slot + 1])), _MM_HINT_T0);
-                    const int next_col = col_ind[slot + 1];
-                    _mm_prefetch(reinterpret_cast<const char*>(&x(graph->block_offsets[next_col], 0)), _MM_HINT_T0);
+            backend.for_each_row_segment(row_ptr, row, [&](auto page, auto) {
+                for (uint32_t idx = 0; idx < page.nblocks; ++idx) {
+                    const int col = page.cols[idx];
+                    const T* block = page.vals + static_cast<size_t>(idx) * page.block_elems;
+                    const T* x_block = &x(graph->block_offsets[col], 0);
+                    FixedBlockKernel<T, BlockSize, BlockSize>::gemm(
+                        num_vecs,
+                        block,
+                        BlockSize,
+                        x_block,
+                        x_ld,
+                        y_block,
+                        y_ld,
+                        T(1),
+                        first ? T(0) : T(1));
+                    first = false;
                 }
-                const int col = col_ind[slot];
-                const T* block = backend.arena.get_ptr(backend.blk_handles[slot]);
-                const T* x_block = &x(graph->block_offsets[col], 0);
-                FixedBlockKernel<T, BlockSize, BlockSize>::gemm(num_vecs, block, BlockSize, x_block, x_ld, y_block, y_ld, T(1), first ? T(0) : T(1));
-                first = false;
-            }
+            });
             if (first) {
                 for (int vec = 0; vec < num_vecs; ++vec) {
                     std::memset(y_block + vec * y_ld, 0, sizeof(T) * BlockSize);
@@ -276,7 +282,6 @@ void bsr_mult_adjoint(DistGraph* graph, const BSRMatrixBackend<T>& backend, Dist
     std::fill(y.data.begin(), y.data.end(), T(0));
 
     const auto& row_ptr = graph->adj_ptr;
-    const auto& col_ind = graph->adj_ind;
     const int n_rows = row_ptr.empty() ? 0 : static_cast<int>(row_ptr.size()) - 1;
     const int block_size = backend.block_size;
 
@@ -287,12 +292,14 @@ void bsr_mult_adjoint(DistGraph* graph, const BSRMatrixBackend<T>& backend, Dist
         #pragma omp for
         for (int row = 0; row < n_rows; ++row) {
             const T* x_block = x.local_data() + graph->block_offsets[row];
-            for (int slot = row_ptr[row]; slot < row_ptr[row + 1]; ++slot) {
-                const int col = col_ind[slot];
-                const T* block = backend.arena.get_ptr(backend.blk_handles[slot]);
-                T* y_block = y_local.data() + graph->block_offsets[col];
-                bsr_block_gemv_trans(block_size, block, x_block, y_block, T(1), T(1));
-            }
+            backend.for_each_row_segment(row_ptr, row, [&](auto page, auto) {
+                for (uint32_t idx = 0; idx < page.nblocks; ++idx) {
+                    const int col = page.cols[idx];
+                    const T* block = page.vals + static_cast<size_t>(idx) * page.block_elems;
+                    T* y_block = y_local.data() + graph->block_offsets[col];
+                    bsr_block_gemv_trans(block_size, block, x_block, y_block, T(1), T(1));
+                }
+            });
         }
 
         #pragma omp critical
@@ -318,7 +325,6 @@ void bsr_mult_dense_adjoint(
     std::fill(y.data.begin(), y.data.end(), T(0));
 
     const auto& row_ptr = graph->adj_ptr;
-    const auto& col_ind = graph->adj_ind;
     const int n_rows = row_ptr.empty() ? 0 : static_cast<int>(row_ptr.size()) - 1;
     const int num_vecs = x.num_vectors;
     const int block_size = backend.block_size;
@@ -332,12 +338,14 @@ void bsr_mult_dense_adjoint(
         #pragma omp for
         for (int row = 0; row < n_rows; ++row) {
             const T* x_block = &x(graph->block_offsets[row], 0);
-            for (int slot = row_ptr[row]; slot < row_ptr[row + 1]; ++slot) {
-                const int col = col_ind[slot];
-                const T* block = backend.arena.get_ptr(backend.blk_handles[slot]);
-                T* y_block = y_local.data() + graph->block_offsets[col];
-                bsr_block_gemm_trans(block_size, num_vecs, block, x_block, x_ld, y_block, y_ld, T(1), T(1));
-            }
+            backend.for_each_row_segment(row_ptr, row, [&](auto page, auto) {
+                for (uint32_t idx = 0; idx < page.nblocks; ++idx) {
+                    const int col = page.cols[idx];
+                    const T* block = page.vals + static_cast<size_t>(idx) * page.block_elems;
+                    T* y_block = y_local.data() + graph->block_offsets[col];
+                    bsr_block_gemm_trans(block_size, num_vecs, block, x_block, x_ld, y_block, y_ld, T(1), T(1));
+                }
+            });
         }
 
         #pragma omp critical

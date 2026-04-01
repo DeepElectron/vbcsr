@@ -129,15 +129,9 @@ class ImageContainer:
 
         core_result = self._core.sample_k(k_point, _resolve_convention(convention))
 
-        # Wrap in VBCSR (same pattern as spmm / transpose in matrix.py)
-        obj = VBCSR.__new__(VBCSR)
-        obj.graph = core_result.graph
-        obj.dtype = np.complex128
-        obj._core = core_result
-        obj.comm = self.atomic_data.comm if hasattr(self.atomic_data, 'comm') else None
+        comm = self.atomic_data.comm if hasattr(self.atomic_data, 'comm') else None
         norb = self.atomic_data.norb()
-        obj.shape = (norb, norb)
-        obj._global_nnz = None
+        obj = VBCSR._wrap_core(core_result, np.complex128, comm, shape=(norb, norb))
 
         if symm:
             obj = obj + obj.T

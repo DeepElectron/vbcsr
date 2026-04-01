@@ -13,20 +13,12 @@ namespace vbcsr::detail {
 template <typename T>
 class BSRResultBuilder {
 public:
-    explicit BSRResultBuilder(DistGraph* graph)
+    explicit BSRResultBuilder(DistGraph* graph, uint32_t blocks_per_page = 0)
         : graph_(graph), block_size_(infer_block_size(graph)) {
         if (graph_ == nullptr) {
             return;
         }
-
-        const size_t nnz = graph_->adj_ind.size();
-        const size_t block_area = static_cast<size_t>(block_size_) * static_cast<size_t>(block_size_);
-        blk_handles_.resize(nnz);
-        blk_sizes_.assign(nnz, block_area);
-        arena_.reserve(nnz * block_area);
-        for (size_t slot = 0; slot < nnz; ++slot) {
-            blk_handles_[slot] = arena_.allocate(block_area);
-        }
+        backend_.initialize_structure(graph_->adj_ind, block_size_, blocks_per_page);
     }
 
     static int infer_block_size(const DistGraph* graph) {
@@ -54,12 +46,20 @@ public:
         return block_size_;
     }
 
-    T* slot_data(int slot) {
-        return arena_.get_ptr(blk_handles_[slot]);
+    T* mutable_block(int slot) {
+        return backend_.block_ptr(slot);
     }
 
-    const T* slot_data(int slot) const {
-        return arena_.get_ptr(blk_handles_[slot]);
+    const T* mutable_block(int slot) const {
+        return backend_.block_ptr(slot);
+    }
+
+    void accumulate_block(int slot, const T* src, T alpha = T(1)) {
+        T* dest = backend_.block_ptr(slot);
+        const size_t block_area = static_cast<size_t>(block_size_) * static_cast<size_t>(block_size_);
+        for (size_t idx = 0; idx < block_area; ++idx) {
+            dest[idx] += alpha * src[idx];
+        }
     }
 
     int find_slot(int local_row, int local_col) const {
@@ -74,21 +74,26 @@ public:
         return static_cast<int>(std::distance(graph_->adj_ind.begin(), it));
     }
 
+    BSRMatrixBackend<T> commit() && {
+        return std::move(backend_);
+    }
+
+    T* slot_data(int slot) {
+        return mutable_block(slot);
+    }
+
+    const T* slot_data(int slot) const {
+        return mutable_block(slot);
+    }
+
     BSRMatrixBackend<T> commit_backend() && {
-        BSRMatrixBackend<T> backend;
-        backend.block_size = block_size_;
-        backend.blk_handles = std::move(blk_handles_);
-        backend.blk_sizes = std::move(blk_sizes_);
-        backend.arena = std::move(arena_);
-        return backend;
+        return std::move(*this).commit();
     }
 
 private:
     DistGraph* graph_ = nullptr;
     int block_size_ = 0;
-    std::vector<uint64_t> blk_handles_;
-    std::vector<size_t> blk_sizes_;
-    BlockArena<T> arena_;
+    BSRMatrixBackend<T> backend_;
 };
 
 } // namespace vbcsr::detail

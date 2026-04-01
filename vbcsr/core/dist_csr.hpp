@@ -35,6 +35,8 @@ template <typename T, typename Kernel>
 DistCSR<T> convert_to_csr(const BlockSpMat<T, Kernel>& mat) {
     DistCSR<T> csr;
     csr.comm = mat.graph->comm;
+    const auto& row_ptr = mat.logical_row_ptr();
+    const auto& col_ind = mat.logical_col_ind();
     int initialized = 0;
     MPI_Initialized(&initialized);
     int rank, size;
@@ -186,11 +188,11 @@ DistCSR<T> convert_to_csr(const BlockSpMat<T, Kernel>& mat) {
         int r_dim = block_sizes[i];
         int start_row = block_local_offsets[i]; // relative to my_local_rows
         
-        int blk_start = mat.row_ptr[i];
-        int blk_end = mat.row_ptr[i+1];
+        int blk_start = row_ptr[i];
+        int blk_end = row_ptr[i+1];
         
         for (int k = blk_start; k < blk_end; ++k) {
-            int col_blk = mat.col_ind[k]; // local index of block
+            int col_blk = col_ind[k]; // local index of block
             int c_dim = block_sizes[col_blk];
             const T* data = mat.block_data(k);
             
@@ -224,8 +226,8 @@ DistCSR<T> convert_to_csr(const BlockSpMat<T, Kernel>& mat) {
         int r_dim = block_sizes[i];
         int start_row = block_local_offsets[i];
         
-        int blk_start = mat.row_ptr[i];
-        int blk_end = mat.row_ptr[i+1];
+        int blk_start = row_ptr[i];
+        int blk_end = row_ptr[i+1];
         
         // Sort blocks by column index? 
         // VBCSR col_ind is sorted by local block ID?
@@ -243,7 +245,7 @@ DistCSR<T> convert_to_csr(const BlockSpMat<T, Kernel>& mat) {
         std::vector<BlockInfo> row_blocks;
         
         for (int k = blk_start; k < blk_end; ++k) {
-            int col_blk = mat.col_ind[k];
+            int col_blk = col_ind[k];
             int c_dim = block_sizes[col_blk];
             
             int global_col_start;

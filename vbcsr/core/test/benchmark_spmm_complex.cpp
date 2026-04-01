@@ -76,38 +76,24 @@ int main(int argc, char** argv) {
     auto t_start = std::chrono::high_resolution_clock::now();
     
     auto t1 = std::chrono::high_resolution_clock::now();
-    auto meta = A.exchange_ghost_metadata(B);
+    auto metadata_plan = detail::RowMetadataExchangePlan<BlockSpMat<T>, BlockSpMat<T>>::build(A, B);
     MPI_Barrier(MPI_COMM_WORLD);
     auto t2 = std::chrono::high_resolution_clock::now();
     
-    auto sym = A.symbolic_multiply_filtered(B, meta, threshold);
+    auto sym = detail::symbolic_multiply_filtered(A, B, metadata_plan.metadata(), threshold);
     MPI_Barrier(MPI_COMM_WORLD);
     auto t3 = std::chrono::high_resolution_clock::now();
     
-    auto [ghost_data_map, ghost_sizes] = B.fetch_ghost_blocks(sym.required_blocks);
+    auto payload_plan = detail::BlockPayloadExchangePlan<BlockSpMat<T>>::fetch_required(B, sym.required_blocks);
     MPI_Barrier(MPI_COMM_WORLD);
     auto t4 = std::chrono::high_resolution_clock::now();
-    
-    // Reorganize ghost data for fast row access
-    std::map<int, std::vector<BlockSpMat<T>::GhostBlockRef>> ghost_rows;
-    for (const auto& [bid, data] : ghost_data_map) {
-        int c_dim = ghost_sizes.at(bid.col);
-        ghost_rows[bid.row].push_back({bid.col, data.data(), c_dim});
-    }
 
-    // Construct Result Matrix Structure
-    std::vector<std::vector<int>> c_adj(graph.owned_global_indices.size());
-    int n_rows = A.row_ptr.size() - 1;
-    for(int i=0; i<n_rows; ++i) {
-        int start = sym.c_row_ptr[i];
-        int end = sym.c_row_ptr[i+1];
-        for(int k=start; k<end; ++k) {
-            c_adj[i].push_back(sym.c_col_ind[k]);
-        }
-    }
-    
-    DistGraph* c_graph = new DistGraph(graph.comm);
-    c_graph->construct_distributed(graph.owned_global_indices, graph.block_sizes, c_adj);
+    auto assembly_plan = detail::ResultAssemblyPlan<BlockSpMat<T>>::for_spmm(
+        A,
+        sym,
+        metadata_plan.metadata(),
+        std::move(payload_plan));
+    DistGraph* c_graph = assembly_plan.construct_result_graph(A, "spmm");
     
     BlockSpMat<T> C(c_graph);
     C.owns_graph = true;
@@ -115,9 +101,9 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     auto t5 = std::chrono::high_resolution_clock::now();
     
-    std::vector<double> A_norms = A.compute_block_norms();
-    std::vector<double> B_local_norms = B.compute_block_norms();
-    A.numeric_multiply(B, ghost_rows, C, threshold, A_norms, B_local_norms);
+    const auto& A_norms = A.get_block_norms();
+    const auto& B_local_norms = B.get_block_norms();
+    A.numeric_multiply(B, assembly_plan.ghost_rows(), C, threshold, A_norms, B_local_norms);
     MPI_Barrier(MPI_COMM_WORLD);
     auto t6 = std::chrono::high_resolution_clock::now();
     

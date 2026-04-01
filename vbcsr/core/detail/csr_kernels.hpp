@@ -18,17 +18,17 @@ void csr_mult(DistGraph* graph, const CSRMatrixBackend<T>& backend, DistVector<T
     x.sync_ghosts();
 
     const auto& row_ptr = graph->adj_ptr;
-    const auto& col_ind = graph->adj_ind;
     const int n_rows = row_ptr.empty() ? 0 : static_cast<int>(row_ptr.size()) - 1;
 
     #pragma omp parallel for
     for (int row = 0; row < n_rows; ++row) {
         T sum = T(0);
-        for (int slot = row_ptr[row]; slot < row_ptr[row + 1]; ++slot) {
-            const int col = col_ind[slot];
-            const T value = *backend.arena.get_ptr(backend.blk_handles[slot]);
-            sum += value * x.data[graph->block_offsets[col]];
-        }
+        backend.for_each_row_segment(row_ptr, row, [&](auto page, auto) {
+            for (uint32_t idx = 0; idx < page.nnz; ++idx) {
+                const int col = page.cols[idx];
+                sum += page.vals[idx] * x.data[graph->block_offsets[col]];
+            }
+        });
         y.data[graph->block_offsets[row]] = sum;
     }
 }
@@ -40,7 +40,6 @@ void csr_mult_dense(DistGraph* graph, const CSRMatrixBackend<T>& backend, DistMu
     x.sync_ghosts();
 
     const auto& row_ptr = graph->adj_ptr;
-    const auto& col_ind = graph->adj_ind;
     const int n_rows = row_ptr.empty() ? 0 : static_cast<int>(row_ptr.size()) - 1;
     const int num_vecs = x.num_vectors;
     const int x_ld = x.local_rows + x.ghost_rows;
@@ -53,14 +52,16 @@ void csr_mult_dense(DistGraph* graph, const CSRMatrixBackend<T>& backend, DistMu
             y.data[vec * y_ld + row_offset] = T(0);
         }
 
-        for (int slot = row_ptr[row]; slot < row_ptr[row + 1]; ++slot) {
-            const int col = col_ind[slot];
-            const int col_offset = graph->block_offsets[col];
-            const T value = *backend.arena.get_ptr(backend.blk_handles[slot]);
-            for (int vec = 0; vec < num_vecs; ++vec) {
-                y.data[vec * y_ld + row_offset] += value * x.data[vec * x_ld + col_offset];
+        backend.for_each_row_segment(row_ptr, row, [&](auto page, auto) {
+            for (uint32_t idx = 0; idx < page.nnz; ++idx) {
+                const int col = page.cols[idx];
+                const int col_offset = graph->block_offsets[col];
+                const T value = page.vals[idx];
+                for (int vec = 0; vec < num_vecs; ++vec) {
+                    y.data[vec * y_ld + row_offset] += value * x.data[vec * x_ld + col_offset];
+                }
             }
-        }
+        });
     }
 }
 
@@ -72,7 +73,6 @@ void csr_mult_adjoint(DistGraph* graph, const CSRMatrixBackend<T>& backend, Dist
     std::fill(y.data.begin(), y.data.end(), T(0));
 
     const auto& row_ptr = graph->adj_ptr;
-    const auto& col_ind = graph->adj_ind;
     const int n_rows = row_ptr.empty() ? 0 : static_cast<int>(row_ptr.size()) - 1;
 
     #pragma omp parallel
@@ -82,12 +82,13 @@ void csr_mult_adjoint(DistGraph* graph, const CSRMatrixBackend<T>& backend, Dist
         #pragma omp for
         for (int row = 0; row < n_rows; ++row) {
             const T x_value = x.data[graph->block_offsets[row]];
-            for (int slot = row_ptr[row]; slot < row_ptr[row + 1]; ++slot) {
-                const int col = col_ind[slot];
-                const int col_offset = graph->block_offsets[col];
-                const T value = *backend.arena.get_ptr(backend.blk_handles[slot]);
-                y_local[col_offset] += ScalarTraits<T>::conjugate(value) * x_value;
-            }
+            backend.for_each_row_segment(row_ptr, row, [&](auto page, auto) {
+                for (uint32_t idx = 0; idx < page.nnz; ++idx) {
+                    const int col = page.cols[idx];
+                    const int col_offset = graph->block_offsets[col];
+                    y_local[col_offset] += ScalarTraits<T>::conjugate(page.vals[idx]) * x_value;
+                }
+            });
         }
 
         #pragma omp critical
@@ -113,7 +114,6 @@ void csr_mult_dense_adjoint(
     std::fill(y.data.begin(), y.data.end(), T(0));
 
     const auto& row_ptr = graph->adj_ptr;
-    const auto& col_ind = graph->adj_ind;
     const int n_rows = row_ptr.empty() ? 0 : static_cast<int>(row_ptr.size()) - 1;
     const int num_vecs = x.num_vectors;
     const int x_ld = x.local_rows + x.ghost_rows;
@@ -126,14 +126,16 @@ void csr_mult_dense_adjoint(
         #pragma omp for
         for (int row = 0; row < n_rows; ++row) {
             const int row_offset = graph->block_offsets[row];
-            for (int slot = row_ptr[row]; slot < row_ptr[row + 1]; ++slot) {
-                const int col = col_ind[slot];
-                const int col_offset = graph->block_offsets[col];
-                const T value = ScalarTraits<T>::conjugate(*backend.arena.get_ptr(backend.blk_handles[slot]));
-                for (int vec = 0; vec < num_vecs; ++vec) {
-                    y_local[vec * y_ld + col_offset] += value * x.data[vec * x_ld + row_offset];
+            backend.for_each_row_segment(row_ptr, row, [&](auto page, auto) {
+                for (uint32_t idx = 0; idx < page.nnz; ++idx) {
+                    const int col = page.cols[idx];
+                    const int col_offset = graph->block_offsets[col];
+                    const T value = ScalarTraits<T>::conjugate(page.vals[idx]);
+                    for (int vec = 0; vec < num_vecs; ++vec) {
+                        y_local[vec * y_ld + col_offset] += value * x.data[vec * x_ld + row_offset];
+                    }
                 }
-            }
+            });
         }
 
         #pragma omp critical

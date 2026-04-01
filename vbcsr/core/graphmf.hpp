@@ -26,9 +26,8 @@ void graph_matrix_function(BlockSpMat<T, Kernel>& A, BlockSpMat<T, Kernel>* Resu
     // 1. Initialize Result
     if (rank == 0 && verbose) std::cout << "graph_matrix_function: Initializing using subgraph method (" << method << ")..." << std::endl;
 
-    // check Result allocation
-    if (Result == nullptr || Result == NULL) {
-        *Result = A.duplicate();
+    if (Result == nullptr) {
+        throw std::invalid_argument("graph_matrix_function requires a valid output matrix pointer");
     }
 
     if (Result->graph != A.graph) {
@@ -102,7 +101,7 @@ void graph_matrix_function(BlockSpMat<T, Kernel>& A, BlockSpMat<T, Kernel>* Resu
             }
         }
         
-        auto batch_blocks = A.fetch_blocks(batch_indices);
+        auto batch_blocks = detail::BlockPayloadExchangePlan<BlockSpMat<T, Kernel>>::fetch_batch(A, batch_indices);
 
         #pragma omp parallel for schedule(dynamic)
         for (int i=0; i < batch_size; ++i) {

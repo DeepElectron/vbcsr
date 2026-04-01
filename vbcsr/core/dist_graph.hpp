@@ -121,10 +121,15 @@ public:
     // Construct from serial data (rank 0 distributes)
     // Simple 1D block partition for now
     void construct_serial(int n_global_blocks, const std::vector<int>& global_block_sizes, const std::vector<std::vector<int>>& global_adj) {
+        int global_block_count = n_global_blocks;
+        if (comm != MPI_COMM_NULL && size > 1) {
+            MPI_Bcast(&global_block_count, 1, MPI_INT, 0, comm);
+        }
+
         // 1. Partitioning
         // Simple 1D partitioning: divide blocks equally among ranks
-        int blocks_per_rank = n_global_blocks / size;
-        int remainder = n_global_blocks % size;
+        int blocks_per_rank = global_block_count / size;
+        int remainder = global_block_count % size;
 
         std::vector<int> count(size);
         std::vector<int> displ(size + 1, 0);
@@ -143,55 +148,24 @@ public:
         owned_global_indices.resize(n_owned);
         std::iota(owned_global_indices.begin(), owned_global_indices.end(), my_start);
 
-        // 3. Build local graph and identify ghosts
-        // This requires scattering the global adjacency list. 
-        // For simplicity in this serial construction, we assume all ranks have the full graph or rank 0 broadcasts.
-        // But to be scalable, we should distribute. 
-        // Here, assuming global_adj is available on rank 0, we scatter it.
-        
-        // ... Implementation detail: For now, let's assume all ranks have global_adj if passed, 
-        // or we implement a proper scatter. 
-        // Given the prompt "construct_serial", it implies rank 0 might have it.
-        // Let's implement a broadcast of the full graph for simplicity if n_global_blocks is small, 
-        // OR better, scatter the relevant parts.
-        
-        // Let's assume global_adj is valid on all ranks for "serial" construction convenience in tests,
-        // or implement the scatter. 
-        // To be safe and scalable-ish, let's assume only rank 0 has valid data if rank != 0.
-        
-        // Broadcast partition info (count, displ) is implicit since we computed it deterministically.
-        
-        // Scatter block sizes
-        std::vector<int> my_block_sizes(n_owned);
-        // If rank 0 has data, scatter.
-        // Note: MPI_Scatterv requires sendcounts and displs arrays.
-        
         if (rank == 0) {
-             // Check sizes
-             if (global_block_sizes.size() != n_global_blocks) throw std::runtime_error("Invalid block sizes size");
+            if (global_block_sizes.size() != static_cast<size_t>(global_block_count)) {
+                throw std::runtime_error("DistGraph::construct_serial received invalid block size metadata on root");
+            }
+            if (global_adj.size() != static_cast<size_t>(global_block_count)) {
+                throw std::runtime_error("DistGraph::construct_serial received invalid adjacency metadata on root");
+            }
         }
 
-        // We need to distribute global_block_sizes. 
-        // Since we need ghost block sizes too, it might be better to broadcast all block sizes if memory allows,
-        // or fetch on demand. For "Block Sparse", usually N is not huge (N_blocks), but N*BlockSize is.
-        // Let's assume we can broadcast global_block_sizes for now.
         std::vector<int> all_block_sizes;
-        if (rank == 0) all_block_sizes = global_block_sizes;
-        all_block_sizes.resize(n_global_blocks);
+        if (rank == 0) {
+            all_block_sizes = global_block_sizes;
+        }
+        all_block_sizes.resize(global_block_count);
         if (size > 1) {
-            MPI_Bcast(all_block_sizes.data(), n_global_blocks, MPI_INT, 0, comm);
-        } else {
-            // Serial case: already have it in rank 0
+            MPI_Bcast(all_block_sizes.data(), global_block_count, MPI_INT, 0, comm);
         }
 
-        // Scatter adjacency? 
-        // Adjacency is a vector of vectors. Hard to scatter directly.
-        // We can flatten and scatter, or just broadcast if not too large.
-        // For a true distributed graph, we should use `construct_distributed`.
-        // `construct_serial` is mostly for testing or small problems. 
-        // Let's broadcast the adjacency list for simplicity in this method.
-        
-        // Flatten global_adj
         std::vector<int> flat_adj;
         std::vector<int> adj_offsets;
         if (rank == 0) {
@@ -202,17 +176,16 @@ public:
             }
         }
         
-        // Broadcast sizes
-        int total_edges = flat_adj.size();
+        int total_edges = static_cast<int>(flat_adj.size());
         if (size > 1) {
             MPI_Bcast(&total_edges, 1, MPI_INT, 0, comm);
         }
         flat_adj.resize(total_edges);
-        adj_offsets.resize(n_global_blocks + 1);
+        adj_offsets.resize(global_block_count + 1);
         
         if (size > 1) {
             MPI_Bcast(flat_adj.data(), total_edges, MPI_INT, 0, comm);
-            MPI_Bcast(adj_offsets.data(), n_global_blocks + 1, MPI_INT, 0, comm);
+            MPI_Bcast(adj_offsets.data(), global_block_count + 1, MPI_INT, 0, comm);
         }
         
         // 3. Build local graph and identify ghosts

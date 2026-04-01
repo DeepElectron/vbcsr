@@ -171,14 +171,13 @@ void bind_block_spmat(py::module& m, const std::string& name) {
         .def("shift", &BlockSpMat<T>::shift)
         .def("add_diagonal", &BlockSpMat<T>::add_diagonal)
         .def("axpy", &BlockSpMat<T>::axpy)
-        .def("duplicate", &BlockSpMat<T>::duplicate)
+        .def("duplicate", &BlockSpMat<T>::duplicate, py::arg("independent_graph") = true)
         .def("save_matrix_market", &BlockSpMat<T>::save_matrix_market)
         .def("spmm", &BlockSpMat<T>::spmm, py::arg("B"), py::arg("threshold"), py::arg("transA") = false, py::arg("transB") = false)
         .def("spmm_self", &BlockSpMat<T>::spmm_self, py::arg("threshold"), py::arg("transA") = false)
         .def("add", &BlockSpMat<T>::add, py::arg("B"), py::arg("alpha") = 1.0, py::arg("beta") = 1.0)
         .def("transpose", &BlockSpMat<T>::transpose)
         .def("extract_submatrix", &BlockSpMat<T>::extract_submatrix, py::arg("global_indices"))
-        .def("insert_submatrix", &BlockSpMat<T>::insert_submatrix, py::arg("submat"), py::arg("global_indices"))
         .def("insert_submatrix", &BlockSpMat<T>::insert_submatrix, py::arg("submat"), py::arg("global_indices"))
         .def("get_block", [](const BlockSpMat<T>& self, int row, int col) {
             std::vector<T> vec = self.get_block(row, col);
@@ -198,6 +197,16 @@ void bind_block_spmat(py::module& m, const std::string& name) {
         })
         .def_property_readonly("local_nnz", [](const BlockSpMat<T>& self) {
             return self.local_scalar_nnz();
+        })
+        .def_property_readonly("global_nnz", [](const BlockSpMat<T>& self) {
+            long long local_nnz = static_cast<long long>(self.local_scalar_nnz());
+            long long global_nnz = local_nnz;
+            int initialized = 0;
+            MPI_Initialized(&initialized);
+            if (initialized && self.graph != nullptr && self.graph->comm != MPI_COMM_NULL && self.graph->size > 1) {
+                MPI_Allreduce(&local_nnz, &global_nnz, 1, MPI_LONG_LONG, MPI_SUM, self.graph->comm);
+            }
+            return global_nnz;
         })
         .def("to_dense", [](const BlockSpMat<T>& self) {
             // Return 2D numpy array
@@ -268,7 +277,33 @@ PYBIND11_MODULE(vbcsr_core, m) {
         .def("construct_serial", &DistGraph::construct_serial)
         .def("construct_distributed", &DistGraph::construct_distributed)
         .def_readonly("owned_global_indices", &DistGraph::owned_global_indices)
+        .def_readonly("ghost_global_indices", &DistGraph::ghost_global_indices)
         .def_readonly("block_sizes", &DistGraph::block_sizes)
+        .def_property_readonly("owned_scalar_rows", [](const DistGraph& self) {
+            const size_t owned_blocks = self.owned_global_indices.size();
+            if (self.block_offsets.size() <= owned_blocks) {
+                return 0;
+            }
+            return self.block_offsets[owned_blocks];
+        })
+        .def_property_readonly("local_scalar_cols", [](const DistGraph& self) {
+            return self.block_offsets.empty() ? 0 : self.block_offsets.back();
+        })
+        .def_property_readonly("global_scalar_rows", [](const DistGraph& self) {
+            int local_rows = 0;
+            const size_t owned_blocks = self.owned_global_indices.size();
+            if (self.block_offsets.size() > owned_blocks) {
+                local_rows = self.block_offsets[owned_blocks];
+            }
+
+            int global_rows = local_rows;
+            int initialized = 0;
+            MPI_Initialized(&initialized);
+            if (initialized && self.comm != MPI_COMM_NULL && self.size > 1) {
+                MPI_Allreduce(&local_rows, &global_rows, 1, MPI_INT, MPI_SUM, self.comm);
+            }
+            return global_rows;
+        })
         .def("get_local_index", [](const DistGraph& self, int gid) {
             auto it = self.global_to_local.find(gid);
             if (it == self.global_to_local.end()) return -1;
