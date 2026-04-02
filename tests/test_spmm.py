@@ -1,3 +1,4 @@
+import _workspace_bootstrap
 import unittest
 import numpy as np
 import vbcsr
@@ -5,10 +6,6 @@ try:
     from mpi4py import MPI
 except ImportError:
     MPI = None
-import sys
-
-# the code still have some logical problem when mpi4py is not available.
-# TODO: fix it.
 
 class TestSpMM(unittest.TestCase):
     def setUp(self):

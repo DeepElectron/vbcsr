@@ -10,7 +10,7 @@
 #include <map>
 #include <vector>
 
-namespace detail {
+namespace vbcsr::detail {
 
 template <typename Matrix>
 struct CSRSpMMExecutor {
@@ -94,12 +94,15 @@ struct CSRSpMMExecutor {
             }
         }
 
-        Matrix C = Matrix::from_csr_builder(c_graph, true, std::move(builder));
+        Matrix C = Matrix::template materialize_from_builder<vbcsr::MatrixKind::CSR>(
+            c_graph,
+            true,
+            std::move(builder));
         C.filter_blocks(threshold);
         return C;
     }
 };
 
-} // namespace detail
+} // namespace vbcsr::detail
 
 #endif // VBCSR_DETAIL_CSR_SPMM_HPP

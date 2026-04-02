@@ -38,13 +38,10 @@ def _resolve_convention(convention):
 
 class ImageContainer:
     """
-    Pythonic wrapper for vbcsr_core.ImageContainer (Double or Complex).
+    Python wrapper for ``vbcsr_core.ImageContainer``.
 
-    Provides:
-      - ``add_block``  - single block, optional *R*, string *mode*
-      - ``add_blocks`` - batched parallel insertion
-      - ``assemble``   - finalize assembly (exchange remote blocks)
-      - ``sample_k``   - Fourier transform to k-space
+    The public wrapper keeps the Python-facing ergonomics here and leaves the
+    distributed image assembly logic in the native implementation.
     """
 
     def __init__(self, atomic_data, dtype=np.float64):
@@ -52,13 +49,11 @@ class ImageContainer:
         self.dtype = np.dtype(dtype)
         
         if self.dtype == np.float64:
-             # Depending on how pybind exposes it, atomic_data might need to be passed as pointer
-             # But pybind handles object conversion if `AtomicData` is bound.
-             self._core = vbcsr_core.ImageContainer(atomic_data)
+            self._core = vbcsr_core.ImageContainer(atomic_data)
         elif self.dtype == np.complex128:
-             self._core = vbcsr_core.ImageContainer_Complex(atomic_data)
+            self._core = vbcsr_core.ImageContainer_Complex(atomic_data)
         else:
-             raise ValueError("Unsupported dtype. Use float64 or complex128.")
+            raise ValueError("Unsupported dtype. Use float64 or complex128.")
 
     def add_block(self, g_row, g_col, data, R=None, mode="add"):
         """
@@ -78,9 +73,7 @@ class ImageContainer:
             if len(R) != 3:
                 raise ValueError("R must have exactly 3 elements")
 
-        # Cast data to correct dtype
         data_arr = np.asarray(data, dtype=self.dtype)
-        
         self._core.add_block(R, g_row, g_col, data_arr, _resolve_mode(mode))
 
     def add_blocks(self, g_rows, g_cols, data_list, R_list=None, mode="add"):
@@ -102,11 +95,9 @@ class ImageContainer:
         else:
             R_list = [[int(x) for x in r] for r in R_list]
 
-        # Cast all data blocks
         data_list = [np.asarray(d, dtype=self.dtype) for d in data_list]
 
-        self._core.add_blocks(R_list, list(g_rows), list(g_cols),
-                              data_list, _resolve_mode(mode))
+        self._core.add_blocks(R_list, list(g_rows), list(g_cols), data_list, _resolve_mode(mode))
 
     def assemble(self):
         """Finalize assembly - exchange remote blocks between MPI ranks."""
@@ -129,7 +120,7 @@ class ImageContainer:
 
         core_result = self._core.sample_k(k_point, _resolve_convention(convention))
 
-        comm = self.atomic_data.comm if hasattr(self.atomic_data, 'comm') else None
+        comm = getattr(self.atomic_data, "comm", None)
         norb = self.atomic_data.norb()
         obj = VBCSR._wrap_core(core_result, np.complex128, comm, shape=(norb, norb))
 

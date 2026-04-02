@@ -21,12 +21,13 @@ namespace atomic {
     
 class AtomicData {
 public:
-    DistGraph* graph;
-    bool own_graph;
+    DistGraph* graph = nullptr;
+    bool own_graph = false;
 
     // Atom attributes (Local + Ghost)
     // Indexed by local index from DistGraph (0 to n_owned+n_ghost-1)
     std::vector<int> atom_type={};
+    std::vector<int> atomic_numbers={};
     std::vector<int> atom_index={}; // Original ID from file
     std::vector<double> x={}; std::vector<double> y={}; std::vector<double> z={};
     
@@ -81,12 +82,45 @@ public:
         compute_offsets();
     }
 
-    AtomicData(MPI_Comm comm_) : comm(comm_), own_graph(false) {}
+    AtomicData(MPI_Comm comm_) : comm(comm_), own_graph(false) {
+        int initialized = 0;
+        MPI_Initialized(&initialized);
+        if (initialized) {
+            MPI_Comm_rank(comm, &rank);
+            MPI_Comm_size(comm, &size);
+        } else {
+            rank = 0;
+            size = 1;
+        }
+    }
 
     AtomicData(
       size_t n_atom_, size_t N_atom_, size_t atom_offset_, size_t n_edge_, size_t N_edge_,
       const int *atom_index_in, const int *atom_type_in, const int *edge_index_in, const int *type_norb_in, const int *edge_shift_vec_in,
       const double *cell_in, const double *pos_in,
+      MPI_Comm comm_,
+      const std::vector<bool>& pbc_in = std::vector<bool>{}
+    ) : AtomicData(
+            n_atom_,
+            N_atom_,
+            atom_offset_,
+            n_edge_,
+            N_edge_,
+            atom_index_in,
+            atom_type_in,
+            edge_index_in,
+            type_norb_in,
+            edge_shift_vec_in,
+            cell_in,
+            pos_in,
+            nullptr,
+            comm_,
+            pbc_in) {}
+
+    AtomicData(
+      size_t n_atom_, size_t N_atom_, size_t atom_offset_, size_t n_edge_, size_t N_edge_,
+      const int *atom_index_in, const int *atom_type_in, const int *edge_index_in, const int *type_norb_in, const int *edge_shift_vec_in,
+      const double *cell_in, const double *pos_in, const int *atomic_numbers_in,
       MPI_Comm comm_,
       const std::vector<bool>& pbc_in = std::vector<bool>{}
     ) : atom_offset(atom_offset_), n_atom(n_atom_), N_atom(N_atom_), n_edge(n_edge_), N_edge(N_edge_), comm(comm_), own_graph(true) {
@@ -166,6 +200,7 @@ public:
         int total_local = n_owned + n_ghost;
         
         atom_type.resize(total_local);
+        atomic_numbers.resize(total_local, -1);
         atom_index.resize(total_local);
         x.resize(total_local);
         y.resize(total_local);
@@ -173,6 +208,7 @@ public:
         
         for(int i=0; i<n_owned; ++i) {
             atom_type[i] = atom_type_in[i];
+            atomic_numbers[i] = atomic_numbers_in != nullptr ? atomic_numbers_in[i] : -1;
             atom_index[i] = atom_index_in[i];
             x[i] = pos_in[3*i];
             y[i] = pos_in[3*i+1];
@@ -183,6 +219,7 @@ public:
         
         // 3. Fetch Ghost Data
         exchange_attribute(atom_type);
+        exchange_attribute(atomic_numbers);
         exchange_attribute(atom_index);
         exchange_attribute(x);
         exchange_attribute(y);
@@ -319,7 +356,19 @@ public:
         }
                       
         // 7. Construct AtomicData
-        return construct_final_object(comm, rank, size, cell, pbc, total_recv, r_indices, r_types, r_pos, r_edges, type_norb);
+        return construct_final_object(
+            comm,
+            rank,
+            size,
+            cell,
+            pbc,
+            total_recv,
+            r_indices,
+            r_z,
+            r_types,
+            r_pos,
+            r_edges,
+            type_norb);
     }
     
     static AtomicData* from_file(const std::string& filename, const std::vector<double>& r_max_per_type, std::vector<int> type_norb, MPI_Comm comm, const std::string& format="") {
@@ -390,6 +439,27 @@ public:
     
     void get_atom_type(int idx, int *tp) const {
         *tp = atom_type[idx];
+    }
+
+    bool has_atomic_numbers() const {
+        if (atomic_numbers.size() < static_cast<size_t>(n_atom)) {
+            return false;
+        }
+        for (int i = 0; i < n_atom; ++i) {
+            if (atomic_numbers[i] < 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void ensure_owned_atomic_numbers(const char* context) const {
+        if (!has_atomic_numbers()) {
+            throw std::runtime_error(
+                std::string(context) +
+                " requires explicit atomic numbers. "
+                "Pass atomic_numbers=... when using AtomicData::from_distributed.");
+        }
     }
     
     void get_pos(int idx, double *rx, double *ry, double *rz) const {
@@ -707,6 +777,11 @@ private:
 
     template<typename T>
     void exchange_attribute(std::vector<T>& data) {
+        if (graph == nullptr || size <= 1 ||
+            (graph->recv_indices.empty() && graph->send_indices.empty())) {
+            return;
+        }
+
         int initialized = 0;
         MPI_Initialized(&initialized);
         
@@ -1390,6 +1465,7 @@ private:
         const std::vector<bool>& pbc,
         int total_recv,
         const std::vector<int>& r_indices,
+        const std::vector<int>& r_atomic_numbers,
         const std::vector<int>& r_types,
         const std::vector<double>& r_pos,
         const std::vector<int>& r_edges,
@@ -1457,7 +1533,7 @@ private:
         
         return new AtomicData(my_final_n, total_atoms, my_final_offset, my_final_n_edge, total_edges_global,
                               r_indices.data(), r_types.data(), edge_indices.data(), type_norb.data(), edge_shifts.data(),
-                              cell.data(), r_pos.data(), comm, final_pbc);
+                              cell.data(), r_pos.data(), r_atomic_numbers.data(), comm, final_pbc);
     }
 
 };

@@ -11,65 +11,479 @@
 
 namespace vbcsr::detail {
 
-template <typename T>
-void csr_mult(DistGraph* graph, const CSRMatrixBackend<T>& backend, DistVector<T>& x, DistVector<T>& y) {
-    x.bind_to_graph(graph);
-    y.bind_to_graph(graph);
-    x.sync_ghosts();
+namespace {
 
+constexpr int kCSRDenseTileWidth = 8;
+
+template <typename T>
+inline void csr_accumulate_dense_entry(
+    T value,
+    const T* x_data,
+    int x_ld,
+    int col_offset,
+    int num_vecs,
+    T* sums) {
+    int vec = 0;
+    for (; vec + kCSRDenseTileWidth <= num_vecs; vec += kCSRDenseTileWidth) {
+        sums[vec + 0] += value * x_data[(vec + 0) * x_ld + col_offset];
+        sums[vec + 1] += value * x_data[(vec + 1) * x_ld + col_offset];
+        sums[vec + 2] += value * x_data[(vec + 2) * x_ld + col_offset];
+        sums[vec + 3] += value * x_data[(vec + 3) * x_ld + col_offset];
+        sums[vec + 4] += value * x_data[(vec + 4) * x_ld + col_offset];
+        sums[vec + 5] += value * x_data[(vec + 5) * x_ld + col_offset];
+        sums[vec + 6] += value * x_data[(vec + 6) * x_ld + col_offset];
+        sums[vec + 7] += value * x_data[(vec + 7) * x_ld + col_offset];
+    }
+    for (; vec < num_vecs; ++vec) {
+        sums[vec] += value * x_data[vec * x_ld + col_offset];
+    }
+}
+
+template <typename T>
+inline void csr_write_dense_row(T* y_data, int y_ld, int row_offset, int num_vecs, const T* sums) {
+    for (int vec = 0; vec < num_vecs; ++vec) {
+        y_data[vec * y_ld + row_offset] = sums[vec];
+    }
+}
+
+#ifdef VBCSR_HAVE_MKL_SPARSE
+inline matrix_descr csr_mkl_descr() {
+    matrix_descr descr{};
+    descr.type = SPARSE_MATRIX_TYPE_GENERAL;
+    descr.mode = SPARSE_FILL_MODE_FULL;
+    descr.diag = SPARSE_DIAG_NON_UNIT;
+    return descr;
+}
+
+template <typename T>
+inline sparse_operation_t csr_mkl_operation(bool adjoint) {
+    if (!adjoint) {
+        return SPARSE_OPERATION_NON_TRANSPOSE;
+    }
+    if constexpr (std::is_same_v<T, std::complex<double>>) {
+        return SPARSE_OPERATION_CONJUGATE_TRANSPOSE;
+    }
+    return SPARSE_OPERATION_TRANSPOSE;
+}
+
+template <typename T>
+bool csr_try_vendor_mkl_vector(
+    const CSRMatrixBackend<T>& backend,
+    const CSRVendorCache<T>& cache,
+    DistVector<T>& x,
+    DistVector<T>& y,
+    bool adjoint) {
+    const matrix_descr descr = csr_mkl_descr();
+    const sparse_operation_t op = csr_mkl_operation<T>(adjoint);
+
+    for (const auto& page : cache.pages) {
+        sparse_status_t status = SPARSE_STATUS_NOT_SUPPORTED;
+        if constexpr (std::is_same_v<T, double>) {
+            const double alpha = 1.0;
+            const double beta = 1.0;
+            const double* x_ptr = adjoint ? x.local_data() + page.metadata.row_begin : x.local_data();
+            double* y_ptr = adjoint ? y.local_data() : y.local_data() + page.metadata.row_begin;
+            status = mkl_sparse_d_mv(op, alpha, page.mkl.handle, descr, x_ptr, beta, y_ptr);
+        } else if constexpr (std::is_same_v<T, std::complex<double>>) {
+            const MKL_Complex16 alpha{1.0, 0.0};
+            const MKL_Complex16 beta{1.0, 0.0};
+            const auto* x_ptr = reinterpret_cast<const MKL_Complex16*>(
+                adjoint ? x.local_data() + page.metadata.row_begin : x.local_data());
+            auto* y_ptr = reinterpret_cast<MKL_Complex16*>(
+                adjoint ? y.local_data() : y.local_data() + page.metadata.row_begin);
+            status = mkl_sparse_z_mv(op, alpha, page.mkl.handle, descr, x_ptr, beta, y_ptr);
+        }
+
+        if (status != SPARSE_STATUS_SUCCESS) {
+            return false;
+        }
+    }
+
+    backend.note_vendor_launch(static_cast<uint64_t>(cache.pages.size()));
+    return true;
+}
+
+template <typename T>
+bool csr_try_vendor_mkl_dense(
+    const CSRMatrixBackend<T>& backend,
+    const CSRVendorCache<T>& cache,
+    DistMultiVector<T>& x,
+    DistMultiVector<T>& y,
+    bool adjoint) {
+    const matrix_descr descr = csr_mkl_descr();
+    const sparse_operation_t op = csr_mkl_operation<T>(adjoint);
+    const sparse_layout_t layout = SPARSE_LAYOUT_COLUMN_MAJOR;
+    const int num_vecs = x.num_vectors;
+    const int x_ld = x.local_rows + x.ghost_rows;
+    const int y_ld = y.local_rows + y.ghost_rows;
+
+    for (const auto& page : cache.pages) {
+        if (mkl_sparse_set_mm_hint(
+                page.mkl.handle,
+                op,
+                descr,
+                layout,
+                static_cast<MKL_INT>(num_vecs),
+                1) != SPARSE_STATUS_SUCCESS) {
+            return false;
+        }
+        if (mkl_sparse_optimize(page.mkl.handle) != SPARSE_STATUS_SUCCESS) {
+            return false;
+        }
+    }
+
+    for (const auto& page : cache.pages) {
+        sparse_status_t status = SPARSE_STATUS_NOT_SUPPORTED;
+        if constexpr (std::is_same_v<T, double>) {
+            const double alpha = 1.0;
+            const double beta = 1.0;
+            const double* b_ptr = adjoint ? x.data.data() + page.metadata.row_begin : x.data.data();
+            double* c_ptr = adjoint ? y.data.data() : y.data.data() + page.metadata.row_begin;
+            status = mkl_sparse_d_mm(
+                op,
+                alpha,
+                page.mkl.handle,
+                descr,
+                layout,
+                b_ptr,
+                static_cast<MKL_INT>(num_vecs),
+                static_cast<MKL_INT>(x_ld),
+                beta,
+                c_ptr,
+                static_cast<MKL_INT>(y_ld));
+        } else if constexpr (std::is_same_v<T, std::complex<double>>) {
+            const MKL_Complex16 alpha{1.0, 0.0};
+            const MKL_Complex16 beta{1.0, 0.0};
+            const auto* b_ptr = reinterpret_cast<const MKL_Complex16*>(
+                adjoint ? x.data.data() + page.metadata.row_begin : x.data.data());
+            auto* c_ptr = reinterpret_cast<MKL_Complex16*>(
+                adjoint ? y.data.data() : y.data.data() + page.metadata.row_begin);
+            status = mkl_sparse_z_mm(
+                op,
+                alpha,
+                page.mkl.handle,
+                descr,
+                layout,
+                b_ptr,
+                static_cast<MKL_INT>(num_vecs),
+                static_cast<MKL_INT>(x_ld),
+                beta,
+                c_ptr,
+                static_cast<MKL_INT>(y_ld));
+        }
+
+        if (status != SPARSE_STATUS_SUCCESS) {
+            return false;
+        }
+    }
+
+    backend.note_vendor_launch(static_cast<uint64_t>(cache.pages.size()));
+    return true;
+}
+#endif
+
+#ifdef VBCSR_HAVE_AOCL_SPARSE
+template <typename T>
+inline aoclsparse_operation csr_aocl_operation(bool adjoint) {
+    if (!adjoint) {
+        return aoclsparse_operation_none;
+    }
+    if constexpr (std::is_same_v<T, std::complex<double>>) {
+        return aoclsparse_operation_conjugate_transpose;
+    }
+    return aoclsparse_operation_transpose;
+}
+
+template <typename T>
+bool csr_try_vendor_aocl_mm(
+    const CSRMatrixBackend<T>& backend,
+    const CSRVendorCache<T>& cache,
+    const T* x_ptr,
+    int x_ld,
+    T* y_ptr,
+    int y_ld,
+    int num_vecs,
+    bool adjoint) {
+    const aoclsparse_operation op = csr_aocl_operation<T>(adjoint);
+    const aoclsparse_order order = aoclsparse_order_column;
+
+    for (const auto& page : cache.pages) {
+        aoclsparse_status status = aoclsparse_status_not_implemented;
+        if constexpr (std::is_same_v<T, double>) {
+            status = aoclsparse_dcsrmm(
+                op,
+                1.0,
+                page.aocl.handle,
+                cache.aocl_descr.handle,
+                order,
+                x_ptr + (adjoint ? page.metadata.row_begin : 0),
+                static_cast<aoclsparse_int>(num_vecs),
+                static_cast<aoclsparse_int>(x_ld),
+                1.0,
+                y_ptr + (adjoint ? 0 : page.metadata.row_begin),
+                static_cast<aoclsparse_int>(y_ld));
+        } else if constexpr (std::is_same_v<T, std::complex<double>>) {
+            const aoclsparse_double_complex alpha{1.0, 0.0};
+            const aoclsparse_double_complex beta{1.0, 0.0};
+            status = aoclsparse_zcsrmm(
+                op,
+                alpha,
+                page.aocl.handle,
+                cache.aocl_descr.handle,
+                order,
+                reinterpret_cast<const aoclsparse_double_complex*>(
+                    x_ptr + (adjoint ? page.metadata.row_begin : 0)),
+                static_cast<aoclsparse_int>(num_vecs),
+                static_cast<aoclsparse_int>(x_ld),
+                beta,
+                reinterpret_cast<aoclsparse_double_complex*>(
+                    y_ptr + (adjoint ? 0 : page.metadata.row_begin)),
+                static_cast<aoclsparse_int>(y_ld));
+        }
+
+        if (status != aoclsparse_status_success) {
+            return false;
+        }
+    }
+
+    backend.note_vendor_launch(static_cast<uint64_t>(cache.pages.size()));
+    return true;
+}
+#endif
+
+template <typename T>
+bool csr_mult_try_vendor_bound(
+    DistGraph* graph,
+    const CSRMatrixBackend<T>& backend,
+    DistVector<T>& x,
+    DistVector<T>& y) {
+    const auto& cache = backend.ensure_vendor_cache(graph->adj_ptr, static_cast<int>(graph->block_sizes.size()));
+    if (cache.kind == CSRVendorBackendKind::None) {
+        return false;
+    }
+
+    std::fill(y.data.begin(), y.data.end(), T(0));
+
+    switch (cache.kind) {
+    case CSRVendorBackendKind::MKL:
+#ifdef VBCSR_HAVE_MKL_SPARSE
+        return csr_try_vendor_mkl_vector(backend, cache, x, y, false);
+#endif
+        break;
+    case CSRVendorBackendKind::AOCL:
+#ifdef VBCSR_HAVE_AOCL_SPARSE
+        return csr_try_vendor_aocl_mm(
+            backend,
+            cache,
+            x.local_data(),
+            x.full_size(),
+            y.local_data(),
+            y.full_size(),
+            1,
+            false);
+#endif
+        break;
+    case CSRVendorBackendKind::None:
+    default:
+        break;
+    }
+
+    return false;
+}
+
+template <typename T>
+bool csr_mult_dense_try_vendor_bound(
+    DistGraph* graph,
+    const CSRMatrixBackend<T>& backend,
+    DistMultiVector<T>& x,
+    DistMultiVector<T>& y) {
+    const auto& cache = backend.ensure_vendor_cache(graph->adj_ptr, static_cast<int>(graph->block_sizes.size()));
+    if (cache.kind == CSRVendorBackendKind::None) {
+        return false;
+    }
+
+    std::fill(y.data.begin(), y.data.end(), T(0));
+
+    switch (cache.kind) {
+    case CSRVendorBackendKind::MKL:
+#ifdef VBCSR_HAVE_MKL_SPARSE
+        return csr_try_vendor_mkl_dense(backend, cache, x, y, false);
+#endif
+        break;
+    case CSRVendorBackendKind::AOCL:
+#ifdef VBCSR_HAVE_AOCL_SPARSE
+        return csr_try_vendor_aocl_mm(
+            backend,
+            cache,
+            x.data.data(),
+            x.local_rows + x.ghost_rows,
+            y.data.data(),
+            y.local_rows + y.ghost_rows,
+            x.num_vectors,
+            false);
+#endif
+        break;
+    case CSRVendorBackendKind::None:
+    default:
+        break;
+    }
+
+    return false;
+}
+
+template <typename T>
+bool csr_mult_adjoint_try_vendor_bound(
+    DistGraph* graph,
+    const CSRMatrixBackend<T>& backend,
+    DistVector<T>& x,
+    DistVector<T>& y) {
+    const auto& cache = backend.ensure_vendor_cache(graph->adj_ptr, static_cast<int>(graph->block_sizes.size()));
+    if (cache.kind == CSRVendorBackendKind::None) {
+        return false;
+    }
+
+    std::fill(y.data.begin(), y.data.end(), T(0));
+
+    bool ok = false;
+    switch (cache.kind) {
+    case CSRVendorBackendKind::MKL:
+#ifdef VBCSR_HAVE_MKL_SPARSE
+        ok = csr_try_vendor_mkl_vector(backend, cache, x, y, true);
+#endif
+        break;
+    case CSRVendorBackendKind::AOCL:
+#ifdef VBCSR_HAVE_AOCL_SPARSE
+        ok = csr_try_vendor_aocl_mm(
+            backend,
+            cache,
+            x.local_data(),
+            x.full_size(),
+            y.local_data(),
+            y.full_size(),
+            1,
+            true);
+#endif
+        break;
+    case CSRVendorBackendKind::None:
+    default:
+        ok = false;
+        break;
+    }
+
+    if (ok) {
+        y.reduce_ghosts();
+    }
+    return ok;
+}
+
+template <typename T>
+bool csr_mult_dense_adjoint_try_vendor_bound(
+    DistGraph* graph,
+    const CSRMatrixBackend<T>& backend,
+    DistMultiVector<T>& x,
+    DistMultiVector<T>& y) {
+    const auto& cache = backend.ensure_vendor_cache(graph->adj_ptr, static_cast<int>(graph->block_sizes.size()));
+    if (cache.kind == CSRVendorBackendKind::None) {
+        return false;
+    }
+
+    std::fill(y.data.begin(), y.data.end(), T(0));
+
+    bool ok = false;
+    switch (cache.kind) {
+    case CSRVendorBackendKind::MKL:
+#ifdef VBCSR_HAVE_MKL_SPARSE
+        ok = csr_try_vendor_mkl_dense(backend, cache, x, y, true);
+#endif
+        break;
+    case CSRVendorBackendKind::AOCL:
+#ifdef VBCSR_HAVE_AOCL_SPARSE
+        ok = csr_try_vendor_aocl_mm(
+            backend,
+            cache,
+            x.data.data(),
+            x.local_rows + x.ghost_rows,
+            y.data.data(),
+            y.local_rows + y.ghost_rows,
+            x.num_vectors,
+            true);
+#endif
+        break;
+    case CSRVendorBackendKind::None:
+    default:
+        ok = false;
+        break;
+    }
+
+    if (ok) {
+        y.reduce_ghosts();
+    }
+    return ok;
+}
+
+template <typename T>
+void csr_mult_native(DistGraph* graph, const CSRMatrixBackend<T>& backend, DistVector<T>& x, DistVector<T>& y) {
     const auto& row_ptr = graph->adj_ptr;
     const int n_rows = row_ptr.empty() ? 0 : static_cast<int>(row_ptr.size()) - 1;
+    const int* block_offsets = graph->block_offsets.data();
+    const T* x_data = x.local_data();
+    T* y_data = y.local_data();
 
-    #pragma omp parallel for
+    #pragma omp parallel for schedule(static)
     for (int row = 0; row < n_rows; ++row) {
         T sum = T(0);
         backend.for_each_row_segment(row_ptr, row, [&](auto page, auto) {
             for (uint32_t idx = 0; idx < page.nnz; ++idx) {
                 const int col = page.cols[idx];
-                sum += page.vals[idx] * x.data[graph->block_offsets[col]];
+                sum += page.vals[idx] * x_data[block_offsets[col]];
             }
         });
-        y.data[graph->block_offsets[row]] = sum;
+        y_data[block_offsets[row]] = sum;
     }
 }
 
 template <typename T>
-void csr_mult_dense(DistGraph* graph, const CSRMatrixBackend<T>& backend, DistMultiVector<T>& x, DistMultiVector<T>& y) {
-    x.bind_to_graph(graph);
-    y.bind_to_graph(graph);
-    x.sync_ghosts();
-
+void csr_mult_dense_native(
+    DistGraph* graph,
+    const CSRMatrixBackend<T>& backend,
+    DistMultiVector<T>& x,
+    DistMultiVector<T>& y) {
     const auto& row_ptr = graph->adj_ptr;
     const int n_rows = row_ptr.empty() ? 0 : static_cast<int>(row_ptr.size()) - 1;
     const int num_vecs = x.num_vectors;
     const int x_ld = x.local_rows + x.ghost_rows;
     const int y_ld = y.local_rows + y.ghost_rows;
+    const int* block_offsets = graph->block_offsets.data();
+    const T* x_data = x.data.data();
+    T* y_data = y.data.data();
 
-    #pragma omp parallel for
-    for (int row = 0; row < n_rows; ++row) {
-        const int row_offset = graph->block_offsets[row];
-        for (int vec = 0; vec < num_vecs; ++vec) {
-            y.data[vec * y_ld + row_offset] = T(0);
-        }
+    #pragma omp parallel
+    {
+        std::vector<T> sums(static_cast<size_t>(num_vecs), T(0));
 
-        backend.for_each_row_segment(row_ptr, row, [&](auto page, auto) {
-            for (uint32_t idx = 0; idx < page.nnz; ++idx) {
-                const int col = page.cols[idx];
-                const int col_offset = graph->block_offsets[col];
-                const T value = page.vals[idx];
-                for (int vec = 0; vec < num_vecs; ++vec) {
-                    y.data[vec * y_ld + row_offset] += value * x.data[vec * x_ld + col_offset];
+        #pragma omp for schedule(static)
+        for (int row = 0; row < n_rows; ++row) {
+            std::fill(sums.begin(), sums.end(), T(0));
+
+            backend.for_each_row_segment(row_ptr, row, [&](auto page, auto) {
+                for (uint32_t idx = 0; idx < page.nnz; ++idx) {
+                    const int col = page.cols[idx];
+                    const int col_offset = block_offsets[col];
+                    csr_accumulate_dense_entry(page.vals[idx], x_data, x_ld, col_offset, num_vecs, sums.data());
                 }
-            }
-        });
+            });
+
+            csr_write_dense_row(y_data, y_ld, block_offsets[row], num_vecs, sums.data());
+        }
     }
 }
 
 template <typename T>
-void csr_mult_adjoint(DistGraph* graph, const CSRMatrixBackend<T>& backend, DistVector<T>& x, DistVector<T>& y) {
-    x.bind_to_graph(graph);
-    y.bind_to_graph(graph);
-
+void csr_mult_adjoint_native(
+    DistGraph* graph,
+    const CSRMatrixBackend<T>& backend,
+    DistVector<T>& x,
+    DistVector<T>& y) {
     std::fill(y.data.begin(), y.data.end(), T(0));
 
     const auto& row_ptr = graph->adj_ptr;
@@ -79,14 +493,14 @@ void csr_mult_adjoint(DistGraph* graph, const CSRMatrixBackend<T>& backend, Dist
     {
         std::vector<T> y_local(y.data.size(), T(0));
 
-        #pragma omp for
+        #pragma omp for schedule(static)
         for (int row = 0; row < n_rows; ++row) {
             const T x_value = x.data[graph->block_offsets[row]];
             backend.for_each_row_segment(row_ptr, row, [&](auto page, auto) {
                 for (uint32_t idx = 0; idx < page.nnz; ++idx) {
                     const int col = page.cols[idx];
                     const int col_offset = graph->block_offsets[col];
-                    y_local[col_offset] += ScalarTraits<T>::conjugate(page.vals[idx]) * x_value;
+                    y_local[static_cast<size_t>(col_offset)] += ScalarTraits<T>::conjugate(page.vals[idx]) * x_value;
                 }
             });
         }
@@ -103,14 +517,11 @@ void csr_mult_adjoint(DistGraph* graph, const CSRMatrixBackend<T>& backend, Dist
 }
 
 template <typename T>
-void csr_mult_dense_adjoint(
+void csr_mult_dense_adjoint_native(
     DistGraph* graph,
     const CSRMatrixBackend<T>& backend,
     DistMultiVector<T>& x,
     DistMultiVector<T>& y) {
-    x.bind_to_graph(graph);
-    y.bind_to_graph(graph);
-
     std::fill(y.data.begin(), y.data.end(), T(0));
 
     const auto& row_ptr = graph->adj_ptr;
@@ -123,7 +534,7 @@ void csr_mult_dense_adjoint(
     {
         std::vector<T> y_local(y.data.size(), T(0));
 
-        #pragma omp for
+        #pragma omp for schedule(static)
         for (int row = 0; row < n_rows; ++row) {
             const int row_offset = graph->block_offsets[row];
             backend.for_each_row_segment(row_ptr, row, [&](auto page, auto) {
@@ -132,7 +543,8 @@ void csr_mult_dense_adjoint(
                     const int col_offset = graph->block_offsets[col];
                     const T value = ScalarTraits<T>::conjugate(page.vals[idx]);
                     for (int vec = 0; vec < num_vecs; ++vec) {
-                        y_local[vec * y_ld + col_offset] += value * x.data[vec * x_ld + row_offset];
+                        y_local[static_cast<size_t>(vec * y_ld + col_offset)] +=
+                            value * x.data[static_cast<size_t>(vec * x_ld + row_offset)];
                     }
                 }
             });
@@ -147,6 +559,50 @@ void csr_mult_dense_adjoint(
     }
 
     y.reduce_ghosts();
+}
+
+} // namespace
+
+template <typename T>
+void csr_mult(DistGraph* graph, const CSRMatrixBackend<T>& backend, DistVector<T>& x, DistVector<T>& y) {
+    x.bind_to_graph(graph);
+    y.bind_to_graph(graph);
+    x.sync_ghosts();
+    if (!csr_mult_try_vendor_bound(graph, backend, x, y)) {
+        csr_mult_native(graph, backend, x, y);
+    }
+}
+
+template <typename T>
+void csr_mult_dense(DistGraph* graph, const CSRMatrixBackend<T>& backend, DistMultiVector<T>& x, DistMultiVector<T>& y) {
+    x.bind_to_graph(graph);
+    y.bind_to_graph(graph);
+    x.sync_ghosts();
+    if (!csr_mult_dense_try_vendor_bound(graph, backend, x, y)) {
+        csr_mult_dense_native(graph, backend, x, y);
+    }
+}
+
+template <typename T>
+void csr_mult_adjoint(DistGraph* graph, const CSRMatrixBackend<T>& backend, DistVector<T>& x, DistVector<T>& y) {
+    x.bind_to_graph(graph);
+    y.bind_to_graph(graph);
+    if (!csr_mult_adjoint_try_vendor_bound(graph, backend, x, y)) {
+        csr_mult_adjoint_native(graph, backend, x, y);
+    }
+}
+
+template <typename T>
+void csr_mult_dense_adjoint(
+    DistGraph* graph,
+    const CSRMatrixBackend<T>& backend,
+    DistMultiVector<T>& x,
+    DistMultiVector<T>& y) {
+    x.bind_to_graph(graph);
+    y.bind_to_graph(graph);
+    if (!csr_mult_dense_adjoint_try_vendor_bound(graph, backend, x, y)) {
+        csr_mult_dense_adjoint_native(graph, backend, x, y);
+    }
 }
 
 } // namespace vbcsr::detail

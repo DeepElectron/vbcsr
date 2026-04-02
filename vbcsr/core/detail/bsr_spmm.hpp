@@ -11,7 +11,7 @@
 #include <map>
 #include <vector>
 
-namespace detail {
+namespace vbcsr::detail {
 
 template <typename Matrix>
 struct BSRSpMMExecutor {
@@ -131,12 +131,15 @@ struct BSRSpMMExecutor {
             }
         }
 
-        Matrix C = Matrix::from_bsr_builder(c_graph, true, std::move(builder));
+        Matrix C = Matrix::template materialize_from_builder<vbcsr::MatrixKind::BSR>(
+            c_graph,
+            true,
+            std::move(builder));
         C.filter_blocks(threshold);
         return C;
     }
 };
 
-} // namespace detail
+} // namespace vbcsr::detail
 
 #endif // VBCSR_DETAIL_BSR_SPMM_HPP

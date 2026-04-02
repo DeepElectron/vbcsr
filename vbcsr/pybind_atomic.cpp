@@ -21,6 +21,32 @@ std::vector<T> numpy_to_vector(py::array_t<T> array) {
     return vec;
 }
 
+template<typename T>
+py::array_t<T> copy_1d_array(const T* data, py::ssize_t size) {
+    py::array_t<T> result(py::array::ShapeContainer{size});
+    if (size > 0 && data != nullptr) {
+        auto out = result.template mutable_unchecked<1>();
+        for (py::ssize_t i = 0; i < size; ++i) {
+            out(i) = data[i];
+        }
+    }
+    return result;
+}
+
+template<typename T>
+py::array_t<T> copy_2d_array(py::ssize_t rows, py::ssize_t cols, const T* data) {
+    py::array_t<T> result({rows, cols});
+    if (rows > 0 && cols > 0 && data != nullptr) {
+        auto out = result.template mutable_unchecked<2>();
+        for (py::ssize_t row = 0; row < rows; ++row) {
+            for (py::ssize_t col = 0; col < cols; ++col) {
+                out(row, col) = data[row * cols + col];
+            }
+        }
+    }
+    return result;
+}
+
 inline std::vector<bool> parse_pbc(py::object pbc_obj) {
     std::vector<bool> vec_pbc(3, false);
     if (pbc_obj.is_none()) {
@@ -124,6 +150,21 @@ void bind_image_container(py::module& m, const std::string& name) {
 }
 
 void bind_atomic_module(py::module& m) {
+    auto owned_positions = [](const AtomicData& self) {
+        py::array_t<double> positions({static_cast<py::ssize_t>(self.n_atom), static_cast<py::ssize_t>(3)});
+        auto out = positions.mutable_unchecked<2>();
+        for (int i = 0; i < self.n_atom; ++i) {
+            out(i, 0) = self.x[i];
+            out(i, 1) = self.y[i];
+            out(i, 2) = self.z[i];
+        }
+        return positions;
+    };
+
+    auto owned_atomic_numbers = [](const AtomicData& self, const char* context) {
+        self.ensure_owned_atomic_numbers(context);
+        return copy_1d_array(self.atomic_numbers.data(), self.n_atom);
+    };
     
     py::class_<AtomicData>(m, "AtomicData")
         .def(py::init([](py::object comm_obj) {
@@ -188,6 +229,7 @@ void bind_atomic_module(py::module& m) {
                 py::array_t<int> edge_shift,
                 py::array_t<double> cell,
                 py::array_t<double> pos,
+                py::object atomic_numbers_obj,
                 py::object comm_obj) {
             
             MPI_Comm comm = get_mpi_comm(comm_obj);
@@ -214,65 +256,54 @@ void bind_atomic_module(py::module& m) {
             auto c_edge_shift = py::array_t<int, py::array::c_style | py::array::forcecast>(edge_shift);
             auto c_cell = py::array_t<double, py::array::c_style | py::array::forcecast>(cell);
             auto c_pos = py::array_t<double, py::array::c_style | py::array::forcecast>(pos);
+
+            const int* atomic_numbers_ptr = nullptr;
+            py::array_t<int, py::array::c_style | py::array::forcecast> c_atomic_numbers;
+            if (!atomic_numbers_obj.is_none()) {
+                c_atomic_numbers = py::array_t<int, py::array::c_style | py::array::forcecast>(
+                    atomic_numbers_obj.cast<py::array_t<int>>());
+                if (c_atomic_numbers.size() != n_atom) {
+                    throw std::runtime_error("atomic_numbers size must equal n_atom");
+                }
+                atomic_numbers_ptr = c_atomic_numbers.data();
+            }
             
             return new AtomicData(
                 (size_t)n_atom, (size_t)N_atom, (size_t)atom_offset, (size_t)n_edge, (size_t)N_edge,
                 c_atom_index.data(), c_atom_type.data(), c_edge_index.data(),
                 c_type_norb.data(), c_edge_shift.data(),
-                c_cell.data(), c_pos.data(),
+                c_cell.data(), c_pos.data(), atomic_numbers_ptr,
                 comm
             );
         }, py::arg("n_atom"), py::arg("N_atom"), py::arg("atom_offset"),
            py::arg("n_edge"), py::arg("N_edge"),
            py::arg("atom_index"), py::arg("atom_type"), py::arg("edge_index"),
            py::arg("type_norb"), py::arg("edge_shift"),
-           py::arg("cell"), py::arg("pos"),
+           py::arg("cell"), py::arg("pos"), py::arg("atomic_numbers") = py::none(),
            py::arg("comm") = py::none())
         
         // Properties
-        .def_property_readonly("pos", [](const AtomicData& self) {
-            std::vector<double> pos_vec(self.n_atom * 3);
-            for(int i=0; i<self.n_atom; ++i) {
-                pos_vec[3*i] = self.x[i];
-                pos_vec[3*i+1] = self.y[i];
-                pos_vec[3*i+2] = self.z[i]; 
-            }
-            return py::array_t<double>(
-                { (py::ssize_t)self.n_atom, (py::ssize_t)3 },
-                { 3 * sizeof(double), sizeof(double) }, 
-                pos_vec.data()
-            );
-        })
-        .def_property_readonly("positions", [](const AtomicData& self) { // Alias
-            std::vector<double> pos_vec(self.n_atom * 3);
-            for(int i=0; i<self.n_atom; ++i) {
-                pos_vec[3*i] = self.x[i];
-                pos_vec[3*i+1] = self.y[i];
-                pos_vec[3*i+2] = self.z[i];
-            }
-            return py::array_t<double>(
-                { (py::ssize_t)self.n_atom, (py::ssize_t)3 },
-                { 3 * sizeof(double), sizeof(double) },
-                pos_vec.data()
-            );
-        })
+        .def_property_readonly("pos", owned_positions)
+        .def_property_readonly("positions", owned_positions)
         .def_property_readonly("atom_indices", [](const AtomicData& self) { 
-             return py::array_t<int>(self.n_atom, self.atom_index.data());
+             return copy_1d_array(self.atom_index.data(), self.n_atom);
         })
         .def_property_readonly("indices", [](const AtomicData& self) { 
-             return py::array_t<int>(self.n_atom, self.atom_index.data());
+             return copy_1d_array(self.atom_index.data(), self.n_atom);
         })
         .def_property_readonly("atom_types", [](const AtomicData& self) { 
-             return py::array_t<int>(self.n_atom, self.atom_type.data());
+             return copy_1d_array(self.atom_type.data(), self.n_atom);
         })
-        .def_property_readonly("z", [](const AtomicData& self) { 
-             return py::array_t<int>(self.n_atom, self.atom_type.data());
+        .def_property_readonly("z", [owned_atomic_numbers](const AtomicData& self) {
+             return owned_atomic_numbers(self, "AtomicData.z");
         })
-        .def_property_readonly("atomic_numbers", [](const AtomicData& self) { 
-             return py::array_t<int>(self.n_atom, self.atom_type.data());
+        .def_property_readonly("atomic_numbers", [owned_atomic_numbers](const AtomicData& self) {
+             return owned_atomic_numbers(self, "AtomicData.atomic_numbers");
         })
         .def_property_readonly("cell", [](const AtomicData& self) {
-             return py::array_t<double>({3, 3}, self.cell.data());
+             const double zero_cell[9] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+             const double* cell_ptr = self.cell.size() == 9 ? self.cell.data() : zero_cell;
+             return copy_2d_array<double>(3, 3, cell_ptr);
         })
         .def("norb", &AtomicData::norb)
         .def_property_readonly("pbc", [](const AtomicData& self) {
@@ -280,30 +311,20 @@ void bind_atomic_module(py::module& m) {
         })
         
         .def_property_readonly("edge_index", [](const AtomicData& self) {
-             int n_local = self.n_atom;
-             int n_edges = self.graph->adj_ptr[n_local];
-             
-             py::array_t<int> edge_index({2, n_edges});
+             py::array_t<int> edge_index({static_cast<py::ssize_t>(self.n_edge), static_cast<py::ssize_t>(2)});
              auto ptr = edge_index.mutable_unchecked<2>();
-             
-             for(int i=0; i<n_local; ++i) {
-                 int start = self.graph->adj_ptr[i];
-                 int end = self.graph->adj_ptr[i+1];
-                 for(int j=start; j<end; ++j) {
-                     ptr(0, j) = i; 
-                     ptr(1, j) = self.graph->adj_ind[j];
-                 }
+
+             for(int i = 0; i < self.n_edge; ++i) {
+                 ptr(i, 0) = self.edges[i].src;
+                 ptr(i, 1) = self.edges[i].dst;
              }
              return edge_index;
         })
         .def_property_readonly("edge_shift", [](const AtomicData& self) {
-             int n_local = self.n_atom;
-             int n_edges = self.graph->adj_ptr[n_local];
-             
-             py::array_t<int> shifts({n_edges, 3});
+             py::array_t<int> shifts({static_cast<py::ssize_t>(self.n_edge), static_cast<py::ssize_t>(3)});
              auto ptr = shifts.mutable_unchecked<2>();
              
-             for(int i=0; i<n_edges; ++i) {
+             for(int i = 0; i < self.n_edge; ++i) {
                   ptr(i, 0) = self.edges[i].rx;
                   ptr(i, 1) = self.edges[i].ry;
                   ptr(i, 2) = self.edges[i].rz;
@@ -313,20 +334,16 @@ void bind_atomic_module(py::module& m) {
         .def_readonly("graph", &AtomicData::graph, py::return_value_policy::reference)
         
         // Keep to_ase for convenience of C++ side data export
-        .def("to_ase", [](const AtomicData& self) {
+        .def("to_ase", [owned_positions](const AtomicData& self) {
+            self.ensure_owned_atomic_numbers("AtomicData.to_ase");
             py::object ase = py::module::import("ase");
             py::object Atoms = ase.attr("Atoms");
-            
-            std::vector<double> pos_vec(self.n_atom * 3);
-            for(int i=0; i<self.n_atom; ++i) {
-                pos_vec[3*i] = self.x[i];
-                pos_vec[3*i+1] = self.y[i];
-                pos_vec[3*i+2] = self.z[i];
-            }
-            py::array_t<double> pos_arr({ (py::ssize_t)self.n_atom, (py::ssize_t)3 }, pos_vec.data());
+            const double zero_cell[9] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+            const double* cell_ptr = self.cell.size() == 9 ? self.cell.data() : zero_cell;
 
-            py::array_t<int> numbers(self.n_atom, self.atom_type.data());
-            py::array_t<double> cell({3, 3}, self.cell.data());
+            py::array_t<double> pos_arr = owned_positions(self);
+            py::array_t<int> numbers = copy_1d_array(self.atomic_numbers.data(), self.n_atom);
+            py::array_t<double> cell = copy_2d_array<double>(3, 3, cell_ptr);
             
             return Atoms(py::arg("numbers")=numbers, 
                          py::arg("positions")=pos_arr, 

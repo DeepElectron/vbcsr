@@ -1,13 +1,19 @@
 #ifndef VBCSR_DETAIL_AXPBY_OPS_HPP
 #define VBCSR_DETAIL_AXPBY_OPS_HPP
 
+#include "../dist_graph.hpp"
+#include "bsr_result_builder.hpp"
+#include "csr_result_builder.hpp"
+#include "distributed_result_graph.hpp"
+#include "vbcsr_result_builder.hpp"
+
 #include <algorithm>
 #include <cstring>
 #include <map>
 #include <type_traits>
 #include <vector>
 
-namespace detail {
+namespace vbcsr::detail {
 
 template <typename Matrix>
 struct CSRAxpbyExecutor {
@@ -40,7 +46,10 @@ struct CSRAxpbyExecutor {
             for (size_t slot = 0; slot < X.local_block_nnz(); ++slot) {
                 *builder.slot_data(static_cast<int>(slot)) = alpha * (*X.block_data(static_cast<int>(slot)));
             }
-            self.replace_with_csr_builder(new_graph, true, std::move(builder));
+            self.template replace_with_builder<vbcsr::MatrixKind::CSR>(
+                new_graph,
+                true,
+                std::move(builder));
             return;
         }
 
@@ -83,7 +92,10 @@ struct CSRAxpbyExecutor {
             }
         }
 
-        self.replace_with_csr_builder(new_graph, true, std::move(builder));
+        self.template replace_with_builder<vbcsr::MatrixKind::CSR>(
+            new_graph,
+            true,
+            std::move(builder));
     }
 };
 
@@ -126,7 +138,10 @@ struct BSRAxpbyExecutor {
                     dest[idx] = alpha * src[idx];
                 }
             }
-            self.replace_with_bsr_builder(new_graph, true, std::move(builder));
+            self.template replace_with_builder<vbcsr::MatrixKind::BSR>(
+                new_graph,
+                true,
+                std::move(builder));
             return;
         }
 
@@ -178,7 +193,10 @@ struct BSRAxpbyExecutor {
             }
         }
 
-        self.replace_with_bsr_builder(new_graph, true, std::move(builder));
+        self.template replace_with_builder<vbcsr::MatrixKind::BSR>(
+            new_graph,
+            true,
+            std::move(builder));
     }
 };
 
@@ -435,7 +453,10 @@ struct VBCSRAxpbyExecutor {
             }
         }
 
-        self.replace_with_vbcsr_builder(new_graph, true, std::move(builder));
+        self.template replace_with_builder<vbcsr::MatrixKind::VBCSR>(
+            new_graph,
+            true,
+            std::move(builder));
     }
 
 private:
@@ -509,6 +530,6 @@ private:
     }
 };
 
-} // namespace detail
+} // namespace vbcsr::detail
 
 #endif // VBCSR_DETAIL_AXPBY_OPS_HPP

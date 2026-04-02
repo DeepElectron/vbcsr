@@ -46,14 +46,6 @@ public:
         return block_size_;
     }
 
-    T* mutable_block(int slot) {
-        return backend_.block_ptr(slot);
-    }
-
-    const T* mutable_block(int slot) const {
-        return backend_.block_ptr(slot);
-    }
-
     void accumulate_block(int slot, const T* src, T alpha = T(1)) {
         T* dest = backend_.block_ptr(slot);
         const size_t block_area = static_cast<size_t>(block_size_) * static_cast<size_t>(block_size_);
@@ -79,15 +71,11 @@ public:
     }
 
     T* slot_data(int slot) {
-        return mutable_block(slot);
+        return backend_.block_ptr(slot);
     }
 
     const T* slot_data(int slot) const {
-        return mutable_block(slot);
-    }
-
-    BSRMatrixBackend<T> commit_backend() && {
-        return std::move(*this).commit();
+        return backend_.block_ptr(slot);
     }
 
 private:

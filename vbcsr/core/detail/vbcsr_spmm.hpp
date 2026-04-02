@@ -4,6 +4,7 @@
 #include "distributed_plans.hpp"
 #include "vbcsr_result_builder.hpp"
 
+#include <cstring>
 #include <map>
 #include <tuple>
 #include <vector>
@@ -12,7 +13,7 @@
 #include <omp.h>
 #endif
 
-namespace detail {
+namespace vbcsr::detail {
 
 template <typename Matrix>
 struct VBCSRSpMMExecutor {
@@ -21,6 +22,8 @@ struct VBCSRSpMMExecutor {
     using GhostBlockRef = typename Matrix::GhostBlockRef;
 
 private:
+    static constexpr size_t kTargetScratchBytes = 1u << 20;
+
     struct HashEntry {
         int key;
         int slot;
@@ -60,7 +63,10 @@ public:
 
         DistGraph* c_graph = assembly_plan.construct_result_graph(A, "spmm");
         VBCSRResultBuilder<T, Kernel> builder(c_graph);
-        Matrix C = Matrix::from_vbcsr_builder(c_graph, true, std::move(builder));
+        Matrix C = Matrix::template materialize_from_builder<vbcsr::MatrixKind::VBCSR>(
+            c_graph,
+            true,
+            std::move(builder));
 
         numeric_multiply(A, B, assembly_plan.ghost_rows(), C, threshold, A_norms, B_local_norms);
         C.filter_blocks(threshold);
@@ -213,7 +219,11 @@ private:
                     case ExecutionKind::StaticFallback:
                     case ExecutionKind::BatchedFallback:
                     case ExecutionKind::JIT:
-                        run_product_batch(key, tasks);
+                        if (A.is_contiguous() && B.is_contiguous() && SmartKernel<T>::supports_batched_gemm()) {
+                            run_product_batch_packed(key, tasks);
+                        } else {
+                            run_product_batch_fallback(key, tasks);
+                        }
                         break;
                 }
             }
@@ -244,7 +254,7 @@ private:
         }
     }
 
-    static void run_product_batch(const ProductBatchKey& key, const std::vector<ProductTask>& tasks) {
+    static void run_product_batch_fallback(const ProductBatchKey& key, const std::vector<ProductTask>& tasks) {
         for (const auto& task : tasks) {
             SmartKernel<T>::gemm(
                 key.row_dim,
@@ -260,8 +270,83 @@ private:
                 key.row_dim);
         }
     }
+
+    static void run_product_batch_packed(const ProductBatchKey& key, const std::vector<ProductTask>& tasks) {
+        if (tasks.empty()) {
+            return;
+        }
+
+        const int a_stride = key.row_dim * key.inner_dim;
+        const int b_stride = key.inner_dim * key.col_dim;
+        const int c_stride = key.row_dim * key.col_dim;
+        const uint32_t chunk_size = choose_chunk_size(
+            static_cast<size_t>(a_stride + b_stride + c_stride),
+            static_cast<uint32_t>(tasks.size()));
+
+        std::vector<T> a_scratch;
+        std::vector<T> b_scratch;
+        std::vector<T> c_scratch;
+        a_scratch.reserve(static_cast<size_t>(chunk_size) * a_stride);
+        b_scratch.reserve(static_cast<size_t>(chunk_size) * b_stride);
+        c_scratch.reserve(static_cast<size_t>(chunk_size) * c_stride);
+
+        for (uint32_t begin = 0; begin < tasks.size(); begin += chunk_size) {
+            const uint32_t count = std::min<uint32_t>(chunk_size, static_cast<uint32_t>(tasks.size()) - begin);
+            a_scratch.resize(static_cast<size_t>(count) * a_stride);
+            b_scratch.resize(static_cast<size_t>(count) * b_stride);
+            c_scratch.assign(static_cast<size_t>(count) * c_stride, T(0));
+
+            for (uint32_t idx = 0; idx < count; ++idx) {
+                const auto& task = tasks[begin + idx];
+                std::memcpy(
+                    a_scratch.data() + static_cast<size_t>(idx) * a_stride,
+                    task.a_ptr,
+                    static_cast<size_t>(a_stride) * sizeof(T));
+                std::memcpy(
+                    b_scratch.data() + static_cast<size_t>(idx) * b_stride,
+                    task.b_ptr,
+                    static_cast<size_t>(b_stride) * sizeof(T));
+            }
+
+            SmartKernel<T>::gemm_batched(
+                key.row_dim,
+                key.col_dim,
+                key.inner_dim,
+                T(1),
+                a_scratch.data(),
+                key.row_dim,
+                a_stride,
+                b_scratch.data(),
+                key.inner_dim,
+                b_stride,
+                T(0),
+                c_scratch.data(),
+                key.row_dim,
+                c_stride,
+                static_cast<int>(count));
+
+            for (uint32_t idx = 0; idx < count; ++idx) {
+                T* dest = tasks[begin + idx].c_ptr;
+                const T* src = c_scratch.data() + static_cast<size_t>(idx) * c_stride;
+                for (int elem = 0; elem < c_stride; ++elem) {
+                    dest[elem] += src[elem];
+                }
+            }
+        }
+    }
+
+    static uint32_t choose_chunk_size(size_t per_task_scratch_elems, uint32_t total_tasks) {
+        if (total_tasks == 0) {
+            return 1;
+        }
+        const size_t target_elems = std::max<size_t>(1, kTargetScratchBytes / sizeof(T));
+        const size_t tasks_per_chunk = per_task_scratch_elems == 0
+            ? static_cast<size_t>(total_tasks)
+            : std::max<size_t>(1, target_elems / per_task_scratch_elems);
+        return static_cast<uint32_t>(std::min<size_t>(tasks_per_chunk, total_tasks));
+    }
 };
 
-} // namespace detail
+} // namespace vbcsr::detail
 
 #endif // VBCSR_DETAIL_VBCSR_SPMM_HPP

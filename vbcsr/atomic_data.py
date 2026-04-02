@@ -1,224 +1,204 @@
-from . import vbcsr_core
-import numpy as np
 import ase.data
 import ase.io
+import numpy as np
+
+from . import vbcsr_core
+
 try:
     from mpi4py import MPI
 except ImportError:
     MPI = None
 
+
+def _default_comm(comm):
+    if comm is not None or MPI is None:
+        return comm
+    return MPI.COMM_WORLD
+
+
+def _normalize_pbc(pbc):
+    if isinstance(pbc, bool):
+        return [pbc, pbc, pbc]
+    values = list(pbc)
+    if len(values) == 1:
+        return [bool(values[0]), bool(values[0]), bool(values[0])]
+    if len(values) != 3:
+        raise ValueError("pbc must be a bool or a sequence of length 1 or 3")
+    return [bool(value) for value in values]
+
+
 class AtomicData(vbcsr_core.AtomicData):
     """
-    Wrapper class for vbcsr_core.AtomicData with enhanced Python support.
-    Handles dictionary inputs for r_max/type_norb with support for atomic numbers
-    and chemical symbols.
+    Python wrapper for ``vbcsr_core.AtomicData``.
+
+    Dictionary inputs for ``r_max`` and ``type_norb`` may use atomic numbers,
+    chemical symbols, or a ``"default"`` fallback.
     """
 
     @classmethod
     def from_points(cls, pos, z, cell, pbc, r_max, type_norb=1, comm=None):
-        """
-        Create AtomicData from atomic positions and numbers.
-        
-        Args:
-            pos: (N, 3) positions
-            z: (N,) atomic numbers
-            cell: (3, 3) unit cell
-            pbc: (3,) PBC flags
-            r_max: float or dict. Cutoff radius. Dict keys can be atomic number (int) or symbol (str).
-            type_norb: int or dict. Orbitals per type. Dict keys similar to r_max.
-            comm: MPI communicator (mpi4py). If None, defaults to MPI.COMM_WORLD if installed.
-        """
-        if comm is None and MPI is not None:
-            comm = MPI.COMM_WORLD
-            
-        # Ensure imports
-        
-        # 1. Determine Unique Zs to map inputs to vectors
-        # Logic: We need to match C++'s mapping: sorted unique Zs.
-        # Data might be distributed or on Rank 0.
-        # vbcsr C++ from_points typically expects data on Rank 0 for initial partition?
-        # Or if passed distributed, it gathers?
-        # Standard usage: Pass global on Rank 0.
-        # But we verify locally.
-        
-        local_z = np.asarray(z, dtype=np.int32).reshape(-1)
-        
-        # We need global unique Zs
-        if comm is not None:
-             # Gather all Zs? Expensive if large.
-             # Gather only unique local Zs.
-             local_unique = np.unique(local_z)
-             all_unique = comm.allgather(local_unique) # list of arrays
-             global_unique = np.unique(np.concatenate(all_unique))
-             sorted_unique_z = np.sort(global_unique)
-        else:
-             sorted_unique_z = np.unique(local_z)
-             
-        # 2. Parse r_max and type_norb into vectors
-        def parse_param(param, name, output_type=float):
-            vec = np.zeros(len(sorted_unique_z), dtype=output_type)
-            if np.isscalar(param) or (isinstance(param, list) and len(param) == 1):
-                vec[:] = param
-            elif isinstance(param, dict):
-                # Check default
-                default_val = param.get("default", None)
-                if default_val is not None:
-                    vec[:] = default_val
-                    
-                for i, z_val in enumerate(sorted_unique_z):
-                    # Try keys: Z (int), Symbol (str)
-                    val = None
-                    if z_val in param:
-                        val = param[z_val]
-                    else:
-                        sym = ase.data.chemical_symbols[z_val]
-                        if sym in param:
-                            val = param[sym]
-                    
-                    if val is not None:
-                        vec[i] = val
-                    elif default_val is None:
-                        raise ValueError(f"{name} missing for Z={z_val} ({ase.data.chemical_symbols[z_val]})")
-            elif isinstance(param, (list, np.ndarray, tuple)):
-                 # Assign directly if size matches?? 
-                 # Risky if user doesn't know mapping.
-                 # Better to allow only if user explicitly asks? 
-                 # But previous C++ binding allowed list.
-                 # We'll allow if len matches.
-                 if len(param) == len(sorted_unique_z):
-                     vec[:] = param
-                 else:
-                     raise ValueError(f"{name} list length {len(param)} != number of unique types {len(sorted_unique_z)}")
-            else:
-                 raise ValueError(f"{name} invalid type: {type(param)}")
-            return vec
+        comm = _default_comm(comm)
 
-        r_max_vec = parse_param(r_max, "r_max", float)
-        type_norb_vec = parse_param(type_norb, "type_norb", int)
-        
-        # 3. Call C++ static method
-        # We pass python objects checkable by Pybind
-        # C++ binding expects: pos, z, cell, pbc, r_max_vec (list), type_norb_vec (list), comm
-        return super().from_points(pos, z, cell, pbc, r_max_vec, type_norb_vec, comm)
+        positions = np.ascontiguousarray(np.asarray(pos, dtype=np.float64).reshape(-1, 3))
+        atomic_numbers = np.ascontiguousarray(np.asarray(z, dtype=np.int32).reshape(-1))
+        if positions.shape[0] != atomic_numbers.size:
+            raise ValueError("pos and z must describe the same number of atoms")
+
+        if comm is not None:
+            local_unique = np.unique(atomic_numbers)
+            gathered = comm.allgather(local_unique)
+            sorted_unique_z = np.unique(np.concatenate(gathered)) if gathered else np.empty((0,), dtype=np.int32)
+        else:
+            sorted_unique_z = np.unique(atomic_numbers)
+
+        def parse_param(param, name, dtype):
+            values = np.zeros(len(sorted_unique_z), dtype=dtype)
+
+            if np.isscalar(param):
+                values.fill(param)
+                return values
+
+            if isinstance(param, dict):
+                default_value = param.get("default")
+                if default_value is not None:
+                    values.fill(default_value)
+
+                for idx, atomic_number in enumerate(sorted_unique_z):
+                    if atomic_number in param:
+                        values[idx] = param[atomic_number]
+                        continue
+
+                    symbol = ase.data.chemical_symbols[int(atomic_number)]
+                    if symbol in param:
+                        values[idx] = param[symbol]
+                        continue
+
+                    if default_value is None:
+                        raise ValueError(
+                            f"{name} missing for Z={atomic_number} ({ase.data.chemical_symbols[int(atomic_number)]})"
+                        )
+                return values
+
+            array = np.asarray(param)
+            if array.ndim == 1 and array.size == 1:
+                values.fill(array.reshape(-1)[0])
+                return values
+            if array.ndim != 1 or array.size != len(sorted_unique_z):
+                raise ValueError(
+                    f"{name} length {array.size} does not match the number of unique atomic types {len(sorted_unique_z)}"
+                )
+            return np.ascontiguousarray(array.astype(dtype, copy=False))
+
+        r_max_vec = parse_param(r_max, "r_max", np.float64)
+        type_norb_vec = parse_param(type_norb, "type_norb", np.int32)
+        cell_array = np.ascontiguousarray(np.asarray(cell, dtype=np.float64).reshape(3, 3))
+
+        return super().from_points(
+            positions,
+            atomic_numbers,
+            cell_array,
+            _normalize_pbc(pbc),
+            r_max_vec,
+            type_norb_vec,
+            comm,
+        )
 
     @classmethod
-    def from_distributed(cls, n_atom, N_atom, atom_offset, n_edge, N_edge,
-                         atom_index, atom_type, edge_index, type_norb,
-                         edge_shift, cell, pos, comm=None):
-        """
-        Create AtomicData from pre-computed distributed atomic graph data.
+    def from_distributed(
+        cls,
+        n_atom,
+        N_atom,
+        atom_offset,
+        n_edge,
+        N_edge,
+        atom_index,
+        atom_type,
+        edge_index,
+        type_norb,
+        edge_shift,
+        cell,
+        pos,
+        atomic_numbers=None,
+        comm=None,
+    ):
+        comm = _default_comm(comm)
 
-        This mirrors the C++ constructor that directly takes distributed graph
-        information. Useful when the user already has edge lists and atom
-        assignments (e.g. from DFT tight-binding codes).
-
-        Args:
-            n_atom: int, number of atoms owned by this rank.
-            N_atom: int, total number of atoms globally.
-            atom_offset: int, global index offset of the first owned atom.
-            n_edge: int, number of edges owned by this rank.
-            N_edge: int, total number of edges globally.
-            atom_index: (n_atom,) int array, original atom IDs.
-            atom_type: (n_atom,) int array, atom type indices.
-            edge_index: (n_edge, 2) int array, [src_gid, dst_gid] per edge.
-            type_norb: (n_types,) int array, number of orbitals per type.
-            edge_shift: (n_edge, 3) int array, lattice shift vectors [Rx,Ry,Rz].
-            cell: (3, 3) float array, unit cell vectors.
-            pos: (n_atom, 3) float array, atom positions.
-            comm: MPI communicator (mpi4py). Defaults to MPI.COMM_WORLD if available.
-        """
-        if comm is None and MPI is not None:
-            comm = MPI.COMM_WORLD
-
-        atom_index = np.asarray(atom_index, dtype=np.int32).ravel()
-        atom_type = np.asarray(atom_type, dtype=np.int32).ravel()
+        atom_index = np.ascontiguousarray(np.asarray(atom_index, dtype=np.int32).reshape(-1))
+        atom_type = np.ascontiguousarray(np.asarray(atom_type, dtype=np.int32).reshape(-1))
         edge_index = np.ascontiguousarray(np.asarray(edge_index, dtype=np.int32).reshape(-1, 2))
-        type_norb = np.asarray(type_norb, dtype=np.int32).ravel()
+        type_norb = np.ascontiguousarray(np.asarray(type_norb, dtype=np.int32).reshape(-1))
         edge_shift = np.ascontiguousarray(np.asarray(edge_shift, dtype=np.int32).reshape(-1, 3))
         cell = np.ascontiguousarray(np.asarray(cell, dtype=np.float64).reshape(3, 3))
         pos = np.ascontiguousarray(np.asarray(pos, dtype=np.float64).reshape(-1, 3))
 
-        return super().from_distributed(
-            int(n_atom), int(N_atom), int(atom_offset), int(n_edge), int(N_edge),
-            atom_index, atom_type, edge_index, type_norb, edge_shift,
-            cell, pos, comm
-        )
+        if atom_index.size != int(n_atom):
+            raise ValueError("atom_index size must equal n_atom")
+        if atom_type.size != int(n_atom):
+            raise ValueError("atom_type size must equal n_atom")
+        if pos.shape[0] != int(n_atom):
+            raise ValueError("pos must have shape (n_atom, 3)")
+        if edge_index.shape[0] != int(n_edge):
+            raise ValueError("edge_index must have shape (n_edge, 2)")
+        if edge_shift.shape[0] != int(n_edge):
+            raise ValueError("edge_shift must have shape (n_edge, 3)")
 
+        atomic_number_array = None
+        if atomic_numbers is not None:
+            atomic_number_array = np.ascontiguousarray(np.asarray(atomic_numbers, dtype=np.int32).reshape(-1))
+            if atomic_number_array.size != int(n_atom):
+                raise ValueError("atomic_numbers size must equal n_atom")
+
+        return super().from_distributed(
+            int(n_atom),
+            int(N_atom),
+            int(atom_offset),
+            int(n_edge),
+            int(N_edge),
+            atom_index,
+            atom_type,
+            edge_index,
+            type_norb,
+            edge_shift,
+            cell,
+            pos,
+            atomic_number_array,
+            comm,
+        )
 
     @classmethod
     def from_ase(cls, atoms, r_max, type_norb=1, comm=None):
-        """
-        Create AtomicData from ASE Atoms.
-        """
-        pos = atoms.get_positions()
-        z = atoms.get_atomic_numbers()
-        cell = atoms.get_cell()
         pbc = atoms.pbc
-        # Handle pbc being bool or array
-        if isinstance(pbc, bool): pbc = [pbc]*3
-        
-        # Note: input atoms should be same on all ranks OR on Rank 0 (with others empty/None?)
-        # ase.io.read usually returns atoms on all ranks if run on all.
-        # But usually we run read on Rank 0.
-        # We assume `atoms` is valid locally.
-        
-        return cls.from_points(pos, z, cell, pbc, r_max, type_norb, comm)
+        return cls.from_points(
+            atoms.get_positions(),
+            atoms.get_atomic_numbers(),
+            atoms.get_cell(),
+            _normalize_pbc(pbc),
+            r_max,
+            type_norb,
+            _default_comm(comm),
+        )
 
     @classmethod
     def from_file(cls, filename, r_max, type_norb=1, comm=None, format=None):
-        """
-        Create AtomicData from file using ASE.
-        """
-        if comm is None and MPI is not None:
-            comm = MPI.COMM_WORLD
-            
-        rank = 0
-        if comm is not None:
-            rank = comm.Get_rank()
-            
-        atoms = None
-        if rank == 0:
+        comm = _default_comm(comm)
+        if comm is None:
             atoms = ase.io.read(filename, format=format)
-            
-        # Broadcast atoms to all ranks? 
-        # C++ from_points usually handles Rank 0 -> All distribution.
-        # So we can pass `atoms` on Rank 0 and None on others?
-        # Python `from_ase` calls `from_points`.
-        # My `from_points` wrapper calculates `unique_z`.
-        # If `atoms` is None on rank 1, `z` is None/empty.
-        # `unique_z` logic: `allgather` of local unique.
-        # If Rank 1 has no atoms, it contributes empty set.
-        # Rank 0 contributes all types.
-        # Union is correct.
-        
-        # But `super().from_points` expects valid numpy arrays or compatible.
-        # If `z` is None on Rank 1, Pybind might complain if it expects array?
-        # `numpy_to_vector` handles empty?
-        # I should ensure on non-root ranks, we pass empty arrays.
-        
-        if comm is not None:
-             # If atoms is None (non-root), make dummy empty atoms or pass empty arrays
-             if rank != 0:
-                 # Need to pass empty arrays to from_points
-                 pos = np.empty((0,3))
-                 z = np.empty((0,), dtype=int)
-                 cell = np.zeros((3,3)) # Cell? Cell usually needed globally?
-                 pbc = [False]*3
-             else:
-                 pos = atoms.get_positions()
-                 z = atoms.get_atomic_numbers()
-                 cell = atoms.get_cell()
-                 pbc = atoms.pbc
-                 # Broadacst cell and pbc? 
-                 # C++ AtomicData constructor (partitioning) usually needs cell on all ranks?
-                 # construct_final_object (line 1213) broadcasts cell.
-                 # process_input_rank0 uses cell.
-                 # So maybe only Rank 0 needs cell?
-                 
-             # Safer to broadcast cell/pbc from Rank 0 so all ranks pass consistent metadata
-             cell = comm.bcast(cell, root=0)
-             pbc = comm.bcast(pbc, root=0)
-             
-             return cls.from_points(pos, z, cell, pbc, r_max, type_norb, comm)
+            return cls.from_ase(atoms, r_max, type_norb, comm=None)
+
+        rank = comm.Get_rank()
+        atoms = ase.io.read(filename, format=format) if rank == 0 else None
+
+        if rank == 0:
+            pos = atoms.get_positions()
+            atomic_numbers = atoms.get_atomic_numbers()
+            cell = atoms.get_cell()
+            pbc = _normalize_pbc(atoms.pbc)
         else:
-             return cls.from_ase(atoms, r_max, type_norb, comm)
+            pos = np.empty((0, 3), dtype=np.float64)
+            atomic_numbers = np.empty((0,), dtype=np.int32)
+            cell = np.zeros((3, 3), dtype=np.float64)
+            pbc = [False, False, False]
+
+        cell = comm.bcast(np.asarray(cell, dtype=np.float64), root=0)
+        pbc = comm.bcast(_normalize_pbc(pbc), root=0)
+        return cls.from_points(pos, atomic_numbers, cell, pbc, r_max, type_norb, comm=comm)

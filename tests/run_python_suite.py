@@ -1,47 +1,16 @@
 import argparse
 import importlib.util
-import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-BUILD_DIR = Path(os.environ.get("VBCSR_BUILD_DIR", REPO_ROOT / "build"))
-SERIAL_TESTS = [
-    "test_matrix_kind.py",
-    "test_scipy_adapter.py",
-    "test_wrapper_contracts.py",
-    "test_api_serial.py",
-    "test_api_compliance.py",
-    "test_spmf.py",
-    "test_kpm.py",
-    "test_vbcsr.py",
-]
-MPI_TESTS = [
-    "test_api_mpi.py",
-    "test_from_scipy_collective.py",
-]
+from _workspace_bootstrap import REPO_ROOT, build_subprocess_env
+from _suite_manifest import MPI_TESTS, SERIAL_TESTS
 
 
 def have_module(name: str) -> bool:
     return importlib.util.find_spec(name) is not None
-
-
-def make_test_env() -> dict[str, str]:
-    env = os.environ.copy()
-    pythonpath_entries = [str(REPO_ROOT)]
-    if BUILD_DIR.is_dir():
-        pythonpath_entries.append(str(BUILD_DIR))
-
-    existing = env.get("PYTHONPATH")
-    if existing:
-        pythonpath_entries.append(existing)
-
-    env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
-    env.setdefault("VBCSR_BUILD_DIR", str(BUILD_DIR))
-    return env
 
 
 def run_command(cmd: list[str], cwd: Path, env: dict[str, str]) -> int:
@@ -63,7 +32,7 @@ def main() -> int:
         print(f"Missing Python dependencies: {', '.join(missing)}")
         return 2
 
-    test_env = make_test_env()
+    test_env = build_subprocess_env()
     failed: list[str] = []
 
     for test_name in SERIAL_TESTS:

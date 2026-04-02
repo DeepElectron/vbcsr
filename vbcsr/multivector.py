@@ -1,6 +1,7 @@
 import numpy as np
-import vbcsr_core
-from typing import Union, Optional, Any
+from typing import Union, Any
+
+from ._wrapper_utils import core_buffer, duplicate_wrapper, infer_dtype_from_core, reduced_extent
 from .vector import DistVector
 
 class DistMultiVector:
@@ -20,21 +21,22 @@ class DistMultiVector:
             comm: MPI communicator.
         """
         self._core = core_obj
-        self.dtype = np.complex128 if "Complex" in core_obj.__class__.__name__ else np.float64
+        self.dtype = infer_dtype_from_core(core_obj)
         self.comm = comm
-        self._global_rows = None
-        if self.comm:
-            try:
-                self._global_rows = self.comm.allreduce(self.local_rows)
-            except:
-                pass
-        else:
-            self._global_rows = self.local_rows
+        self._global_rows = reduced_extent(self.comm, self.local_rows)
+
+    def _local_buffer(self) -> np.ndarray:
+        return core_buffer(self._core)[:self.local_rows, :]
 
     @property
     def local_rows(self) -> int:
         """Returns the number of locally owned rows."""
         return self._core.local_rows
+
+    @property
+    def ghost_rows(self) -> int:
+        """Returns the number of ghost rows cached locally."""
+        return self._core.ghost_rows
 
     @property
     def num_vectors(self) -> int:
@@ -59,9 +61,7 @@ class DistMultiVector:
         return 0
 
     def copy(self) -> 'DistMultiVector':
-        obj = self.duplicate()
-        obj.comm = self.comm
-        return obj
+        return duplicate_wrapper(self)
 
     def __len__(self) -> int:
         s = self.shape[0]
@@ -80,8 +80,7 @@ class DistMultiVector:
             np.ndarray: A 2D array of shape (local_rows, num_vectors).
         """
         # Buffer is (rows, cols) F-contiguous
-        buf = np.array(self._core, copy=False)
-        return buf[:self.local_rows, :]
+        return self._local_buffer()
 
     def from_numpy(self, arr: np.ndarray) -> None:
         """
@@ -95,8 +94,7 @@ class DistMultiVector:
         """
         if arr.shape != (self.local_rows, self.num_vectors):
              raise ValueError(f"Array shape {arr.shape} mismatch. Expected ({self.local_rows}, {self.num_vectors})")
-        buf = np.array(self._core, copy=False)
-        buf[:self.local_rows, :] = arr
+        self._local_buffer()[:] = arr
 
     def __array__(self) -> np.ndarray:
         """Support for np.array(vec)."""
@@ -105,6 +103,10 @@ class DistMultiVector:
     def sync_ghosts(self) -> None:
         """Synchronize ghost elements."""
         self._core.sync_ghosts()
+
+    def reduce_ghosts(self) -> None:
+        """Reduce ghost contributions back to their owners."""
+        self._core.reduce_ghosts()
     
     def duplicate(self) -> 'DistMultiVector':
         """
@@ -189,8 +191,7 @@ class DistMultiVector:
         if isinstance(other, DistMultiVector):
             self._core.axpy(1.0, other._core)
         elif np.isscalar(other) or isinstance(other, np.ndarray):
-            buf = np.array(self._core, copy=False)
-            buf[:self.local_rows, :] += other
+            self._local_buffer()[:] += other
         else:
             return NotImplemented
         return self
@@ -204,8 +205,7 @@ class DistMultiVector:
         if isinstance(other, DistMultiVector):
             self._core.axpy(-1.0, other._core)
         elif np.isscalar(other) or isinstance(other, np.ndarray):
-            buf = np.array(self._core, copy=False)
-            buf[:self.local_rows, :] -= other
+            self._local_buffer()[:] -= other
         else:
             return NotImplemented
         return self
@@ -223,8 +223,7 @@ class DistMultiVector:
         elif isinstance(other, DistVector):
             self._core.pointwise_mult_vec(other._core)
         elif isinstance(other, np.ndarray):
-            buf = np.array(self._core, copy=False)
-            buf[:self.local_rows, :] *= other
+            self._local_buffer()[:] *= other
         else:
             return NotImplemented
         return self
@@ -249,14 +248,11 @@ class DistMultiVector:
         if np.isscalar(other):
             self._core.scale(1.0 / other)
         elif isinstance(other, DistMultiVector):
-            buf = np.array(self._core, copy=False)
-            buf[:self.local_rows, :] /= np.array(other._core, copy=False)
+            self._local_buffer()[:] /= core_buffer(other._core)[:other.local_rows, :]
         elif isinstance(other, DistVector):
-            buf = np.array(self._core, copy=False)
-            buf[:self.local_rows, :] /= np.array(other._core, copy=False)
+            self._local_buffer()[:] /= core_buffer(other._core)[:other.local_size]
         elif isinstance(other, np.ndarray):
-            buf = np.array(self._core, copy=False)
-            buf[:self.local_rows, :] /= other
+            self._local_buffer()[:] /= other
         else:
             return NotImplemented
         return self

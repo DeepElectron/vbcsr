@@ -47,6 +47,18 @@ class TestFromScipyCollective(unittest.TestCase):
 
         np.testing.assert_allclose(y, np.ones_like(y))
 
+    def test_rejects_replicated_non_root_input(self):
+        if MPI is None:
+            self.skipTest("mpi4py is not available")
+
+        comm = MPI.COMM_WORLD
+        if comm.Get_size() == 1:
+            self.skipTest("requires multiple MPI ranks")
+
+        bad_input = sp.eye(4, format="csr", dtype=np.float64) if comm.Get_rank() == 1 else None
+        with self.assertRaises(ValueError):
+            VBCSR.from_scipy(bad_input, comm=comm, root=0)
+
 
 if __name__ == "__main__":
     unittest.main()

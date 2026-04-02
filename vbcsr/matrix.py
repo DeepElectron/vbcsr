@@ -31,12 +31,6 @@ def _global_scalar_rows(graph: Any, comm: Any) -> int:
     return local_rows
 
 
-def _local_scalar_cols(graph: Any) -> int:
-    if hasattr(graph, "local_scalar_cols"):
-        return int(graph.local_scalar_cols)
-    return int(sum(graph.block_sizes))
-
-
 class VBCSR(LinearOperator):
     """
     Variable Block Compressed Sparse Row (VBCSR) Matrix.
@@ -145,11 +139,13 @@ class VBCSR(LinearOperator):
         self._core.conjugate()
 
     def conj(self) -> 'VBCSR':
+        """Compatibility alias for conjugate()."""
         obj = self.duplicate()
         obj.conj_()
         return obj
 
     def conjugate(self) -> 'VBCSR':
+        """Primary out-of-place conjugation API. `conj()` is a compatibility alias."""
         return self.conj()
 
     @property
@@ -167,11 +163,6 @@ class VBCSR(LinearOperator):
     def __neg__(self) -> 'VBCSR':
         return self * -1
 
-    def __sub__(self, other: 'VBCSR') -> 'VBCSR':
-        if isinstance(other, VBCSR):
-            return self.add(other, alpha=1.0, beta=-1.0)
-        return NotImplemented
-
     def __pos__(self) -> 'VBCSR':
         return self
 
@@ -186,6 +177,7 @@ class VBCSR(LinearOperator):
         return self @ other
 
     def copy(self) -> 'VBCSR':
+        """Compatibility alias for duplicate()."""
         return self.duplicate()
 
     def __len__(self) -> int:
@@ -489,10 +481,10 @@ class VBCSR(LinearOperator):
         else:
             raise TypeError("add_diagonal expects DistVector or numpy.ndarray")
 
-    def duplicate(self) -> 'VBCSR':
-        """Create a deep copy of the matrix."""
+    def duplicate(self, independent_graph: bool = True) -> 'VBCSR':
+        """Primary copy API. `copy()` is a compatibility alias."""
         return self._wrap_core(
-            self._core.duplicate(False),
+            self._core.duplicate(independent_graph),
             self.dtype,
             self.comm,
             shape=self.shape,

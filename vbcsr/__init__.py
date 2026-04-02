@@ -20,7 +20,7 @@ if os.environ.get("VBCSR_PREFER_BUILD", "1") != "0" and _BUILD_DIR.is_dir():
         sys.path.insert(0, str(_BUILD_DIR))
 
 import vbcsr_core
-from vbcsr_core import AssemblyMode
+from vbcsr_core import AssemblyMode, DistGraph
 from .vector import DistVector
 from .multivector import DistMultiVector
 from .matrix import VBCSR
@@ -35,5 +35,14 @@ if not HAS_MPI:
 
 __version__ = "0.2.2"
 
-__all__ = ["VBCSR", "DistVector", "DistMultiVector", "AssemblyMode", "HAS_MPI", "MPI", 
-           "AtomicData", "ImageContainer"]
+__all__ = [
+    "VBCSR",
+    "DistVector",
+    "DistMultiVector",
+    "DistGraph",
+    "AssemblyMode",
+    "HAS_MPI",
+    "MPI",
+    "AtomicData",
+    "ImageContainer",
+]

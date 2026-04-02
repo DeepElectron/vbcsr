@@ -35,16 +35,8 @@ public:
         backend_.rebuild_shape_registry(graph_, graph_->adj_ptr, graph_->adj_ind);
     }
 
-    T* mutable_block(int slot) {
-        return backend_.get_ptr(backend_.blk_handles[slot]);
-    }
-
-    const T* mutable_block(int slot) const {
-        return backend_.get_ptr(backend_.blk_handles[slot]);
-    }
-
     void accumulate_block(int slot, const T* src, T alpha = T(1)) {
-        T* dest = mutable_block(slot);
+        T* dest = backend_.get_ptr(backend_.blk_handles[slot]);
         const size_t size = backend_.block_size_elements(slot);
         for (size_t idx = 0; idx < size; ++idx) {
             dest[idx] += alpha * src[idx];
@@ -69,15 +61,11 @@ public:
     }
 
     T* slot_data(int slot) {
-        return mutable_block(slot);
+        return backend_.get_ptr(backend_.blk_handles[slot]);
     }
 
     const T* slot_data(int slot) const {
-        return mutable_block(slot);
-    }
-
-    VBCSRMatrixBackend<T, Kernel> commit_backend() && {
-        return std::move(*this).commit();
+        return backend_.get_ptr(backend_.blk_handles[slot]);
     }
 
 private:

@@ -1,128 +1,141 @@
 #include "../block_csr.hpp"
-#include <iostream>
+
+#include <algorithm>
 #include <chrono>
-#include <random>
 #include <complex>
+#include <cstdlib>
+#include <iostream>
+#include <random>
 #include <set>
+#include <vector>
 
 using namespace vbcsr;
 
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
-    int rank, size;
+
+    int rank = 0;
+    int size = 1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    // a. 2000 row/col blocks, 200 blocks per row
     int n_blocks = 2000;
     int blocks_per_row = 200;
-    
-    // Use a fixed seed for graph structure so all ranks agree
-    std::mt19937 gen_struct(12345);
-    
-    // b. block size [9, 13, 15, 20]
-    std::vector<int> block_size_options = {9, 13, 15, 20};
-    std::uniform_int_distribution<> size_dist(0, block_size_options.size() - 1);
-    
-    std::vector<int> block_sizes(n_blocks);
-    for(int i=0; i<n_blocks; ++i) block_sizes[i] = block_size_options[size_dist(gen_struct)];
+    double threshold = 3e3;
+    int iterations = 3;
+    bool make_contiguous = false;
 
-    // d. random sparsity
+    if (argc > 1) n_blocks = std::atoi(argv[1]);
+    if (argc > 2) blocks_per_row = std::atoi(argv[2]);
+    if (argc > 3) threshold = std::atof(argv[3]);
+    if (argc > 4) iterations = std::max(1, std::atoi(argv[4]));
+    if (argc > 5) make_contiguous = std::atoi(argv[5]) != 0;
+
+    std::mt19937 gen_struct(12345);
+
+    std::vector<int> block_size_options = {9, 13, 15, 20};
+    std::uniform_int_distribution<> size_dist(0, static_cast<int>(block_size_options.size()) - 1);
+
+    std::vector<int> block_sizes(n_blocks);
+    for (int i = 0; i < n_blocks; ++i) {
+        block_sizes[i] = block_size_options[size_dist(gen_struct)];
+    }
+
     std::vector<std::vector<int>> adj(n_blocks);
     std::uniform_int_distribution<> col_dist(0, n_blocks - 1);
-    for(int i=0; i<n_blocks; ++i) {
+    for (int row = 0; row < n_blocks; ++row) {
         std::set<int> row_cols;
-        while(row_cols.size() < blocks_per_row) {
+        while (static_cast<int>(row_cols.size()) < blocks_per_row) {
             row_cols.insert(col_dist(gen_struct));
         }
-        adj[i].assign(row_cols.begin(), row_cols.end());
+        adj[row].assign(row_cols.begin(), row_cols.end());
     }
 
     DistGraph graph(MPI_COMM_WORLD);
     graph.construct_serial(n_blocks, block_sizes, adj);
 
-    // c. complex data type
     using T = std::complex<double>;
     BlockSpMat<T> A(&graph);
     BlockSpMat<T> B(&graph);
 
-    // Use rank-dependent seed for data values
     std::mt19937 gen_data(12345 + rank);
     std::uniform_real_distribution<> data_dist(-1.0, 1.0);
-    int n_owned = graph.owned_global_indices.size();
-    
-    for(int i=0; i<n_owned; ++i) {
-        int gid_r = graph.owned_global_indices[i];
-        for(int gid_c : adj[gid_r]) {
-            int rows = block_sizes[gid_r];
-            int cols = block_sizes[gid_c];
-            std::vector<T> block(rows * cols);
-            for(auto& val : block) val = T(data_dist(gen_data), data_dist(gen_data));
-            A.add_block(gid_r, gid_c, block.data(), rows, cols, AssemblyMode::INSERT, MatrixLayout::RowMajor);
-            
-            for(auto& val : block) val = T(data_dist(gen_data), data_dist(gen_data));
-            B.add_block(gid_r, gid_c, block.data(), rows, cols, AssemblyMode::INSERT, MatrixLayout::RowMajor);
+    const int n_owned = static_cast<int>(graph.owned_global_indices.size());
+
+    for (int local_row = 0; local_row < n_owned; ++local_row) {
+        const int global_row = graph.owned_global_indices[local_row];
+        for (int global_col : adj[global_row]) {
+            const int rows = block_sizes[global_row];
+            const int cols = block_sizes[global_col];
+            std::vector<T> block(static_cast<size_t>(rows) * cols);
+
+            for (auto& value : block) {
+                value = T(data_dist(gen_data), data_dist(gen_data));
+            }
+            A.add_block(global_row, global_col, block.data(), rows, cols, AssemblyMode::INSERT, MatrixLayout::RowMajor);
+
+            for (auto& value : block) {
+                value = T(data_dist(gen_data), data_dist(gen_data));
+            }
+            B.add_block(global_row, global_col, block.data(), rows, cols, AssemblyMode::INSERT, MatrixLayout::RowMajor);
         }
     }
+
     A.assemble();
     B.assemble();
 
-    if(rank == 0) std::cout << "Starting SpMM Benchmark (Complex, 2000x2000 blocks, 200 blocks/row)..." << std::endl;
+    if (make_contiguous) {
+        A.contiguous();
+        B.contiguous();
+    }
 
-    double threshold = 3e3;
-    
-    // e. profiling
-    MPI_Barrier(MPI_COMM_WORLD);
-    auto t_start = std::chrono::high_resolution_clock::now();
-    
-    auto t1 = std::chrono::high_resolution_clock::now();
-    auto metadata_plan = detail::RowMetadataExchangePlan<BlockSpMat<T>, BlockSpMat<T>>::build(A, B);
-    MPI_Barrier(MPI_COMM_WORLD);
-    auto t2 = std::chrono::high_resolution_clock::now();
-    
-    auto sym = detail::symbolic_multiply_filtered(A, B, metadata_plan.metadata(), threshold);
-    MPI_Barrier(MPI_COMM_WORLD);
-    auto t3 = std::chrono::high_resolution_clock::now();
-    
-    auto payload_plan = detail::BlockPayloadExchangePlan<BlockSpMat<T>>::fetch_required(B, sym.required_blocks);
-    MPI_Barrier(MPI_COMM_WORLD);
-    auto t4 = std::chrono::high_resolution_clock::now();
+    if (rank == 0) {
+        std::cout << "Starting complex SpMM benchmark..." << std::endl;
+        std::cout << "  Ranks: " << size << std::endl;
+        std::cout << "  Blocks: " << n_blocks << std::endl;
+        std::cout << "  Blocks per row: " << blocks_per_row << std::endl;
+        std::cout << "  Threshold: " << threshold << std::endl;
+        std::cout << "  Iterations: " << iterations << std::endl;
+        std::cout << "  A kind: " << static_cast<int>(A.matrix_kind()) << std::endl;
+        std::cout << "  A contiguous: " << A.is_contiguous() << std::endl;
+        std::cout << "  B contiguous: " << B.is_contiguous() << std::endl;
+        std::cout << "  Strided GEMM available: " << BLASKernel::supports_strided_gemm() << std::endl;
+    }
 
-    auto assembly_plan = detail::ResultAssemblyPlan<BlockSpMat<T>>::for_spmm(
-        A,
-        sym,
-        metadata_plan.metadata(),
-        std::move(payload_plan));
-    DistGraph* c_graph = assembly_plan.construct_result_graph(A, "spmm");
-    
-    BlockSpMat<T> C(c_graph);
-    C.owns_graph = true;
-    
     MPI_Barrier(MPI_COMM_WORLD);
-    auto t5 = std::chrono::high_resolution_clock::now();
-    
-    const auto& A_norms = A.get_block_norms();
-    const auto& B_local_norms = B.get_block_norms();
-    A.numeric_multiply(B, assembly_plan.ghost_rows(), C, threshold, A_norms, B_local_norms);
+    const auto warmup_start = std::chrono::high_resolution_clock::now();
+    BlockSpMat<T> warmup = A.spmm(B, threshold);
     MPI_Barrier(MPI_COMM_WORLD);
-    auto t6 = std::chrono::high_resolution_clock::now();
-    
-    auto t_end = std::chrono::high_resolution_clock::now();
-    
-    if(rank == 0) {
-        std::cout << "Profiling Results (seconds):" << std::endl;
-        std::cout << "  Exchange Metadata: " << std::chrono::duration<double>(t2 - t1).count() << std::endl;
-        std::cout << "  Symbolic Phase:    " << std::chrono::duration<double>(t3 - t2).count() << std::endl;
-        std::cout << "  Fetch Ghost Blocks: " << std::chrono::duration<double>(t4 - t3).count() << std::endl;
-        std::cout << "  Allocate C:        " << std::chrono::duration<double>(t5 - t4).count() << std::endl;
-        std::cout << "  Numeric Phase:     " << std::chrono::duration<double>(t6 - t5).count() << std::endl;
-        std::cout << "  Total SpMM:        " << std::chrono::duration<double>(t_end - t_start).count() << std::endl;
-        
-        int total_nnz = 0;
-        for(int i=0; i<C.graph->owned_global_indices.size(); ++i) {
-            total_nnz += C.row_ptr[i+1] - C.row_ptr[i];
+    const auto warmup_end = std::chrono::high_resolution_clock::now();
+
+    long long local_blocks = static_cast<long long>(warmup.local_block_nnz());
+    long long global_blocks = 0;
+    MPI_Reduce(&local_blocks, &global_blocks, 1, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+    const double warmup_local_seconds = std::chrono::duration<double>(warmup_end - warmup_start).count();
+    double warmup_seconds = 0.0;
+    MPI_Reduce(&warmup_local_seconds, &warmup_seconds, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    double total_seconds = 0.0;
+    for (int iter = 0; iter < iterations; ++iter) {
+        MPI_Barrier(MPI_COMM_WORLD);
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        BlockSpMat<T> result = A.spmm(B, threshold);
+        MPI_Barrier(MPI_COMM_WORLD);
+        const auto t1 = std::chrono::high_resolution_clock::now();
+
+        const double local_seconds = std::chrono::duration<double>(t1 - t0).count();
+        double iter_seconds = 0.0;
+        MPI_Reduce(&local_seconds, &iter_seconds, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+        if (rank == 0) {
+            total_seconds += iter_seconds;
         }
-        std::cout << "  C blocks (local rank 0): " << total_nnz << std::endl;
+    }
+
+    if (rank == 0) {
+        std::cout << "Profiling Results (seconds):" << std::endl;
+        std::cout << "  Warmup SpMM: " << warmup_seconds << " (excluded from average)" << std::endl;
+        std::cout << "  Average SpMM: " << (total_seconds / iterations) << std::endl;
+        std::cout << "  Result blocks: " << global_blocks << std::endl;
     }
 
     MPI_Finalize();

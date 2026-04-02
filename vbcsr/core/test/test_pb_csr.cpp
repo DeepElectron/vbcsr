@@ -184,6 +184,7 @@ void test_axpby_structure_mismatch() {
     BlockSpMat<double> Y(&graph);
     double d00[] = {1.0, 1.0, 1.0, 1.0};
     Y.add_block(0, 0, d00, 2, 2, AssemblyMode::INSERT, MatrixLayout::RowMajor);
+    Y.assemble();
     
     // X has (0,0)
     // We need a separate graph/matrix for X? 
@@ -202,6 +203,7 @@ void test_axpby_structure_mismatch() {
     // Now Y is empty. X has (0,0).
     BlockSpMat<double> X(&graph); // X has (0,0)
     X.add_block(0, 0, d00, 2, 2, AssemblyMode::INSERT, MatrixLayout::RowMajor);
+    X.assemble();
     
     // Y = 1.0 * X + 1.0 * Y
     // Y should become X
@@ -360,11 +362,11 @@ void test_paged_storage_contracts() {
     DistGraph csr_graph(MPI_COMM_SELF);
     csr_graph.construct_serial(3, {1, 1, 1}, {{0, 1, 2}, {1}, {2}});
     detail::CSRResultBuilder<double> csr_builder(&csr_graph, 2);
-    *csr_builder.mutable_block(0) = 2.0;
-    *csr_builder.mutable_block(1) = 3.0;
-    *csr_builder.mutable_block(2) = 5.0;
-    *csr_builder.mutable_block(3) = 7.0;
-    *csr_builder.mutable_block(4) = 11.0;
+    *csr_builder.slot_data(0) = 2.0;
+    *csr_builder.slot_data(1) = 3.0;
+    *csr_builder.slot_data(2) = 5.0;
+    *csr_builder.slot_data(3) = 7.0;
+    *csr_builder.slot_data(4) = 11.0;
     const double extra_scalar = 4.0;
     csr_builder.accumulate_block(1, &extra_scalar, 0.5);
     auto csr_backend = std::move(csr_builder).commit();
@@ -391,9 +393,9 @@ void test_paged_storage_contracts() {
     bsr_graph.construct_serial(3, {2, 2, 2}, {{0, 1}, {2}, {}});
     detail::BSRResultBuilder<double> bsr_builder(&bsr_graph, 1);
     {
-        double* slot0 = bsr_builder.mutable_block(0);
-        double* slot1 = bsr_builder.mutable_block(1);
-        double* slot2 = bsr_builder.mutable_block(2);
+        double* slot0 = bsr_builder.slot_data(0);
+        double* slot1 = bsr_builder.slot_data(1);
+        double* slot2 = bsr_builder.slot_data(2);
         for (int i = 0; i < 4; ++i) {
             slot0[i] = static_cast<double>(i + 1);
             slot1[i] = static_cast<double>(i + 5);
@@ -471,6 +473,138 @@ void test_vbcsr_batch_views() {
         total_blocks += batch.block_count();
     });
     assert(total_blocks == mat.local_block_nnz());
+
+    std::cout << "PASSED" << std::endl;
+}
+
+void test_batched_blas_capability_flags() {
+    std::cout << "Testing Batched BLAS Capability Flags..." << std::endl;
+
+#ifdef VBCSR_USE_MKL
+    assert(BLASKernel::supports_strided_gemm());
+    assert(BLASKernel::supports_strided_gemv());
+#elif defined(VBCSR_USE_OPENBLAS)
+#ifdef VBCSR_BLAS_HAS_BATCH_GEMM
+    assert(BLASKernel::supports_strided_gemm());
+#else
+    assert(!BLASKernel::supports_strided_gemm());
+#endif
+    assert(!BLASKernel::supports_strided_gemv());
+#else
+    assert(!BLASKernel::supports_strided_gemm());
+    assert(!BLASKernel::supports_strided_gemv());
+#endif
+
+    std::cout << "PASSED" << std::endl;
+}
+
+void test_contiguous_api_and_vbcsr_packing() {
+    std::cout << "Testing Contiguous API and VBCSR Packing..." << std::endl;
+
+    {
+        std::vector<int> block_sizes = {1, 1};
+        std::vector<std::vector<int>> adj = {{0}, {1}};
+        DistGraph graph(MPI_COMM_SELF);
+        graph.construct_serial(2, block_sizes, adj);
+        BlockSpMat<double> csr(&graph);
+        double d00[] = {2.0};
+        double d11[] = {3.0};
+        csr.add_block(0, 0, d00, 1, 1, AssemblyMode::INSERT, MatrixLayout::RowMajor);
+        csr.add_block(1, 1, d11, 1, 1, AssemblyMode::INSERT, MatrixLayout::RowMajor);
+        csr.assemble();
+        assert(csr.matrix_kind() == MatrixKind::CSR);
+        assert(csr.is_contiguous());
+        csr.contiguous();
+        assert(csr.is_contiguous());
+    }
+
+    {
+        std::vector<int> block_sizes = {2, 2};
+        std::vector<std::vector<int>> adj = {{0}, {1}};
+        DistGraph graph(MPI_COMM_SELF);
+        graph.construct_serial(2, block_sizes, adj);
+        BlockSpMat<double> bsr(&graph);
+        double d00[] = {1.0, 0.0, 0.0, 1.0};
+        double d11[] = {2.0, 0.0, 0.0, 2.0};
+        bsr.add_block(0, 0, d00, 2, 2, AssemblyMode::INSERT, MatrixLayout::RowMajor);
+        bsr.add_block(1, 1, d11, 2, 2, AssemblyMode::INSERT, MatrixLayout::RowMajor);
+        bsr.assemble();
+        assert(bsr.matrix_kind() == MatrixKind::BSR);
+        assert(bsr.is_contiguous());
+        bsr.contiguous();
+        assert(bsr.is_contiguous());
+    }
+
+    std::vector<int> block_sizes = {2, 3};
+    std::vector<std::vector<int>> adj = {{0, 1}, {0, 1}};
+    DistGraph graph(MPI_COMM_SELF);
+    graph.construct_serial(2, block_sizes, adj);
+
+    BlockSpMat<double> mat(&graph);
+    assert(mat.matrix_kind() == MatrixKind::VBCSR);
+    assert(!mat.is_contiguous());
+
+    double a00[] = {1.0, 2.0, 3.0, 4.0};
+    double a01[] = {5.0, 6.0, 7.0, 8.0, 9.0, 10.0};
+    double a10[] = {11.0, 12.0, 13.0, 14.0, 15.0, 16.0};
+    double a11[] = {17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0, 25.0};
+    mat.add_block(0, 0, a00, 2, 2, AssemblyMode::INSERT, MatrixLayout::RowMajor);
+    mat.add_block(0, 1, a01, 2, 3, AssemblyMode::INSERT, MatrixLayout::RowMajor);
+    mat.add_block(1, 0, a10, 3, 2, AssemblyMode::INSERT, MatrixLayout::RowMajor);
+    mat.add_block(1, 1, a11, 3, 3, AssemblyMode::INSERT, MatrixLayout::RowMajor);
+    mat.assemble();
+    assert(!mat.is_contiguous());
+
+    const std::vector<std::vector<double>> before_blocks = {
+        mat.get_block(0, 0),
+        mat.get_block(0, 1),
+        mat.get_block(1, 0),
+        mat.get_block(1, 1)
+    };
+
+    mat.contiguous();
+    assert(mat.is_contiguous());
+
+    size_t total_live_slots = 0;
+    mat.for_each_shape_batch([&](const auto& batch) {
+        assert(batch.page != nullptr);
+        assert(batch.page->live_slots.size() == batch.block_count());
+        for (uint32_t idx = 0; idx < batch.block_count(); ++idx) {
+            assert(batch.page->live_slots[idx] == idx);
+            assert(batch.page->slot_live_pos[idx] == idx);
+            assert(batch.logical_slot(idx) >= 0);
+        }
+        total_live_slots += batch.block_count();
+    });
+    assert(total_live_slots == mat.local_block_nnz());
+
+    assert(mat.get_block(0, 0) == before_blocks[0]);
+    assert(mat.get_block(0, 1) == before_blocks[1]);
+    assert(mat.get_block(1, 0) == before_blocks[2]);
+    assert(mat.get_block(1, 1) == before_blocks[3]);
+
+    double overwrite01[] = {1.0, 0.0, 0.0, 1.0, 2.0, 3.0};
+    mat.add_block(0, 1, overwrite01, 2, 3, AssemblyMode::INSERT, MatrixLayout::RowMajor);
+    assert(mat.is_contiguous());
+
+    mat.assemble();
+    assert(!mat.is_contiguous());
+
+    mat.contiguous();
+    assert(mat.is_contiguous());
+    BlockSpMat<double> trans = mat.transpose();
+    assert(trans.matrix_kind() == MatrixKind::VBCSR);
+    assert(!trans.is_contiguous());
+
+    mat.contiguous();
+    BlockSpMat<double> prod = mat.spmm_self(0.0);
+    assert(prod.matrix_kind() == MatrixKind::VBCSR);
+    assert(!prod.is_contiguous());
+
+    mat.contiguous();
+    mat.filter_blocks(1e9);
+    assert(mat.matrix_kind() == MatrixKind::VBCSR);
+    assert(!mat.is_contiguous());
 
     std::cout << "PASSED" << std::endl;
 }
@@ -1229,6 +1363,27 @@ void test_vbcsr_shape_batched_apply_kernels() {
     mat.mult_dense_adjoint(X_adj, Y_adj);
     assert_close(Y_adj.data, dense_matmat_transpose(dense, rows, cols, X_adj.data, rows, 2));
 
+    mat.contiguous();
+    assert(mat.is_contiguous());
+
+    DistVector<double> y_packed(&graph);
+    mat.mult(x, y_packed);
+    assert_close(std::vector<double>(y_packed.data.begin(), y_packed.data.begin() + rows), dense_matvec(dense, rows, cols, x.data));
+
+    DistMultiVector<double> Y_packed(&graph, 2);
+    mat.mult_dense(X, Y_packed);
+    assert_close(Y_packed.data, dense_matmat(dense, rows, cols, X.data, cols, 2));
+
+    DistVector<double> y_adj_packed(&graph);
+    mat.mult_adjoint(x_adj, y_adj_packed);
+    assert_close(
+        std::vector<double>(y_adj_packed.data.begin(), y_adj_packed.data.begin() + cols),
+        dense_matvec_transpose(dense, rows, cols, x_adj.data));
+
+    DistMultiVector<double> Y_adj_packed(&graph, 2);
+    mat.mult_dense_adjoint(X_adj, Y_adj_packed);
+    assert_close(Y_adj_packed.data, dense_matmat_transpose(dense, rows, cols, X_adj.data, rows, 2));
+
     std::cout << "PASSED" << std::endl;
 }
 
@@ -1266,9 +1421,19 @@ void test_vbcsr_shape_batched_spmm() {
     BlockSpMat<double> prod = mat.spmm_self(0.0);
     assert(prod.matrix_kind() == MatrixKind::VBCSR);
     assert(prod.shape_class_count() > 0);
+    assert(!prod.is_contiguous());
 
     const std::vector<double> dense_prod = prod.to_dense();
     assert_close(dense_prod, dense_matmul(dense, rows, cols, dense, cols));
+
+    mat.contiguous();
+    assert(mat.is_contiguous());
+
+    BlockSpMat<double> packed_prod = mat.spmm_self(0.0);
+    assert(packed_prod.matrix_kind() == MatrixKind::VBCSR);
+    assert(!packed_prod.is_contiguous());
+    assert(packed_prod.shape_class_count() > 0);
+    assert_close(packed_prod.to_dense(), dense_matmul(dense, rows, cols, dense, cols));
 
     std::cout << "PASSED" << std::endl;
 }
@@ -1333,6 +1498,178 @@ void test_csr_backend_dispatch_kernels() {
     assert(std::abs(Y_adj(1, 0) - 50.0) < 1e-12);
     assert(std::abs(Y_adj(0, 1) - 74.0) < 1e-12);
     assert(std::abs(Y_adj(1, 1) - 98.0) < 1e-12);
+
+    std::cout << "PASSED" << std::endl;
+}
+
+void test_csr_backend_dispatch_kernels_complex() {
+    std::cout << "Testing CSR Backend Kernels (Complex)..." << std::endl;
+
+    std::vector<int> block_sizes = {1, 1};
+    std::vector<std::vector<int>> adj = {{0, 1}, {0, 1}};
+    DistGraph graph(MPI_COMM_SELF);
+    graph.construct_serial(2, block_sizes, adj);
+
+    using T = std::complex<double>;
+    BlockSpMat<T> mat(&graph);
+    T a00[] = {T(2.0, 1.0)};
+    T a01[] = {T(3.0, -2.0)};
+    T a10[] = {T(4.0, 1.0)};
+    T a11[] = {T(5.0, 0.0)};
+    mat.add_block(0, 0, a00, 1, 1, AssemblyMode::INSERT, MatrixLayout::RowMajor);
+    mat.add_block(0, 1, a01, 1, 1, AssemblyMode::INSERT, MatrixLayout::RowMajor);
+    mat.add_block(1, 0, a10, 1, 1, AssemblyMode::INSERT, MatrixLayout::RowMajor);
+    mat.add_block(1, 1, a11, 1, 1, AssemblyMode::INSERT, MatrixLayout::RowMajor);
+    mat.assemble();
+
+    auto assert_close = [](T got, T expected) {
+        assert(std::abs(got - expected) < 1e-12);
+    };
+
+    DistVector<T> x(&graph);
+    DistVector<T> y(&graph);
+    x.local_data()[0] = T(1.0, 2.0);
+    x.local_data()[1] = T(-1.0, 1.0);
+    mat.mult(x, y);
+    assert_close(y.local_data()[0], T(-1.0, 10.0));
+    assert_close(y.local_data()[1], T(-3.0, 14.0));
+
+    DistMultiVector<T> X(&graph, 2);
+    DistMultiVector<T> Y(&graph, 2);
+    X(0, 0) = T(1.0, 0.0);
+    X(1, 0) = T(2.0, 0.0);
+    X(0, 1) = T(0.0, 1.0);
+    X(1, 1) = T(1.0, -1.0);
+    mat.mult_dense(X, Y);
+    assert_close(Y(0, 0), T(8.0, -3.0));
+    assert_close(Y(1, 0), T(14.0, 1.0));
+    assert_close(Y(0, 1), T(0.0, -3.0));
+    assert_close(Y(1, 1), T(4.0, -1.0));
+
+    DistVector<T> x_adj(&graph);
+    DistVector<T> y_adj(&graph);
+    x_adj.local_data()[0] = T(2.0, -1.0);
+    x_adj.local_data()[1] = T(1.0, 3.0);
+    mat.mult_adjoint(x_adj, y_adj);
+    assert_close(y_adj.local_data()[0], T(10.0, 7.0));
+    assert_close(y_adj.local_data()[1], T(13.0, 16.0));
+
+    DistMultiVector<T> X_adj(&graph, 2);
+    DistMultiVector<T> Y_adj(&graph, 2);
+    X_adj(0, 0) = T(1.0, 1.0);
+    X_adj(1, 0) = T(2.0, 0.0);
+    X_adj(0, 1) = T(0.0, -1.0);
+    X_adj(1, 1) = T(3.0, 1.0);
+    mat.mult_dense_adjoint(X_adj, Y_adj);
+    assert_close(Y_adj(0, 0), T(11.0, -1.0));
+    assert_close(Y_adj(1, 0), T(11.0, 5.0));
+    assert_close(Y_adj(0, 1), T(12.0, -1.0));
+    assert_close(Y_adj(1, 1), T(17.0, 2.0));
+
+    std::cout << "PASSED" << std::endl;
+}
+
+void test_csr_vendor_page_cache_metadata() {
+    std::cout << "Testing CSR Vendor Page Cache Metadata..." << std::endl;
+
+    DistGraph graph(MPI_COMM_SELF);
+    graph.construct_serial(3, {1, 1, 1}, {{0, 2}, {0, 1, 2}, {1}});
+
+    detail::CSRMatrixBackend<double> backend;
+    backend.initialize_structure(graph.adj_ind, 3);
+    for (int slot = 0; slot < static_cast<int>(graph.adj_ind.size()); ++slot) {
+        *backend.value_ptr(slot) = 1.0 + slot;
+    }
+
+    const auto& cache = backend.ensure_vendor_cache(graph.adj_ptr, static_cast<int>(graph.block_sizes.size()));
+    assert(cache.pages.size() == 2);
+
+    const auto& page0 = cache.pages[0];
+    assert(page0.metadata.page_id == 0);
+    assert(page0.metadata.global_nnz_begin == 0);
+    assert(page0.metadata.nnz == 3);
+    assert(page0.metadata.row_begin == 0);
+    assert(page0.metadata.row_end == 2);
+    assert(page0.row_ptr == std::vector<int>({0, 2, 3}));
+
+    const auto& page1 = cache.pages[1];
+    assert(page1.metadata.page_id == 1);
+    assert(page1.metadata.global_nnz_begin == 3);
+    assert(page1.metadata.nnz == 3);
+    assert(page1.metadata.row_begin == 1);
+    assert(page1.metadata.row_end == 3);
+    assert(page1.row_ptr == std::vector<int>({0, 2, 3}));
+
+#ifdef VBCSR_HAVE_MKL_SPARSE
+    assert(cache.kind == detail::CSRVendorBackendKind::MKL);
+    assert(backend.vendor_backend_name() == "mkl");
+#elif defined(VBCSR_HAVE_AOCL_SPARSE)
+    assert(cache.kind == detail::CSRVendorBackendKind::AOCL);
+    assert(backend.vendor_backend_name() == "aocl");
+#else
+    assert(cache.kind == detail::CSRVendorBackendKind::None);
+    assert(backend.vendor_backend_name() == "none");
+#endif
+
+    std::cout << "PASSED" << std::endl;
+}
+
+void test_csr_vendor_dispatch_selection() {
+    std::cout << "Testing CSR Vendor Dispatch Selection..." << std::endl;
+
+    DistGraph graph(MPI_COMM_SELF);
+    graph.construct_serial(2, {1, 1}, {{0, 1}, {0, 1}});
+
+    detail::CSRMatrixBackend<double> backend;
+    backend.initialize_structure(graph.adj_ind, 1);
+    const double vals[] = {2.0, 3.0, 4.0, 5.0};
+    for (int slot = 0; slot < 4; ++slot) {
+        *backend.value_ptr(slot) = vals[slot];
+    }
+
+    DistVector<double> x(&graph);
+    DistVector<double> y(&graph);
+    x.local_data()[0] = 7.0;
+    x.local_data()[1] = 11.0;
+
+    backend.reset_vendor_launch_count();
+    detail::csr_mult(&graph, backend, x, y);
+    assert(std::abs(y.local_data()[0] - 47.0) < 1e-12);
+    assert(std::abs(y.local_data()[1] - 83.0) < 1e-12);
+
+    DistMultiVector<double> X(&graph, 2);
+    DistMultiVector<double> Y(&graph, 2);
+    X(0, 0) = 1.0;
+    X(1, 0) = 2.0;
+    X(0, 1) = 3.0;
+    X(1, 1) = 4.0;
+    detail::csr_mult_dense(&graph, backend, X, Y);
+    assert(std::abs(Y(0, 0) - 8.0) < 1e-12);
+    assert(std::abs(Y(1, 0) - 14.0) < 1e-12);
+
+    DistVector<double> x_adj(&graph);
+    DistVector<double> y_adj(&graph);
+    x_adj.local_data()[0] = 13.0;
+    x_adj.local_data()[1] = 17.0;
+    detail::csr_mult_adjoint(&graph, backend, x_adj, y_adj);
+    assert(std::abs(y_adj.local_data()[0] - 94.0) < 1e-12);
+    assert(std::abs(y_adj.local_data()[1] - 124.0) < 1e-12);
+
+    DistMultiVector<double> X_adj(&graph, 2);
+    DistMultiVector<double> Y_adj(&graph, 2);
+    X_adj(0, 0) = 5.0;
+    X_adj(1, 0) = 7.0;
+    X_adj(0, 1) = 11.0;
+    X_adj(1, 1) = 13.0;
+    detail::csr_mult_dense_adjoint(&graph, backend, X_adj, Y_adj);
+    assert(std::abs(Y_adj(0, 0) - 38.0) < 1e-12);
+    assert(std::abs(Y_adj(1, 0) - 50.0) < 1e-12);
+
+#if defined(VBCSR_HAVE_MKL_SPARSE) || defined(VBCSR_HAVE_AOCL_SPARSE)
+    assert(backend.get_vendor_launch_count() > 0);
+#else
+    assert(backend.get_vendor_launch_count() == 0);
+#endif
 
     std::cout << "PASSED" << std::endl;
 }
@@ -1691,6 +2028,8 @@ int main(int argc, char** argv) {
     test_paged_storage_contracts();
     test_vbcsr_execution_registry_scaffold();
     test_vbcsr_batch_views();
+    test_batched_blas_capability_flags();
+    test_contiguous_api_and_vbcsr_packing();
     if (size == 1) {
         test_transpose();
     }
@@ -1708,6 +2047,9 @@ int main(int argc, char** argv) {
     test_vbcsr_shape_batched_apply_kernels();
     test_vbcsr_shape_batched_spmm();
     test_csr_backend_dispatch_kernels();
+    test_csr_backend_dispatch_kernels_complex();
+    test_csr_vendor_page_cache_metadata();
+    test_csr_vendor_dispatch_selection();
     test_csr_transpose_native_serial();
     test_csr_transpose_native_distributed();
     test_csr_axpby_same_structure_native();

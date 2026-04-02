@@ -6,7 +6,7 @@
 
 #include <vector>
 
-namespace detail {
+namespace vbcsr::detail {
 
 template <typename Matrix>
 struct CSRTransposeExecutor {
@@ -48,7 +48,10 @@ struct CSRTransposeExecutor {
             }
         }
 
-        return Matrix::from_csr_builder(graph_C, true, std::move(builder));
+        return Matrix::template materialize_from_builder<vbcsr::MatrixKind::CSR>(
+            graph_C,
+            true,
+            std::move(builder));
     }
 
     static Matrix distributed(const Matrix& matrix) {
@@ -77,7 +80,10 @@ struct CSRTransposeExecutor {
             *builder.slot_data(slot) = ScalarTraits<T>::conjugate(*value_ptr++);
         }
 
-        return Matrix::from_csr_builder(graph_C, true, std::move(builder));
+        return Matrix::template materialize_from_builder<vbcsr::MatrixKind::CSR>(
+            graph_C,
+            true,
+            std::move(builder));
     }
 
     static Matrix run(const Matrix& matrix) {
@@ -130,7 +136,10 @@ struct BSRTransposeExecutor {
             }
         }
 
-        return Matrix::from_bsr_builder(graph_C, true, std::move(builder));
+        return Matrix::template materialize_from_builder<vbcsr::MatrixKind::BSR>(
+            graph_C,
+            true,
+            std::move(builder));
     }
 
     static Matrix distributed(const Matrix& matrix) {
@@ -157,7 +166,10 @@ struct BSRTransposeExecutor {
             value_ptr += static_cast<size_t>(row_dim) * col_dim;
         }
 
-        return Matrix::from_bsr_builder(graph_C, true, std::move(builder));
+        return Matrix::template materialize_from_builder<vbcsr::MatrixKind::BSR>(
+            graph_C,
+            true,
+            std::move(builder));
     }
 
     static Matrix run(const Matrix& matrix) {
@@ -219,7 +231,10 @@ private:
                     matrix.graph->block_sizes[matrix.col_ind[slot]]);
             }
         }
-        return Matrix::from_vbcsr_builder(graph_C, true, std::move(builder));
+        return Matrix::template materialize_from_builder<vbcsr::MatrixKind::VBCSR>(
+            graph_C,
+            true,
+            std::move(builder));
     }
 
     static Matrix distributed(const Matrix& matrix) {
@@ -244,10 +259,13 @@ private:
             Matrix::write_transposed_conjugate_values(builder.slot_data(slot), value_ptr, col_dim, row_dim);
             value_ptr += static_cast<size_t>(row_dim) * col_dim;
         }
-        return Matrix::from_vbcsr_builder(graph_C, true, std::move(builder));
+        return Matrix::template materialize_from_builder<vbcsr::MatrixKind::VBCSR>(
+            graph_C,
+            true,
+            std::move(builder));
     }
 };
 
-} // namespace detail
+} // namespace vbcsr::detail
 
 #endif // VBCSR_DETAIL_TRANSPOSE_OPS_HPP

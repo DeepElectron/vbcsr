@@ -1,6 +1,7 @@
 import numpy as np
-import vbcsr_core
-from typing import Union, Optional, Any
+from typing import Union, Any
+
+from ._wrapper_utils import core_buffer, duplicate_wrapper, infer_dtype_from_core, reduced_extent
 
 class DistVector:
     """
@@ -20,16 +21,12 @@ class DistVector:
             comm: MPI communicator.
         """
         self._core = core_obj
-        self.dtype = np.complex128 if "Complex" in core_obj.__class__.__name__ else np.float64
+        self.dtype = infer_dtype_from_core(core_obj)
         self.comm = comm
-        self._global_size = None
-        if self.comm:
-            try:
-                self._global_size = self.comm.allreduce(self.local_size)
-            except:
-                pass
-        else:
-            self._global_size = self.local_size
+        self._global_size = reduced_extent(self.comm, self.local_size)
+
+    def _local_buffer(self) -> np.ndarray:
+        return core_buffer(self._core)[:self.local_size]
 
     @property
     def local_size(self) -> int:
@@ -66,9 +63,7 @@ class DistVector:
         return self
 
     def copy(self) -> 'DistVector':
-        obj = self.duplicate()
-        obj.comm = self.comm
-        return obj
+        return duplicate_wrapper(self)
 
     def __matmul__(self, other):
         if isinstance(other, DistVector):
@@ -90,8 +85,7 @@ class DistVector:
         Returns:
             np.ndarray: A copy (or view) of the locally owned data.
         """
-        buf = np.array(self._core, copy=False)
-        return buf[:self.local_size]
+        return self._local_buffer()
 
     def from_numpy(self, arr: np.ndarray) -> None:
         """
@@ -105,8 +99,7 @@ class DistVector:
         """
         if arr.size != self.local_size:
             raise ValueError(f"Array size {arr.size} does not match vector local size {self.local_size}")
-        buf = np.array(self._core, copy=False)
-        buf[:self.local_size] = arr
+        self._local_buffer()[:] = arr
 
     def __array__(self) -> np.ndarray:
         """Support for np.array(vec)."""
@@ -227,11 +220,9 @@ class DistVector:
         if isinstance(other, DistVector):
             self._core.axpy(1.0, other._core)
         elif np.isscalar(other):
-            buf = np.array(self._core, copy=False)
-            buf[:self.local_size] += other
+            self._local_buffer()[:] += other
         elif isinstance(other, np.ndarray):
-            buf = np.array(self._core, copy=False)
-            buf[:self.local_size] += other
+            self._local_buffer()[:] += other
         else:
             return NotImplemented
         return self
@@ -245,11 +236,9 @@ class DistVector:
         if isinstance(other, DistVector):
             self._core.axpy(-1.0, other._core)
         elif np.isscalar(other):
-            buf = np.array(self._core, copy=False)
-            buf[:self.local_size] -= other
+            self._local_buffer()[:] -= other
         elif isinstance(other, np.ndarray):
-            buf = np.array(self._core, copy=False)
-            buf[:self.local_size] -= other
+            self._local_buffer()[:] -= other
         else:
             return NotImplemented
         return self
@@ -273,8 +262,7 @@ class DistVector:
         elif isinstance(other, DistVector):
             self._core.pointwise_mult(other._core)
         elif isinstance(other, np.ndarray):
-            buf = np.array(self._core, copy=False)
-            buf[:self.local_size] *= other
+            self._local_buffer()[:] *= other
         else:
             return NotImplemented
         return self
@@ -291,11 +279,9 @@ class DistVector:
         if np.isscalar(other):
             self._core.scale(1.0 / other)
         elif isinstance(other, DistVector):
-            buf = np.array(self._core, copy=False)
-            buf[:self.local_size] /= np.array(other._core, copy=False)
+            self._local_buffer()[:] /= core_buffer(other._core)[:other.local_size]
         elif isinstance(other, np.ndarray):
-            buf = np.array(self._core, copy=False)
-            buf[:self.local_size] /= other
+            self._local_buffer()[:] /= other
         else:
             return NotImplemented
         return self

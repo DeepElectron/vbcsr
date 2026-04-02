@@ -24,14 +24,7 @@ PRESET_PROFILES = {
 }
 
 VBCSR_SHAPES = np.array([9, 13, 15, 20], dtype=np.int32)
-
-MODE_ALIASES = {
-    "mult": "mult",
-    "spmv": "mult",
-    "mult_dense": "mult_dense",
-    "spmm": "spmm",
-    "spgemm": "spmm",
-}
+CANONICAL_MODES = ("mult", "mult_dense", "spmm")
 
 
 def try_get_git_commit() -> str:
@@ -68,14 +61,6 @@ def apply_profile_defaults(args: argparse.Namespace) -> None:
     else:
         args.min_block = 10 if args.min_block is None else args.min_block
         args.max_block = 50 if args.max_block is None else args.max_block
-
-
-def normalize_mode(mode: str) -> str:
-    try:
-        return MODE_ALIASES[mode]
-    except KeyError as exc:
-        raise ValueError(f"Unsupported benchmark mode: {mode}") from exc
-
 
 def generate_block_sizes(global_blocks: int, family: str, block_size_min: int, block_size_max: int, seed: int = 42) -> list[int]:
     rng = np.random.default_rng(seed)
@@ -151,8 +136,8 @@ def main():
         "--mode",
         type=str,
         default="mult",
-        choices=sorted(MODE_ALIASES),
-        help="Benchmark mode (`mult`, `mult_dense`, `spmm`) plus legacy aliases",
+        choices=CANONICAL_MODES,
+        help="Benchmark mode (`mult`, `mult_dense`, `spmm`)",
     )
     parser.add_argument("--num-vecs", type=int, default=None, help="Number of vectors for mult_dense")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -161,8 +146,6 @@ def main():
     args = parser.parse_args()
 
     apply_profile_defaults(args)
-    args.mode = normalize_mode(args.mode)
-
     if args.mkl:
         try:
             import sparse_dot_mkl
@@ -278,8 +261,6 @@ def main():
             x_local_data = rng.random((x_vbcsr.local_rows, args.num_vecs)) + 1j * rng.random((x_vbcsr.local_rows, args.num_vecs))
         x_vbcsr.from_numpy(x_local_data)
         x_np = x_vbcsr.to_numpy() if size == 1 else None
-    elif args.mode == "spgemm":
-        x_vbcsr = mat
 
     def benchmark_op(op_func, name):
         if rank == 0:

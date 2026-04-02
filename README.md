@@ -74,6 +74,17 @@ For advanced installation options (MKL, OpenMP, etc.), see [doc/advanced_install
 - [API Reference](doc/api_reference.md): Detailed documentation of classes and methods.
 - [Advanced Installation](doc/advanced_installation.md): BLAS/MKL and OpenMP tuning.
 
+## Testing
+
+Use the maintained top-level entrypoints:
+
+```bash
+python tests/run_python_suite.py --include-mpi
+python vbcsr/core/test/run_native_suite.py
+```
+
+`tests/run_python_suite.py` is the maintained Python regression workflow. `vbcsr/core/test/run_native_suite.py` is the maintained native regression workflow that chains the direct core tests with the CMake-registered atomic/image tests.
+
 ### Performance at a Glance
 
 VBCSR is designed for high-performance block-sparse operations, significantly outperforming standard CSR implementations for block-structured matrices.
@@ -93,7 +104,7 @@ VBCSR is designed for high-performance block-sparse operations, significantly ou
 VBCSR matrices behave like first-class Python objects, supporting standard arithmetic and seamless integration with the SciPy ecosystem.
 
 ### 1. Easy Initialization from SciPy
-Convert any SciPy sparse matrix (BSR or CSR) to a distributed VBCSR matrix in one line.
+Convert a SciPy sparse matrix (BSR or CSR) into a VBCSR matrix. In MPI, call collectively with the SciPy input on the root rank only.
 
 ```python
 import scipy.sparse as sp
@@ -102,8 +113,11 @@ from vbcsr import VBCSR
 # Create a SciPy BSR matrix
 A_scipy = sp.bsr_matrix(np.random.rand(100, 100), blocksize=(10, 10))
 
-# Convert to VBCSR (automatically distributed if MPI is initialized)
+# Serial import
 A = VBCSR.from_scipy(A_scipy)
+
+# MPI import
+# A = VBCSR.from_scipy(A_scipy if comm.rank == 0 else None, comm=comm, root=0)
 ```
 
 ### 2. Natural Arithmetic & Operators
@@ -160,3 +174,5 @@ from scipy.sparse.linalg import cg
 # Solve Ax = b using Conjugate Gradient
 x, info = cg(A, b, rtol=1e-6)
 ```
+
+`to_scipy()` and `to_dense()` export only the local matrix view. `save_matrix_market()` is serial-only.

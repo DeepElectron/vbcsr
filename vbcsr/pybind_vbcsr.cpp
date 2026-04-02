@@ -4,6 +4,8 @@
 #include <pybind11/numpy.h>
 #include <mpi.h>
 
+#include <cstring>
+
 #include "dist_graph.hpp"
 #include "block_csr.hpp"
 #include "dist_vector.hpp"
@@ -46,9 +48,6 @@ py::array_t<T> make_owned_array_2d_row_major(const std::vector<T>& data, py::ssi
 
 // Forward declaration for atomic module binding
 void bind_atomic_module(py::module& m);
-
-namespace py = pybind11;
-using namespace vbcsr;
 
 template<typename T>
 void bind_dist_vector(py::module& m, const std::string& name) {
@@ -94,22 +93,12 @@ void bind_dist_multivector(py::module& m, const std::string& name) {
         .def("pointwise_mult", py::overload_cast<const DistMultiVector<T>&>(&DistMultiVector<T>::pointwise_mult))
         .def("pointwise_mult_vec", py::overload_cast<const DistVector<T>&>(&DistMultiVector<T>::pointwise_mult))
         .def("bdot", &DistMultiVector<T>::bdot)
-        .def("duplicate", [](const DistMultiVector<T>& v) {
-            // DistMultiVector doesn't have a duplicate method in C++, implement a simple one here or add to C++
-            // Assuming C++ side doesn't have it, we can create new and copy.
-            // But wait, DistMultiVector copy constructor/assignment might be deleted or not efficient?
-            // Let's rely on copy_from.
-            DistMultiVector<T> new_v(v.graph, v.num_vectors);
-            new_v.copy_from(v);
-            return new_v;
-        })
+        .def("duplicate", &DistMultiVector<T>::duplicate)
         .def("copy_from", &DistMultiVector<T>::copy_from)
         .def("set_random_normal", &DistMultiVector<T>::set_random_normal)
         .def_property_readonly("local_rows", [](const DistMultiVector<T>& v) { return v.local_rows; })
         .def_property_readonly("ghost_rows", [](const DistMultiVector<T>& v) { return v.ghost_rows; })
         .def_property_readonly("num_vectors", [](const DistMultiVector<T>& v) { return v.num_vectors; })
-        // Buffer protocol (Column-Major storage in C++)
-        // Exposed as (rows, cols) 2D array
         .def_buffer([](DistMultiVector<T>& v) -> py::buffer_info {
             return py::buffer_info(
                 v.data.data(),

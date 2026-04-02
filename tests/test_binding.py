@@ -1,3 +1,4 @@
+import _workspace_bootstrap
 import numpy as np
 import vbcsr
 try:

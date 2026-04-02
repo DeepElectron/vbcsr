@@ -2,13 +2,16 @@
 #define VBCSR_KERNELS_HPP
 
 #include <complex>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
 #include <vector>
 
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 
-#ifdef VBCSR_BLAS_ILP64
+#if defined(VBCSR_BLAS_ILP64) || defined(VBCSR_USE_ILP64)
 #include <cstdint>
 using vbcsr_blas_int = int64_t;
 #else
@@ -48,6 +51,36 @@ extern "C" {
                      const void *alpha, const void *A, const vbcsr_blas_int lda,
                      const void *B, const vbcsr_blas_int ldb,
                      const void *beta, void *C, const vbcsr_blas_int ldc);
+
+#ifdef VBCSR_BLAS_HAS_BATCH_GEMM
+    void cblas_dgemm_batch_strided(const int Order, const int TransA, const int TransB,
+                                   const vbcsr_blas_int M, const vbcsr_blas_int N, const vbcsr_blas_int K,
+                                   const double alpha, const double *A, const vbcsr_blas_int lda, const vbcsr_blas_int stridea,
+                                   const double *B, const vbcsr_blas_int ldb, const vbcsr_blas_int strideb,
+                                   const double beta, double *C, const vbcsr_blas_int ldc, const vbcsr_blas_int stridec,
+                                   const vbcsr_blas_int batch_size);
+    void cblas_zgemm_batch_strided(const int Order, const int TransA, const int TransB,
+                                   const vbcsr_blas_int M, const vbcsr_blas_int N, const vbcsr_blas_int K,
+                                   const void *alpha, const void *A, const vbcsr_blas_int lda, const vbcsr_blas_int stridea,
+                                   const void *B, const vbcsr_blas_int ldb, const vbcsr_blas_int strideb,
+                                   const void *beta, void *C, const vbcsr_blas_int ldc, const vbcsr_blas_int stridec,
+                                   const vbcsr_blas_int batch_size);
+#endif
+
+#ifdef VBCSR_BLAS_HAS_BATCH_GEMV
+    void cblas_dgemv_batch_strided(const int Order, const int TransA,
+                                   const vbcsr_blas_int M, const vbcsr_blas_int N,
+                                   const double alpha, const double *A, const vbcsr_blas_int lda, const vbcsr_blas_int stridea,
+                                   const double *X, const vbcsr_blas_int incX, const vbcsr_blas_int stridex,
+                                   const double beta, double *Y, const vbcsr_blas_int incY, const vbcsr_blas_int stridey,
+                                   const vbcsr_blas_int batch_size);
+    void cblas_zgemv_batch_strided(const int Order, const int TransA,
+                                   const vbcsr_blas_int M, const vbcsr_blas_int N,
+                                   const void *alpha, const void *A, const vbcsr_blas_int lda, const vbcsr_blas_int stridea,
+                                   const void *X, const vbcsr_blas_int incX, const vbcsr_blas_int stridex,
+                                   const void *beta, void *Y, const vbcsr_blas_int incY, const vbcsr_blas_int stridey,
+                                   const vbcsr_blas_int batch_size);
+#endif
 }
 
 namespace vbcsr {
@@ -444,6 +477,22 @@ struct FixedBlockKernel {
 
 // MKL/BLAS Kernel
 struct BLASKernel {
+    static constexpr bool supports_strided_gemm() {
+#ifdef VBCSR_BLAS_HAS_BATCH_GEMM
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    static constexpr bool supports_strided_gemv() {
+#ifdef VBCSR_BLAS_HAS_BATCH_GEMV
+        return true;
+#else
+        return false;
+#endif
+    }
+
     // Double
     static void gemv(int m, int n, double alpha, const double* A, int lda, const double* x, int incx, double beta, double* y, int incy, CBLAS_TRANSPOSE trans = CblasNoTrans) {
         cblas_dgemv(CblasColMajor, trans, m, n, alpha, A, lda, x, incx, beta, y, incy);
@@ -460,6 +509,226 @@ struct BLASKernel {
 
     static void gemm(int m, int n, int k, std::complex<double> alpha, const std::complex<double>* A, int lda, const std::complex<double>* B, int ldb, std::complex<double> beta, std::complex<double>* C, int ldc, CBLAS_TRANSPOSE transA = CblasNoTrans, CBLAS_TRANSPOSE transB = CblasNoTrans) {
         cblas_zgemm(CblasColMajor, transA, transB, m, n, k, &alpha, A, lda, B, ldb, &beta, C, ldc);
+    }
+
+    static void gemv_batched(
+        int m,
+        int n,
+        double alpha,
+        const double* A,
+        int lda,
+        int stridea,
+        const double* x,
+        int incx,
+        int stridex,
+        double beta,
+        double* y,
+        int incy,
+        int stridey,
+        int batch_count,
+        CBLAS_TRANSPOSE trans = CblasNoTrans) {
+#ifdef VBCSR_BLAS_HAS_BATCH_GEMV
+        cblas_dgemv_batch_strided(
+            CblasColMajor,
+            trans,
+            static_cast<vbcsr_blas_int>(m),
+            static_cast<vbcsr_blas_int>(n),
+            alpha,
+            A,
+            static_cast<vbcsr_blas_int>(lda),
+            static_cast<vbcsr_blas_int>(stridea),
+            x,
+            static_cast<vbcsr_blas_int>(incx),
+            static_cast<vbcsr_blas_int>(stridex),
+            beta,
+            y,
+            static_cast<vbcsr_blas_int>(incy),
+            static_cast<vbcsr_blas_int>(stridey),
+            static_cast<vbcsr_blas_int>(batch_count));
+#else
+        for (int batch = 0; batch < batch_count; ++batch) {
+            gemv(
+                m,
+                n,
+                alpha,
+                A + static_cast<size_t>(batch) * stridea,
+                lda,
+                x + static_cast<size_t>(batch) * stridex,
+                incx,
+                beta,
+                y + static_cast<size_t>(batch) * stridey,
+                incy,
+                trans);
+        }
+#endif
+    }
+
+    static void gemm_batched(
+        int m,
+        int n,
+        int k,
+        double alpha,
+        const double* A,
+        int lda,
+        int stridea,
+        const double* B,
+        int ldb,
+        int strideb,
+        double beta,
+        double* C,
+        int ldc,
+        int stridec,
+        int batch_count,
+        CBLAS_TRANSPOSE transA = CblasNoTrans,
+        CBLAS_TRANSPOSE transB = CblasNoTrans) {
+#ifdef VBCSR_BLAS_HAS_BATCH_GEMM
+        cblas_dgemm_batch_strided(
+            CblasColMajor,
+            transA,
+            transB,
+            static_cast<vbcsr_blas_int>(m),
+            static_cast<vbcsr_blas_int>(n),
+            static_cast<vbcsr_blas_int>(k),
+            alpha,
+            A,
+            static_cast<vbcsr_blas_int>(lda),
+            static_cast<vbcsr_blas_int>(stridea),
+            B,
+            static_cast<vbcsr_blas_int>(ldb),
+            static_cast<vbcsr_blas_int>(strideb),
+            beta,
+            C,
+            static_cast<vbcsr_blas_int>(ldc),
+            static_cast<vbcsr_blas_int>(stridec),
+            static_cast<vbcsr_blas_int>(batch_count));
+#else
+        for (int batch = 0; batch < batch_count; ++batch) {
+            gemm(
+                m,
+                n,
+                k,
+                alpha,
+                A + static_cast<size_t>(batch) * stridea,
+                lda,
+                B + static_cast<size_t>(batch) * strideb,
+                ldb,
+                beta,
+                C + static_cast<size_t>(batch) * stridec,
+                ldc,
+                transA,
+                transB);
+        }
+#endif
+    }
+
+    static void gemv_batched(
+        int m,
+        int n,
+        std::complex<double> alpha,
+        const std::complex<double>* A,
+        int lda,
+        int stridea,
+        const std::complex<double>* x,
+        int incx,
+        int stridex,
+        std::complex<double> beta,
+        std::complex<double>* y,
+        int incy,
+        int stridey,
+        int batch_count,
+        CBLAS_TRANSPOSE trans = CblasNoTrans) {
+#ifdef VBCSR_BLAS_HAS_BATCH_GEMV
+        cblas_zgemv_batch_strided(
+            CblasColMajor,
+            trans,
+            static_cast<vbcsr_blas_int>(m),
+            static_cast<vbcsr_blas_int>(n),
+            &alpha,
+            A,
+            static_cast<vbcsr_blas_int>(lda),
+            static_cast<vbcsr_blas_int>(stridea),
+            x,
+            static_cast<vbcsr_blas_int>(incx),
+            static_cast<vbcsr_blas_int>(stridex),
+            &beta,
+            y,
+            static_cast<vbcsr_blas_int>(incy),
+            static_cast<vbcsr_blas_int>(stridey),
+            static_cast<vbcsr_blas_int>(batch_count));
+#else
+        for (int batch = 0; batch < batch_count; ++batch) {
+            gemv(
+                m,
+                n,
+                alpha,
+                A + static_cast<size_t>(batch) * stridea,
+                lda,
+                x + static_cast<size_t>(batch) * stridex,
+                incx,
+                beta,
+                y + static_cast<size_t>(batch) * stridey,
+                incy,
+                trans);
+        }
+#endif
+    }
+
+    static void gemm_batched(
+        int m,
+        int n,
+        int k,
+        std::complex<double> alpha,
+        const std::complex<double>* A,
+        int lda,
+        int stridea,
+        const std::complex<double>* B,
+        int ldb,
+        int strideb,
+        std::complex<double> beta,
+        std::complex<double>* C,
+        int ldc,
+        int stridec,
+        int batch_count,
+        CBLAS_TRANSPOSE transA = CblasNoTrans,
+        CBLAS_TRANSPOSE transB = CblasNoTrans) {
+#ifdef VBCSR_BLAS_HAS_BATCH_GEMM
+        cblas_zgemm_batch_strided(
+            CblasColMajor,
+            transA,
+            transB,
+            static_cast<vbcsr_blas_int>(m),
+            static_cast<vbcsr_blas_int>(n),
+            static_cast<vbcsr_blas_int>(k),
+            &alpha,
+            A,
+            static_cast<vbcsr_blas_int>(lda),
+            static_cast<vbcsr_blas_int>(stridea),
+            B,
+            static_cast<vbcsr_blas_int>(ldb),
+            static_cast<vbcsr_blas_int>(strideb),
+            &beta,
+            C,
+            static_cast<vbcsr_blas_int>(ldc),
+            static_cast<vbcsr_blas_int>(stridec),
+            static_cast<vbcsr_blas_int>(batch_count));
+#else
+        for (int batch = 0; batch < batch_count; ++batch) {
+            gemm(
+                m,
+                n,
+                k,
+                alpha,
+                A + static_cast<size_t>(batch) * stridea,
+                lda,
+                B + static_cast<size_t>(batch) * strideb,
+                ldb,
+                beta,
+                C + static_cast<size_t>(batch) * stridec,
+                ldc,
+                transA,
+                transB);
+        }
+#endif
     }
 
     static void init_threading() {
@@ -490,6 +759,16 @@ struct BLASKernel {
 // Smart Kernel Dispatcher
 template <typename T>
 struct SmartKernel {
+    static constexpr bool supports_batched_gemm() {
+        return (std::is_same_v<T, double> || std::is_same_v<T, std::complex<double>>) &&
+               BLASKernel::supports_strided_gemm();
+    }
+
+    static constexpr bool supports_batched_gemv() {
+        return (std::is_same_v<T, double> || std::is_same_v<T, std::complex<double>>) &&
+               BLASKernel::supports_strided_gemv();
+    }
+
     // Dispatch macros
     #define CASE_GEMV(R, C) case C: FixedBlockKernel<T, R, C>::gemv(A, x, y, alpha, beta); break;
     #define SWITCH_GEMV(R) \
@@ -600,6 +879,188 @@ struct SmartKernel {
             BLASKernel::gemm(k, n, m, alpha, A, lda, B, ldb, beta, C_ptr, ldc, CblasConjTrans, CblasNoTrans);
         }
     }
+
+    static void gemv_batched(
+        int m,
+        int n,
+        T alpha,
+        const T* A,
+        int lda,
+        int stridea,
+        const T* x,
+        int incx,
+        int stridex,
+        T beta,
+        T* y,
+        int incy,
+        int stridey,
+        int batch_count) {
+        if constexpr (std::is_same_v<T, double> || std::is_same_v<T, std::complex<double>>) {
+            if (BLASKernel::supports_strided_gemv()) {
+                BLASKernel::gemv_batched(
+                    m, n, alpha, A, lda, stridea, x, incx, stridex, beta, y, incy, stridey, batch_count);
+                return;
+            }
+        }
+        for (int batch = 0; batch < batch_count; ++batch) {
+            gemv(
+                m,
+                n,
+                alpha,
+                A + static_cast<size_t>(batch) * stridea,
+                lda,
+                x + static_cast<size_t>(batch) * stridex,
+                incx,
+                beta,
+                y + static_cast<size_t>(batch) * stridey,
+                incy);
+        }
+    }
+
+    static void gemm_batched(
+        int m,
+        int n,
+        int k,
+        T alpha,
+        const T* A,
+        int lda,
+        int stridea,
+        const T* B,
+        int ldb,
+        int strideb,
+        T beta,
+        T* C_ptr,
+        int ldc,
+        int stridec,
+        int batch_count) {
+        if constexpr (std::is_same_v<T, double> || std::is_same_v<T, std::complex<double>>) {
+            if (BLASKernel::supports_strided_gemm()) {
+                BLASKernel::gemm_batched(
+                    m, n, k, alpha, A, lda, stridea, B, ldb, strideb, beta, C_ptr, ldc, stridec, batch_count);
+                return;
+            }
+        }
+        for (int batch = 0; batch < batch_count; ++batch) {
+            gemm(
+                m,
+                n,
+                k,
+                alpha,
+                A + static_cast<size_t>(batch) * stridea,
+                lda,
+                B + static_cast<size_t>(batch) * strideb,
+                ldb,
+                beta,
+                C_ptr + static_cast<size_t>(batch) * stridec,
+                ldc);
+        }
+    }
+
+    static void gemv_trans_batched(
+        int m,
+        int n,
+        T alpha,
+        const T* A,
+        int lda,
+        int stridea,
+        const T* x,
+        int incx,
+        int stridex,
+        T beta,
+        T* y,
+        int incy,
+        int stridey,
+        int batch_count) {
+        if constexpr (std::is_same_v<T, double> || std::is_same_v<T, std::complex<double>>) {
+            if (BLASKernel::supports_strided_gemv()) {
+                BLASKernel::gemv_batched(
+                    m,
+                    n,
+                    alpha,
+                    A,
+                    lda,
+                    stridea,
+                    x,
+                    incx,
+                    stridex,
+                    beta,
+                    y,
+                    incy,
+                    stridey,
+                    batch_count,
+                    CblasConjTrans);
+                return;
+            }
+        }
+        for (int batch = 0; batch < batch_count; ++batch) {
+            gemv_trans(
+                m,
+                n,
+                alpha,
+                A + static_cast<size_t>(batch) * stridea,
+                lda,
+                x + static_cast<size_t>(batch) * stridex,
+                incx,
+                beta,
+                y + static_cast<size_t>(batch) * stridey,
+                incy);
+        }
+    }
+
+    static void gemm_trans_batched(
+        int m,
+        int n,
+        int k,
+        T alpha,
+        const T* A,
+        int lda,
+        int stridea,
+        const T* B,
+        int ldb,
+        int strideb,
+        T beta,
+        T* C_ptr,
+        int ldc,
+        int stridec,
+        int batch_count) {
+        if constexpr (std::is_same_v<T, double> || std::is_same_v<T, std::complex<double>>) {
+            if (BLASKernel::supports_strided_gemm()) {
+                BLASKernel::gemm_batched(
+                    k,
+                    n,
+                    m,
+                    alpha,
+                    A,
+                    lda,
+                    stridea,
+                    B,
+                    ldb,
+                    strideb,
+                    beta,
+                    C_ptr,
+                    ldc,
+                    stridec,
+                    batch_count,
+                    CblasConjTrans,
+                    CblasNoTrans);
+                return;
+            }
+        }
+        for (int batch = 0; batch < batch_count; ++batch) {
+            gemm_trans(
+                m,
+                n,
+                k,
+                alpha,
+                A + static_cast<size_t>(batch) * stridea,
+                lda,
+                B + static_cast<size_t>(batch) * strideb,
+                ldb,
+                beta,
+                C_ptr + static_cast<size_t>(batch) * stridec,
+                ldc);
+        }
+    }
     
     // Cleanup macros
     #undef CASE_GEMV
@@ -608,6 +1069,12 @@ struct SmartKernel {
     #undef CASE_GEMM
     #undef SWITCH_GEMM
     #undef CASE_ROW_GEMM
+    #undef CASE_GEMV_TRANS
+    #undef SWITCH_GEMV_TRANS
+    #undef CASE_ROW_GEMV_TRANS
+    #undef CASE_GEMM_TRANS
+    #undef SWITCH_GEMM_TRANS
+    #undef CASE_ROW_GEMM_TRANS
 };
 
 

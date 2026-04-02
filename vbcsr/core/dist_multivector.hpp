@@ -2,11 +2,13 @@
 #define VBCSR_DIST_MULTIVECTOR_HPP
 
 #include "dist_graph.hpp"
+#include "dist_vector.hpp"
 #include <vector>
 #include <cassert>
 #include <cstring>
 #include <algorithm>
 #include <random>
+#include <stdexcept>
 
 #include <complex>
 #include "scalar_traits.hpp"
@@ -160,6 +162,12 @@ public:
             throw std::runtime_error("DistMultiVector::copy_from: size mismatch");
         }
         std::copy(other.data.begin(), other.data.end(), data.begin());
+    }
+
+    DistMultiVector<T> duplicate() const {
+        DistMultiVector<T> copy(graph, num_vectors);
+        copy.copy_from(*this);
+        return copy;
     }
 
     void swap(DistMultiVector<T>& other) {

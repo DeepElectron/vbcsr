@@ -20,14 +20,6 @@ public:
         backend_.initialize_structure(graph_->adj_ind, nnz_per_page);
     }
 
-    T* mutable_block(int slot) {
-        return backend_.value_ptr(slot);
-    }
-
-    const T* mutable_block(int slot) const {
-        return backend_.value_ptr(slot);
-    }
-
     void accumulate_block(int slot, const T* src, T alpha = T(1)) {
         *backend_.value_ptr(slot) += alpha * (*src);
     }
@@ -49,15 +41,11 @@ public:
     }
 
     T* slot_data(int slot) {
-        return mutable_block(slot);
+        return backend_.value_ptr(slot);
     }
 
     const T* slot_data(int slot) const {
-        return mutable_block(slot);
-    }
-
-    CSRMatrixBackend<T> commit_backend() && {
-        return std::move(*this).commit();
+        return backend_.value_ptr(slot);
     }
 
 private:

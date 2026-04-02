@@ -6,27 +6,30 @@ import sys
 from pathlib import Path
 
 
-TESTS = [
+MAINTAINED_TESTS = [
+    "test_backend_extensions.cpp",
+    "test_block_csr.cpp",
+    "test_complex_dist_vector.cpp",
+    "test_dist_csr.cpp",
+    "test_dist_graph.cpp",
+    "test_migration_contract.cpp",
+    "test_numeric_reference.cpp",
+    "test_pb_csr.cpp",
+]
+
+LEGACY_TESTS = [
     "test_asymmetric_filter.cpp",
     "test_axpby.cpp",
     "test_axpby_diff_graph.cpp",
-    "test_backend_extensions.cpp",
-    "test_block_arena.cpp",
-    "test_block_csr.cpp",
     "test_block_csr_export.cpp",
-    "test_complex_dist_vector.cpp",
     "test_density.cpp",
-    "test_dist_csr.cpp",
-    "test_dist_graph.cpp",
     "test_extract_batched.cpp",
     "test_extract_batched_extended.cpp",
     "test_extract_batched_robust.cpp",
     "test_graphmf.cpp",
     "test_hermitian_product.cpp",
-    "test_migration_contract.cpp",
     "test_mult_graph_mismatch.cpp",
     "test_multi_sparsity.cpp",
-    "test_pb_csr.cpp",
     "test_robustness.cpp",
     "test_spmm.cpp",
     "test_subgraph.cpp",
@@ -53,14 +56,25 @@ def run_command(cmd: list[str], cwd: Path, env: dict[str, str]) -> subprocess.Co
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Compile and run the VBCSR C++ regression suite.")
+    parser = argparse.ArgumentParser(
+        description="Compile and run the direct core VBCSR C++ regression subset."
+    )
     parser.add_argument("--mpicxx", default=shutil.which("mpicxx") or "mpicxx", help="MPI C++ compiler")
     parser.add_argument("--mpirun", default=shutil.which("mpirun") or "mpirun", help="MPI launcher")
     parser.add_argument("--np", type=int, default=4, help="MPI rank count for test execution")
     parser.add_argument("--openblas", default="openblas", help="BLAS library name without the -l prefix")
     parser.add_argument("--std", default="c++17", help="C++ language standard")
-    parser.add_argument("--tests", nargs="*", default=TESTS, help="Specific test files to compile and run")
+    parser.add_argument("--all-tests", action="store_true", help="Run the maintained subset plus legacy ad hoc tests")
+    parser.add_argument(
+        "--tests",
+        nargs="*",
+        default=None,
+        help="Specific test files to compile and run; defaults to the maintained direct-core subset",
+    )
     args = parser.parse_args()
+    selected_tests = args.tests
+    if selected_tests is None:
+        selected_tests = MAINTAINED_TESTS + LEGACY_TESTS if args.all_tests else MAINTAINED_TESTS
 
     script_dir = Path(__file__).resolve().parent
     include_dir = script_dir.parent
@@ -76,8 +90,8 @@ def main() -> int:
     passed: list[str] = []
     tool_env = make_tool_env(args.mpicxx, args.mpirun)
 
-    print(f"Running {len(args.tests)} C++ tests...")
-    for test_file in args.tests:
+    print(f"Running {len(selected_tests)} C++ tests...")
+    for test_file in selected_tests:
         exe_name = f"exec_{Path(test_file).stem}"
         compile_cmd = [
             args.mpicxx,
@@ -113,7 +127,7 @@ def main() -> int:
         passed.append(test_file)
 
     print("==================================================")
-    print(f"Summary: {len(passed)}/{len(args.tests)} passed.")
+    print(f"Summary: {len(passed)}/{len(selected_tests)} passed.")
     if failed:
         print("Failed tests:")
         for test_name in failed:

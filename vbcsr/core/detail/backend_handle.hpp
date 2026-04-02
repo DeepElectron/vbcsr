@@ -3,20 +3,36 @@
 
 #include "paged_array.hpp"
 
-#include "../block_memory_pool.hpp"
-
+#include <algorithm>
+#include <complex>
 #include <cstddef>
+#include <cstring>
 #include <cstdint>
 #include <atomic>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <stdexcept>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
+
+#ifdef VBCSR_HAVE_MKL_SPARSE
+#ifdef VBCSR_USE_ILP64
+#ifndef MKL_ILP64
+#define MKL_ILP64
+#endif
+#endif
+#include <mkl_spblas.h>
+#endif
+
+#ifdef VBCSR_HAVE_AOCL_SPARSE
+#include <aoclsparse.h>
+#endif
 
 namespace vbcsr::detail {
 
@@ -123,6 +139,200 @@ struct CSRRowSegment {
     bool is_row_end = false;
 };
 
+enum class CSRVendorBackendKind {
+    None,
+    MKL,
+    AOCL
+};
+
+inline const char* csr_vendor_backend_name(CSRVendorBackendKind kind) {
+    switch (kind) {
+    case CSRVendorBackendKind::MKL:
+        return "mkl";
+    case CSRVendorBackendKind::AOCL:
+        return "aocl";
+    case CSRVendorBackendKind::None:
+    default:
+        return "none";
+    }
+}
+
+template <typename T>
+constexpr CSRVendorBackendKind preferred_csr_vendor_backend() {
+    constexpr bool supported_type =
+        std::is_same_v<T, double> || std::is_same_v<T, std::complex<double>>;
+    if constexpr (!supported_type) {
+        return CSRVendorBackendKind::None;
+    }
+#if defined(VBCSR_HAVE_MKL_SPARSE)
+    return CSRVendorBackendKind::MKL;
+#elif defined(VBCSR_HAVE_AOCL_SPARSE)
+    return CSRVendorBackendKind::AOCL;
+#else
+    return CSRVendorBackendKind::None;
+#endif
+}
+
+struct CSRVendorPageMetadata {
+    uint32_t page_id = 0;
+    uint64_t global_nnz_begin = 0;
+    uint32_t nnz = 0;
+    int row_begin = 0;
+    int row_end = 0;
+};
+
+#ifdef VBCSR_HAVE_MKL_SPARSE
+struct CSRVendorMKLHandle {
+    sparse_matrix_t handle = nullptr;
+
+    CSRVendorMKLHandle() = default;
+    CSRVendorMKLHandle(const CSRVendorMKLHandle&) = delete;
+    CSRVendorMKLHandle& operator=(const CSRVendorMKLHandle&) = delete;
+
+    CSRVendorMKLHandle(CSRVendorMKLHandle&& other) noexcept : handle(other.handle) {
+        other.handle = nullptr;
+    }
+
+    CSRVendorMKLHandle& operator=(CSRVendorMKLHandle&& other) noexcept {
+        if (this != &other) {
+            reset();
+            handle = other.handle;
+            other.handle = nullptr;
+        }
+        return *this;
+    }
+
+    ~CSRVendorMKLHandle() {
+        reset();
+    }
+
+    void reset() {
+        if (handle != nullptr) {
+            mkl_sparse_destroy(handle);
+            handle = nullptr;
+        }
+    }
+};
+#endif
+
+#ifdef VBCSR_HAVE_AOCL_SPARSE
+struct CSRVendorAOCLHandle {
+    aoclsparse_matrix handle = nullptr;
+
+    CSRVendorAOCLHandle() = default;
+    CSRVendorAOCLHandle(const CSRVendorAOCLHandle&) = delete;
+    CSRVendorAOCLHandle& operator=(const CSRVendorAOCLHandle&) = delete;
+
+    CSRVendorAOCLHandle(CSRVendorAOCLHandle&& other) noexcept : handle(other.handle) {
+        other.handle = nullptr;
+    }
+
+    CSRVendorAOCLHandle& operator=(CSRVendorAOCLHandle&& other) noexcept {
+        if (this != &other) {
+            reset();
+            handle = other.handle;
+            other.handle = nullptr;
+        }
+        return *this;
+    }
+
+    ~CSRVendorAOCLHandle() {
+        reset();
+    }
+
+    void reset() {
+        if (handle != nullptr) {
+            aoclsparse_destroy(handle);
+            handle = nullptr;
+        }
+    }
+};
+
+struct CSRVendorAOCLDescr {
+    aoclsparse_mat_descr handle = nullptr;
+
+    CSRVendorAOCLDescr() = default;
+    CSRVendorAOCLDescr(const CSRVendorAOCLDescr&) = delete;
+    CSRVendorAOCLDescr& operator=(const CSRVendorAOCLDescr&) = delete;
+
+    CSRVendorAOCLDescr(CSRVendorAOCLDescr&& other) noexcept : handle(other.handle) {
+        other.handle = nullptr;
+    }
+
+    CSRVendorAOCLDescr& operator=(CSRVendorAOCLDescr&& other) noexcept {
+        if (this != &other) {
+            reset();
+            handle = other.handle;
+            other.handle = nullptr;
+        }
+        return *this;
+    }
+
+    ~CSRVendorAOCLDescr() {
+        reset();
+    }
+
+    void reset() {
+        if (handle != nullptr) {
+            aoclsparse_destroy_mat_descr(handle);
+            handle = nullptr;
+        }
+    }
+};
+#endif
+
+template <typename T>
+struct CSRVendorPageEntry {
+    CSRVendorPageMetadata metadata;
+    std::vector<int> row_ptr;
+
+#ifdef VBCSR_HAVE_MKL_SPARSE
+    CSRVendorMKLHandle mkl;
+#endif
+#ifdef VBCSR_HAVE_AOCL_SPARSE
+    CSRVendorAOCLHandle aocl;
+#endif
+
+    int row_count() const {
+        return metadata.row_end - metadata.row_begin;
+    }
+
+    void clear_vendor_handle() {
+#ifdef VBCSR_HAVE_MKL_SPARSE
+        mkl.reset();
+#endif
+#ifdef VBCSR_HAVE_AOCL_SPARSE
+        aocl.reset();
+#endif
+    }
+};
+
+template <typename T>
+struct CSRVendorCache {
+    CSRVendorBackendKind kind = CSRVendorBackendKind::None;
+    int num_cols = 0;
+    std::vector<CSRVendorPageEntry<T>> pages;
+
+#ifdef VBCSR_HAVE_AOCL_SPARSE
+    CSRVendorAOCLDescr aocl_descr;
+#endif
+#ifdef VBCSR_HAVE_MKL_SPARSE
+    int prepared_mm_columns = -1;
+#endif
+
+    void clear_vendor_handles() {
+        for (auto& page : pages) {
+            page.clear_vendor_handle();
+        }
+#ifdef VBCSR_HAVE_AOCL_SPARSE
+        aocl_descr.reset();
+#endif
+#ifdef VBCSR_HAVE_MKL_SPARSE
+        prepared_mm_columns = -1;
+#endif
+    }
+};
+
 template <typename T>
 struct BSRPageView {
     const int* cols = nullptr;
@@ -149,11 +359,34 @@ template <typename T>
 struct CSRMatrixBackend {
     PagedArray<int> cols;
     PagedArray<T> values;
+    mutable std::unique_ptr<CSRVendorCache<T>> vendor_cache;
+    mutable std::mutex vendor_cache_mutex;
+    mutable std::atomic<uint64_t> vendor_launch_count{0};
 
     CSRMatrixBackend() = default;
 
     explicit CSRMatrixBackend(uint32_t nnz_per_page)
         : cols(nnz_per_page), values(nnz_per_page) {}
+
+    CSRMatrixBackend(const CSRMatrixBackend&) = delete;
+    CSRMatrixBackend& operator=(const CSRMatrixBackend&) = delete;
+
+    CSRMatrixBackend(CSRMatrixBackend&& other) noexcept
+        : cols(std::move(other.cols)),
+          values(std::move(other.values)) {
+        other.vendor_launch_count.store(0, std::memory_order_release);
+    }
+
+    CSRMatrixBackend& operator=(CSRMatrixBackend&& other) noexcept {
+        if (this != &other) {
+            cols = std::move(other.cols);
+            values = std::move(other.values);
+            invalidate_vendor_cache();
+            vendor_launch_count.store(0, std::memory_order_release);
+            other.vendor_launch_count.store(0, std::memory_order_release);
+        }
+        return *this;
+    }
 
     static uint32_t default_nnz_per_page() {
         constexpr size_t kTargetBytes = 1u << 20;
@@ -165,6 +398,7 @@ struct CSRMatrixBackend {
         const uint32_t capacity = nnz_per_page == 0 ? default_nnz_per_page() : nnz_per_page;
         cols = PagedArray<int>(capacity);
         values = PagedArray<T>(capacity);
+        invalidate_vendor_cache();
     }
 
     size_t local_scalar_nnz() const {
@@ -263,6 +497,251 @@ struct CSRMatrixBackend {
                     current == static_cast<uint64_t>(row_ptr[static_cast<size_t>(row)]),
                     current + chunk == end});
             current += chunk;
+        }
+    }
+
+    const CSRVendorCache<T>& ensure_vendor_cache(const std::vector<int>& row_ptr, int num_cols) const {
+        std::lock_guard<std::mutex> lock(vendor_cache_mutex);
+        if (vendor_cache == nullptr) {
+            vendor_cache = std::make_unique<CSRVendorCache<T>>();
+            build_vendor_cache_locked(*vendor_cache, row_ptr, num_cols);
+        }
+        return *vendor_cache;
+    }
+
+    CSRVendorBackendKind vendor_backend_kind() const {
+        std::lock_guard<std::mutex> lock(vendor_cache_mutex);
+        if (vendor_cache != nullptr) {
+            return vendor_cache->kind;
+        }
+        return preferred_csr_vendor_backend<T>();
+    }
+
+    std::string vendor_backend_name() const {
+        return csr_vendor_backend_name(vendor_backend_kind());
+    }
+
+    uint64_t get_vendor_launch_count() const {
+        return vendor_launch_count.load(std::memory_order_acquire);
+    }
+
+    void reset_vendor_launch_count() const {
+        vendor_launch_count.store(0, std::memory_order_release);
+    }
+
+    void note_vendor_launch(uint64_t page_calls = 1) const {
+        vendor_launch_count.fetch_add(page_calls, std::memory_order_acq_rel);
+    }
+
+private:
+    void invalidate_vendor_cache() {
+        std::lock_guard<std::mutex> lock(vendor_cache_mutex);
+        vendor_cache.reset();
+        vendor_launch_count.store(0, std::memory_order_release);
+    }
+
+    static CSRVendorPageEntry<T> build_vendor_page_entry(
+        const std::vector<int>& row_ptr,
+        CSRPageView<const T> page) {
+        CSRVendorPageEntry<T> entry;
+        entry.metadata.page_id = page.page_id;
+        entry.metadata.global_nnz_begin = page.global_nnz_begin;
+        entry.metadata.nnz = page.nnz;
+        if (page.nnz == 0) {
+            return entry;
+        }
+
+        const int begin = static_cast<int>(page.global_nnz_begin);
+        const int end = begin + static_cast<int>(page.nnz);
+        const auto row_begin_it =
+            std::upper_bound(row_ptr.begin() + 1, row_ptr.end(), begin);
+        const auto row_end_it =
+            std::lower_bound(row_ptr.begin(), row_ptr.end() - 1, end);
+
+        entry.metadata.row_begin = static_cast<int>(std::distance(row_ptr.begin(), row_begin_it)) - 1;
+        entry.metadata.row_end = static_cast<int>(std::distance(row_ptr.begin(), row_end_it));
+
+        entry.row_ptr.reserve(static_cast<size_t>(entry.metadata.row_end - entry.metadata.row_begin + 1));
+        for (int row = entry.metadata.row_begin; row <= entry.metadata.row_end; ++row) {
+            const int clamped = std::clamp(row_ptr[static_cast<size_t>(row)], begin, end);
+            entry.row_ptr.push_back(clamped - begin);
+        }
+        return entry;
+    }
+
+#ifdef VBCSR_HAVE_MKL_SPARSE
+    static matrix_descr make_mkl_descr() {
+        matrix_descr descr{};
+        descr.type = SPARSE_MATRIX_TYPE_GENERAL;
+        descr.mode = SPARSE_FILL_MODE_FULL;
+        descr.diag = SPARSE_DIAG_NON_UNIT;
+        return descr;
+    }
+
+    bool build_mkl_page_handle(
+        CSRVendorPageEntry<T>& entry,
+        CSRPageView<const T> page,
+        int num_cols) const {
+        sparse_status_t status = SPARSE_STATUS_NOT_SUPPORTED;
+        const MKL_INT rows = static_cast<MKL_INT>(entry.row_count());
+        const MKL_INT cols_count = static_cast<MKL_INT>(num_cols);
+        auto* row_begin = reinterpret_cast<MKL_INT*>(entry.row_ptr.data());
+        auto* row_end = row_begin + 1;
+        auto* col_idx = reinterpret_cast<MKL_INT*>(const_cast<int*>(page.cols));
+
+        if constexpr (std::is_same_v<T, double>) {
+            status = mkl_sparse_d_create_csr(
+                &entry.mkl.handle,
+                SPARSE_INDEX_BASE_ZERO,
+                rows,
+                cols_count,
+                row_begin,
+                row_end,
+                col_idx,
+                const_cast<double*>(page.vals));
+        } else if constexpr (std::is_same_v<T, std::complex<double>>) {
+            status = mkl_sparse_z_create_csr(
+                &entry.mkl.handle,
+                SPARSE_INDEX_BASE_ZERO,
+                rows,
+                cols_count,
+                row_begin,
+                row_end,
+                col_idx,
+                reinterpret_cast<MKL_Complex16*>(const_cast<std::complex<double>*>(page.vals)));
+        } else {
+            return false;
+        }
+
+        if (status != SPARSE_STATUS_SUCCESS) {
+            entry.mkl.reset();
+            return false;
+        }
+
+        const matrix_descr descr = make_mkl_descr();
+        mkl_sparse_set_mv_hint(entry.mkl.handle, SPARSE_OPERATION_NON_TRANSPOSE, descr, 1);
+        if constexpr (std::is_same_v<T, double>) {
+            mkl_sparse_set_mv_hint(entry.mkl.handle, SPARSE_OPERATION_TRANSPOSE, descr, 1);
+        } else if constexpr (std::is_same_v<T, std::complex<double>>) {
+            mkl_sparse_set_mv_hint(entry.mkl.handle, SPARSE_OPERATION_CONJUGATE_TRANSPOSE, descr, 1);
+        }
+        return mkl_sparse_optimize(entry.mkl.handle) == SPARSE_STATUS_SUCCESS;
+    }
+#endif
+
+#ifdef VBCSR_HAVE_AOCL_SPARSE
+    bool build_aocl_page_handle(
+        CSRVendorPageEntry<T>& entry,
+        CSRPageView<const T> page,
+        aoclsparse_mat_descr descr,
+        int num_cols) const {
+        aoclsparse_status status = aoclsparse_status_not_implemented;
+        const aoclsparse_int rows = static_cast<aoclsparse_int>(entry.row_count());
+        const aoclsparse_int cols_count = static_cast<aoclsparse_int>(num_cols);
+        const aoclsparse_int nnz = static_cast<aoclsparse_int>(page.nnz);
+        auto* row_ptr_local = reinterpret_cast<aoclsparse_int*>(entry.row_ptr.data());
+        auto* col_idx = reinterpret_cast<aoclsparse_int*>(const_cast<int*>(page.cols));
+
+        if constexpr (std::is_same_v<T, double>) {
+            status = aoclsparse_create_dcsr(
+                &entry.aocl.handle,
+                aoclsparse_index_base_zero,
+                rows,
+                cols_count,
+                nnz,
+                row_ptr_local,
+                col_idx,
+                const_cast<double*>(page.vals));
+        } else if constexpr (std::is_same_v<T, std::complex<double>>) {
+            status = aoclsparse_create_zcsr(
+                &entry.aocl.handle,
+                aoclsparse_index_base_zero,
+                rows,
+                cols_count,
+                nnz,
+                row_ptr_local,
+                col_idx,
+                reinterpret_cast<aoclsparse_double_complex*>(const_cast<std::complex<double>*>(page.vals)));
+        } else {
+            return false;
+        }
+
+        if (status != aoclsparse_status_success) {
+            entry.aocl.reset();
+            return false;
+        }
+
+        aoclsparse_set_mm_hint(entry.aocl.handle, aoclsparse_operation_none, descr, 1);
+        if constexpr (std::is_same_v<T, double>) {
+            aoclsparse_set_mm_hint(entry.aocl.handle, aoclsparse_operation_transpose, descr, 1);
+        } else if constexpr (std::is_same_v<T, std::complex<double>>) {
+            aoclsparse_set_mm_hint(
+                entry.aocl.handle,
+                aoclsparse_operation_conjugate_transpose,
+                descr,
+                1);
+        }
+        return aoclsparse_optimize(entry.aocl.handle) == aoclsparse_status_success;
+    }
+#endif
+
+    void build_vendor_cache_locked(
+        CSRVendorCache<T>& cache,
+        const std::vector<int>& row_ptr,
+        int num_cols) const {
+        cache.kind = preferred_csr_vendor_backend<T>();
+        cache.num_cols = num_cols;
+        cache.pages.clear();
+        cache.pages.reserve(values.page_count());
+
+        for (uint32_t page_id = 0; page_id < values.page_count(); ++page_id) {
+            const auto page = page_view(page_id);
+            if (page.nnz == 0) {
+                continue;
+            }
+            cache.pages.push_back(build_vendor_page_entry(row_ptr, page));
+        }
+
+        if (cache.kind == CSRVendorBackendKind::None) {
+            return;
+        }
+
+#ifdef VBCSR_HAVE_AOCL_SPARSE
+        if (cache.kind == CSRVendorBackendKind::AOCL) {
+            if (aoclsparse_create_mat_descr(&cache.aocl_descr.handle) != aoclsparse_status_success) {
+                cache.kind = CSRVendorBackendKind::None;
+                cache.clear_vendor_handles();
+                return;
+            }
+            aoclsparse_set_mat_type(cache.aocl_descr.handle, aoclsparse_matrix_type_general);
+            aoclsparse_set_mat_index_base(cache.aocl_descr.handle, aoclsparse_index_base_zero);
+        }
+#endif
+
+        for (auto& entry : cache.pages) {
+            const auto page = page_view(entry.metadata.page_id);
+            bool ok = false;
+            switch (cache.kind) {
+            case CSRVendorBackendKind::MKL:
+#ifdef VBCSR_HAVE_MKL_SPARSE
+                ok = build_mkl_page_handle(entry, page, num_cols);
+#endif
+                break;
+            case CSRVendorBackendKind::AOCL:
+#ifdef VBCSR_HAVE_AOCL_SPARSE
+                ok = build_aocl_page_handle(entry, page, cache.aocl_descr.handle, num_cols);
+#endif
+                break;
+            case CSRVendorBackendKind::None:
+            default:
+                ok = true;
+                break;
+            }
+            if (!ok) {
+                cache.kind = CSRVendorBackendKind::None;
+                cache.clear_vendor_handles();
+                return;
+            }
         }
     }
 };
@@ -410,6 +889,7 @@ struct BSRMatrixBackend {
 
 template <typename T, typename Kernel>
 struct VBCSRMatrixBackend {
+    static constexpr size_t kDefaultPayloadPageElements = 1ULL << 22;
     static constexpr uint64_t kShapeBits = 16;
     static constexpr uint64_t kPageBits = 24;
     static constexpr uint64_t kSlotBits = 24;
@@ -520,6 +1000,7 @@ struct VBCSRMatrixBackend {
           shape_storage(std::move(other.shape_storage)),
           shape_registry(std::move(other.shape_registry)),
           shape_lookup(std::move(other.shape_lookup)),
+          contiguous_layout(other.contiguous_layout),
           spmm_policy_lookup(std::move(other.spmm_policy_lookup)),
           spmm_policy_records(std::move(other.spmm_policy_records)) {}
 
@@ -530,6 +1011,7 @@ struct VBCSRMatrixBackend {
             shape_storage = std::move(other.shape_storage);
             shape_registry = std::move(other.shape_registry);
             shape_lookup = std::move(other.shape_lookup);
+            contiguous_layout = other.contiguous_layout;
             std::lock_guard<std::mutex> lock(policy_mutex);
             spmm_policy_lookup = std::move(other.spmm_policy_lookup);
             spmm_policy_records = std::move(other.spmm_policy_records);
@@ -537,11 +1019,15 @@ struct VBCSRMatrixBackend {
         return *this;
     }
 
+    // Per-logical-slot payload handle. The slot index is the flat local nonzero-block
+    // index from row_ptr/col_ind; the handle locates that slot's payload page storage.
     std::vector<uint64_t> blk_handles;
+    // Per-logical-slot shape-class id, aligned with blk_handles and logical slots.
     std::vector<int> slot_shape_ids;
     std::vector<ShapeStorageEntry> shape_storage;
     std::vector<ShapeRegistryEntry> shape_registry;
     std::map<std::pair<int, int>, int> shape_lookup;
+    bool contiguous_layout = false;
     mutable std::mutex policy_mutex;
     mutable std::map<SpMMPolicyKey, size_t> spmm_policy_lookup;
     mutable std::vector<std::unique_ptr<SpMMExecutionPolicy>> spmm_policy_records;
@@ -607,6 +1093,88 @@ struct VBCSRMatrixBackend {
         return policy == nullptr
             ? 0
             : static_cast<size_t>(policy->launched_batches.load(std::memory_order_relaxed));
+    }
+
+    bool is_contiguous() const {
+        return contiguous_layout;
+    }
+
+    void mark_noncontiguous() {
+        contiguous_layout = false;
+    }
+
+    template <typename GraphLike>
+    void pack_contiguous(
+        const GraphLike* graph,
+        const std::vector<int>& row_ptr,
+        const std::vector<int>& col_ind) {
+        rebuild_shape_registry(graph, row_ptr, col_ind);
+
+        std::vector<int> registry_indices(shape_storage.size(), -1);
+        for (int registry_idx = 0; registry_idx < static_cast<int>(shape_registry.size()); ++registry_idx) {
+            registry_indices[shape_registry[registry_idx].shape_id] = registry_idx;
+        }
+
+        for (auto& storage_entry : shape_storage) {
+            const ShapeRegistryEntry* registry_entry = nullptr;
+            if (storage_entry.shape_id >= 0 &&
+                storage_entry.shape_id < static_cast<int>(registry_indices.size()) &&
+                registry_indices[storage_entry.shape_id] >= 0) {
+                registry_entry = &shape_registry[registry_indices[storage_entry.shape_id]];
+            }
+
+            std::vector<ShapePage> packed_pages;
+            packed_pages.reserve(storage_entry.active_page_count);
+
+            if (registry_entry != nullptr && !registry_entry->slots.empty()) {
+                for (int logical_slot : registry_entry->slots) {
+                    const uint64_t old_handle = blk_handles.at(static_cast<size_t>(logical_slot));
+                    const int old_page_id = decode_page_id(old_handle);
+                    const uint32_t old_slot_id = decode_slot_id(old_handle);
+                    const auto& old_page = storage_entry.pages.at(static_cast<size_t>(old_page_id));
+                    const T* old_ptr =
+                        old_page.data.get() + static_cast<size_t>(old_slot_id) * storage_entry.slot_elems;
+
+                    if (packed_pages.empty() ||
+                        packed_pages.back().next_unused_slot >= packed_pages.back().slot_capacity) {
+                        packed_pages.push_back(make_shape_page(
+                            storage_entry.shape_id,
+                            static_cast<int>(packed_pages.size()),
+                            storage_entry.slot_elems,
+                            storage_entry.page_slot_capacity));
+                    }
+
+                    auto& new_page = packed_pages.back();
+                    const uint32_t new_slot_id = new_page.next_unused_slot++;
+                    T* new_ptr =
+                        new_page.data.get() + static_cast<size_t>(new_slot_id) * storage_entry.slot_elems;
+                    std::memcpy(new_ptr, old_ptr, storage_entry.slot_elems * sizeof(T));
+                    new_page.slot_live_pos[new_slot_id] = static_cast<uint32_t>(new_page.live_slots.size());
+                    new_page.live_slots.push_back(new_slot_id);
+                    new_page.slot_logical_slots[new_slot_id] = logical_slot;
+                    ++new_page.live_count;
+                    blk_handles[static_cast<size_t>(logical_slot)] = encode_handle(
+                        storage_entry.shape_id,
+                        new_page.page_id,
+                        new_slot_id);
+                }
+            }
+
+            storage_entry.pages = std::move(packed_pages);
+            storage_entry.pages_with_free_slots.clear();
+            if (!storage_entry.pages.empty() &&
+                storage_entry.pages.back().live_count < storage_entry.pages.back().slot_capacity) {
+                storage_entry.pages_with_free_slots.push_back(
+                    static_cast<uint32_t>(storage_entry.pages.back().page_id));
+            }
+
+            storage_entry.active_block_count =
+                registry_entry == nullptr ? 0 : static_cast<size_t>(registry_entry->live_slots);
+            storage_entry.active_page_count = storage_entry.pages.size();
+        }
+
+        rebuild_shape_registry(graph, row_ptr, col_ind);
+        contiguous_layout = true;
     }
 
     template <typename Fn>
@@ -714,6 +1282,7 @@ struct VBCSRMatrixBackend {
     }
 
     void bind_logical_slot(int logical_slot, int shape_id, uint64_t handle) {
+        contiguous_layout = false;
         if (logical_slot < 0) {
             throw std::logic_error("VBCSR logical slot cannot be negative");
         }
@@ -733,6 +1302,7 @@ struct VBCSRMatrixBackend {
     }
 
     uint64_t allocate_slot_for_shape(int shape_id) {
+        contiguous_layout = false;
         auto& entry = shape_storage.at(shape_id);
         while (!entry.pages_with_free_slots.empty()) {
             const uint32_t candidate = entry.pages_with_free_slots.back();
@@ -761,6 +1331,7 @@ struct VBCSRMatrixBackend {
     }
 
     void free_handle(uint64_t handle) {
+        contiguous_layout = false;
         const int shape_id = decode_shape_id(handle);
         const int page_id = decode_page_id(handle);
         const uint32_t slot_id = decode_slot_id(handle);
@@ -867,6 +1438,21 @@ struct VBCSRMatrixBackend {
     }
 
 private:
+    static ShapePage make_shape_page(int shape_id, int page_id, size_t slot_elems, uint32_t slot_capacity) {
+        ShapePage page;
+        page.shape_id = shape_id;
+        page.page_id = page_id;
+        page.slot_elems = slot_elems;
+        page.slot_capacity = slot_capacity;
+        page.live_count = 0;
+        page.next_unused_slot = 0;
+        page.data = std::make_unique<T[]>(slot_elems * static_cast<size_t>(slot_capacity));
+        std::fill(page.data.get(), page.data.get() + slot_elems * static_cast<size_t>(slot_capacity), T(0));
+        page.slot_live_pos.assign(slot_capacity, std::numeric_limits<uint32_t>::max());
+        page.slot_logical_slots.assign(slot_capacity, -1);
+        return page;
+    }
+
     static bool page_has_free(const ShapePage& page) {
         return !page.free_slots.empty() || page.next_unused_slot < page.slot_capacity;
     }
@@ -875,24 +1461,17 @@ private:
         if (slot_elems == 0) {
             return 1;
         }
-        const size_t page_elems = std::max<size_t>(1, BlockArena<T>::DEFAULT_PAGE_SIZE / slot_elems);
+        const size_t page_elems = std::max<size_t>(1, kDefaultPayloadPageElements / slot_elems);
         const size_t bounded = std::min<size_t>(page_elems, static_cast<size_t>(kSlotMask));
         return static_cast<uint32_t>(std::max<size_t>(bounded, 1));
     }
 
     static uint32_t create_page(ShapeStorageEntry& entry) {
-        ShapePage page;
-        page.shape_id = entry.shape_id;
-        page.page_id = static_cast<int>(entry.pages.size());
-        page.slot_elems = entry.slot_elems;
-        page.slot_capacity = entry.page_slot_capacity;
-        page.live_count = 0;
-        page.next_unused_slot = 0;
-        page.data = std::make_unique<T[]>(entry.slot_elems * static_cast<size_t>(page.slot_capacity));
-        std::fill(page.data.get(), page.data.get() + entry.slot_elems * static_cast<size_t>(page.slot_capacity), T(0));
-        page.slot_live_pos.assign(page.slot_capacity, std::numeric_limits<uint32_t>::max());
-        page.slot_logical_slots.assign(page.slot_capacity, -1);
-        entry.pages.push_back(std::move(page));
+        entry.pages.push_back(make_shape_page(
+            entry.shape_id,
+            static_cast<int>(entry.pages.size()),
+            entry.slot_elems,
+            entry.page_slot_capacity));
         return static_cast<uint32_t>(entry.pages.size() - 1);
     }
 

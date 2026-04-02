@@ -166,8 +166,8 @@ TEST_F(AtomicDataTest, DeterministicTypeMapping) {
         AtomicData* ad = AtomicData::from_points(pos, z, cell, pbc, r_max, type_norb, MPI_COMM_WORLD);
         
         for(int i=0; i<ad->n_atom; ++i) {
-            if (ad->z[i] == 1) EXPECT_EQ(ad->atom_type[i], 0);
-            if (ad->z[i] == 2) EXPECT_EQ(ad->atom_type[i], 1);
+            if (ad->atomic_numbers[i] == 1) EXPECT_EQ(ad->atom_type[i], 0);
+            if (ad->atomic_numbers[i] == 2) EXPECT_EQ(ad->atom_type[i], 1);
         }
         delete ad;
     }
@@ -184,8 +184,8 @@ TEST_F(AtomicDataTest, DeterministicTypeMapping) {
         AtomicData* ad = AtomicData::from_points(pos, z, cell, pbc, r_max, type_norb, MPI_COMM_WORLD);
         
         for(int i=0; i<ad->n_atom; ++i) {
-            if (ad->z[i] == 1) EXPECT_EQ(ad->atom_type[i], 0);
-            if (ad->z[i] == 2) EXPECT_EQ(ad->atom_type[i], 1);
+            if (ad->atomic_numbers[i] == 1) EXPECT_EQ(ad->atom_type[i], 0);
+            if (ad->atomic_numbers[i] == 2) EXPECT_EQ(ad->atom_type[i], 1);
         }
         delete ad;
     }
@@ -202,8 +202,8 @@ TEST_F(AtomicDataTest, DeterministicTypeMapping) {
         AtomicData* ad = AtomicData::from_points(pos, z, cell, pbc, r_max, type_norb, MPI_COMM_WORLD);
         
         for(int i=0; i<ad->n_atom; ++i) {
-            if (ad->z[i] == 1) EXPECT_EQ(ad->atom_type[i], 0);
-            if (ad->z[i] == 8) EXPECT_EQ(ad->atom_type[i], 1);
+            if (ad->atomic_numbers[i] == 1) EXPECT_EQ(ad->atom_type[i], 0);
+            if (ad->atomic_numbers[i] == 8) EXPECT_EQ(ad->atom_type[i], 1);
         }
         delete ad;
     }

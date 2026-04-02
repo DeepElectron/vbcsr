@@ -1,17 +1,19 @@
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
+from _workspace_bootstrap import REPO_ROOT, build_subprocess_env
+from _suite_manifest import BASELINE_SMOKE_TESTS
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
 BENCHMARK = REPO_ROOT / "tests" / "benchmark_large_scale.py"
 
 
-def run_command(cmd, cwd):
+def run_command(cmd, cwd, env):
     print("Running:", " ".join(str(part) for part in cmd), flush=True)
-    subprocess.run(cmd, cwd=cwd, check=True)
+    subprocess.run(cmd, cwd=cwd, env=env, check=True)
 
 
 def build_cases(families, profiles, rank_counts, modes):
@@ -35,17 +37,11 @@ def main():
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    test_env = build_subprocess_env(os.environ)
 
     if not args.skip_smoke:
-        smoke_scripts = [
-            REPO_ROOT / "tests" / "test_scipy_adapter.py",
-            REPO_ROOT / "tests" / "test_api_serial.py",
-            REPO_ROOT / "tests" / "test_api_mpi.py",
-            REPO_ROOT / "tests" / "test_api_compliance.py",
-            REPO_ROOT / "tests" / "test_matrix_kind.py",
-        ]
-        for script in smoke_scripts:
-            run_command([sys.executable, str(script)], cwd=REPO_ROOT)
+        for test_name in BASELINE_SMOKE_TESTS:
+            run_command([sys.executable, str(REPO_ROOT / "tests" / test_name)], cwd=REPO_ROOT, env=test_env)
 
     manifest = []
     for family, profile, rank_count, mode in build_cases(args.families, args.profiles, args.rank_counts, args.modes):
@@ -73,7 +69,7 @@ def main():
             cmd.append("--scipy")
         if rank_count > 1:
             cmd = ["mpirun", "-np", str(rank_count)] + cmd
-        run_command(cmd, cwd=REPO_ROOT)
+        run_command(cmd, cwd=REPO_ROOT, env=test_env)
         manifest.append({"label": label, "snapshot": str(snapshot_path)})
 
     manifest_path = args.output_dir / "manifest.json"

@@ -2,6 +2,7 @@
 #define VBCSR_DIST_GRAPH_HPP
 
 #include <mpi.h>
+#include <atomic>
 #include <vector>
 #include <map>
 #include <numeric>
@@ -68,7 +69,38 @@ public:
     // For neighbor collectives (if used)
     MPI_Comm neighbor_comm = MPI_COMM_NULL;
 
+private:
+    mutable std::atomic<int> matrix_ref_count_{0};
+    mutable std::atomic<bool> matrix_managed_{false};
+
 public:
+    void acquire_matrix_reference(bool managed_request) const {
+        if (!managed_request && !matrix_managed_.load(std::memory_order_acquire)) {
+            return;
+        }
+        matrix_managed_.store(true, std::memory_order_release);
+        matrix_ref_count_.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    bool has_managed_matrix_lifetime() const {
+        return matrix_managed_.load(std::memory_order_acquire);
+    }
+
+    bool release_matrix_reference() const {
+        if (!matrix_managed_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        const int previous = matrix_ref_count_.fetch_sub(1, std::memory_order_acq_rel);
+        if (previous <= 0) {
+            throw std::runtime_error("DistGraph matrix reference count underflow");
+        }
+        if (previous == 1) {
+            matrix_managed_.store(false, std::memory_order_release);
+            return true;
+        }
+        return false;
+    }
+
     DistGraph(MPI_Comm c = MPI_COMM_WORLD) : comm(c) {
         int initialized = 0;
         MPI_Initialized(&initialized);
@@ -111,6 +143,8 @@ public:
         recv_displs_scalar = other.recv_displs_scalar;
         // neighbor_comm is NOT copied to avoid double-free or sharing managed handle
         neighbor_comm = MPI_COMM_NULL;
+        matrix_ref_count_.store(0, std::memory_order_release);
+        matrix_managed_.store(false, std::memory_order_release);
     }
 
     // Duplicate method for convenience (returns a pointer to a new deep copy)

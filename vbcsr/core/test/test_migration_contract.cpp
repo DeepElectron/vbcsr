@@ -1,4 +1,5 @@
 #include "../block_csr.hpp"
+#include "../dist_multivector.hpp"
 #include "../dist_vector.hpp"
 
 #include <algorithm>
@@ -17,6 +18,10 @@ void assert_close(const std::vector<double>& lhs, const std::vector<double>& rhs
     for (size_t i = 0; i < lhs.size(); ++i) {
         assert(std::abs(lhs[i] - rhs[i]) < tol);
     }
+}
+
+void assert_matrix_dense_close(const BlockSpMat<double>& lhs, const BlockSpMat<double>& rhs, double tol = 1e-12) {
+    assert_close(lhs.to_dense(), rhs.to_dense(), tol);
 }
 
 void fill_reference_matrix(BlockSpMat<double>& mat) {
@@ -130,6 +135,185 @@ void test_construct_serial_root_only() {
     assert(!graph.block_sizes.empty());
 }
 
+void test_dist_multivector_duplicate() {
+    DistGraph graph(MPI_COMM_SELF);
+    graph.construct_serial(2, {1, 1}, {{0}, {1}});
+
+    DistMultiVector<double> mv(&graph, 2);
+    mv.set_constant(1.0);
+
+    DistMultiVector<double> dup = mv.duplicate();
+    mv.scale(3.0);
+
+    for (int col = 0; col < dup.num_vectors; ++col) {
+        const double* dup_col = dup.col_data(col);
+        const double* mv_col = mv.col_data(col);
+        for (int row = 0; row < dup.local_rows; ++row) {
+            assert(std::abs(dup_col[row] - 1.0) < 1e-12);
+            assert(std::abs(mv_col[row] - 3.0) < 1e-12);
+        }
+    }
+}
+
+BlockSpMat<double> make_shared_graph_duplicate_from_owned_source() {
+    DistGraph* graph = new DistGraph(MPI_COMM_SELF);
+    graph->construct_serial(2, {1, 1}, {{0, 1}, {1}});
+
+    BlockSpMat<double> owner(graph);
+    owner.owns_graph = true;
+
+    const double one = 1.0;
+    const double two = 2.0;
+    const double three = 3.0;
+    owner.add_block(0, 0, &one, 1, 1, AssemblyMode::INSERT, MatrixLayout::ColMajor);
+    owner.add_block(0, 1, &two, 1, 1, AssemblyMode::INSERT, MatrixLayout::ColMajor);
+    owner.add_block(1, 1, &three, 1, 1, AssemblyMode::INSERT, MatrixLayout::ColMajor);
+    owner.assemble();
+
+    return owner.duplicate(false);
+}
+
+void test_duplicate_false_keeps_shared_owned_graph_alive() {
+    BlockSpMat<double> duplicate = make_shared_graph_duplicate_from_owned_source();
+
+    DistVector<double> x(duplicate.graph);
+    DistVector<double> y(duplicate.graph);
+    x.local_data()[0] = 1.0;
+    x.local_data()[1] = 1.0;
+    duplicate.mult(x, y);
+
+    assert(std::abs(y.local_data()[0] - 3.0) < 1e-12);
+    assert(std::abs(y.local_data()[1] - 3.0) < 1e-12);
+}
+
+void test_duplicate_and_copy_from_require_assembled_remote_state() {
+    int size = 1;
+    int rank = 0;
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    if (size < 2) {
+        return;
+    }
+
+    DistGraph graph(MPI_COMM_WORLD);
+    graph.construct_serial(2, {1, 1}, {{0}, {1}});
+
+    BlockSpMat<double> mat(&graph);
+    BlockSpMat<double> target(&graph);
+    const double one = 1.0;
+
+    if (rank == 0) {
+        mat.add_block(1, 1, &one, 1, 1, AssemblyMode::INSERT, MatrixLayout::ColMajor);
+
+        bool duplicate_threw = false;
+        try {
+            (void)mat.duplicate();
+        } catch (const std::runtime_error&) {
+            duplicate_threw = true;
+        }
+        assert(duplicate_threw);
+
+        bool copy_threw = false;
+        try {
+            target.copy_from(mat);
+        } catch (const std::runtime_error&) {
+            copy_threw = true;
+        }
+        assert(copy_threw);
+    }
+}
+
+void test_filter_blocks_requires_assembled_remote_state() {
+    int size = 1;
+    int rank = 0;
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    if (size < 2) {
+        return;
+    }
+
+    DistGraph graph(MPI_COMM_WORLD);
+    graph.construct_serial(2, {1, 1}, {{0}, {1}});
+
+    BlockSpMat<double> mat(&graph);
+    const double one = 1.0;
+
+    if (rank == 0) {
+        mat.add_block(1, 1, &one, 1, 1, AssemblyMode::INSERT, MatrixLayout::ColMajor);
+
+        bool threw = false;
+        try {
+            mat.filter_blocks(0.5);
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        assert(threw);
+    }
+}
+
+void test_utility_surface_matches_expected_dense_behavior() {
+    DistGraph graph(MPI_COMM_SELF);
+    graph.construct_serial(2, {2, 3}, {{0, 1}, {0, 1}});
+
+    BlockSpMat<double> mat(&graph);
+    const double b00[] = {1.0, 3.0, 2.0, 4.0};
+    const double b01[] = {5.0, 8.0, 6.0, 9.0, 7.0, 10.0};
+    const double b10[] = {11.0, 13.0, 15.0, 12.0, 14.0, 16.0};
+    const double b11[] = {
+        17.0, 20.0, 23.0,
+        18.0, 21.0, 24.0,
+        19.0, 22.0, 25.0};
+
+    mat.add_block(0, 0, b00, 2, 2, AssemblyMode::INSERT, MatrixLayout::ColMajor);
+    mat.add_block(0, 1, b01, 2, 3, AssemblyMode::INSERT, MatrixLayout::ColMajor);
+    mat.add_block(1, 0, b10, 3, 2, AssemblyMode::INSERT, MatrixLayout::ColMajor);
+    mat.add_block(1, 1, b11, 3, 3, AssemblyMode::INSERT, MatrixLayout::ColMajor);
+    mat.assemble();
+
+    std::vector<double> dense = mat.to_dense();
+    assert(dense.size() == 25);
+    assert(mat.matrix_kind() == MatrixKind::VBCSR);
+    assert_close(mat.get_block(0, 1), std::vector<double>({5.0, 6.0, 7.0, 8.0, 9.0, 10.0}));
+    assert_close(mat.get_values(), std::vector<double>({
+        1.0, 2.0, 3.0, 4.0,
+        5.0, 6.0, 7.0, 8.0, 9.0, 10.0,
+        11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
+        17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0, 25.0}));
+
+    BlockSpMat<double> from_dense = mat.duplicate();
+    std::vector<double> replacement(25);
+    for (size_t i = 0; i < replacement.size(); ++i) {
+        replacement[i] = static_cast<double>(i);
+    }
+    from_dense.from_dense(replacement);
+    assert_close(from_dense.to_dense(), replacement);
+
+    DistVector<double> diag(&graph);
+    double* diag_ptr = diag.local_data();
+    for (int i = 0; i < diag.local_size; ++i) {
+        diag_ptr[i] = 1.0;
+    }
+
+    BlockSpMat<double> shifted = mat.duplicate();
+    BlockSpMat<double> shifted_ref = mat.duplicate();
+    shifted.scale(2.0);
+    shifted_ref.scale(2.0);
+    shifted.shift(0.5);
+    shifted_ref.shift(0.5);
+    shifted.add_diagonal(diag);
+    shifted_ref.add_diagonal(diag);
+    assert_matrix_dense_close(shifted, shifted_ref);
+
+    BlockSpMat<double> sub = mat.extract_submatrix({0, 1});
+    assert_matrix_dense_close(sub, mat);
+
+    BlockSpMat<double> inserted = mat.duplicate();
+    BlockSpMat<double> sub_scaled = sub.duplicate();
+    sub_scaled.scale(0.5);
+    inserted.insert_submatrix(sub_scaled, {0, 1});
+    assert_matrix_dense_close(inserted, sub_scaled);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -139,6 +323,11 @@ int main(int argc, char** argv) {
     test_copy_from_rejects_mismatched_structure();
     test_mult_optimized_matches_mult();
     test_construct_serial_root_only();
+    test_dist_multivector_duplicate();
+    test_duplicate_false_keeps_shared_owned_graph_alive();
+    test_duplicate_and_copy_from_require_assembled_remote_state();
+    test_filter_blocks_requires_assembled_remote_state();
+    test_utility_surface_matches_expected_dense_behavior();
 
     int rank = 0;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);

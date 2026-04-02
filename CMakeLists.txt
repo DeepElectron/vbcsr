@@ -86,6 +86,178 @@ else()
     message(STATUS "Using 32-bit integers for BLAS interfaces.")
 endif()
 
+include(CheckCXXSourceCompiles)
+
+set(_vbcsr_saved_required_libs "${CMAKE_REQUIRED_LIBRARIES}")
+set(CMAKE_REQUIRED_LIBRARIES ${BLAS_LIBRARIES})
+
+if(VBCSR_HAS_MKL OR VBCSR_HAS_OPENBLAS)
+    check_cxx_source_compiles([=[
+        extern "C" void cblas_dgemm_batch_strided(
+            int, int, int, int, int, int, double,
+            const double*, int, int,
+            const double*, int, int,
+            double, double*, int, int, int);
+        int main() {
+            cblas_dgemm_batch_strided(
+                102, 111, 111,
+                0, 0, 0,
+                1.0,
+                static_cast<const double*>(nullptr), 1, 0,
+                static_cast<const double*>(nullptr), 1, 0,
+                0.0,
+                static_cast<double*>(nullptr), 1, 0, 0);
+            return 0;
+        }
+    ]=] VBCSR_HAVE_CBLAS_DGEMM_BATCH_STRIDED)
+endif()
+
+if(VBCSR_HAS_MKL)
+    check_cxx_source_compiles([=[
+        extern "C" void cblas_dgemv_batch_strided(
+            int, int, int, int, double,
+            const double*, int, int,
+            const double*, int, int,
+            double, double*, int, int, int);
+        int main() {
+            cblas_dgemv_batch_strided(
+                102, 111,
+                0, 0,
+                1.0,
+                static_cast<const double*>(nullptr), 1, 0,
+                static_cast<const double*>(nullptr), 1, 0,
+                0.0,
+                static_cast<double*>(nullptr), 1, 0, 0);
+            return 0;
+        }
+    ]=] VBCSR_HAVE_CBLAS_DGEMV_BATCH_STRIDED)
+endif()
+
+set(CMAKE_REQUIRED_LIBRARIES "${_vbcsr_saved_required_libs}")
+unset(_vbcsr_saved_required_libs)
+
+set(VBCSR_SPARSE_VENDOR_INCLUDE_DIRS "")
+set(VBCSR_SPARSE_VENDOR_LIBRARIES "")
+
+if(VBCSR_USE_ILP64)
+    message(STATUS "Skipping sparse vendor probes for ILP64 builds; CSR vendor sparse v1 currently assumes 32-bit sparse indices.")
+else()
+    if(VBCSR_HAS_MKL)
+        set(VBCSR_MKL_SPARSE_HINTS
+            $ENV{CONDA_PREFIX}/include
+            $ENV{MKLROOT}/include
+            /opt/intel/oneapi/mkl/latest/include
+            /opt/intel/mkl/include)
+
+        if(DEFINED ENV{CONDA_PREFIX})
+            file(GLOB VBCSR_MKL_CONDA_INCLUDE_HINTS
+                "$ENV{CONDA_PREFIX}/../../pkgs/mkl-include-*/include")
+            list(APPEND VBCSR_MKL_SPARSE_HINTS ${VBCSR_MKL_CONDA_INCLUDE_HINTS})
+        endif()
+
+        find_path(VBCSR_MKL_SPARSE_INCLUDE_DIR
+            NAMES mkl_spblas.h mkl.h
+            HINTS ${VBCSR_MKL_SPARSE_HINTS})
+
+        if(VBCSR_MKL_SPARSE_INCLUDE_DIR)
+            set(_vbcsr_saved_required_libs "${CMAKE_REQUIRED_LIBRARIES}")
+            set(_vbcsr_saved_required_includes "${CMAKE_REQUIRED_INCLUDES}")
+            set(CMAKE_REQUIRED_LIBRARIES ${BLAS_LIBRARIES})
+            set(CMAKE_REQUIRED_INCLUDES ${VBCSR_MKL_SPARSE_INCLUDE_DIR})
+            check_cxx_source_compiles([=[
+                #include <mkl_spblas.h>
+                int main() {
+                    sparse_matrix_t A = nullptr;
+                    MKL_INT rows_start[1] = {0};
+                    MKL_INT rows_end[1] = {1};
+                    MKL_INT cols[1] = {0};
+                    double vals[1] = {1.0};
+                    const sparse_status_t status = mkl_sparse_d_create_csr(
+                        &A,
+                        SPARSE_INDEX_BASE_ZERO,
+                        1,
+                        1,
+                        rows_start,
+                        rows_end,
+                        cols,
+                        vals);
+                    if (A != nullptr) {
+                        mkl_sparse_destroy(A);
+                    }
+                    return status == SPARSE_STATUS_SUCCESS ? 0 : 1;
+                }
+            ]=] VBCSR_HAVE_MKL_SPARSE)
+            set(CMAKE_REQUIRED_LIBRARIES "${_vbcsr_saved_required_libs}")
+            set(CMAKE_REQUIRED_INCLUDES "${_vbcsr_saved_required_includes}")
+            unset(_vbcsr_saved_required_libs)
+            unset(_vbcsr_saved_required_includes)
+
+            if(VBCSR_HAVE_MKL_SPARSE)
+                list(APPEND VBCSR_SPARSE_VENDOR_INCLUDE_DIRS ${VBCSR_MKL_SPARSE_INCLUDE_DIR})
+                message(STATUS "MKL sparse CSR backend enabled.")
+            endif()
+        endif()
+    endif()
+
+    if(NOT VBCSR_HAVE_MKL_SPARSE)
+        find_path(VBCSR_AOCL_SPARSE_INCLUDE_DIR
+            NAMES aoclsparse.h
+            HINTS
+                $ENV{CONDA_PREFIX}/include
+                $ENV{AOCL_ROOT}/include
+                $ENV{AOCLROOT}/include
+                /opt/AMD/aocl-sparse/include
+                /opt/aocl/include)
+        find_library(VBCSR_AOCL_SPARSE_LIBRARY
+            NAMES aoclsparse
+            HINTS
+                $ENV{CONDA_PREFIX}/lib
+                $ENV{AOCL_ROOT}/lib
+                $ENV{AOCLROOT}/lib
+                /opt/AMD/aocl-sparse/lib
+                /opt/aocl/lib)
+
+        if(VBCSR_AOCL_SPARSE_INCLUDE_DIR AND VBCSR_AOCL_SPARSE_LIBRARY)
+            set(_vbcsr_saved_required_libs "${CMAKE_REQUIRED_LIBRARIES}")
+            set(_vbcsr_saved_required_includes "${CMAKE_REQUIRED_INCLUDES}")
+            set(CMAKE_REQUIRED_LIBRARIES ${VBCSR_AOCL_SPARSE_LIBRARY} ${BLAS_LIBRARIES})
+            set(CMAKE_REQUIRED_INCLUDES ${VBCSR_AOCL_SPARSE_INCLUDE_DIR})
+            check_cxx_source_compiles([=[
+                #include <aoclsparse.h>
+                int main() {
+                    aoclsparse_matrix A = nullptr;
+                    aoclsparse_int row_ptr[2] = {0, 1};
+                    aoclsparse_int cols[1] = {0};
+                    double vals[1] = {1.0};
+                    const aoclsparse_status status = aoclsparse_create_dcsr(
+                        &A,
+                        aoclsparse_index_base_zero,
+                        1,
+                        1,
+                        1,
+                        row_ptr,
+                        cols,
+                        vals);
+                    if (A != nullptr) {
+                        aoclsparse_destroy(A);
+                    }
+                    return status == aoclsparse_status_success ? 0 : 1;
+                }
+            ]=] VBCSR_HAVE_AOCL_SPARSE)
+            set(CMAKE_REQUIRED_LIBRARIES "${_vbcsr_saved_required_libs}")
+            set(CMAKE_REQUIRED_INCLUDES "${_vbcsr_saved_required_includes}")
+            unset(_vbcsr_saved_required_libs)
+            unset(_vbcsr_saved_required_includes)
+
+            if(VBCSR_HAVE_AOCL_SPARSE)
+                list(APPEND VBCSR_SPARSE_VENDOR_INCLUDE_DIRS ${VBCSR_AOCL_SPARSE_INCLUDE_DIR})
+                list(APPEND VBCSR_SPARSE_VENDOR_LIBRARIES ${VBCSR_AOCL_SPARSE_LIBRARY})
+                message(STATUS "AOCL-Sparse CSR backend enabled.")
+            endif()
+        endif()
+    endif()
+endif()
+
 # Pybind11
 find_package(pybind11 CONFIG)
 if(NOT pybind11_FOUND)
@@ -105,7 +277,16 @@ add_library(vbcsr INTERFACE)
 add_library(vbcsr::vbcsr ALIAS vbcsr)
 
 # Link dependencies
-target_link_libraries(vbcsr INTERFACE MPI::MPI_C MPI::MPI_CXX OpenMP::OpenMP_CXX ${BLAS_LIBRARIES})
+target_link_libraries(vbcsr INTERFACE MPI::MPI_C MPI::MPI_CXX OpenMP::OpenMP_CXX)
+target_link_libraries(vbcsr INTERFACE $<BUILD_INTERFACE:${BLAS_LIBRARIES}>)
+if(TARGET BLAS::BLAS)
+    target_link_libraries(vbcsr INTERFACE $<INSTALL_INTERFACE:BLAS::BLAS>)
+else()
+    target_link_libraries(vbcsr INTERFACE $<INSTALL_INTERFACE:${BLAS_LIBRARIES}>)
+endif()
+if(VBCSR_SPARSE_VENDOR_LIBRARIES)
+    target_link_libraries(vbcsr INTERFACE $<BUILD_INTERFACE:${VBCSR_SPARSE_VENDOR_LIBRARIES}>)
+endif()
 if(VBCSR_HAVE_PARMETIS)
     target_link_libraries(vbcsr INTERFACE ${PARMETIS_LIB} ${METIS_LIB})
     target_include_directories(vbcsr INTERFACE ${PARMETIS_INCLUDE_DIR} ${METIS_INCLUDE_DIR})
@@ -117,6 +298,9 @@ target_include_directories(vbcsr INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/vbcsr/core>
     $<INSTALL_INTERFACE:include>
 )
+if(VBCSR_SPARSE_VENDOR_INCLUDE_DIRS)
+    target_include_directories(vbcsr INTERFACE $<BUILD_INTERFACE:${VBCSR_SPARSE_VENDOR_INCLUDE_DIRS}>)
+endif()
 
 # Compile definitions
 if(VBCSR_HAS_MKL)
@@ -131,6 +315,18 @@ endif()
 if(VBCSR_USE_ILP64)
     target_compile_definitions(vbcsr INTERFACE VBCSR_USE_ILP64)
 endif()
+if(VBCSR_HAVE_CBLAS_DGEMM_BATCH_STRIDED)
+    target_compile_definitions(vbcsr INTERFACE VBCSR_BLAS_HAS_BATCH_GEMM)
+endif()
+if(VBCSR_HAVE_CBLAS_DGEMV_BATCH_STRIDED)
+    target_compile_definitions(vbcsr INTERFACE VBCSR_BLAS_HAS_BATCH_GEMV)
+endif()
+if(VBCSR_HAVE_MKL_SPARSE)
+    target_compile_definitions(vbcsr INTERFACE $<BUILD_INTERFACE:VBCSR_HAVE_MKL_SPARSE>)
+endif()
+if(VBCSR_HAVE_AOCL_SPARSE)
+    target_compile_definitions(vbcsr INTERFACE $<BUILD_INTERFACE:VBCSR_HAVE_AOCL_SPARSE>)
+endif()
 
 # Source files for Python binding
 set(SOURCES
@@ -143,6 +339,13 @@ pybind11_add_module(vbcsr_core ${SOURCES})
 
 # Link libraries for Python binding
 target_link_libraries(vbcsr_core PRIVATE vbcsr)
+set_target_properties(vbcsr_core PROPERTIES
+    BUILD_WITH_INSTALL_RPATH OFF
+    INSTALL_RPATH ""
+    INSTALL_RPATH_USE_LINK_PATH FALSE
+    INSTALL_REMOVE_ENVIRONMENT_RPATH TRUE
+    SKIP_BUILD_RPATH TRUE
+)
 
 # Install rules
 include(GNUInstallDirs)
@@ -161,6 +364,18 @@ install(TARGETS vbcsr
 
 # Install the Python extension (optional, but good for pip install)
 install(TARGETS vbcsr_core DESTINATION .)
+if(DEFINED ENV{CONDA_PREFIX} AND NOT "$ENV{CONDA_PREFIX}" STREQUAL "")
+    file(TO_CMAKE_PATH "$ENV{CONDA_PREFIX}/lib" VBCSR_PYTHON_ENV_RPATH)
+    install(CODE "
+        if(EXISTS \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/./$<TARGET_FILE_NAME:vbcsr_core>\" AND
+           NOT IS_SYMLINK \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/./$<TARGET_FILE_NAME:vbcsr_core>\")
+          file(RPATH_CHANGE
+               FILE \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/./$<TARGET_FILE_NAME:vbcsr_core>\"
+               OLD_RPATH \"${VBCSR_PYTHON_ENV_RPATH}\"
+               NEW_RPATH \"\")
+        endif()
+    ")
+endif()
 
 # Export targets
 install(EXPORT vbcsrTargets
@@ -194,11 +409,13 @@ option(VBCSR_ENABLE_TESTS "Enable building tests" OFF)
 
 if(VBCSR_ENABLE_TESTS)
     enable_testing()
+    include(CMakeParseArguments)
 
-    find_package(GTest)
+    find_package(GTest QUIET)
     if(NOT GTest_FOUND)
         message(STATUS "GTest not found, fetching from git...")
         include(FetchContent)
+        set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
         FetchContent_Declare(
             googletest
             GIT_REPOSITORY https://github.com/google/googletest.git
@@ -207,63 +424,83 @@ if(VBCSR_ENABLE_TESTS)
         # For Windows: Prevent overriding the parent project's compiler/linker settings
         set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
         FetchContent_MakeAvailable(googletest)
-        include(GoogleTest)
     endif()
+    include(GoogleTest)
 
-    function(add_vbcsr_test name source)
+    function(add_vbcsr_gtest name source)
+        set(options)
+        set(oneValueArgs MPI_RANKS)
+        cmake_parse_arguments(ARG "${options}" "${oneValueArgs}" "" ${ARGN})
         add_executable(${name} ${source})
         target_link_libraries(${name} PRIVATE vbcsr GTest::gtest GTest::gtest_main Threads::Threads dl)
-        add_test(NAME ${name} COMMAND mpirun -np 2 $<TARGET_FILE:${name}>)
+        if(ARG_MPI_RANKS)
+            add_test(NAME ${name} COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${ARG_MPI_RANKS} $<TARGET_FILE:${name}>)
+        else()
+            add_test(NAME ${name} COMMAND $<TARGET_FILE:${name}>)
+        endif()
     endfunction()
 
-    add_vbcsr_test(test_pb_csr vbcsr/core/test/test_pb_csr.cpp)
-    add_vbcsr_test(test_spmm vbcsr/core/test/test_spmm.cpp)
-    add_vbcsr_test(test_block_csr vbcsr/core/test/test_block_csr.cpp)
-    add_vbcsr_test(test_dist_graph vbcsr/core/test/test_dist_graph.cpp)
-    add_vbcsr_test(test_robustness vbcsr/core/test/test_robustness.cpp)
-    add_vbcsr_test(test_complex_dist_vector vbcsr/core/test/test_complex_dist_vector.cpp)
-    # add_vbcsr_test(test_multi_sparsity vbcsr/core/test/test_multi_sparsity.cpp) # Fails with np=2
-    add_vbcsr_test(test_backend_extensions vbcsr/core/test/test_backend_extensions.cpp)
-    add_vbcsr_test(benchmark_dist vbcsr/core/test/benchmark_dist.cpp)
-    add_vbcsr_test(benchmark_spmm_complex vbcsr/core/test/benchmark_spmm_complex.cpp)
-    add_vbcsr_test(test_axpby vbcsr/core/test/test_axpby.cpp)
-    add_vbcsr_test(test_axpby_diff_graph vbcsr/core/test/test_axpby_diff_graph.cpp)
-    add_vbcsr_test(benchmark_axpby vbcsr/core/test/benchmark_axpby.cpp)
-    add_vbcsr_test(test_density vbcsr/core/test/test_density.cpp)
-    add_vbcsr_test(test_asymmetric_filter vbcsr/core/test/test_asymmetric_filter.cpp)
-    add_vbcsr_test(test_block_arena vbcsr/core/test/test_block_arena.cpp)
-    add_vbcsr_test(test_extract_batched vbcsr/core/test/test_extract_batched.cpp)
-    add_vbcsr_test(test_extract_batched_extended vbcsr/core/test/test_extract_batched_extended.cpp)
-    add_vbcsr_test(test_extract_batched_robust vbcsr/core/test/test_extract_batched_robust.cpp)
-    add_vbcsr_test(test_hermitian_product vbcsr/core/test/test_hermitian_product.cpp)
-    add_vbcsr_test(test_mult_graph_mismatch vbcsr/core/test/test_mult_graph_mismatch.cpp)
-    add_vbcsr_test(test_subgraph vbcsr/core/test/test_subgraph.cpp)
-    add_vbcsr_test(test_graphmf vbcsr/core/test/test_graphmf.cpp)
-    add_vbcsr_test(test_dist_csr vbcsr/core/test/test_dist_csr.cpp)
+    function(add_vbcsr_mpi_test name source)
+        set(options)
+        set(oneValueArgs MPI_RANKS)
+        cmake_parse_arguments(ARG "${options}" "${oneValueArgs}" "" ${ARGN})
+        if(NOT ARG_MPI_RANKS)
+            set(ARG_MPI_RANKS 2)
+        endif()
+        add_executable(${name} ${source})
+        target_link_libraries(${name} PRIVATE vbcsr Threads::Threads dl)
+        add_test(NAME ${name} COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${ARG_MPI_RANKS} $<TARGET_FILE:${name}>)
+    endfunction()
 
-    # Atomic Module Tests
-    # Atomic Module Tests
-    # ParMETIS detection moved to top-level
+    function(add_vbcsr_plain_test name source)
+        add_executable(${name} ${source})
+        target_link_libraries(${name} PRIVATE vbcsr Threads::Threads dl)
+        add_test(NAME ${name} COMMAND $<TARGET_FILE:${name}>)
+    endfunction()
+
+    function(add_vbcsr_benchmark name source)
+        add_executable(${name} ${source})
+        target_link_libraries(${name} PRIVATE vbcsr Threads::Threads dl)
+    endfunction()
+
+    add_vbcsr_mpi_test(test_pb_csr vbcsr/core/test/test_pb_csr.cpp)
+    add_vbcsr_mpi_test(test_spmm vbcsr/core/test/test_spmm.cpp)
+    add_vbcsr_mpi_test(test_block_csr vbcsr/core/test/test_block_csr.cpp)
+    add_vbcsr_mpi_test(test_dist_graph vbcsr/core/test/test_dist_graph.cpp)
+    add_vbcsr_mpi_test(test_robustness vbcsr/core/test/test_robustness.cpp)
+    add_vbcsr_mpi_test(test_complex_dist_vector vbcsr/core/test/test_complex_dist_vector.cpp)
+    add_vbcsr_mpi_test(test_backend_extensions vbcsr/core/test/test_backend_extensions.cpp)
+    add_vbcsr_benchmark(benchmark_dist vbcsr/core/test/benchmark_dist.cpp)
+    add_vbcsr_benchmark(benchmark_csr_vendor vbcsr/core/test/benchmark_csr_vendor.cpp)
+    add_vbcsr_benchmark(benchmark_spmm_complex vbcsr/core/test/benchmark_spmm_complex.cpp)
+    add_vbcsr_benchmark(benchmark_vbcsr_packed vbcsr/core/test/benchmark_vbcsr_packed.cpp)
+    add_vbcsr_mpi_test(test_axpby vbcsr/core/test/test_axpby.cpp)
+    add_vbcsr_mpi_test(test_axpby_diff_graph vbcsr/core/test/test_axpby_diff_graph.cpp)
+    add_vbcsr_benchmark(benchmark_axpby vbcsr/core/test/benchmark_axpby.cpp)
+    add_vbcsr_mpi_test(test_density vbcsr/core/test/test_density.cpp)
+    add_vbcsr_mpi_test(test_asymmetric_filter vbcsr/core/test/test_asymmetric_filter.cpp)
+    add_vbcsr_mpi_test(test_extract_batched vbcsr/core/test/test_extract_batched.cpp)
+    add_vbcsr_mpi_test(test_extract_batched_extended vbcsr/core/test/test_extract_batched_extended.cpp)
+    add_vbcsr_mpi_test(test_extract_batched_robust vbcsr/core/test/test_extract_batched_robust.cpp)
+    add_vbcsr_mpi_test(test_hermitian_product vbcsr/core/test/test_hermitian_product.cpp)
+    add_vbcsr_mpi_test(test_mult_graph_mismatch vbcsr/core/test/test_mult_graph_mismatch.cpp)
+    add_vbcsr_mpi_test(test_subgraph vbcsr/core/test/test_subgraph.cpp)
+    add_vbcsr_mpi_test(test_graphmf vbcsr/core/test/test_graphmf.cpp)
+    add_vbcsr_mpi_test(test_dist_csr vbcsr/core/test/test_dist_csr.cpp)
+    add_vbcsr_gtest(test_block_csr_export vbcsr/core/test/test_block_csr_export.cpp MPI_RANKS 2)
+
+    add_vbcsr_gtest(test_atomic_data vbcsr/core/atomic/test/test_atomic_data.cpp MPI_RANKS 2)
+    add_vbcsr_mpi_test(test_image_container vbcsr/core/atomic/test/test_image_container.cpp MPI_RANKS 2)
+    add_vbcsr_plain_test(test_neighbourlist vbcsr/core/atomic/test/test_neighbourlist.cpp)
+    add_vbcsr_gtest(test_neighbourlist_repro vbcsr/core/atomic/test/test_neighbourlist_repro.cpp)
 
     if(PARMETIS_LIB AND METIS_LIB AND PARMETIS_INCLUDE_DIR AND METIS_INCLUDE_DIR)
-        add_vbcsr_test(test_atomic_data vbcsr/core/atomic/test/test_atomic_data.cpp)
-        target_link_libraries(test_atomic_data PRIVATE ${PARMETIS_LIB} ${METIS_LIB})
-        target_include_directories(test_atomic_data PRIVATE ${PARMETIS_INCLUDE_DIR} ${METIS_INCLUDE_DIR})
-
-        add_vbcsr_test(test_image_container vbcsr/core/atomic/test/test_image_container.cpp)
-        target_link_libraries(test_image_container PRIVATE ${PARMETIS_LIB} ${METIS_LIB})
-        target_include_directories(test_image_container PRIVATE ${PARMETIS_INCLUDE_DIR} ${METIS_INCLUDE_DIR})
-    else()
-        # Compile tests without ParMETIS linking (testing fallback)
-        add_vbcsr_test(test_atomic_data vbcsr/core/atomic/test/test_atomic_data.cpp)
-        
-        add_vbcsr_test(test_image_container vbcsr/core/atomic/test/test_image_container.cpp)
+        foreach(target
+            test_atomic_data
+            test_image_container
+        )
+            target_link_libraries(${target} PRIVATE ${PARMETIS_LIB} ${METIS_LIB})
+            target_include_directories(${target} PRIVATE ${PARMETIS_INCLUDE_DIR} ${METIS_INCLUDE_DIR})
+        endforeach()
     endif()
-
-    add_vbcsr_test(test_neighbourlist vbcsr/core/atomic/test/test_neighbourlist.cpp)
-    add_vbcsr_test(test_neighbourlist_repro vbcsr/core/atomic/test/test_neighbourlist_repro.cpp)
-
-    add_executable(test_block_csr_export vbcsr/core/test/test_block_csr_export.cpp)
-    target_link_libraries(test_block_csr_export PRIVATE vbcsr GTest::gtest GTest::gtest_main Threads::Threads dl)
-    add_test(NAME test_block_csr_export COMMAND mpirun -np 2 $<TARGET_FILE:test_block_csr_export>)
 endif()

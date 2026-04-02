@@ -59,7 +59,7 @@
 
 - `CSR`: native scalar CSR whose backend owns paged scalar payloads and any derived execution metadata, while reusing graph-owned logical adjacency for row/column structure.
 - `BSR`: native uniform-block storage whose backend owns one global `bsz`, paged block payloads, and any derived execution metadata, while reusing graph-owned logical adjacency for logical block slots.
-- `VBCSR`: native paged block storage, evolved from the current `BlockArena`, whose backend owns block handles, shape registry, and page-local payload organization, while the backend-neutral logical block graph continues to come from `DistGraph`.
+- `VBCSR`: native paged block storage, evolved from the former `BlockArena` design, whose backend owns block handles, shape registry, and page-local payload organization, while the backend-neutral logical block graph continues to come from `DistGraph`.
 
 ### Cross-Backend Paged Linear Storage
 

@@ -60,6 +60,23 @@ struct RemoteAssemblyState {
         std::lock_guard<std::mutex> lock(reg.mutex);
         reg.buffers.erase(matrix);
     }
+
+    static bool has_pending(const Matrix* matrix) {
+        auto& reg = registry();
+        std::lock_guard<std::mutex> lock(reg.mutex);
+        auto it = reg.buffers.find(matrix);
+        if (it == reg.buffers.end()) {
+            return false;
+        }
+        for (const auto& thread_buffers : it->second) {
+            for (const auto& owner_entry : thread_buffers) {
+                if (!owner_entry.second.empty()) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
 };
 
 } // namespace vbcsr::detail
