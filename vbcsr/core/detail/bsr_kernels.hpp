@@ -1,6 +1,9 @@
 #ifndef VBCSR_DETAIL_BSR_KERNELS_HPP
 #define VBCSR_DETAIL_BSR_KERNELS_HPP
 
+// TODO: the native kernels can be optimized to use batched GEMM for acceleration
+// But since we have vendor MKL path, the priority is less than other features.
+
 #include "../dist_multivector.hpp"
 #include "../dist_vector.hpp"
 #include "../kernels.hpp"
@@ -401,6 +404,7 @@ void bsr_mult(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistVector<T
     x.sync_ghosts();
 
 #ifdef VBCSR_HAVE_MKL_BSR_SPARSE
+    BLASKernel::configure_vendor_sparse_threading();
     const auto& cache = backend.ensure_vendor_cache(
         graph->adj_ptr,
         graph->adj_ind,
@@ -414,6 +418,7 @@ void bsr_mult(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistVector<T
     }
 #endif
 
+    BLASKernel::configure_native_threading();
     bsr_dispatch_block_size(backend.block_size, [&](auto block_tag) {
         constexpr int BlockSize = decltype(block_tag)::value;
         bsr_mult_impl<BlockSize>(graph, backend, x, y);
@@ -479,6 +484,7 @@ void bsr_mult_dense(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistMu
     x.sync_ghosts();
 
 #ifdef VBCSR_HAVE_MKL_BSR_SPARSE
+    BLASKernel::configure_vendor_sparse_threading();
     const auto& cache = backend.ensure_vendor_cache(
         graph->adj_ptr,
         graph->adj_ind,
@@ -492,6 +498,7 @@ void bsr_mult_dense(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistMu
     }
 #endif
 
+    BLASKernel::configure_native_threading();
     bsr_dispatch_block_size(backend.block_size, [&](auto block_tag) {
         constexpr int BlockSize = decltype(block_tag)::value;
         bsr_mult_dense_impl<BlockSize>(graph, backend, x, y);
@@ -564,6 +571,7 @@ void bsr_mult_adjoint(DistGraph* graph, const BSRMatrixBackend<T>& backend, Dist
     y.bind_to_graph(graph);
 
 #ifdef VBCSR_HAVE_MKL_BSR_SPARSE
+    BLASKernel::configure_vendor_sparse_threading();
     const auto& cache = backend.ensure_vendor_cache(
         graph->adj_ptr,
         graph->adj_ind,
@@ -578,6 +586,7 @@ void bsr_mult_adjoint(DistGraph* graph, const BSRMatrixBackend<T>& backend, Dist
     }
 #endif
 
+    BLASKernel::configure_native_threading();
     bsr_dispatch_block_size(backend.block_size, [&](auto block_tag) {
         constexpr int BlockSize = decltype(block_tag)::value;
         bsr_mult_adjoint_impl<BlockSize>(graph, backend, x, y);
@@ -677,6 +686,7 @@ void bsr_mult_dense_adjoint(
     y.bind_to_graph(graph);
 
 #ifdef VBCSR_HAVE_MKL_BSR_SPARSE
+    BLASKernel::configure_vendor_sparse_threading();
     const auto& cache = backend.ensure_vendor_cache(
         graph->adj_ptr,
         graph->adj_ind,
@@ -691,6 +701,7 @@ void bsr_mult_dense_adjoint(
     }
 #endif
 
+    BLASKernel::configure_native_threading();
     bsr_dispatch_block_size(backend.block_size, [&](auto block_tag) {
         constexpr int BlockSize = decltype(block_tag)::value;
         bsr_mult_dense_adjoint_impl<BlockSize>(graph, backend, x, y);

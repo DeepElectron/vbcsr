@@ -731,7 +731,17 @@ struct BLASKernel {
 #endif
     }
 
-    static void init_threading() {
+    static int preferred_parallel_thread_count() {
+#ifdef _OPENMP
+        return std::max(1, omp_get_max_threads());
+#else
+        return 1;
+#endif
+    }
+
+    // Native sparse kernels may call BLAS inside an outer OpenMP region. Clamp the
+    // inner BLAS runtime to one thread to avoid oversubscription.
+    static void configure_native_threading() {
 #ifdef VBCSR_USE_MKL
         int one = 1;
         mkl_set_num_threads_(&one);
@@ -741,6 +751,16 @@ struct BLASKernel {
         // Generic BLAS: Do nothing. 
         // We do NOT want to call omp_set_num_threads(1) here because it would disable
         // parallelism for the outer loops (Sparse MVP/MM).
+#endif
+    }
+
+    // Vendor sparse kernels should own parallelism themselves. For MKL sparse we
+    // align the MKL thread pool with the configured OpenMP thread budget so callers
+    // only need to manage one thread setting.
+    static void configure_vendor_sparse_threading() {
+#ifdef VBCSR_USE_MKL
+        int threads = preferred_parallel_thread_count();
+        mkl_set_num_threads_(&threads);
 #endif
     }
 

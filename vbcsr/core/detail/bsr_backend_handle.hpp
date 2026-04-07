@@ -123,6 +123,7 @@ struct BSRApplyPlan {
 template <typename T>
 struct BSRVendorBatchEntry {
     // Owning storage for batch.row_block_offsets.
+    // each batch correspond to a page, with row aware metadata
     std::vector<int> row_block_offsets_storage;
     BSRPageBatch<const T> batch;
 

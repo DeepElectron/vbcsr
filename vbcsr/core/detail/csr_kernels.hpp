@@ -623,7 +623,9 @@ void csr_mult(DistGraph* graph, const CSRMatrixBackend<T>& backend, DistVector<T
     x.bind_to_graph(graph);
     y.bind_to_graph(graph);
     x.sync_ghosts();
+    BLASKernel::configure_vendor_sparse_threading();
     if (!csr_mult_try_vendor_bound(graph, backend, x, y)) {
+        BLASKernel::configure_native_threading();
         csr_mult_native(graph, backend, x, y);
     }
 }
@@ -633,7 +635,9 @@ void csr_mult_dense(DistGraph* graph, const CSRMatrixBackend<T>& backend, DistMu
     x.bind_to_graph(graph);
     y.bind_to_graph(graph);
     x.sync_ghosts();
+    BLASKernel::configure_vendor_sparse_threading();
     if (!csr_mult_dense_try_vendor_bound(graph, backend, x, y)) {
+        BLASKernel::configure_native_threading();
         csr_mult_dense_native(graph, backend, x, y);
     }
 }
@@ -642,7 +646,9 @@ template <typename T>
 void csr_mult_adjoint(DistGraph* graph, const CSRMatrixBackend<T>& backend, DistVector<T>& x, DistVector<T>& y) {
     x.bind_to_graph(graph);
     y.bind_to_graph(graph);
+    BLASKernel::configure_vendor_sparse_threading();
     if (!csr_mult_adjoint_try_vendor_bound(graph, backend, x, y)) {
+        BLASKernel::configure_native_threading();
         csr_mult_adjoint_native(graph, backend, x, y);
     }
 }
@@ -655,7 +661,9 @@ void csr_mult_dense_adjoint(
     DistMultiVector<T>& y) {
     x.bind_to_graph(graph);
     y.bind_to_graph(graph);
+    BLASKernel::configure_vendor_sparse_threading();
     if (!csr_mult_dense_adjoint_try_vendor_bound(graph, backend, x, y)) {
+        BLASKernel::configure_native_threading();
         csr_mult_dense_adjoint_native(graph, backend, x, y);
     }
 }

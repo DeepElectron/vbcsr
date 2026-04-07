@@ -31,6 +31,7 @@ void bsr_mult_native_benchmark(
     const detail::BSRMatrixBackend<T>& backend,
     DistVector<T>& x,
     DistVector<T>& y) {
+    BLASKernel::configure_native_threading();
     detail::bsr_dispatch_block_size(backend.block_size, [&](auto block_tag) {
         constexpr int BlockSize = decltype(block_tag)::value;
         detail::bsr_mult_impl<BlockSize>(graph, backend, x, y);
@@ -43,10 +44,54 @@ void bsr_mult_dense_native_benchmark(
     const detail::BSRMatrixBackend<T>& backend,
     DistMultiVector<T>& x,
     DistMultiVector<T>& y) {
+    BLASKernel::configure_native_threading();
     detail::bsr_dispatch_block_size(backend.block_size, [&](auto block_tag) {
         constexpr int BlockSize = decltype(block_tag)::value;
         detail::bsr_mult_dense_impl<BlockSize>(graph, backend, x, y);
     });
+}
+
+template <typename T>
+void bsr_mult_adjoint_native_benchmark(
+    DistGraph* graph,
+    const detail::BSRMatrixBackend<T>& backend,
+    DistVector<T>& x,
+    DistVector<T>& y) {
+    BLASKernel::configure_native_threading();
+    detail::bsr_dispatch_block_size(backend.block_size, [&](auto block_tag) {
+        constexpr int BlockSize = decltype(block_tag)::value;
+        detail::bsr_mult_adjoint_impl<BlockSize>(graph, backend, x, y);
+    });
+}
+
+template <typename T>
+void bsr_mult_dense_adjoint_native_benchmark(
+    DistGraph* graph,
+    const detail::BSRMatrixBackend<T>& backend,
+    DistMultiVector<T>& x,
+    DistMultiVector<T>& y) {
+    BLASKernel::configure_native_threading();
+    detail::bsr_dispatch_block_size(backend.block_size, [&](auto block_tag) {
+        constexpr int BlockSize = decltype(block_tag)::value;
+        detail::bsr_mult_dense_adjoint_impl<BlockSize>(graph, backend, x, y);
+    });
+}
+
+double mpi_max_double(MPI_Comm comm, double value) {
+    double reduced = 0.0;
+    MPI_Allreduce(&value, &reduced, 1, MPI_DOUBLE, MPI_MAX, comm);
+    return reduced;
+}
+
+template <typename Fn>
+double benchmark_max_seconds(MPI_Comm comm, int n_iter, Fn&& fn) {
+    MPI_Barrier(comm);
+    const double start = MPI_Wtime();
+    for (int i = 0; i < n_iter; ++i) {
+        fn();
+    }
+    const double elapsed = MPI_Wtime() - start;
+    return mpi_max_double(comm, elapsed);
 }
 
 int main(int argc, char** argv) {
@@ -73,6 +118,7 @@ int main(int argc, char** argv) {
         std::cout << "Benchmark & Verification Configuration:" << std::endl;
         std::cout << "  Ranks: " << size << std::endl;
         std::cout << "  Global Blocks: " << n_global_blocks << std::endl;
+        std::cout << "  Global Scalar Dimension: " << (n_global_blocks * block_size) << std::endl;
         std::cout << "  Block Size: " << block_size << std::endl;
         std::cout << "  RHS Vectors: " << n_vecs << std::endl;
         std::cout << "  Requested Page Size: "
@@ -161,8 +207,42 @@ int main(int argc, char** argv) {
         std::cout << "  Vendor Batches: " << cache.batches.size() << std::endl;
     }
 
+    const auto fill_forward_reference = [&](int gid_r, int vec_idx, std::vector<double>& y_ref) {
+        std::fill(y_ref.begin(), y_ref.end(), 0.0);
+        std::vector<int> neighbors;
+        if (gid_r > 0) neighbors.push_back(gid_r - 1);
+        neighbors.push_back(gid_r);
+        if (gid_r < n_global_blocks - 1) neighbors.push_back(gid_r + 1);
+
+        for (int gid_c : neighbors) {
+            for (int c = 0; c < block_size; ++c) {
+                const double x_val = get_vec_val(gid_c, c, vec_idx);
+                for (int r = 0; r < block_size; ++r) {
+                    y_ref[r] += get_mat_val(gid_r, gid_c, r, c) * x_val;
+                }
+            }
+        }
+    };
+
+    const auto fill_adjoint_reference = [&](int gid_c, int vec_idx, std::vector<double>& y_ref) {
+        std::fill(y_ref.begin(), y_ref.end(), 0.0);
+        std::vector<int> source_rows;
+        if (gid_c > 0) source_rows.push_back(gid_c - 1);
+        source_rows.push_back(gid_c);
+        if (gid_c < n_global_blocks - 1) source_rows.push_back(gid_c + 1);
+
+        for (int gid_r : source_rows) {
+            for (int r = 0; r < block_size; ++r) {
+                const double x_val = get_vec_val(gid_r, r, vec_idx);
+                for (int c = 0; c < block_size; ++c) {
+                    y_ref[c] += get_mat_val(gid_r, gid_c, r, c) * x_val;
+                }
+            }
+        }
+    };
+
     // 3. MatVec Benchmark & Verify
-    DistVector<double> x(&graph), y(&graph);
+    DistVector<double> x(&graph), y_vendor(&graph), y_native(&graph);
     
     // Fill x
     double* x_ptr = x.local_data();
@@ -172,77 +252,72 @@ int main(int argc, char** argv) {
             x_ptr[i * block_size + k] = get_vec_val(gid, k);
         }
     }
-    y.set_constant(0.0);
-    
-    // Warmup & Verify
-    detail::bsr_mult(&graph, backend, x, y);
-    
-    // Verification
-    double max_err = 0.0;
-    double* y_ptr = y.local_data();
+    y_vendor.set_constant(0.0);
+    y_native.set_constant(0.0);
+
+    detail::bsr_mult(&graph, backend, x, y_vendor);
+    bsr_mult_native_benchmark(&graph, backend, x, y_native);
+
+    double max_vendor_ref_err = 0.0;
+    double max_native_ref_err = 0.0;
+    double max_vendor_native_diff = 0.0;
+    double* y_vendor_ptr = y_vendor.local_data();
+    double* y_native_ptr = y_native.local_data();
     for (int i = 0; i < n_owned; ++i) {
         int gid_r = graph.owned_global_indices[i];
-        
-        // Compute reference for this block row
         std::vector<double> y_ref(block_size, 0.0);
-        
-        // Neighbors: gid_r-1, gid_r, gid_r+1
-        std::vector<int> neighbors;
-        if (gid_r > 0) neighbors.push_back(gid_r - 1);
-        neighbors.push_back(gid_r);
-        if (gid_r < n_global_blocks - 1) neighbors.push_back(gid_r + 1);
-        
-        for (int gid_c : neighbors) {
-            for (int c = 0; c < block_size; ++c) {
-                double x_val = get_vec_val(gid_c, c);
-                for (int r = 0; r < block_size; ++r) {
-                    double a_val = get_mat_val(gid_r, gid_c, r, c);
-                    y_ref[r] += a_val * x_val;
-                }
-            }
-        }
-        
+        fill_forward_reference(gid_r, 0, y_ref);
         for (int r = 0; r < block_size; ++r) {
-            double err = std::abs(y_ptr[i * block_size + r] - y_ref[r]);
-            max_err = std::max(max_err, err);
+            const double vendor_val = y_vendor_ptr[i * block_size + r];
+            const double native_val = y_native_ptr[i * block_size + r];
+            max_vendor_ref_err = std::max(max_vendor_ref_err, std::abs(vendor_val - y_ref[r]));
+            max_native_ref_err = std::max(max_native_ref_err, std::abs(native_val - y_ref[r]));
+            max_vendor_native_diff = std::max(
+                max_vendor_native_diff,
+                std::abs(vendor_val - native_val));
         }
     }
-    
-    double global_max_err;
-    MPI_Reduce(&max_err, &global_max_err, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-    
+
+    const double global_vendor_ref_err = mpi_max_double(MPI_COMM_WORLD, max_vendor_ref_err);
+    const double global_native_ref_err = mpi_max_double(MPI_COMM_WORLD, max_native_ref_err);
+    const double global_vendor_native_diff = mpi_max_double(MPI_COMM_WORLD, max_vendor_native_diff);
+
     if (rank == 0) {
-        std::cout << "MatVec Max Error: " << global_max_err << std::endl;
-        if (global_max_err > 1e-12) std::cout << "  VERIFICATION FAILED" << std::endl;
+        std::cout << "MatVec Vendor-vs-Ref Max Error: " << global_vendor_ref_err << std::endl;
+        std::cout << "MatVec Native-vs-Ref Max Error: " << global_native_ref_err << std::endl;
+        std::cout << "MatVec Vendor-vs-Native Max Diff: " << global_vendor_native_diff << std::endl;
+        if (std::max({global_vendor_ref_err, global_native_ref_err, global_vendor_native_diff}) > 1e-12) {
+            std::cout << "  VERIFICATION FAILED" << std::endl;
+        }
         else std::cout << "  VERIFICATION PASSED" << std::endl;
     }
 
-    t0 = MPI_Wtime();
-    for (int i = 0; i < n_iter; ++i) {
-        detail::bsr_mult(&graph, backend, x, y);
-    }
-    double t_matvec = MPI_Wtime() - t0;
-    double avg_matvec = t_matvec / n_iter;
-
     backend.reset_vendor_launch_count();
-    const double native_vec_seconds = [&] {
-        const double start = MPI_Wtime();
-        for (int i = 0; i < n_iter; ++i) {
-            bsr_mult_native_benchmark(&graph, backend, x, y);
-        }
-        return MPI_Wtime() - start;
-    }();
+    const double native_vec_seconds =
+        benchmark_max_seconds(MPI_COMM_WORLD, n_iter, [&] {
+            bsr_mult_native_benchmark(&graph, backend, x, y_native);
+        });
+    backend.reset_vendor_launch_count();
+    const double vendor_vec_seconds =
+        benchmark_max_seconds(MPI_COMM_WORLD, n_iter, [&] {
+            detail::bsr_mult(&graph, backend, x, y_vendor);
+        });
+    const uint64_t matvec_vendor_launches = backend.get_vendor_launch_count();
     
     if (rank == 0) {
         std::cout << "MatVec Native Time (avg): " << (native_vec_seconds / n_iter) << " s" << std::endl;
-        std::cout << "MatVec Time (avg): " << avg_matvec << " s" << std::endl;
+        std::cout << "MatVec Vendor Time (avg): " << (vendor_vec_seconds / n_iter) << " s" << std::endl;
+        std::cout << "MatVec Speedup (native/vendor): " << (native_vec_seconds / vendor_vec_seconds) << std::endl;
         double flops = (double)n_global_blocks * 3.0 * 2.0 * block_size * block_size;
-        std::cout << "MatVec GFLOPS: " << (flops / avg_matvec) * 1e-9 << std::endl;
+        std::cout << "MatVec Native GFLOPS: " << (flops / (native_vec_seconds / n_iter)) * 1e-9 << std::endl;
+        std::cout << "MatVec Vendor GFLOPS: " << (flops / (vendor_vec_seconds / n_iter)) * 1e-9 << std::endl;
+        std::cout << "MatVec Vendor Launch Count: " << matvec_vendor_launches << std::endl;
     }
 
     // 4. MatMat Benchmark & Verify
     DistMultiVector<double> X(&graph, n_vecs);
-    DistMultiVector<double> Y(&graph, n_vecs);
+    DistMultiVector<double> Y_vendor(&graph, n_vecs);
+    DistMultiVector<double> Y_native(&graph, n_vecs);
     
     // Init X
     for (int v = 0; v < n_vecs; ++v) {
@@ -255,69 +330,212 @@ int main(int argc, char** argv) {
         }
     }
     
-    // Warmup & Verify
-    detail::bsr_mult_dense(&graph, backend, X, Y);
-    
-    // Verification
-    max_err = 0.0;
+    detail::bsr_mult_dense(&graph, backend, X, Y_vendor);
+    bsr_mult_dense_native_benchmark(&graph, backend, X, Y_native);
+
+    max_vendor_ref_err = 0.0;
+    max_native_ref_err = 0.0;
+    max_vendor_native_diff = 0.0;
     for (int v = 0; v < n_vecs; ++v) {
-        double* col_ptr = Y.col_data(v);
+        double* vendor_col_ptr = Y_vendor.col_data(v);
+        double* native_col_ptr = Y_native.col_data(v);
         for (int i = 0; i < n_owned; ++i) {
             int gid_r = graph.owned_global_indices[i];
-            
-            // Compute reference
             std::vector<double> y_ref(block_size, 0.0);
-            std::vector<int> neighbors;
-            if (gid_r > 0) neighbors.push_back(gid_r - 1);
-            neighbors.push_back(gid_r);
-            if (gid_r < n_global_blocks - 1) neighbors.push_back(gid_r + 1);
-            
-            for (int gid_c : neighbors) {
-                for (int c = 0; c < block_size; ++c) {
-                    double x_val = get_vec_val(gid_c, c, v);
-                    for (int r = 0; r < block_size; ++r) {
-                        double a_val = get_mat_val(gid_r, gid_c, r, c);
-                        y_ref[r] += a_val * x_val;
-                    }
-                }
-            }
-            
+            fill_forward_reference(gid_r, v, y_ref);
             for (int r = 0; r < block_size; ++r) {
-                double err = std::abs(col_ptr[i * block_size + r] - y_ref[r]);
-                max_err = std::max(max_err, err);
+                const double vendor_val = vendor_col_ptr[i * block_size + r];
+                const double native_val = native_col_ptr[i * block_size + r];
+                max_vendor_ref_err = std::max(max_vendor_ref_err, std::abs(vendor_val - y_ref[r]));
+                max_native_ref_err = std::max(max_native_ref_err, std::abs(native_val - y_ref[r]));
+                max_vendor_native_diff = std::max(
+                    max_vendor_native_diff,
+                    std::abs(vendor_val - native_val));
             }
         }
     }
-    
-    MPI_Reduce(&max_err, &global_max_err, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-    
+
+    const double global_matmat_vendor_ref_err = mpi_max_double(MPI_COMM_WORLD, max_vendor_ref_err);
+    const double global_matmat_native_ref_err = mpi_max_double(MPI_COMM_WORLD, max_native_ref_err);
+    const double global_matmat_vendor_native_diff = mpi_max_double(MPI_COMM_WORLD, max_vendor_native_diff);
+
     if (rank == 0) {
-        std::cout << "MatMat Max Error: " << global_max_err << std::endl;
-        if (global_max_err > 1e-12) std::cout << "  VERIFICATION FAILED" << std::endl;
+        std::cout << "MatMat Vendor-vs-Ref Max Error: " << global_matmat_vendor_ref_err << std::endl;
+        std::cout << "MatMat Native-vs-Ref Max Error: " << global_matmat_native_ref_err << std::endl;
+        std::cout << "MatMat Vendor-vs-Native Max Diff: " << global_matmat_vendor_native_diff << std::endl;
+        if (std::max({global_matmat_vendor_ref_err, global_matmat_native_ref_err, global_matmat_vendor_native_diff}) > 1e-12) {
+            std::cout << "  VERIFICATION FAILED" << std::endl;
+        }
         else std::cout << "  VERIFICATION PASSED" << std::endl;
     }
-    
-    t0 = MPI_Wtime();
-    for (int i = 0; i < n_iter; ++i) {
-        detail::bsr_mult_dense(&graph, backend, X, Y);
-    }
-    double t_matmat = MPI_Wtime() - t0;
-    double avg_matmat = t_matmat / n_iter;
 
-    const double native_dense_seconds = [&] {
-        const double start = MPI_Wtime();
-        for (int i = 0; i < n_iter; ++i) {
-            bsr_mult_dense_native_benchmark(&graph, backend, X, Y);
-        }
-        return MPI_Wtime() - start;
-    }();
+    backend.reset_vendor_launch_count();
+    const double native_dense_seconds =
+        benchmark_max_seconds(MPI_COMM_WORLD, n_iter, [&] {
+            bsr_mult_dense_native_benchmark(&graph, backend, X, Y_native);
+        });
+    backend.reset_vendor_launch_count();
+    const double vendor_dense_seconds =
+        benchmark_max_seconds(MPI_COMM_WORLD, n_iter, [&] {
+            detail::bsr_mult_dense(&graph, backend, X, Y_vendor);
+        });
+    const uint64_t matmat_vendor_launches = backend.get_vendor_launch_count();
     
     if (rank == 0) {
         std::cout << "MatMat Native Time (avg): " << (native_dense_seconds / n_iter) << " s" << std::endl;
-        std::cout << "MatMat Time (avg): " << avg_matmat << " s" << std::endl;
+        std::cout << "MatMat Vendor Time (avg): " << (vendor_dense_seconds / n_iter) << " s" << std::endl;
+        std::cout << "MatMat Speedup (native/vendor): " << (native_dense_seconds / vendor_dense_seconds) << std::endl;
         double flops = (double)n_global_blocks * 3.0 * 2.0 * block_size * block_size * n_vecs;
-        std::cout << "MatMat GFLOPS: " << (flops / avg_matmat) * 1e-9 << std::endl;
-        std::cout << "Vendor Launch Count: " << backend.get_vendor_launch_count() << std::endl;
+        std::cout << "MatMat Native GFLOPS: " << (flops / (native_dense_seconds / n_iter)) * 1e-9 << std::endl;
+        std::cout << "MatMat Vendor GFLOPS: " << (flops / (vendor_dense_seconds / n_iter)) * 1e-9 << std::endl;
+        std::cout << "MatMat Vendor Launch Count: " << matmat_vendor_launches << std::endl;
+    }
+
+    // 5. Adjoint MatVec Benchmark & Verify
+    DistVector<double> x_adj(&graph), y_adj_vendor(&graph), y_adj_native(&graph);
+    double* x_adj_ptr = x_adj.local_data();
+    for (int i = 0; i < n_owned; ++i) {
+        const int gid = graph.owned_global_indices[i];
+        for (int k = 0; k < block_size; ++k) {
+            x_adj_ptr[i * block_size + k] = get_vec_val(gid, k, 17);
+        }
+    }
+
+    detail::bsr_mult_adjoint(&graph, backend, x_adj, y_adj_vendor);
+    bsr_mult_adjoint_native_benchmark(&graph, backend, x_adj, y_adj_native);
+
+    max_vendor_ref_err = 0.0;
+    max_native_ref_err = 0.0;
+    max_vendor_native_diff = 0.0;
+    double* y_adj_vendor_ptr = y_adj_vendor.local_data();
+    double* y_adj_native_ptr = y_adj_native.local_data();
+    for (int i = 0; i < n_owned; ++i) {
+        const int gid_c = graph.owned_global_indices[i];
+        std::vector<double> y_ref(block_size, 0.0);
+        fill_adjoint_reference(gid_c, 17, y_ref);
+        for (int c = 0; c < block_size; ++c) {
+            const double vendor_val = y_adj_vendor_ptr[i * block_size + c];
+            const double native_val = y_adj_native_ptr[i * block_size + c];
+            max_vendor_ref_err = std::max(max_vendor_ref_err, std::abs(vendor_val - y_ref[c]));
+            max_native_ref_err = std::max(max_native_ref_err, std::abs(native_val - y_ref[c]));
+            max_vendor_native_diff = std::max(
+                max_vendor_native_diff,
+                std::abs(vendor_val - native_val));
+        }
+    }
+
+    const double global_adj_vendor_ref_err = mpi_max_double(MPI_COMM_WORLD, max_vendor_ref_err);
+    const double global_adj_native_ref_err = mpi_max_double(MPI_COMM_WORLD, max_native_ref_err);
+    const double global_adj_vendor_native_diff = mpi_max_double(MPI_COMM_WORLD, max_vendor_native_diff);
+
+    if (rank == 0) {
+        std::cout << "Adjoint MatVec Vendor-vs-Ref Max Error: " << global_adj_vendor_ref_err << std::endl;
+        std::cout << "Adjoint MatVec Native-vs-Ref Max Error: " << global_adj_native_ref_err << std::endl;
+        std::cout << "Adjoint MatVec Vendor-vs-Native Max Diff: " << global_adj_vendor_native_diff << std::endl;
+        if (std::max({global_adj_vendor_ref_err, global_adj_native_ref_err, global_adj_vendor_native_diff}) > 1e-12) {
+            std::cout << "  VERIFICATION FAILED" << std::endl;
+        } else {
+            std::cout << "  VERIFICATION PASSED" << std::endl;
+        }
+    }
+
+    backend.reset_vendor_launch_count();
+    const double native_adj_vec_seconds =
+        benchmark_max_seconds(MPI_COMM_WORLD, n_iter, [&] {
+            bsr_mult_adjoint_native_benchmark(&graph, backend, x_adj, y_adj_native);
+        });
+    backend.reset_vendor_launch_count();
+    const double vendor_adj_vec_seconds =
+        benchmark_max_seconds(MPI_COMM_WORLD, n_iter, [&] {
+            detail::bsr_mult_adjoint(&graph, backend, x_adj, y_adj_vendor);
+        });
+    const uint64_t adjoint_matvec_vendor_launches = backend.get_vendor_launch_count();
+
+    if (rank == 0) {
+        std::cout << "Adjoint MatVec Native Time (avg): " << (native_adj_vec_seconds / n_iter) << " s" << std::endl;
+        std::cout << "Adjoint MatVec Vendor Time (avg): " << (vendor_adj_vec_seconds / n_iter) << " s" << std::endl;
+        std::cout << "Adjoint MatVec Speedup (native/vendor): " << (native_adj_vec_seconds / vendor_adj_vec_seconds) << std::endl;
+        const double flops = (double)n_global_blocks * 3.0 * 2.0 * block_size * block_size;
+        std::cout << "Adjoint MatVec Native GFLOPS: " << (flops / (native_adj_vec_seconds / n_iter)) * 1e-9 << std::endl;
+        std::cout << "Adjoint MatVec Vendor GFLOPS: " << (flops / (vendor_adj_vec_seconds / n_iter)) * 1e-9 << std::endl;
+        std::cout << "Adjoint MatVec Vendor Launch Count: " << adjoint_matvec_vendor_launches << std::endl;
+    }
+
+    // 6. Adjoint MatMat Benchmark & Verify
+    DistMultiVector<double> X_adj(&graph, n_vecs);
+    DistMultiVector<double> Y_adj_vendor(&graph, n_vecs);
+    DistMultiVector<double> Y_adj_native(&graph, n_vecs);
+
+    for (int v = 0; v < n_vecs; ++v) {
+        double* col = X_adj.col_data(v);
+        for (int i = 0; i < n_owned; ++i) {
+            const int gid = graph.owned_global_indices[i];
+            for (int k = 0; k < block_size; ++k) {
+                col[i * block_size + k] = get_vec_val(gid, k, 100 + v);
+            }
+        }
+    }
+
+    detail::bsr_mult_dense_adjoint(&graph, backend, X_adj, Y_adj_vendor);
+    bsr_mult_dense_adjoint_native_benchmark(&graph, backend, X_adj, Y_adj_native);
+
+    max_vendor_ref_err = 0.0;
+    max_native_ref_err = 0.0;
+    max_vendor_native_diff = 0.0;
+    for (int v = 0; v < n_vecs; ++v) {
+        double* vendor_col_ptr = Y_adj_vendor.col_data(v);
+        double* native_col_ptr = Y_adj_native.col_data(v);
+        for (int i = 0; i < n_owned; ++i) {
+            const int gid_c = graph.owned_global_indices[i];
+            std::vector<double> y_ref(block_size, 0.0);
+            fill_adjoint_reference(gid_c, 100 + v, y_ref);
+            for (int c = 0; c < block_size; ++c) {
+                const double vendor_val = vendor_col_ptr[i * block_size + c];
+                const double native_val = native_col_ptr[i * block_size + c];
+                max_vendor_ref_err = std::max(max_vendor_ref_err, std::abs(vendor_val - y_ref[c]));
+                max_native_ref_err = std::max(max_native_ref_err, std::abs(native_val - y_ref[c]));
+                max_vendor_native_diff = std::max(
+                    max_vendor_native_diff,
+                    std::abs(vendor_val - native_val));
+            }
+        }
+    }
+
+    const double global_adj_dense_vendor_ref_err = mpi_max_double(MPI_COMM_WORLD, max_vendor_ref_err);
+    const double global_adj_dense_native_ref_err = mpi_max_double(MPI_COMM_WORLD, max_native_ref_err);
+    const double global_adj_dense_vendor_native_diff = mpi_max_double(MPI_COMM_WORLD, max_vendor_native_diff);
+
+    if (rank == 0) {
+        std::cout << "Adjoint MatMat Vendor-vs-Ref Max Error: " << global_adj_dense_vendor_ref_err << std::endl;
+        std::cout << "Adjoint MatMat Native-vs-Ref Max Error: " << global_adj_dense_native_ref_err << std::endl;
+        std::cout << "Adjoint MatMat Vendor-vs-Native Max Diff: " << global_adj_dense_vendor_native_diff << std::endl;
+        if (std::max({global_adj_dense_vendor_ref_err, global_adj_dense_native_ref_err, global_adj_dense_vendor_native_diff}) > 1e-12) {
+            std::cout << "  VERIFICATION FAILED" << std::endl;
+        } else {
+            std::cout << "  VERIFICATION PASSED" << std::endl;
+        }
+    }
+
+    backend.reset_vendor_launch_count();
+    const double native_adj_dense_seconds =
+        benchmark_max_seconds(MPI_COMM_WORLD, n_iter, [&] {
+            bsr_mult_dense_adjoint_native_benchmark(&graph, backend, X_adj, Y_adj_native);
+        });
+    backend.reset_vendor_launch_count();
+    const double vendor_adj_dense_seconds =
+        benchmark_max_seconds(MPI_COMM_WORLD, n_iter, [&] {
+            detail::bsr_mult_dense_adjoint(&graph, backend, X_adj, Y_adj_vendor);
+        });
+    const uint64_t adjoint_matmat_vendor_launches = backend.get_vendor_launch_count();
+
+    if (rank == 0) {
+        std::cout << "Adjoint MatMat Native Time (avg): " << (native_adj_dense_seconds / n_iter) << " s" << std::endl;
+        std::cout << "Adjoint MatMat Vendor Time (avg): " << (vendor_adj_dense_seconds / n_iter) << " s" << std::endl;
+        std::cout << "Adjoint MatMat Speedup (native/vendor): " << (native_adj_dense_seconds / vendor_adj_dense_seconds) << std::endl;
+        const double flops = (double)n_global_blocks * 3.0 * 2.0 * block_size * block_size * n_vecs;
+        std::cout << "Adjoint MatMat Native GFLOPS: " << (flops / (native_adj_dense_seconds / n_iter)) * 1e-9 << std::endl;
+        std::cout << "Adjoint MatMat Vendor GFLOPS: " << (flops / (vendor_adj_dense_seconds / n_iter)) * 1e-9 << std::endl;
+        std::cout << "Adjoint MatMat Vendor Launch Count: " << adjoint_matmat_vendor_launches << std::endl;
     }
 
     MPI_Finalize();

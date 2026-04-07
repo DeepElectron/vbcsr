@@ -28,6 +28,7 @@ struct VBCSRShapeBatchExecutor {
     };
 
     static void mult(const Matrix& matrix, DistVector<T>& x, DistVector<T>& y) {
+        BLASKernel::configure_native_threading();
         x.bind_to_graph(matrix.graph);
         y.bind_to_graph(matrix.graph);
         x.sync_ghosts();
@@ -57,6 +58,7 @@ struct VBCSRShapeBatchExecutor {
     }
 
     static void mult_dense(const Matrix& matrix, DistMultiVector<T>& X, DistMultiVector<T>& Y) {
+        BLASKernel::configure_native_threading();
         X.bind_to_graph(matrix.graph);
         Y.bind_to_graph(matrix.graph);
         X.sync_ghosts();
@@ -90,6 +92,7 @@ struct VBCSRShapeBatchExecutor {
     }
 
     static void mult_adjoint(const Matrix& matrix, DistVector<T>& x, DistVector<T>& y) {
+        BLASKernel::configure_native_threading();
         x.bind_to_graph(matrix.graph);
         y.bind_to_graph(matrix.graph);
         std::fill(y.data.begin(), y.data.end(), T(0));
@@ -119,6 +122,7 @@ struct VBCSRShapeBatchExecutor {
     }
 
     static void mult_dense_adjoint(const Matrix& matrix, DistMultiVector<T>& X, DistMultiVector<T>& Y) {
+        BLASKernel::configure_native_threading();
         X.bind_to_graph(matrix.graph);
         Y.bind_to_graph(matrix.graph);
         std::fill(Y.data.begin(), Y.data.end(), T(0));
