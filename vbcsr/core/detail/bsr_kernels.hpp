@@ -130,10 +130,10 @@ void bsr_mult(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistVector<T
         for (int row = 0; row < n_rows; ++row) {
             T* y_block = y.local_data() + graph->block_offsets[row];
             std::memset(y_block, 0, sizeof(T) * block_size);
-            backend.for_each_row_segment(row_ptr, row, [&](auto page, auto) {
-                for (uint32_t idx = 0; idx < page.nblocks; ++idx) {
-                    const int col = page.cols[idx];
-                    const T* block = page.vals + static_cast<size_t>(idx) * page.block_elems;
+            backend.for_each_row_slice(row_ptr, graph->adj_ind, row, [&](auto slice) {
+                for (uint32_t idx = 0; idx < slice.block_count; ++idx) {
+                    const int col = slice.cols[idx];
+                    const T* block = slice.values + static_cast<size_t>(idx) * slice.block_value_count;
                     const T* x_block = x.data.data() + graph->block_offsets[col];
                     SmartKernel<T>::gemv(block_size, block_size, T(1), block, block_size, x_block, 1, T(1), y_block, 1);
                 }
@@ -147,10 +147,10 @@ void bsr_mult(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistVector<T
         for (int row = 0; row < n_rows; ++row) {
             T* y_block = y.local_data() + graph->block_offsets[row];
             std::memset(y_block, 0, sizeof(T) * BlockSize);
-            backend.for_each_row_segment(row_ptr, row, [&](auto page, auto) {
-                for (uint32_t idx = 0; idx < page.nblocks; ++idx) {
-                    const int col = page.cols[idx];
-                    const T* block = page.vals + static_cast<size_t>(idx) * page.block_elems;
+            backend.for_each_row_slice(row_ptr, graph->adj_ind, row, [&](auto slice) {
+                for (uint32_t idx = 0; idx < slice.block_count; ++idx) {
+                    const int col = slice.cols[idx];
+                    const T* block = slice.values + static_cast<size_t>(idx) * slice.block_value_count;
                     const T* x_block = x.data.data() + graph->block_offsets[col];
                     FixedBlockKernel<T, BlockSize, BlockSize>::gemv(block, x_block, y_block, T(1), T(1));
                 }
@@ -195,10 +195,10 @@ void bsr_mult_dense(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistMu
         for (int row = 0; row < n_rows; ++row) {
             T* y_block = &y(graph->block_offsets[row], 0);
             bool first = true;
-            backend.for_each_row_segment(row_ptr, row, [&](auto page, auto) {
-                for (uint32_t idx = 0; idx < page.nblocks; ++idx) {
-                    const int col = page.cols[idx];
-                    const T* block = page.vals + static_cast<size_t>(idx) * page.block_elems;
+            backend.for_each_row_slice(row_ptr, graph->adj_ind, row, [&](auto slice) {
+                for (uint32_t idx = 0; idx < slice.block_count; ++idx) {
+                    const int col = slice.cols[idx];
+                    const T* block = slice.values + static_cast<size_t>(idx) * slice.block_value_count;
                     const T* x_block = &x(graph->block_offsets[col], 0);
                     SmartKernel<T>::gemm(
                         block_size,
@@ -229,10 +229,10 @@ void bsr_mult_dense(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistMu
         for (int row = 0; row < n_rows; ++row) {
             T* y_block = &y(graph->block_offsets[row], 0);
             bool first = true;
-            backend.for_each_row_segment(row_ptr, row, [&](auto page, auto) {
-                for (uint32_t idx = 0; idx < page.nblocks; ++idx) {
-                    const int col = page.cols[idx];
-                    const T* block = page.vals + static_cast<size_t>(idx) * page.block_elems;
+            backend.for_each_row_slice(row_ptr, graph->adj_ind, row, [&](auto slice) {
+                for (uint32_t idx = 0; idx < slice.block_count; ++idx) {
+                    const int col = slice.cols[idx];
+                    const T* block = slice.values + static_cast<size_t>(idx) * slice.block_value_count;
                     const T* x_block = &x(graph->block_offsets[col], 0);
                     FixedBlockKernel<T, BlockSize, BlockSize>::gemm(
                         num_vecs,
@@ -292,10 +292,10 @@ void bsr_mult_adjoint(DistGraph* graph, const BSRMatrixBackend<T>& backend, Dist
         #pragma omp for
         for (int row = 0; row < n_rows; ++row) {
             const T* x_block = x.local_data() + graph->block_offsets[row];
-            backend.for_each_row_segment(row_ptr, row, [&](auto page, auto) {
-                for (uint32_t idx = 0; idx < page.nblocks; ++idx) {
-                    const int col = page.cols[idx];
-                    const T* block = page.vals + static_cast<size_t>(idx) * page.block_elems;
+            backend.for_each_row_slice(row_ptr, graph->adj_ind, row, [&](auto slice) {
+                for (uint32_t idx = 0; idx < slice.block_count; ++idx) {
+                    const int col = slice.cols[idx];
+                    const T* block = slice.values + static_cast<size_t>(idx) * slice.block_value_count;
                     T* y_block = y_local.data() + graph->block_offsets[col];
                     bsr_block_gemv_trans(block_size, block, x_block, y_block, T(1), T(1));
                 }
@@ -338,10 +338,10 @@ void bsr_mult_dense_adjoint(
         #pragma omp for
         for (int row = 0; row < n_rows; ++row) {
             const T* x_block = &x(graph->block_offsets[row], 0);
-            backend.for_each_row_segment(row_ptr, row, [&](auto page, auto) {
-                for (uint32_t idx = 0; idx < page.nblocks; ++idx) {
-                    const int col = page.cols[idx];
-                    const T* block = page.vals + static_cast<size_t>(idx) * page.block_elems;
+            backend.for_each_row_slice(row_ptr, graph->adj_ind, row, [&](auto slice) {
+                for (uint32_t idx = 0; idx < slice.block_count; ++idx) {
+                    const int col = slice.cols[idx];
+                    const T* block = slice.values + static_cast<size_t>(idx) * slice.block_value_count;
                     T* y_block = y_local.data() + graph->block_offsets[col];
                     bsr_block_gemm_trans(block_size, num_vecs, block, x_block, x_ld, y_block, y_ld, T(1), T(1));
                 }

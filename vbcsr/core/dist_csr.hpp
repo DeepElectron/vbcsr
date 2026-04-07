@@ -35,8 +35,8 @@ template <typename T, typename Kernel>
 DistCSR<T> convert_to_csr(const BlockSpMat<T, Kernel>& mat) {
     DistCSR<T> csr;
     csr.comm = mat.graph->comm;
-    const auto& row_ptr = mat.logical_row_ptr();
-    const auto& col_ind = mat.logical_col_ind();
+    const auto& row_ptr = mat.row_ptr();
+    const auto& col_ind = mat.col_ind();
     int initialized = 0;
     MPI_Initialized(&initialized);
     int rank, size;

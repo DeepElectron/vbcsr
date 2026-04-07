@@ -79,10 +79,10 @@ void graph_matrix_function(BlockSpMat<T, Kernel>& A, BlockSpMat<T, Kernel>* Resu
                 int global_row = graph->owned_global_indices[idx];
                 // Identify Neighborhood C_i
                 std::vector<int> neighbors;
-                int start = A.row_ptr[idx]; // Use local index idx
-                int end = A.row_ptr[idx+1];
+                int start = A.row_ptr()[idx]; // Use local index idx
+                int end = A.row_ptr()[idx+1];
                 for (int k = start; k < end; ++k) {
-                    int col_lid = A.col_ind[k];
+                    int col_lid = A.col_ind()[k];
                     int col_gid = graph->get_global_index(col_lid);
                     neighbors.push_back(col_gid);
                 }

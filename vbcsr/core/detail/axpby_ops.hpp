@@ -22,7 +22,7 @@ struct CSRAxpbyExecutor {
     static void run(Matrix& self, const Matrix& X, T alpha, T beta) {
         Matrix::ensure_csr_binary_compatibility(self, X);
 
-        const bool local_same_structure = (self.row_ptr == X.row_ptr && self.col_ind == X.col_ind);
+        const bool local_same_structure = (self.row_ptr() == X.row_ptr() && self.col_ind() == X.col_ind());
         int same_structure_flag = local_same_structure ? 1 : 0;
         if (self.graph->size > 1) {
             MPI_Allreduce(MPI_IN_PLACE, &same_structure_flag, 1, MPI_INT, MPI_MIN, self.graph->comm);
@@ -41,7 +41,7 @@ struct CSRAxpbyExecutor {
 
         if (beta == T(0)) {
             DistGraph* new_graph = X.graph->duplicate();
-            CSRResultBuilder<T> builder(new_graph);
+            CSRResultBuilder<T> builder(new_graph, X.backend_page_settings().csr_page_size);
             #pragma omp parallel for
             for (size_t slot = 0; slot < X.local_block_nnz(); ++slot) {
                 *builder.slot_data(static_cast<int>(slot)) = alpha * (*X.block_data(static_cast<int>(slot)));
@@ -49,21 +49,22 @@ struct CSRAxpbyExecutor {
             self.template replace_with_builder<vbcsr::MatrixKind::CSR>(
                 new_graph,
                 true,
-                std::move(builder));
+                std::move(builder),
+                X.backend_page_settings());
             return;
         }
 
-        const int n_rows = static_cast<int>(self.row_ptr.size()) - 1;
+        const int n_rows = static_cast<int>(self.row_ptr().size()) - 1;
         std::vector<std::vector<int>> new_adj(n_rows);
         #pragma omp parallel for
         for (int row = 0; row < n_rows; ++row) {
             auto& cols = new_adj[row];
-            cols.reserve((self.row_ptr[row + 1] - self.row_ptr[row]) + (X.row_ptr[row + 1] - X.row_ptr[row]));
-            for (int slot = self.row_ptr[row]; slot < self.row_ptr[row + 1]; ++slot) {
-                cols.push_back(self.graph->get_global_index(self.col_ind[slot]));
+            cols.reserve((self.row_ptr()[row + 1] - self.row_ptr()[row]) + (X.row_ptr()[row + 1] - X.row_ptr()[row]));
+            for (int slot = self.row_ptr()[row]; slot < self.row_ptr()[row + 1]; ++slot) {
+                cols.push_back(self.graph->get_global_index(self.col_ind()[slot]));
             }
-            for (int slot = X.row_ptr[row]; slot < X.row_ptr[row + 1]; ++slot) {
-                cols.push_back(X.graph->get_global_index(X.col_ind[slot]));
+            for (int slot = X.row_ptr()[row]; slot < X.row_ptr()[row + 1]; ++slot) {
+                cols.push_back(X.graph->get_global_index(X.col_ind()[slot]));
             }
             std::sort(cols.begin(), cols.end());
             cols.erase(std::unique(cols.begin(), cols.end()), cols.end());
@@ -75,15 +76,15 @@ struct CSRAxpbyExecutor {
             owned_block_sizes(*self.graph),
             new_adj);
 
-        CSRResultBuilder<T> builder(new_graph);
+        CSRResultBuilder<T> builder(new_graph, self.backend_page_settings().csr_page_size);
         #pragma omp parallel for
         for (int row = 0; row < n_rows; ++row) {
             std::map<int, T> row_values;
-            for (int slot = self.row_ptr[row]; slot < self.row_ptr[row + 1]; ++slot) {
-                row_values[self.graph->get_global_index(self.col_ind[slot])] = beta * (*self.block_data(slot));
+            for (int slot = self.row_ptr()[row]; slot < self.row_ptr()[row + 1]; ++slot) {
+                row_values[self.graph->get_global_index(self.col_ind()[slot])] = beta * (*self.block_data(slot));
             }
-            for (int slot = X.row_ptr[row]; slot < X.row_ptr[row + 1]; ++slot) {
-                row_values[X.graph->get_global_index(X.col_ind[slot])] += alpha * (*X.block_data(slot));
+            for (int slot = X.row_ptr()[row]; slot < X.row_ptr()[row + 1]; ++slot) {
+                row_values[X.graph->get_global_index(X.col_ind()[slot])] += alpha * (*X.block_data(slot));
             }
             for (const auto& [global_col, value] : row_values) {
                 const int local_col = new_graph->global_to_local.at(global_col);
@@ -95,7 +96,8 @@ struct CSRAxpbyExecutor {
         self.template replace_with_builder<vbcsr::MatrixKind::CSR>(
             new_graph,
             true,
-            std::move(builder));
+            std::move(builder),
+            self.backend_page_settings());
     }
 };
 
@@ -106,7 +108,7 @@ struct BSRAxpbyExecutor {
     static void run(Matrix& self, const Matrix& X, T alpha, T beta) {
         Matrix::ensure_bsr_binary_compatibility(self, X);
 
-        const bool local_same_structure = (self.row_ptr == X.row_ptr && self.col_ind == X.col_ind);
+        const bool local_same_structure = (self.row_ptr() == X.row_ptr() && self.col_ind() == X.col_ind());
         int same_structure_flag = local_same_structure ? 1 : 0;
         if (self.graph->size > 1) {
             MPI_Allreduce(MPI_IN_PLACE, &same_structure_flag, 1, MPI_INT, MPI_MIN, self.graph->comm);
@@ -128,7 +130,7 @@ struct BSRAxpbyExecutor {
 
         if (beta == T(0)) {
             DistGraph* new_graph = X.graph->duplicate();
-            BSRResultBuilder<T> builder(new_graph);
+            BSRResultBuilder<T> builder(new_graph, X.backend_page_settings().bsr_page_size);
             #pragma omp parallel for
             for (size_t slot = 0; slot < X.local_block_nnz(); ++slot) {
                 T* dest = builder.slot_data(static_cast<int>(slot));
@@ -141,21 +143,22 @@ struct BSRAxpbyExecutor {
             self.template replace_with_builder<vbcsr::MatrixKind::BSR>(
                 new_graph,
                 true,
-                std::move(builder));
+                std::move(builder),
+                X.backend_page_settings());
             return;
         }
 
-        const int n_rows = static_cast<int>(self.row_ptr.size()) - 1;
+        const int n_rows = static_cast<int>(self.row_ptr().size()) - 1;
         std::vector<std::vector<int>> new_adj(n_rows);
         #pragma omp parallel for
         for (int row = 0; row < n_rows; ++row) {
             auto& cols = new_adj[row];
-            cols.reserve((self.row_ptr[row + 1] - self.row_ptr[row]) + (X.row_ptr[row + 1] - X.row_ptr[row]));
-            for (int slot = self.row_ptr[row]; slot < self.row_ptr[row + 1]; ++slot) {
-                cols.push_back(self.graph->get_global_index(self.col_ind[slot]));
+            cols.reserve((self.row_ptr()[row + 1] - self.row_ptr()[row]) + (X.row_ptr()[row + 1] - X.row_ptr()[row]));
+            for (int slot = self.row_ptr()[row]; slot < self.row_ptr()[row + 1]; ++slot) {
+                cols.push_back(self.graph->get_global_index(self.col_ind()[slot]));
             }
-            for (int slot = X.row_ptr[row]; slot < X.row_ptr[row + 1]; ++slot) {
-                cols.push_back(X.graph->get_global_index(X.col_ind[slot]));
+            for (int slot = X.row_ptr()[row]; slot < X.row_ptr()[row + 1]; ++slot) {
+                cols.push_back(X.graph->get_global_index(X.col_ind()[slot]));
             }
             std::sort(cols.begin(), cols.end());
             cols.erase(std::unique(cols.begin(), cols.end()), cols.end());
@@ -167,11 +170,11 @@ struct BSRAxpbyExecutor {
             owned_block_sizes(*self.graph),
             new_adj);
 
-        BSRResultBuilder<T> builder(new_graph);
+        BSRResultBuilder<T> builder(new_graph, self.backend_page_settings().bsr_page_size);
         #pragma omp parallel for
         for (int row = 0; row < n_rows; ++row) {
-            for (int slot = self.row_ptr[row]; slot < self.row_ptr[row + 1]; ++slot) {
-                const int local_col = new_graph->global_to_local.at(self.graph->get_global_index(self.col_ind[slot]));
+            for (int slot = self.row_ptr()[row]; slot < self.row_ptr()[row + 1]; ++slot) {
+                const int local_col = new_graph->global_to_local.at(self.graph->get_global_index(self.col_ind()[slot]));
                 const int dest_slot = builder.find_slot(row, local_col);
                 T* dest = builder.slot_data(dest_slot);
                 const T* src = self.block_data(slot);
@@ -181,8 +184,8 @@ struct BSRAxpbyExecutor {
                 }
             }
 
-            for (int slot = X.row_ptr[row]; slot < X.row_ptr[row + 1]; ++slot) {
-                const int local_col = new_graph->global_to_local.at(X.graph->get_global_index(X.col_ind[slot]));
+            for (int slot = X.row_ptr()[row]; slot < X.row_ptr()[row + 1]; ++slot) {
+                const int local_col = new_graph->global_to_local.at(X.graph->get_global_index(X.col_ind()[slot]));
                 const int dest_slot = builder.find_slot(row, local_col);
                 T* dest = builder.slot_data(dest_slot);
                 const T* src = X.block_data(slot);
@@ -196,7 +199,8 @@ struct BSRAxpbyExecutor {
         self.template replace_with_builder<vbcsr::MatrixKind::BSR>(
             new_graph,
             true,
-            std::move(builder));
+            std::move(builder),
+            self.backend_page_settings());
     }
 };
 
@@ -211,7 +215,7 @@ struct VBCSRAxpbyExecutor {
                 return;
             }
 
-            const bool same_structure = (self.row_ptr == X.row_ptr && self.col_ind == X.col_ind);
+            const bool same_structure = (self.row_ptr() == X.row_ptr() && self.col_ind() == X.col_ind());
             if (same_structure) {
                 copy_scaled_structure(self, X, alpha);
                 return;
@@ -225,8 +229,8 @@ struct VBCSRAxpbyExecutor {
         bool same_graph = (self.graph == X.graph);
         bool same_structure = false;
         if (same_graph) {
-            if (self.row_ptr.size() == X.row_ptr.size() && self.col_ind.size() == X.col_ind.size()) {
-                if (self.row_ptr == X.row_ptr && self.col_ind == X.col_ind) {
+            if (self.row_ptr().size() == X.row_ptr().size() && self.col_ind().size() == X.col_ind().size()) {
+                if (self.row_ptr() == X.row_ptr() && self.col_ind() == X.col_ind()) {
                     same_structure = true;
                 }
             }
@@ -246,8 +250,8 @@ struct VBCSRAxpbyExecutor {
             return;
         }
 
-        const int n_rows = static_cast<int>(self.row_ptr.size()) - 1;
-        if (static_cast<int>(X.row_ptr.size()) - 1 != n_rows) {
+        const int n_rows = static_cast<int>(self.row_ptr().size()) - 1;
+        if (static_cast<int>(X.row_ptr().size()) - 1 != n_rows) {
             throw std::runtime_error("Matrix row count mismatch in axpby");
         }
 
@@ -291,20 +295,20 @@ struct VBCSRAxpbyExecutor {
                 if (!sparsity_subset) {
                     continue;
                 }
-                int y_start = self.row_ptr[row];
-                const int y_end = self.row_ptr[row + 1];
-                const int x_start = X.row_ptr[row];
-                const int x_end = X.row_ptr[row + 1];
+                int y_start = self.row_ptr()[row];
+                const int y_end = self.row_ptr()[row + 1];
+                const int x_start = X.row_ptr()[row];
+                const int x_end = X.row_ptr()[row + 1];
 
                 int y_k = y_start;
                 for (int x_k = x_start; x_k < x_end; ++x_k) {
-                    const int x_col_local = X.col_ind[x_k];
+                    const int x_col_local = X.col_ind()[x_k];
                     const int target_col = x_to_this[x_col_local];
 
-                    while (y_k < y_end && self.col_ind[y_k] < target_col) {
+                    while (y_k < y_end && self.col_ind()[y_k] < target_col) {
                         ++y_k;
                     }
-                    if (y_k == y_end || self.col_ind[y_k] != target_col) {
+                    if (y_k == y_end || self.col_ind()[y_k] != target_col) {
                         sparsity_subset = false;
                         break;
                     }
@@ -322,17 +326,17 @@ struct VBCSRAxpbyExecutor {
                 self.scale(beta);
                 #pragma omp parallel for
                 for (int row = 0; row < n_rows; ++row) {
-                    int y_start = self.row_ptr[row];
-                    const int y_end = self.row_ptr[row + 1];
-                    const int x_start = X.row_ptr[row];
-                    const int x_end = X.row_ptr[row + 1];
+                    int y_start = self.row_ptr()[row];
+                    const int y_end = self.row_ptr()[row + 1];
+                    const int x_start = X.row_ptr()[row];
+                    const int x_end = X.row_ptr()[row + 1];
 
                     int y_k = y_start;
                     for (int x_k = x_start; x_k < x_end; ++x_k) {
-                        const int x_col_local = X.col_ind[x_k];
+                        const int x_col_local = X.col_ind()[x_k];
                         const int target_col = x_to_this[x_col_local];
 
-                        while (y_k < y_end && self.col_ind[y_k] < target_col) {
+                        while (y_k < y_end && self.col_ind()[y_k] < target_col) {
                             ++y_k;
                         }
                         T* y_ptr = self.mutable_block_data(y_k);
@@ -353,15 +357,15 @@ struct VBCSRAxpbyExecutor {
         #pragma omp parallel for
         for (int row = 0; row < n_rows; ++row) {
             std::vector<int>& cols = new_adj[row];
-            const int y_count = self.row_ptr[row + 1] - self.row_ptr[row];
-            const int x_count = X.row_ptr[row + 1] - X.row_ptr[row];
+            const int y_count = self.row_ptr()[row + 1] - self.row_ptr()[row];
+            const int x_count = X.row_ptr()[row + 1] - X.row_ptr()[row];
             cols.reserve(y_count + x_count);
 
-            for (int slot = self.row_ptr[row]; slot < self.row_ptr[row + 1]; ++slot) {
-                cols.push_back(self.graph->get_global_index(self.col_ind[slot]));
+            for (int slot = self.row_ptr()[row]; slot < self.row_ptr()[row + 1]; ++slot) {
+                cols.push_back(self.graph->get_global_index(self.col_ind()[slot]));
             }
-            for (int slot = X.row_ptr[row]; slot < X.row_ptr[row + 1]; ++slot) {
-                cols.push_back(X.graph->get_global_index(X.col_ind[slot]));
+            for (int slot = X.row_ptr()[row]; slot < X.row_ptr()[row + 1]; ++slot) {
+                cols.push_back(X.graph->get_global_index(X.col_ind()[slot]));
             }
 
             std::sort(cols.begin(), cols.end());
@@ -396,14 +400,16 @@ struct VBCSRAxpbyExecutor {
         std::vector<int> new_row_ptr;
         std::vector<int> new_col_ind;
         new_graph->get_matrix_structure(new_row_ptr, new_col_ind);
-        VBCSRResultBuilder<T, typename Matrix::KernelType> builder(new_graph);
+        VBCSRResultBuilder<T, typename Matrix::KernelType> builder(
+            new_graph,
+            self.backend_page_settings().vbcsr_page_size);
 
         #pragma omp parallel for
         for (int row = 0; row < n_rows; ++row) {
-            const int y_start = self.row_ptr[row];
-            const int y_end = self.row_ptr[row + 1];
-            const int x_start = X.row_ptr[row];
-            const int x_end = X.row_ptr[row + 1];
+            const int y_start = self.row_ptr()[row];
+            const int y_end = self.row_ptr()[row + 1];
+            const int x_start = X.row_ptr()[row];
+            const int x_end = X.row_ptr()[row + 1];
             const int start = new_row_ptr[row];
             const int end = new_row_ptr[row + 1];
 
@@ -413,15 +419,15 @@ struct VBCSRAxpbyExecutor {
             for (int slot = start; slot < end; ++slot) {
                 const int col = new_col_ind[slot];
 
-                while (y_k < y_end && canonical_less(self.col_ind[y_k], self.graph, col, new_graph)) {
+                while (y_k < y_end && canonical_less(self.col_ind()[y_k], self.graph, col, new_graph)) {
                     ++y_k;
                 }
-                const bool in_y = (y_k < y_end && !canonical_less(col, new_graph, self.col_ind[y_k], self.graph));
+                const bool in_y = (y_k < y_end && !canonical_less(col, new_graph, self.col_ind()[y_k], self.graph));
 
-                while (x_k < x_end && canonical_less(X.col_ind[x_k], X.graph, col, new_graph)) {
+                while (x_k < x_end && canonical_less(X.col_ind()[x_k], X.graph, col, new_graph)) {
                     ++x_k;
                 }
-                const bool in_x = (x_k < x_end && !canonical_less(col, new_graph, X.col_ind[x_k], X.graph));
+                const bool in_x = (x_k < x_end && !canonical_less(col, new_graph, X.col_ind()[x_k], X.graph));
 
                 T* dest_ptr = builder.slot_data(slot);
                 const size_t sz = static_cast<size_t>(new_graph->block_sizes[row]) *
@@ -456,7 +462,8 @@ struct VBCSRAxpbyExecutor {
         self.template replace_with_builder<vbcsr::MatrixKind::VBCSR>(
             new_graph,
             true,
-            std::move(builder));
+            std::move(builder),
+            self.backend_page_settings());
     }
 
 private:

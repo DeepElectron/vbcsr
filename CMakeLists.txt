@@ -226,10 +226,21 @@ else()
                 #include <aoclsparse.h>
                 int main() {
                     aoclsparse_matrix A = nullptr;
+                    aoclsparse_matrix Z = nullptr;
+                    aoclsparse_mat_descr descr = nullptr;
                     aoclsparse_int row_ptr[2] = {0, 1};
                     aoclsparse_int cols[1] = {0};
                     double vals[1] = {1.0};
-                    const aoclsparse_status status = aoclsparse_create_dcsr(
+                    const double alpha = 1.0;
+                    const double beta = 0.0;
+                    double x[1] = {1.0};
+                    double y[1] = {0.0};
+                    aoclsparse_double_complex zvals[1] = {{1.0, 0.0}};
+                    aoclsparse_double_complex zalpha{1.0, 0.0};
+                    aoclsparse_double_complex zbeta{0.0, 0.0};
+                    aoclsparse_double_complex zx[1] = {{1.0, 0.0}};
+                    aoclsparse_double_complex zy[1] = {{0.0, 0.0}};
+                    const aoclsparse_status create_d = aoclsparse_create_dcsr(
                         &A,
                         aoclsparse_index_base_zero,
                         1,
@@ -238,10 +249,78 @@ else()
                         row_ptr,
                         cols,
                         vals);
+                    const aoclsparse_status create_z = aoclsparse_create_zcsr(
+                        &Z,
+                        aoclsparse_index_base_zero,
+                        1,
+                        1,
+                        1,
+                        row_ptr,
+                        cols,
+                        zvals);
+                    const aoclsparse_status descr_status = aoclsparse_create_mat_descr(&descr);
+                    aoclsparse_set_mat_type(descr, aoclsparse_matrix_type_general);
+                    aoclsparse_set_mat_index_base(descr, aoclsparse_index_base_zero);
+                    const aoclsparse_status mv_hint =
+                        aoclsparse_set_mv_hint(A, aoclsparse_operation_none, descr, 1);
+                    const aoclsparse_status mm_hint =
+                        aoclsparse_set_mm_hint(A, aoclsparse_operation_none, descr, 1);
+                    const aoclsparse_status opt = aoclsparse_optimize(A);
+                    const aoclsparse_status mv = aoclsparse_dcsrmv(
+                        aoclsparse_operation_none,
+                        &alpha,
+                        1,
+                        1,
+                        1,
+                        vals,
+                        cols,
+                        row_ptr,
+                        descr,
+                        x,
+                        &beta,
+                        y);
+                    const aoclsparse_status mm = aoclsparse_dcsrmm(
+                        aoclsparse_operation_none,
+                        alpha,
+                        A,
+                        descr,
+                        aoclsparse_order_column,
+                        x,
+                        1,
+                        1,
+                        beta,
+                        y,
+                        1);
+                    const aoclsparse_status zmm = aoclsparse_zcsrmm(
+                        aoclsparse_operation_none,
+                        zalpha,
+                        Z,
+                        descr,
+                        aoclsparse_order_column,
+                        zx,
+                        1,
+                        1,
+                        zbeta,
+                        zy,
+                        1);
                     if (A != nullptr) {
-                        aoclsparse_destroy(A);
+                        aoclsparse_destroy(&A);
                     }
-                    return status == aoclsparse_status_success ? 0 : 1;
+                    if (Z != nullptr) {
+                        aoclsparse_destroy(&Z);
+                    }
+                    if (descr != nullptr) {
+                        aoclsparse_destroy_mat_descr(descr);
+                    }
+                    return (create_d == aoclsparse_status_success &&
+                            create_z == aoclsparse_status_success &&
+                            descr_status == aoclsparse_status_success &&
+                            mv_hint == aoclsparse_status_success &&
+                            mm_hint == aoclsparse_status_success &&
+                            opt == aoclsparse_status_success &&
+                            mv == aoclsparse_status_success &&
+                            mm == aoclsparse_status_success &&
+                            zmm == aoclsparse_status_success) ? 0 : 1;
                 }
             ]=] VBCSR_HAVE_AOCL_SPARSE)
             set(CMAKE_REQUIRED_LIBRARIES "${_vbcsr_saved_required_libs}")
@@ -488,6 +567,7 @@ if(VBCSR_ENABLE_TESTS)
     add_vbcsr_mpi_test(test_graphmf vbcsr/core/test/test_graphmf.cpp)
     add_vbcsr_mpi_test(test_dist_csr vbcsr/core/test/test_dist_csr.cpp)
     add_vbcsr_gtest(test_block_csr_export vbcsr/core/test/test_block_csr_export.cpp MPI_RANKS 2)
+    add_vbcsr_plain_test(test_shape_paged_storage vbcsr/core/test/test_shape_paged_storage.cpp)
 
     add_vbcsr_gtest(test_atomic_data vbcsr/core/atomic/test/test_atomic_data.cpp MPI_RANKS 2)
     add_vbcsr_mpi_test(test_image_container vbcsr/core/atomic/test/test_image_container.cpp MPI_RANKS 2)

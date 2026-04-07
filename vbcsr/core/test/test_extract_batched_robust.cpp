@@ -120,7 +120,7 @@ int main(int argc, char** argv) {
             const auto& sub = results[b_idx];
             
             // 1. Check Dimensions
-            if(sub.row_ptr.size() != indices.size() + 1) {
+            if(sub.row_ptr().size() != indices.size() + 1) {
                 std::cout << "Batch " << b_idx << ": Row ptr size mismatch." << std::endl;
                 exit(1);
             }
@@ -128,11 +128,11 @@ int main(int argc, char** argv) {
             // 2. Check Data Integrity
             for(size_t i=0; i<indices.size(); ++i) {
                 int global_row = indices[i];
-                int start = sub.row_ptr[i];
-                int end = sub.row_ptr[i+1];
+                int start = sub.row_ptr()[i];
+                int end = sub.row_ptr()[i+1];
                 
                 for(int k=start; k<end; ++k) {
-                    int col_lid = sub.col_ind[k];
+                    int col_lid = sub.col_ind()[k];
                     if(col_lid >= indices.size()) {
                          std::cout << "Batch " << b_idx << ": Col index out of bounds." << std::endl;
                          exit(1);

@@ -35,11 +35,11 @@ std::vector<T> gather_dense(BlockSpMat<T, SmartKernel<T>>& A, int global_rows, i
         int gid_row_start = block_offsets[gid_blk];
         int r_dim = A.graph->block_sizes[i];
         
-        int start = A.row_ptr[i];
-        int end = A.row_ptr[i+1];
+        int start = A.row_ptr()[i];
+        int end = A.row_ptr()[i+1];
         
         for(int k=start; k<end; ++k) {
-            int lid_col = A.col_ind[k];
+            int lid_col = A.col_ind()[k];
             int gid_col_blk = A.graph->get_global_index(lid_col);
             int gid_col_start = block_offsets[gid_col_blk];
             int c_dim = A.graph->block_sizes[lid_col];
@@ -176,8 +176,8 @@ void test_random_spmm(int n_block_rows, double density, int min_blk, int max_blk
     int n_owned = graph->owned_global_indices.size();
     std::uniform_real_distribution<> dis_val(-1.0, 1.0);
     for(int i=0; i<n_owned; ++i) {
-        int start = A.row_ptr[i];
-        int end = A.row_ptr[i+1];
+        int start = A.row_ptr()[i];
+        int end = A.row_ptr()[i+1];
         for(int k=start; k<end; ++k) {
             T* data = A.mutable_block_data(k);
             for(size_t n=0; n<A.block_size_elements(k); ++n) {
@@ -323,8 +323,8 @@ void test_diverse_spmm(int n_block_rows, double base_density, int min_blk, int m
     // 6. Fill with random values
     std::uniform_real_distribution<> dis_val(-1.0, 1.0);
     for(int i=0; i<my_count; ++i) {
-        int start = A.row_ptr[i];
-        int end = A.row_ptr[i+1];
+        int start = A.row_ptr()[i];
+        int end = A.row_ptr()[i+1];
         for(int k=start; k<end; ++k) {
             T* data = A.mutable_block_data(k);
             for(size_t n=0; n<A.block_size_elements(k); ++n) {
@@ -449,7 +449,7 @@ void test_filtered_spmm(bool test_complex = false) {
     // Verify C structure
     // Should have 0->0, 0->1. Should NOT have 0->2.
     
-    int c_nnz = C.col_ind.size();
+    int c_nnz = C.col_ind().size();
     int expected_nnz_per_row = 2; // I and P
     
     // Count local nnz
@@ -464,7 +464,7 @@ void test_filtered_spmm(bool test_complex = false) {
     
     // Test Duplicate
     BlockSpMat<T, SmartKernel<T>> C_dup = C.duplicate();
-    if (C_dup.col_ind.size() != C.col_ind.size()) {
+    if (C_dup.col_ind().size() != C.col_ind().size()) {
         if (rank == 0) std::cout << "Duplicate failed to preserve structure size" << std::endl;
     }
     
@@ -478,13 +478,13 @@ void test_filtered_spmm(bool test_complex = false) {
     B.filter_blocks(1.0);
     
     // Check B has only diagonals
-    if (B.col_ind.size() != my_count) {
-         if (rank == 0) std::cout << "Filter failed to remove off-diagonals. Size: " << B.col_ind.size() << std::endl;
+    if (B.col_ind().size() != my_count) {
+         if (rank == 0) std::cout << "Filter failed to remove off-diagonals. Size: " << B.col_ind().size() << std::endl;
     }
     
     // Check A is untouched
-    if (A.col_ind.size() != my_count * 2) {
-         if (rank == 0) std::cout << "Filter on B affected A! A size: " << A.col_ind.size() << std::endl;
+    if (A.col_ind().size() != my_count * 2) {
+         if (rank == 0) std::cout << "Filter on B affected A! A size: " << A.col_ind().size() << std::endl;
     }
     
     if (B.graph == A.graph) {

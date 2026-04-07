@@ -55,10 +55,10 @@ GhostMetadata exchange_ghost_metadata(const MatrixA& A, const MatrixB& B) {
     const int rank = A.graph->rank;
 
     std::set<int> needed_rows;
-    const int n_rows = static_cast<int>(A.row_ptr.size()) - 1;
+    const int n_rows = static_cast<int>(A.row_ptr().size()) - 1;
     for (int i = 0; i < n_rows; ++i) {
-        for (int k = A.row_ptr[i]; k < A.row_ptr[i + 1]; ++k) {
-            const int global_col = A.graph->get_global_index(A.col_ind[k]);
+        for (int k = A.row_ptr()[i]; k < A.row_ptr()[i + 1]; ++k) {
+            const int global_col = A.graph->get_global_index(A.col_ind()[k]);
             if (B.graph->find_owner(global_col) != rank) {
                 needed_rows.insert(global_col);
             }
@@ -101,7 +101,7 @@ GhostMetadata exchange_ghost_metadata(const MatrixA& A, const MatrixB& B) {
             const int global_row = *req_ptr++;
             if (B.graph->global_to_local.count(global_row)) {
                 const int local_row = B.graph->global_to_local.at(global_row);
-                const int n_blocks = B.row_ptr[local_row + 1] - B.row_ptr[local_row];
+                const int n_blocks = B.row_ptr()[local_row + 1] - B.row_ptr()[local_row];
                 send_reply_bytes[i] += 2 * sizeof(int) + n_blocks * (sizeof(int) + sizeof(double));
             }
         }
@@ -127,8 +127,8 @@ GhostMetadata exchange_ghost_metadata(const MatrixA& A, const MatrixB& B) {
             const int global_row = *req_ptr++;
             if (B.graph->global_to_local.count(global_row)) {
                 const int local_row = B.graph->global_to_local.at(global_row);
-                const int start = B.row_ptr[local_row];
-                const int end = B.row_ptr[local_row + 1];
+                const int start = B.row_ptr()[local_row];
+                const int end = B.row_ptr()[local_row + 1];
                 const int n_blocks = end - start;
 
                 std::memcpy(blob_ptr, &global_row, sizeof(int));
@@ -136,7 +136,7 @@ GhostMetadata exchange_ghost_metadata(const MatrixA& A, const MatrixB& B) {
                 std::memcpy(blob_ptr, &n_blocks, sizeof(int));
                 blob_ptr += sizeof(int);
                 for (int k = start; k < end; ++k) {
-                    const int col = B.graph->get_global_index(B.col_ind[k]);
+                    const int col = B.graph->get_global_index(B.col_ind()[k]);
                     const double norm = b_norms[k];
                     std::memcpy(blob_ptr, &col, sizeof(int));
                     blob_ptr += sizeof(int);
@@ -231,10 +231,10 @@ std::pair<GhostBlockData<typename Matrix::value_type>, GhostSizes> fetch_ghost_b
             const int g_col = *req_ptr++;
             if (matrix.graph->global_to_local.count(g_row)) {
                 const int l_row = matrix.graph->global_to_local.at(g_row);
-                for (int k = matrix.row_ptr[l_row]; k < matrix.row_ptr[l_row + 1]; ++k) {
-                    if (matrix.graph->get_global_index(matrix.col_ind[k]) == g_col) {
+                for (int k = matrix.row_ptr()[l_row]; k < matrix.row_ptr()[l_row + 1]; ++k) {
+                    if (matrix.graph->get_global_index(matrix.col_ind()[k]) == g_col) {
                         const int r_dim = matrix.graph->block_sizes[l_row];
-                        const int c_dim = matrix.graph->block_sizes[matrix.col_ind[k]];
+                        const int c_dim = matrix.graph->block_sizes[matrix.col_ind()[k]];
                         send_reply_bytes[i] += 4 * sizeof(int) + static_cast<size_t>(r_dim) * c_dim * sizeof(T);
                         break;
                     }
@@ -264,10 +264,10 @@ std::pair<GhostBlockData<typename Matrix::value_type>, GhostSizes> fetch_ghost_b
             const int g_col = *req_ptr++;
             if (matrix.graph->global_to_local.count(g_row)) {
                 const int l_row = matrix.graph->global_to_local.at(g_row);
-                for (int k = matrix.row_ptr[l_row]; k < matrix.row_ptr[l_row + 1]; ++k) {
-                    if (matrix.graph->get_global_index(matrix.col_ind[k]) == g_col) {
+                for (int k = matrix.row_ptr()[l_row]; k < matrix.row_ptr()[l_row + 1]; ++k) {
+                    if (matrix.graph->get_global_index(matrix.col_ind()[k]) == g_col) {
                         const int r_dim = matrix.graph->block_sizes[l_row];
-                        const int c_dim = matrix.graph->block_sizes[matrix.col_ind[k]];
+                        const int c_dim = matrix.graph->block_sizes[matrix.col_ind()[k]];
                         const size_t n_elem = static_cast<size_t>(r_dim) * c_dim;
 
                         std::memcpy(blob_ptr, &g_row, sizeof(int));

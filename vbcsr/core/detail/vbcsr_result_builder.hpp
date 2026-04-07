@@ -5,6 +5,7 @@
 #include "../dist_graph.hpp"
 
 #include <algorithm>
+#include <map>
 #include <stdexcept>
 #include <vector>
 
@@ -13,26 +14,43 @@ namespace vbcsr::detail {
 template <typename T, typename Kernel>
 class VBCSRResultBuilder {
 public:
-    explicit VBCSRResultBuilder(DistGraph* graph) : graph_(graph) {
+    explicit VBCSRResultBuilder(
+        DistGraph* graph,
+        uint32_t max_slots_per_shape_page = VBCSRMatrixBackend<T, Kernel>::hard_safe_slots_per_page())
+        : graph_(graph),
+          backend_(max_slots_per_shape_page) {
         if (graph_ == nullptr) {
             return;
         }
 
         const size_t nnz = graph_->adj_ind.size();
         backend_.blk_handles.resize(nnz);
-        backend_.slot_shape_ids.resize(nnz, -1);
+        std::map<std::pair<int, int>, size_t> shape_counts;
         const int n_rows = static_cast<int>(graph_->owned_global_indices.size());
         for (int row = 0; row < n_rows; ++row) {
             const int row_dim = graph_->block_sizes[row];
             for (int slot = graph_->adj_ptr[row]; slot < graph_->adj_ptr[row + 1]; ++slot) {
                 const int col = graph_->adj_ind[slot];
                 const int col_dim = graph_->block_sizes[col];
-                const int shape_id = backend_.ensure_shape(row_dim, col_dim);
-                const uint64_t handle = backend_.allocate_slot_for_shape(shape_id);
-                backend_.bind_logical_slot(slot, shape_id, handle);
+                ++shape_counts[std::make_pair(row_dim, col_dim)];
             }
         }
-        backend_.rebuild_shape_registry(graph_, graph_->adj_ptr, graph_->adj_ind);
+
+        for (const auto& [shape, count] : shape_counts) {
+            backend_.ensure_shape(shape.first, shape.second, count);
+        }
+
+        for (int row = 0; row < n_rows; ++row) {
+            const int row_dim = graph_->block_sizes[row];
+            for (int slot = graph_->adj_ptr[row]; slot < graph_->adj_ptr[row + 1]; ++slot) {
+                const int col = graph_->adj_ind[slot];
+                const int col_dim = graph_->block_sizes[col];
+                const int shape_id =
+                    backend_.ensure_shape(row_dim, col_dim, shape_counts[std::make_pair(row_dim, col_dim)]);
+                backend_.blk_handles[static_cast<size_t>(slot)] =
+                    backend_.append_block_for_shape(shape_id, slot);
+            }
+        }
     }
 
     void accumulate_block(int slot, const T* src, T alpha = T(1)) {
@@ -56,7 +74,6 @@ public:
     }
 
     VBCSRMatrixBackend<T, Kernel> commit() && {
-        backend_.rebuild_shape_registry(graph_, graph_->adj_ptr, graph_->adj_ind);
         return std::move(backend_);
     }
 

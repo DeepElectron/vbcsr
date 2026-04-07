@@ -241,10 +241,10 @@ void bind_block_spmat(py::module& m, const std::string& name) {
         }, py::arg("array"))
         .def("spmf", &py_graph_matrix_function<T>, py::arg("func_name"), py::arg("method") = "lanczos", py::arg("verbose") = false)
         .def_property_readonly("row_ptr", [](const BlockSpMat<T>& self) {
-            return make_owned_array_1d(self.logical_row_ptr());
+            return make_owned_array_1d(self.row_ptr());
         })
         .def_property_readonly("col_ind", [](const BlockSpMat<T>& self) {
-            return make_owned_array_1d(self.logical_col_ind());
+            return make_owned_array_1d(self.col_ind());
         })
         ;
 }

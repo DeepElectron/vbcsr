@@ -28,16 +28,16 @@ TransposeExchangeResult<typename Matrix::value_type> exchange_transpose_blocks(c
     }
 
     const int size = matrix.graph->size;
-    const int n_rows = static_cast<int>(matrix.row_ptr.size()) - 1;
+    const int n_rows = static_cast<int>(matrix.row_ptr().size()) - 1;
 
     std::vector<size_t> send_counts(size, 0);
     std::vector<size_t> send_data_counts(size, 0);
     for (int i = 0; i < n_rows; ++i) {
         const int r_dim = matrix.graph->block_sizes[i];
-        for (int k = matrix.row_ptr[i]; k < matrix.row_ptr[i + 1]; ++k) {
-            const int g_col = matrix.graph->get_global_index(matrix.col_ind[k]);
+        for (int k = matrix.row_ptr()[i]; k < matrix.row_ptr()[i + 1]; ++k) {
+            const int g_col = matrix.graph->get_global_index(matrix.col_ind()[k]);
             const int owner = matrix.graph->find_owner(g_col);
-            const int c_dim = matrix.graph->block_sizes[matrix.col_ind[k]];
+            const int c_dim = matrix.graph->block_sizes[matrix.col_ind()[k]];
             send_counts[owner] += 4;
             send_data_counts[owner] += static_cast<size_t>(r_dim) * c_dim;
         }
@@ -69,10 +69,10 @@ TransposeExchangeResult<typename Matrix::value_type> exchange_transpose_blocks(c
     for (int i = 0; i < n_rows; ++i) {
         const int g_row = matrix.graph->owned_global_indices[i];
         const int r_dim = matrix.graph->block_sizes[i];
-        for (int k = matrix.row_ptr[i]; k < matrix.row_ptr[i + 1]; ++k) {
-            const int g_col = matrix.graph->get_global_index(matrix.col_ind[k]);
+        for (int k = matrix.row_ptr()[i]; k < matrix.row_ptr()[i + 1]; ++k) {
+            const int g_col = matrix.graph->get_global_index(matrix.col_ind()[k]);
             const int owner = matrix.graph->find_owner(g_col);
-            const int c_dim = matrix.graph->block_sizes[matrix.col_ind[k]];
+            const int c_dim = matrix.graph->block_sizes[matrix.col_ind()[k]];
 
             int* meta_ptr = send_meta.data() + sdispls[owner] + current_counts[owner];
             meta_ptr[0] = g_col;

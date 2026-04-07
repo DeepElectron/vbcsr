@@ -251,12 +251,12 @@ public:
 
             #pragma omp parallel for
             for (int local_row = 0; local_row < n_owned; ++local_row) {
-                const int start = mat_r->row_ptr[local_row];
-                const int end = mat_r->row_ptr[local_row + 1];
+                const int start = mat_r->row_ptr()[local_row];
+                const int end = mat_r->row_ptr()[local_row + 1];
                 const int row_dim = graph_r->block_sizes[local_row];
 
                 for (int k = start; k < end; ++k) {
-                    const int local_col_r = mat_r->col_ind[k];
+                    const int local_col_r = mat_r->col_ind()[k];
                     const int local_col_ref = col_map[local_col_r];
                     const ResultT block_weight =
                         image_weight * static_cast<ResultT>(block_weight_fn(local_row, local_col_ref));

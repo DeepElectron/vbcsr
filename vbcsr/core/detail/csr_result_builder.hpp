@@ -13,11 +13,15 @@ namespace vbcsr::detail {
 template <typename T>
 class CSRResultBuilder {
 public:
-    explicit CSRResultBuilder(DistGraph* graph, uint32_t nnz_per_page = 0) : graph_(graph) {
+    explicit CSRResultBuilder(
+        DistGraph* graph,
+        uint32_t nnz_per_page = CSRMatrixBackend<T>::hard_safe_nnz_per_page())
+        : graph_(graph),
+          backend_(nnz_per_page) {
         if (graph_ == nullptr) {
             return;
         }
-        backend_.initialize_structure(graph_->adj_ind, nnz_per_page);
+        backend_.initialize_structure(graph_->adj_ind.size());
     }
 
     void accumulate_block(int slot, const T* src, T alpha = T(1)) {

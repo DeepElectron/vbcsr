@@ -62,11 +62,14 @@ public:
         const auto& B_local_norms = B.get_block_norms();
 
         DistGraph* c_graph = assembly_plan.construct_result_graph(A, "spmm");
-        VBCSRResultBuilder<T, Kernel> builder(c_graph);
+        VBCSRResultBuilder<T, Kernel> builder(
+            c_graph,
+            A.backend_page_settings().vbcsr_page_size);
         Matrix C = Matrix::template materialize_from_builder<vbcsr::MatrixKind::VBCSR>(
             c_graph,
             true,
-            std::move(builder));
+            std::move(builder),
+            A.backend_page_settings());
 
         numeric_multiply(A, B, assembly_plan.ghost_rows(), C, threshold, A_norms, B_local_norms);
         C.filter_blocks(threshold);
@@ -94,7 +97,7 @@ private:
         const std::vector<double>& A_norms,
         const std::vector<double>& B_local_norms) {
         using ExecutionKind = typename Matrix::VBCSRBackendStorage::ExecutionKind;
-        const int n_rows = static_cast<int>(A.row_ptr.size()) - 1;
+        const int n_rows = static_cast<int>(A.row_ptr().size()) - 1;
 
         const int max_threads = omp_get_max_threads();
         const size_t HASH_SIZE = 8192;
@@ -122,10 +125,10 @@ private:
                     tag = 1;
                 }
 
-                const int c_start = C.row_ptr[row];
-                const int c_end = C.row_ptr[row + 1];
+                const int c_start = C.row_ptr()[row];
+                const int c_end = C.row_ptr()[row + 1];
                 for (int slot = c_start; slot < c_end; ++slot) {
-                    const int local_col = C.col_ind[slot];
+                    const int local_col = C.col_ind()[slot];
                     const int global_col = C.graph->get_global_index(local_col);
 
                     size_t h = static_cast<size_t>(global_col) & HASH_MASK;
@@ -139,15 +142,15 @@ private:
                     table[h] = {global_col, slot, tag};
                 }
 
-                const int a_start = A.row_ptr[row];
-                const int a_end = A.row_ptr[row + 1];
+                const int a_start = A.row_ptr()[row];
+                const int a_end = A.row_ptr()[row + 1];
                 const int r_dim = A.graph->block_sizes[row];
 
                 for (int a_slot = a_start; a_slot < a_end; ++a_slot) {
                     const int row_count = a_end - a_start;
                     const double row_eps = threshold / std::max(1, row_count);
 
-                    const int local_col_A = A.col_ind[a_slot];
+                    const int local_col_A = A.col_ind()[a_slot];
                     const int global_col_A = A.graph->get_global_index(local_col_A);
                     const T* a_val = A.block_data(a_slot);
                     const int inner_dim = A.graph->block_sizes[local_col_A];
@@ -155,15 +158,15 @@ private:
 
                     if (A.graph->find_owner(global_col_A) == A.graph->rank) {
                         const int local_row_B = B.graph->global_to_local.at(global_col_A);
-                        const int b_start = B.row_ptr[local_row_B];
-                        const int b_end = B.row_ptr[local_row_B + 1];
+                        const int b_start = B.row_ptr()[local_row_B];
+                        const int b_end = B.row_ptr()[local_row_B + 1];
                         for (int b_slot = b_start; b_slot < b_end; ++b_slot) {
                             const double norm_B = B_local_norms[b_slot];
                             if (norm_A * norm_B < row_eps) {
                                 continue;
                             }
 
-                            const int local_col_B = B.col_ind[b_slot];
+                            const int local_col_B = B.col_ind()[b_slot];
                             const int global_col_B = B.graph->get_global_index(local_col_B);
                             const T* b_val = B.block_data(b_slot);
                             const int c_dim = B.graph->block_sizes[local_col_B];

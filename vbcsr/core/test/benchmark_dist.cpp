@@ -88,11 +88,11 @@ int main(int argc, char** argv) {
     t0 = MPI_Wtime();
     for (int i = 0; i < n_owned; ++i) {
         int gid_r = graph.owned_global_indices[i];
-        int start = mat.row_ptr[i];
-        int end = mat.row_ptr[i+1];
+        int start = mat.row_ptr()[i];
+        int end = mat.row_ptr()[i+1];
         for (int k = start; k < end; ++k) {
             double* data = mat.mutable_block_data(k);
-            int lid_c = mat.col_ind[k];
+            int lid_c = mat.col_ind()[k];
             
             // Resolve GID for column
             int gid_c;

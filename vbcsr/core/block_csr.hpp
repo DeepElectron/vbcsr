@@ -89,6 +89,13 @@ struct MMWriter<std::complex<T>> {
     static bool is_complex() { return true; }
 };
 
+struct BackendPageSettings {
+    uint32_t csr_page_size = detail::CSRMatrixBackend<double>::page_size_limit();
+    uint32_t bsr_page_size = std::numeric_limits<uint32_t>::max();
+    uint32_t vbcsr_page_size =
+        detail::VBCSRMatrixBackend<double, DefaultKernel<double>>::hard_safe_slots_per_page();
+};
+
 template <typename T, typename Kernel = DefaultKernel<T>>
 class BlockSpMat {
 private:
@@ -125,9 +132,8 @@ private:
 
     struct ConstructionToken {};
 
-    std::vector<int> detached_row_ptr_storage_;
-    std::vector<int> detached_col_ind_storage_;
     BackendHandle backend_handle_;
+    BackendPageSettings page_settings_;
 
 public:
     // Public facade state and view types.
@@ -137,7 +143,7 @@ public:
 
     struct ConstLocalBlockView {
         // Flat local nonzero-block index. Slots run across the local sparsity pattern:
-        // for row r, the row's slots are row_ptr[r] .. row_ptr[r + 1) - 1.
+        // for row r, the row's slots are graph->adj_ptr[r] .. graph->adj_ptr[r + 1) - 1.
         int slot = -1;
         int row = -1;
         int col = -1;
@@ -159,10 +165,6 @@ public:
         T* values = nullptr;
     };
     
-    // Logical block structure views (local indices), graph-backed in steady state
-    detail::ConstBoundVector<int> row_ptr;
-    detail::ConstBoundVector<int> col_ind;
-
     // Cached block norms
     mutable std::vector<double> block_norms;
     mutable bool norms_valid = false;
@@ -185,16 +187,78 @@ public:
         return std::string(vbcsr::matrix_kind_name(kind));
     }
 
-    const std::vector<int>& logical_row_ptr() const {
-        return active_row_ptr();
+    const std::vector<int>& row_ptr() const {
+        return require_live_graph(graph, "row_ptr")->adj_ptr;
     }
 
-    const std::vector<int>& logical_col_ind() const {
-        return active_col_ind();
+    const std::vector<int>& col_ind() const {
+        return require_live_graph(graph, "col_ind")->adj_ind;
     }
 
     size_t local_block_nnz() const {
-        return active_col_ind().size();
+        return graph->adj_ind.size();
+    }
+
+    static BackendPageSettings default_backend_page_settings() {
+        return BackendPageSettings{};
+    }
+
+    const BackendPageSettings& backend_page_settings() const {
+        return page_settings_;
+    }
+
+    void set_backend_page_settings(const BackendPageSettings& settings) {
+        BackendPageSettings normalized = normalize_backend_page_settings(settings, kind, graph);
+        if (page_settings_.csr_page_size == normalized.csr_page_size &&
+            page_settings_.bsr_page_size == normalized.bsr_page_size &&
+            page_settings_.vbcsr_page_size == normalized.vbcsr_page_size) {
+            return;
+        }
+
+        const bool current_backend_changed =
+            (kind == MatrixKind::CSR &&
+             page_settings_.csr_page_size != normalized.csr_page_size) ||
+            (kind == MatrixKind::BSR &&
+             page_settings_.bsr_page_size != normalized.bsr_page_size) ||
+            (kind == MatrixKind::VBCSR &&
+             page_settings_.vbcsr_page_size != normalized.vbcsr_page_size);
+        page_settings_ = normalized;
+        if (!current_backend_changed ||
+            graph == nullptr ||
+            std::holds_alternative<std::monostate>(backend_handle_)) {
+            return;
+        }
+        rebuild_backend_for_page_settings("set_backend_page_settings");
+    }
+
+    void set_csr_page_size(uint32_t page_size) {
+        BackendPageSettings settings = page_settings_;
+        settings.csr_page_size = page_size;
+        set_backend_page_settings(settings);
+    }
+
+    void set_bsr_page_size(uint32_t page_size) {
+        BackendPageSettings settings = page_settings_;
+        settings.bsr_page_size = page_size;
+        set_backend_page_settings(settings);
+    }
+
+    void set_vbcsr_page_size(uint32_t page_size) {
+        BackendPageSettings settings = page_settings_;
+        settings.vbcsr_page_size = page_size;
+        set_backend_page_settings(settings);
+    }
+
+    uint32_t active_page_size() const {
+        switch (kind) {
+        case MatrixKind::CSR:
+            return active_csr_backend().page_size();
+        case MatrixKind::BSR:
+            return active_bsr_backend().page_size();
+        case MatrixKind::VBCSR:
+            return active_vbcsr_backend().configured_max_slots_per_page();
+        }
+        return 0;
     }
 
     bool is_contiguous() const {
@@ -209,15 +273,15 @@ public:
         if (kind != MatrixKind::VBCSR) {
             return;
         }
-        active_vbcsr_backend().pack_contiguous(graph, active_row_ptr(), active_col_ind());
+        active_vbcsr_backend().pack_contiguous(graph, graph->adj_ptr, graph->adj_ind);
     }
 
     size_t local_scalar_nnz() const {
         if (kind == MatrixKind::CSR) {
-            return active_csr_backend().local_scalar_nnz();
+            return static_cast<size_t>(active_csr_backend().nnz_count());
         }
         if (kind == MatrixKind::BSR) {
-            return active_bsr_backend().local_scalar_nnz();
+            return static_cast<size_t>(active_bsr_backend().value_count());
         }
         return active_vbcsr_backend().local_scalar_nnz();
     }
@@ -246,20 +310,20 @@ public:
     }
 
     int block_row_count() const {
-        const auto& structure_row_ptr = active_row_ptr();
+        const auto& structure_row_ptr = graph->adj_ptr;
         return structure_row_ptr.empty() ? 0 : static_cast<int>(structure_row_ptr.size()) - 1;
     }
 
     // Map a flat local slot back to its owning local block row.
     int block_row_from_slot(int slot) const {
-        const auto& structure_row_ptr = active_row_ptr();
+        const auto& structure_row_ptr = graph->adj_ptr;
         auto it = std::upper_bound(structure_row_ptr.begin(), structure_row_ptr.end(), slot);
         return std::max(0, static_cast<int>(std::distance(structure_row_ptr.begin(), it) - 1));
     }
 
     // Return the local block column of a flat local slot.
     int block_col_from_slot(int slot) const {
-        return active_col_ind()[slot];
+        return graph->adj_ind[slot];
     }
 
     int block_row_dim(int local_row) const {
@@ -307,7 +371,7 @@ public:
             return 1;
         }
         if (kind == MatrixKind::BSR) {
-            return active_bsr_backend().block_elems();
+            return active_bsr_backend().block_value_count();
         }
         if (kind == MatrixKind::VBCSR) {
             return active_vbcsr_backend().block_size_elements(slot);
@@ -317,7 +381,7 @@ public:
 
     ConstLocalBlockView local_block_view(int slot) const {
         const int row = block_row_from_slot(slot);
-        const int col = active_col_ind()[slot];
+        const int col = graph->adj_ind[slot];
         return ConstLocalBlockView{
             slot,
             row,
@@ -330,7 +394,7 @@ public:
 
     LocalBlockView local_block_view(int slot) {
         const int row = block_row_from_slot(slot);
-        const int col = active_col_ind()[slot];
+        const int col = graph->adj_ind[slot];
         return LocalBlockView{
             slot,
             row,
@@ -344,8 +408,8 @@ public:
     template <typename Fn>
     void for_each_local_block(Fn&& fn) const {
         const int n_rows = block_row_count();
-        const auto& structure_row_ptr = active_row_ptr();
-        const auto& structure_col_ind = active_col_ind();
+        const auto& structure_row_ptr = graph->adj_ptr;
+        const auto& structure_col_ind = graph->adj_ind;
         for (int row = 0; row < n_rows; ++row) {
             const int row_dim = graph->block_sizes[row];
             for (int slot = structure_row_ptr[row]; slot < structure_row_ptr[row + 1]; ++slot) {
@@ -365,8 +429,8 @@ public:
     template <typename Fn>
     void for_each_local_block(Fn&& fn) {
         const int n_rows = block_row_count();
-        const auto& structure_row_ptr = active_row_ptr();
-        const auto& structure_col_ind = active_col_ind();
+        const auto& structure_row_ptr = graph->adj_ptr;
+        const auto& structure_col_ind = graph->adj_ind;
         for (int row = 0; row < n_rows; ++row) {
             const int row_dim = graph->block_sizes[row];
             for (int slot = structure_row_ptr[row]; slot < structure_row_ptr[row + 1]; ++slot) {
@@ -385,7 +449,11 @@ public:
 
     // Lifetime and copy/move semantics.
     BlockSpMat(DistGraph* g)
-        : BlockSpMat(g, detect_matrix_kind(g), false, ConstructionToken{}) {
+        : BlockSpMat(
+              require_live_graph(g, "BlockSpMat"),
+              detect_matrix_kind(require_live_graph(g, "BlockSpMat")),
+              false,
+              ConstructionToken{}) {
         allocate_from_graph();
     }
 
@@ -397,22 +465,17 @@ public:
     // Move constructor
     BlockSpMat(BlockSpMat&& other) noexcept : 
         kind(other.kind),
-        detached_row_ptr_storage_(std::move(other.detached_row_ptr_storage_)),
-        detached_col_ind_storage_(std::move(other.detached_col_ind_storage_)),
         backend_handle_(std::move(other.backend_handle_)),
+        page_settings_(other.page_settings_),
         graph(other.graph),
-        row_ptr(),
-        col_ind(),
         block_norms(std::move(other.block_norms)),
         norms_valid(other.norms_valid),
         owns_graph(other.owns_graph)
     {
         transfer_remote_assembly_state(&other, this);
-        bind_structure_views();
         other.graph = nullptr;
         other.owns_graph = false;
         other.backend_handle_ = std::monostate{};
-        other.bind_structure_views();
     }
 
     // Move assignment
@@ -422,10 +485,8 @@ public:
             release_graph_reference(graph, owns_graph);
             graph = other.graph;
             kind = other.kind;
-            detached_row_ptr_storage_ = std::move(other.detached_row_ptr_storage_);
-            detached_col_ind_storage_ = std::move(other.detached_col_ind_storage_);
             backend_handle_ = std::move(other.backend_handle_);
-            bind_structure_views();
+            page_settings_ = other.page_settings_;
             block_norms = std::move(other.block_norms);
             norms_valid = other.norms_valid;
             owns_graph = other.owns_graph;
@@ -434,7 +495,6 @@ public:
             other.graph = nullptr;
             other.owns_graph = false;
             other.backend_handle_ = std::monostate{};
-            other.bind_structure_views();
         }
         return *this;
     }
@@ -455,7 +515,8 @@ public:
             prepare_graph_for_shared_use();
         }
         BlockSpMat<T, Kernel> new_mat(new_graph, kind, new_owns_graph, ConstructionToken{});
-        new_mat.attach_backend(build_backend_for_structure(kind, new_graph));
+        new_mat.page_settings_ = page_settings_;
+        new_mat.attach_backend(build_backend_for_structure(kind, new_graph, page_settings_));
         new_mat.copy_from(*this);
         if (norms_valid) {
             new_mat.block_norms = block_norms;
@@ -466,7 +527,7 @@ public:
 
     // Matrix operations and conversions.
     void allocate_from_graph() {
-        attach_backend(build_backend_for_structure(kind, graph));
+        attach_backend(build_backend_for_structure(kind, graph, page_settings_));
     }
 
     // Add a block (local or remote)
@@ -801,10 +862,10 @@ public:
             throw std::runtime_error("Incompatible graph structure in copy_from");
         }
 
-        int n_rows = row_ptr.size() - 1;
+        int n_rows = graph->adj_ptr.size() - 1;
         for (int i = 0; i < n_rows; ++i){
-            int start = row_ptr[i];
-            int end = row_ptr[i+1];
+            int start = graph->adj_ptr[i];
+            int end = graph->adj_ptr[i+1];
             for (int k = start; k < end; ++k){
                 T* block_val = mutable_block_data(k);
                 const T* block_val_other = other.block_data(k);
@@ -825,7 +886,11 @@ public:
             graph,
             false,
             kind,
-            BlockSpMat<RealT, DefaultKernel<RealT>>::build_backend_for_structure(kind, graph));
+            BlockSpMat<RealT, DefaultKernel<RealT>>::build_backend_for_structure(
+                kind,
+                graph,
+                page_settings_),
+            page_settings_);
         
         // Copy and cast data
         #pragma omp parallel for
@@ -851,7 +916,11 @@ public:
             graph,
             false,
             kind,
-            BlockSpMat<RealT, DefaultKernel<RealT>>::build_backend_for_structure(kind, graph));
+            BlockSpMat<RealT, DefaultKernel<RealT>>::build_backend_for_structure(
+                kind,
+                graph,
+                page_settings_),
+            page_settings_);
         
         #pragma omp parallel for
         for (size_t i = 0; i < local_block_nnz(); ++i) {
@@ -871,11 +940,11 @@ public:
 
     // Get a specific block (copy)
     std::vector<T> get_block(int local_row, int local_col, MatrixLayout layout = MatrixLayout::RowMajor) const {
-        int start = row_ptr[local_row];
-        int end = row_ptr[local_row+1];
+        int start = graph->adj_ptr[local_row];
+        int end = graph->adj_ptr[local_row+1];
         
         for (int k = start; k < end; ++k) {
-            if (col_ind[k] == local_col) {
+            if (graph->adj_ind[k] == local_col) {
                 int r_dim = block_row_dim(local_row);
                 int c_dim = block_col_dim(local_col);
                 size_t sz = block_size_elements(k);
@@ -906,21 +975,21 @@ public:
     std::vector<T> get_values(MatrixLayout layout = MatrixLayout::RowMajor) const {
         // Calculate total size
         size_t total_size = 0;
-        for (int slot = 0; slot < static_cast<int>(col_ind.size()); ++slot) {
+        for (int slot = 0; slot < static_cast<int>(graph->adj_ind.size()); ++slot) {
             total_size += block_size_elements(slot);
         }
         
         std::vector<T> result(total_size);
         size_t offset = 0;
         
-        int n_rows = row_ptr.size() - 1;
+        int n_rows = graph->adj_ptr.size() - 1;
         for (int i = 0; i < n_rows; ++i) {
             int r_dim = block_row_dim(i);
-            int start = row_ptr[i];
-            int end = row_ptr[i+1];
+            int start = graph->adj_ptr[i];
+            int end = graph->adj_ptr[i+1];
             
             for (int k = start; k < end; ++k) {
-                int col = col_ind[k];
+                int col = graph->adj_ind[k];
                 int c_dim = block_col_dim(col);
                 const T* block_ptr = block_data(k);
                 size_t sz = block_size_elements(k); // should be r_dim * c_dim
@@ -986,20 +1055,20 @@ public:
 
     // Add alpha to diagonal elements
     void shift(T alpha) {
-        int n_rows = row_ptr.size() - 1;
+        int n_rows = graph->adj_ptr.size() - 1;
         
         #pragma omp parallel for
         for (int i = 0; i < n_rows; ++i) {
             // Find diagonal block (col == local_col corresponding to local_row i)
             // Local row i corresponds to global row G = graph->get_global_index(i)
             
-            int start = row_ptr[i];
-            int end = row_ptr[i+1];
+            int start = graph->adj_ptr[i];
+            int end = graph->adj_ptr[i+1];
             
             int global_row = graph->get_global_index(i);
             
             for (int k = start; k < end; ++k) {
-                int local_col = col_ind[k];
+                int local_col = graph->adj_ind[k];
                 // Check if this local_col maps to global_row
                 
                 if (graph->get_global_index(local_col) == global_row) {
@@ -1025,7 +1094,7 @@ public:
 
     // Add scalar diagonal entries: H_ii += v_i
     void add_diagonal(const DistVector<T>& diag) {
-        int n_rows = row_ptr.size() - 1;
+        int n_rows = graph->adj_ptr.size() - 1;
         const int required_size = graph->block_offsets[n_rows];
         if (diag.size() < required_size) {
             throw std::runtime_error("Vector size too small for add_diagonal");
@@ -1033,14 +1102,14 @@ public:
 
         #pragma omp parallel for
         for (int i = 0; i < n_rows; ++i) {
-            int start = row_ptr[i];
-            int end = row_ptr[i+1];
+            int start = graph->adj_ptr[i];
+            int end = graph->adj_ptr[i+1];
             
             int global_row = graph->get_global_index(i);
             const int row_offset = graph->block_offsets[i];
             
             for (int k = start; k < end; ++k) {
-                int local_col = col_ind[k];
+                int local_col = graph->adj_ind[k];
                 if (graph->get_global_index(local_col) == global_row) {
                     // Found diagonal block
                     T* target = mutable_block_data(k);
@@ -1068,17 +1137,17 @@ public:
 
         const std::vector<T>& R = diag.data; // Includes ghosts
         
-        int n_rows = row_ptr.size() - 1;
+        int n_rows = graph->adj_ptr.size() - 1;
         
         #pragma omp parallel for
         for (int i = 0; i < n_rows; ++i) {
-            int start = row_ptr[i];
-            int end = row_ptr[i+1];
+            int start = graph->adj_ptr[i];
+            int end = graph->adj_ptr[i+1];
             const int row_offset = graph->block_offsets[i];
             const int row_dim = graph->block_sizes[i];
             
             for (int k = start; k < end; ++k) {
-                int col = col_ind[k];
+                int col = graph->adj_ind[k];
                 const int col_offset = graph->block_offsets[col];
                 const int col_dim = graph->block_sizes[col];
                 const T* H_ptr = block_data(k);
@@ -1099,15 +1168,15 @@ public:
 
         require_assembled_for_state_copy("filter_blocks");
         get_block_norms();
-        const int n_rows = row_ptr.size() - 1;
+        const int n_rows = graph->adj_ptr.size() - 1;
         std::vector<std::vector<int>> new_adj_global(n_rows);
         int local_removed_any = 0;
         #pragma omp parallel for reduction(|:local_removed_any)
         for (int row = 0; row < n_rows; ++row) {
-            new_adj_global[row].reserve(static_cast<size_t>(row_ptr[row + 1] - row_ptr[row]));
-            for (int slot = row_ptr[row]; slot < row_ptr[row + 1]; ++slot) {
+            new_adj_global[row].reserve(static_cast<size_t>(graph->adj_ptr[row + 1] - graph->adj_ptr[row]));
+            for (int slot = graph->adj_ptr[row]; slot < graph->adj_ptr[row + 1]; ++slot) {
                 if (block_norms[slot] >= threshold) {
-                    new_adj_global[row].push_back(graph->get_global_index(col_ind[slot]));
+                    new_adj_global[row].push_back(graph->get_global_index(graph->adj_ind[slot]));
                 } else {
                     local_removed_any = 1;
                 }
@@ -1134,7 +1203,7 @@ public:
             for (int row = 0; row < n_rows; ++row) {
                 size_t kept_index = 0;
                 const auto& kept_globals = new_adj_global[row];
-                for (int slot = row_ptr[row]; slot < row_ptr[row + 1]; ++slot) {
+                for (int slot = graph->adj_ptr[row]; slot < graph->adj_ptr[row + 1]; ++slot) {
                     if (block_norms[slot] < threshold) {
                         continue;
                     }
@@ -1150,21 +1219,21 @@ public:
 
         switch (kind) {
         case MatrixKind::CSR: {
-            detail::CSRResultBuilder<T> builder(new_graph);
+            detail::CSRResultBuilder<T> builder(new_graph, page_settings_.csr_page_size);
             copy_kept_blocks(builder);
-            replace_with_builder<MatrixKind::CSR>(new_graph, true, std::move(builder));
+            replace_with_builder<MatrixKind::CSR>(new_graph, true, std::move(builder), page_settings_);
             break;
         }
         case MatrixKind::BSR: {
-            detail::BSRResultBuilder<T> builder(new_graph);
+            detail::BSRResultBuilder<T> builder(new_graph, page_settings_.bsr_page_size);
             copy_kept_blocks(builder);
-            replace_with_builder<MatrixKind::BSR>(new_graph, true, std::move(builder));
+            replace_with_builder<MatrixKind::BSR>(new_graph, true, std::move(builder), page_settings_);
             break;
         }
         case MatrixKind::VBCSR: {
-            detail::VBCSRResultBuilder<T, Kernel> builder(new_graph);
+            detail::VBCSRResultBuilder<T, Kernel> builder(new_graph, page_settings_.vbcsr_page_size);
             copy_kept_blocks(builder);
-            replace_with_builder<MatrixKind::VBCSR>(new_graph, true, std::move(builder));
+            replace_with_builder<MatrixKind::VBCSR>(new_graph, true, std::move(builder), page_settings_);
             break;
         }
         }
@@ -1210,7 +1279,7 @@ public:
 
     void fill(T val) {
         #pragma omp parallel for
-        for (int i = 0; i < col_ind.size(); ++i) {
+        for (int i = 0; i < graph->adj_ind.size(); ++i) {
             T* data = mutable_block_data(i);
             const size_t size = block_size_elements(i);
             std::fill(data, data + size, val);
@@ -1246,7 +1315,7 @@ public:
         int total_rows = 0;
         int total_cols = 0;
         
-        int n_owned = row_ptr.size() - 1;
+        int n_owned = graph->adj_ptr.size() - 1;
         
         // Calculate total rows
         for (int i = 0; i < n_owned; ++i) {
@@ -1261,10 +1330,10 @@ public:
         // Count NNZ
         for (int i = 0; i < n_owned; ++i) {
             int r_dim = graph->block_sizes[i];
-            int start = row_ptr[i];
-            int end = row_ptr[i+1];
+            int start = graph->adj_ptr[i];
+            int end = graph->adj_ptr[i+1];
             for (int k = start; k < end; ++k) {
-                int col = col_ind[k];
+                int col = graph->adj_ind[k];
                 int c_dim = graph->block_sizes[col];
                 element_nnz += r_dim * c_dim;
             }
@@ -1279,11 +1348,11 @@ public:
             int r_dim = graph->block_sizes[i];
             int row_start_idx = graph->block_offsets[i] + 1; // 1-based
             
-            int start = row_ptr[i];
-            int end = row_ptr[i+1];
+            int start = graph->adj_ptr[i];
+            int end = graph->adj_ptr[i+1];
             
             for (int k = start; k < end; ++k) {
-                int col = col_ind[k];
+                int col = graph->adj_ind[k];
                 int c_dim = graph->block_sizes[col];
                 int col_start_idx = graph->block_offsets[col] + 1; // 1-based
                 
@@ -1407,16 +1476,16 @@ public:
         }
         
         // Iterate over submat blocks
-        int n_rows = submat.row_ptr.size() - 1;
+        int n_rows = submat.graph->adj_ptr.size() - 1;
         for(int i=0; i<n_rows; ++i) {
             int r_dim = submat.graph->block_sizes[i];
-            int start = submat.row_ptr[i];
-            int end = submat.row_ptr[i+1];
+            int start = submat.graph->adj_ptr[i];
+            int end = submat.graph->adj_ptr[i+1];
             
             int global_row = global_indices[i];
             
             for(int k=start; k<end; ++k) {
-                int col = submat.col_ind[k];
+                int col = submat.graph->adj_ind[k];
                 int c_dim = submat.graph->block_sizes[col];
                 int global_col = global_indices[col];
                 
@@ -1450,11 +1519,11 @@ public:
             int r_dim = graph->block_sizes[i];
             int row_offset = graph->block_offsets[i]; // Local offset
             
-            int start = row_ptr[i];
-            int end = row_ptr[i+1];
+            int start = graph->adj_ptr[i];
+            int end = graph->adj_ptr[i+1];
             
             for(int k=start; k<end; ++k) {
-                int col = col_ind[k];
+                int col = graph->adj_ind[k];
                 int c_dim = graph->block_sizes[col];
                 int col_offset = graph->block_offsets[col];
                 
@@ -1492,11 +1561,11 @@ public:
             int r_dim = graph->block_sizes[i];
             int row_offset = graph->block_offsets[i];
             
-            int start = row_ptr[i];
-            int end = row_ptr[i+1];
+            int start = graph->adj_ptr[i];
+            int end = graph->adj_ptr[i+1];
             
             for(int k=start; k<end; ++k) {
-                int col = col_ind[k];
+                int col = graph->adj_ind[k];
                 int c_dim = graph->block_sizes[col];
                 int col_offset = graph->block_offsets[col];
                 
@@ -1518,7 +1587,7 @@ public:
     }
     // Calculate block density (global nnz blocks / total global blocks^2)
     double get_block_density() const {
-        long long local_nnz = col_ind.size();
+        long long local_nnz = graph->adj_ind.size();
         long long global_nnz = 0;
         
         if (graph->size > 1) {
@@ -1564,13 +1633,20 @@ private:
     RemoteThreadBuffers& remote_assembly_buffers() const;
     static void transfer_remote_assembly_state(const BlockSpMat* from, const BlockSpMat* to);
     static void clear_remote_assembly_state(const BlockSpMat* matrix);
+    static DistGraph* require_live_graph(DistGraph* graph, const char* op_name);
+    static const DistGraph* require_live_graph(const DistGraph* graph, const char* op_name);
+    static BackendPageSettings default_page_settings_for(MatrixKind matrix_kind, const DistGraph* graph);
+    static BackendPageSettings normalize_backend_page_settings(
+        const BackendPageSettings& settings,
+        MatrixKind matrix_kind,
+        const DistGraph* graph);
+    void rebuild_backend_for_page_settings(const char* op_name);
 
     static MatrixKind detect_matrix_kind(const DistGraph* g);
-    void bind_structure_views();
-    const std::vector<int>& active_row_ptr() const;
-    const std::vector<int>& active_col_ind() const;
-
-    static CommittedBackendStorage build_backend_for_structure(MatrixKind matrix_kind, DistGraph* graph);
+    static CommittedBackendStorage build_backend_for_structure(
+        MatrixKind matrix_kind,
+        DistGraph* graph,
+        const BackendPageSettings& page_settings = default_backend_page_settings());
 
     void attach_backend(VBCSRBackendStorage backend);
     void attach_backend(CSRBackendStorage backend);
@@ -1585,7 +1661,8 @@ private:
         DistGraph* graph,
         bool owns_graph,
         MatrixKind kind,
-        CommittedBackendStorage backend);
+        CommittedBackendStorage backend,
+        const BackendPageSettings& page_settings = default_backend_page_settings());
 
     static void ensure_same_backend_family(const BlockSpMat& lhs, const BlockSpMat& rhs, const char* op_name);
     static void ensure_csr_binary_compatibility(const BlockSpMat& lhs, const BlockSpMat& rhs);
@@ -1597,13 +1674,15 @@ private:
     static BlockSpMat materialize_from_builder(
         DistGraph* graph,
         bool owns_graph,
-        Builder&& builder);
+        Builder&& builder,
+        const BackendPageSettings& page_settings = default_backend_page_settings());
 
     template <MatrixKind BuilderKind, typename Builder>
     void replace_with_builder(
         DistGraph* graph,
         bool owns_graph,
-        Builder&& builder);
+        Builder&& builder,
+        const BackendPageSettings& page_settings = default_backend_page_settings());
 
     static void write_transposed_conjugate_values(T* dest, const T* src, int src_rows, int src_cols);
 };
@@ -1620,7 +1699,7 @@ double BlockSpMat<T, Kernel>::get_sq_norm(const T& v) {
 
 template <typename T, typename Kernel>
 std::vector<double> BlockSpMat<T, Kernel>::compute_block_norms() const {
-    int nnz = static_cast<int>(active_col_ind().size());
+    int nnz = static_cast<int>(graph->adj_ind.size());
     std::vector<double> norms(nnz);
 
     #pragma omp parallel for
@@ -1700,15 +1779,11 @@ BlockSpMat<T, Kernel>::BlockSpMat(
     bool owns_graph_flag,
     ConstructionToken)
     : kind(matrix_kind),
-      detached_row_ptr_storage_(),
-      detached_col_ind_storage_(),
       backend_handle_(std::monostate{}),
-      graph(g),
-      row_ptr(),
-      col_ind(),
+      page_settings_(default_page_settings_for(matrix_kind, require_live_graph(g, "BlockSpMat"))),
+      graph(require_live_graph(g, "BlockSpMat")),
       owns_graph(owns_graph_flag) {
     acquire_graph_reference(graph, owns_graph_flag);
-    bind_structure_views();
 }
 
 template <typename T, typename Kernel>
@@ -1757,6 +1832,77 @@ void BlockSpMat<T, Kernel>::clear_remote_assembly_state(const BlockSpMat* matrix
 }
 
 template <typename T, typename Kernel>
+DistGraph* BlockSpMat<T, Kernel>::require_live_graph(DistGraph* graph, const char* op_name) {
+    if (graph == nullptr) {
+        throw std::invalid_argument(std::string(op_name) + " requires a live DistGraph");
+    }
+    return graph;
+}
+
+template <typename T, typename Kernel>
+const DistGraph* BlockSpMat<T, Kernel>::require_live_graph(const DistGraph* graph, const char* op_name) {
+    if (graph == nullptr) {
+        throw std::invalid_argument(std::string(op_name) + " requires a live DistGraph");
+    }
+    return graph;
+}
+
+template <typename T, typename Kernel>
+BackendPageSettings BlockSpMat<T, Kernel>::default_page_settings_for(
+    MatrixKind matrix_kind,
+    const DistGraph* graph) {
+    BackendPageSettings settings;
+    settings.csr_page_size = CSRBackendStorage::page_size_limit();
+    settings.vbcsr_page_size = VBCSRBackendStorage::hard_safe_slots_per_page();
+    if (matrix_kind == MatrixKind::BSR && graph != nullptr) {
+        settings.bsr_page_size =
+            BSRBackendStorage::page_size_limit(detail::BSRResultBuilder<T>::infer_block_size(graph));
+    }
+    return settings;
+}
+
+template <typename T, typename Kernel>
+BackendPageSettings BlockSpMat<T, Kernel>::normalize_backend_page_settings(
+    const BackendPageSettings& settings,
+    MatrixKind matrix_kind,
+    const DistGraph* graph) {
+    BackendPageSettings normalized = settings;
+    normalized.csr_page_size = CSRBackendStorage::clamp_page_size(settings.csr_page_size);
+    normalized.vbcsr_page_size =
+        VBCSRBackendStorage::normalize_configured_max_slots_per_page(settings.vbcsr_page_size);
+    if (settings.bsr_page_size == 0) {
+        throw std::runtime_error("bsr_page_size must be positive");
+    }
+    if (matrix_kind == MatrixKind::BSR && graph != nullptr) {
+        normalized.bsr_page_size =
+            BSRBackendStorage::clamp_page_size(
+                settings.bsr_page_size,
+                detail::BSRResultBuilder<T>::infer_block_size(graph));
+    } else {
+        normalized.bsr_page_size = std::max<uint32_t>(settings.bsr_page_size, 1u);
+    }
+    return normalized;
+}
+
+template <typename T, typename Kernel>
+void BlockSpMat<T, Kernel>::rebuild_backend_for_page_settings(const char* op_name) {
+    require_assembled_for_state_copy(op_name);
+    const bool had_norms = norms_valid;
+    std::vector<double> saved_norms = had_norms ? block_norms : std::vector<double>{};
+
+    BlockSpMat rebuilt(graph, kind, false, ConstructionToken{});
+    rebuilt.page_settings_ = page_settings_;
+    rebuilt.attach_backend(build_backend_for_structure(kind, graph, page_settings_));
+    rebuilt.copy_from(*this);
+
+    attach_backend(std::move(rebuilt.backend_handle_));
+    if (had_norms) {
+        block_norms = std::move(saved_norms);
+        norms_valid = true;
+    }
+}
+
+template <typename T, typename Kernel>
 MatrixKind BlockSpMat<T, Kernel>::detect_matrix_kind(const DistGraph* g) {
     if (g == nullptr) {
         return MatrixKind::CSR;
@@ -1789,58 +1935,25 @@ MatrixKind BlockSpMat<T, Kernel>::detect_matrix_kind(const DistGraph* g) {
 }
 
 template <typename T, typename Kernel>
-void BlockSpMat<T, Kernel>::bind_structure_views() {
-    if (graph != nullptr) {
-        row_ptr.bind(graph->adj_ptr);
-        col_ind.bind(graph->adj_ind);
-        return;
-    }
-    row_ptr.bind(detached_row_ptr_storage_);
-    col_ind.bind(detached_col_ind_storage_);
-}
-
-template <typename T, typename Kernel>
-const std::vector<int>& BlockSpMat<T, Kernel>::active_row_ptr() const {
-    if (graph != nullptr) {
-        return graph->adj_ptr;
-    }
-    return detached_row_ptr_storage_;
-}
-
-template <typename T, typename Kernel>
-const std::vector<int>& BlockSpMat<T, Kernel>::active_col_ind() const {
-    if (graph != nullptr) {
-        return graph->adj_ind;
-    }
-    return detached_col_ind_storage_;
-}
-
-template <typename T, typename Kernel>
 typename BlockSpMat<T, Kernel>::CommittedBackendStorage BlockSpMat<T, Kernel>::build_backend_for_structure(
     MatrixKind matrix_kind,
-    DistGraph* graph) {
+    DistGraph* graph,
+    const BackendPageSettings& page_settings) {
+    graph = require_live_graph(graph, "build_backend_for_structure");
     switch (matrix_kind) {
     case MatrixKind::CSR:
-        if (graph == nullptr) {
-            return CSRBackendStorage{};
-        }
-        return std::move(detail::CSRResultBuilder<T>(graph)).commit();
+        return std::move(detail::CSRResultBuilder<T>(graph, page_settings.csr_page_size)).commit();
     case MatrixKind::BSR:
-        if (graph == nullptr) {
-            return BSRBackendStorage{};
-        }
-        return std::move(detail::BSRResultBuilder<T>(graph)).commit();
+        return std::move(detail::BSRResultBuilder<T>(graph, page_settings.bsr_page_size)).commit();
     case MatrixKind::VBCSR:
-        if (graph == nullptr) {
-            return VBCSRBackendStorage{};
-        }
-        return std::move(detail::VBCSRResultBuilder<T, Kernel>(graph)).commit();
+        return std::move(detail::VBCSRResultBuilder<T, Kernel>(graph, page_settings.vbcsr_page_size)).commit();
     }
     throw std::runtime_error("Unsupported matrix kind in build_backend_for_structure");
 }
 
 template <typename T, typename Kernel>
 void BlockSpMat<T, Kernel>::attach_backend(VBCSRBackendStorage backend) {
+    page_settings_.vbcsr_page_size = backend.configured_max_slots_per_page();
     backend_handle_ = detail::make_vbcsr_backend_handle<T, Kernel>(std::move(backend));
     block_norms.clear();
     norms_valid = false;
@@ -1848,6 +1961,7 @@ void BlockSpMat<T, Kernel>::attach_backend(VBCSRBackendStorage backend) {
 
 template <typename T, typename Kernel>
 void BlockSpMat<T, Kernel>::attach_backend(CSRBackendStorage backend) {
+    page_settings_.csr_page_size = backend.page_setting();
     backend_handle_ = detail::make_csr_backend_handle<T, Kernel>(std::move(backend));
     block_norms.clear();
     norms_valid = false;
@@ -1855,6 +1969,7 @@ void BlockSpMat<T, Kernel>::attach_backend(CSRBackendStorage backend) {
 
 template <typename T, typename Kernel>
 void BlockSpMat<T, Kernel>::attach_backend(BSRBackendStorage backend) {
+    page_settings_.bsr_page_size = backend.page_setting();
     backend_handle_ = detail::make_bsr_backend_handle<T, Kernel>(std::move(backend));
     block_norms.clear();
     norms_valid = false;
@@ -1875,6 +1990,7 @@ void BlockSpMat<T, Kernel>::replace_with_parts(
     bool new_owns_graph,
     MatrixKind new_kind,
     CommittedBackendStorage backend) {
+    new_graph = require_live_graph(new_graph, "replace_with_parts");
     if (new_kind != kind) {
         throw std::runtime_error(
             "replace_with_parts cannot change backend family in place; "
@@ -1892,7 +2008,6 @@ void BlockSpMat<T, Kernel>::replace_with_parts(
     if (old_graph != new_graph) {
         acquire_graph_reference(graph, owns_graph);
     }
-    bind_structure_views();
     attach_backend(std::move(backend));
 }
 
@@ -1901,8 +2016,11 @@ BlockSpMat<T, Kernel> BlockSpMat<T, Kernel>::from_parts(
     DistGraph* graph,
     bool owns_graph,
     MatrixKind kind,
-    CommittedBackendStorage backend) {
+    CommittedBackendStorage backend,
+    const BackendPageSettings& page_settings) {
+    graph = require_live_graph(graph, "from_parts");
     BlockSpMat matrix(graph, kind, owns_graph, ConstructionToken{});
+    matrix.page_settings_ = normalize_backend_page_settings(page_settings, kind, graph);
     matrix.attach_backend(std::move(backend));
     return matrix;
 }
@@ -1962,14 +2080,13 @@ bool BlockSpMat<T, Kernel>::has_same_logical_structure(const BlockSpMat& other) 
     }
 
     if (graph == nullptr || other.graph == nullptr) {
-        return active_row_ptr() == other.active_row_ptr() &&
-               active_col_ind() == other.active_col_ind();
+        return false;
     }
 
     return graph->owned_global_indices == other.graph->owned_global_indices &&
            graph->block_sizes == other.graph->block_sizes &&
-           active_row_ptr() == other.active_row_ptr() &&
-           active_col_ind() == other.active_col_ind();
+           graph->adj_ptr == other.graph->adj_ptr &&
+           graph->adj_ind == other.graph->adj_ind;
 }
 
 template <typename T, typename Kernel>
@@ -1977,9 +2094,10 @@ template <MatrixKind BuilderKind, typename Builder>
 BlockSpMat<T, Kernel> BlockSpMat<T, Kernel>::materialize_from_builder(
     DistGraph* graph,
     bool owns_graph,
-    Builder&& builder) {
+    Builder&& builder,
+    const BackendPageSettings& page_settings) {
     CommittedBackendStorage backend = std::move(builder).commit();
-    return from_parts(graph, owns_graph, BuilderKind, std::move(backend));
+    return from_parts(graph, owns_graph, BuilderKind, std::move(backend), page_settings);
 }
 
 template <typename T, typename Kernel>
@@ -1987,8 +2105,10 @@ template <MatrixKind BuilderKind, typename Builder>
 void BlockSpMat<T, Kernel>::replace_with_builder(
     DistGraph* graph,
     bool owns_graph,
-    Builder&& builder) {
+    Builder&& builder,
+    const BackendPageSettings& page_settings) {
     CommittedBackendStorage backend = std::move(builder).commit();
+    page_settings_ = normalize_backend_page_settings(page_settings, BuilderKind, graph);
     replace_with_parts(graph, owns_graph, BuilderKind, std::move(backend));
 }
 
@@ -2015,11 +2135,11 @@ bool BlockSpMat<T, Kernel>::update_local_block(
     int cols,
     AssemblyMode mode,
     MatrixLayout layout) {
-    int start = row_ptr[local_row];
-    int end = row_ptr[local_row + 1];
+    int start = graph->adj_ptr[local_row];
+    int end = graph->adj_ptr[local_row + 1];
 
     for (int k = start; k < end; ++k) {
-        if (col_ind[k] == local_col) {
+        if (graph->adj_ind[k] == local_col) {
             T* target = mutable_block_data(k);
 
             int r_dim = graph->block_sizes[local_row];

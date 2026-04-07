@@ -64,11 +64,11 @@ void run_test(const std::string& kernel_name, int rank, int size) {
     int n_owned = graph.owned_global_indices.size();
     for (int i = 0; i < n_owned; ++i) {
         int gid_r = graph.owned_global_indices[i];
-        int start = mat.row_ptr[i];
-        int end = mat.row_ptr[i+1];
+        int start = mat.row_ptr()[i];
+        int end = mat.row_ptr()[i+1];
         
         for (int k = start; k < end; ++k) {
-            int lid_c = mat.col_ind[k];
+            int lid_c = mat.col_ind()[k];
             // We need GID of lid_c. 
             // DistGraph doesn't expose local->global map easily for ghosts?
             // Wait, DistGraph has global_to_local. We need reverse.

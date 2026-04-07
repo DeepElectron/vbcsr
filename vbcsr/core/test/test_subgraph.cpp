@@ -184,14 +184,14 @@ int main(int argc, char** argv) {
         // Row 2 is local row 0 on Rank 1.
         // Col 0 is... somewhere.
         // Iterate to find col 0.
-        int start = A.row_ptr[0];
-        int end = A.row_ptr[1];
+        int start = A.row_ptr()[0];
+        int end = A.row_ptr()[1];
         bool found = false;
         for(int k=start; k<end; ++k) {
             // We need to map global 0 to local.
             if (A.graph->global_to_local.count(0)) {
                 int lid_0 = A.graph->global_to_local.at(0);
-                if (A.col_ind[k] == lid_0) {
+                if (A.col_ind()[k] == lid_0) {
                     const double* data = A.block_data(k);
                     if (std::abs(data[0] - 1020.0) > 1e-9) { // Original 20.0 + 1000
                             std::cout << "FAILED: Rank 1 update mismatch. Got " << data[0] << " Expected 1020.0" << std::endl;
@@ -300,13 +300,13 @@ int main(int argc, char** argv) {
     if (rank == 1) {
         // Check Global (2,2). Should be 1022.0 + 5000.0 = 6022.0
         // Find block (2,2). Row 2 is local 0.
-        int start = A.row_ptr[0];
-        int end = A.row_ptr[1];
+        int start = A.row_ptr()[0];
+        int end = A.row_ptr()[1];
         bool found = false;
         for(int k=start; k<end; ++k) {
             if (A.graph->global_to_local.count(2)) {
                  int lid_2 = A.graph->global_to_local.at(2);
-                 if (A.col_ind[k] == lid_2) {
+                 if (A.col_ind()[k] == lid_2) {
                      const double* data = A.block_data(k);
                      if (std::abs(data[0] - 6022.0) > 1e-9) {
                          std::cout << "FAILED: Global (2,2) update mismatch. Got " << data[0] << " Expected 6022.0" << std::endl;
@@ -371,11 +371,11 @@ int main(int argc, char** argv) {
         
         // Verify S(1,1) -> Should be 11.0
         // S(1,1) is local row 1, col 1.
-        int start = S.row_ptr[1];
-        int end = S.row_ptr[2];
+        int start = S.row_ptr()[1];
+        int end = S.row_ptr()[2];
         bool found = false;
         for(int k=start; k<end; ++k) {
-            if (S.col_ind[k] == 1) { // Local col 1 is global 1
+            if (S.col_ind()[k] == 1) { // Local col 1 is global 1
                 const double* data = S.block_data(k);
                 if (std::abs(data[0] - 11.0) > 1e-9) {
                     std::cout << "Rank " << rank << " FAILED: Serial update mismatch. Got " << data[0] << std::endl;

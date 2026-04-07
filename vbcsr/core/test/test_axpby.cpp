@@ -21,14 +21,14 @@ bool check_equal(const BlockSpMat<double, NaiveKernel<double>>& mat,
                  int n_blocks, const std::vector<int>& block_sizes,
                  double tol = 1e-12) {
     
-    int n_owned = mat.row_ptr.size() - 1;
+    int n_owned = mat.row_ptr().size() - 1;
     for (int i = 0; i < n_owned; ++i) {
         int gid_r = mat.graph->owned_global_indices[i];
-        int start = mat.row_ptr[i];
-        int end = mat.row_ptr[i+1];
+        int start = mat.row_ptr()[i];
+        int end = mat.row_ptr()[i+1];
         
         for (int k = start; k < end; ++k) {
-            int lid_c = mat.col_ind[k];
+            int lid_c = mat.col_ind()[k];
             int gid_c = mat.graph->get_global_index(lid_c);
             
             if (ref_data.find({gid_r, gid_c}) == ref_data.end()) {
@@ -75,10 +75,10 @@ bool check_equal(const BlockSpMat<double, NaiveKernel<double>>& mat,
                 owned = true;
                 // Check if block exists
                 bool found = false;
-                int start = mat.row_ptr[i];
-                int end = mat.row_ptr[i+1];
+                int start = mat.row_ptr()[i];
+                int end = mat.row_ptr()[i+1];
                 for(int k=start; k<end; ++k) {
-                    if (mat.graph->get_global_index(mat.col_ind[k]) == c) {
+                    if (mat.graph->get_global_index(mat.col_ind()[k]) == c) {
                         found = true; break;
                     }
                 }
@@ -157,11 +157,11 @@ void run_test(int rank, int size) {
     
     auto get_data = [&](const BlockSpMat<double, NaiveKernel<double>>& mat) {
         std::map<std::pair<int,int>, std::vector<double>> data;
-        int n_owned = mat.row_ptr.size() - 1;
+        int n_owned = mat.row_ptr().size() - 1;
         for(int i=0; i<n_owned; ++i) {
             int r = mat.graph->owned_global_indices[i];
-            for(int k=mat.row_ptr[i]; k<mat.row_ptr[i+1]; ++k) {
-                int c = mat.graph->get_global_index(mat.col_ind[k]);
+            for(int k=mat.row_ptr()[i]; k<mat.row_ptr()[i+1]; ++k) {
+                int c = mat.graph->get_global_index(mat.col_ind()[k]);
                 const double* data_T = mat.block_data(k);
                 std::vector<double> blk(data_T, data_T + 4);
                 data[{r,c}] = blk;

@@ -17,6 +17,8 @@ struct CSRSpMMExecutor {
     using T = typename Matrix::value_type;
 
     static Matrix run(const Matrix& A, const Matrix& B, double threshold) {
+        // TODO: spmm for csr is a bit wired since there is no block exist, then the symbolic filter step basically done the full multiplication
+        // therefore, the spmm performance is doubled. We should think of a good way to design new mechanism for this op in CSR case.
         auto metadata_plan = RowMetadataExchangePlan<Matrix, Matrix>::build(A, B);
         auto sym = symbolic_multiply_filtered(A, B, metadata_plan.metadata(), threshold);
         auto payload_plan = BlockPayloadExchangePlan<Matrix>::fetch_required(B, sym.required_blocks);
@@ -29,10 +31,10 @@ struct CSRSpMMExecutor {
         const auto& A_norms = A.get_block_norms();
         const auto& B_local_norms = B.get_block_norms();
 
-        const int n_rows = static_cast<int>(A.row_ptr.size()) - 1;
+        const int n_rows = static_cast<int>(A.row_ptr().size()) - 1;
         DistGraph* c_graph = assembly_plan.construct_result_graph(A, "spmm");
 
-        CSRResultBuilder<T> builder(c_graph);
+        CSRResultBuilder<T> builder(c_graph, A.backend_page_settings().csr_page_size);
 
         #pragma omp parallel for
         for (int row = 0; row < n_rows; ++row) {
@@ -50,8 +52,8 @@ struct CSRSpMMExecutor {
                 dest_ptrs[idx - c_start] = builder.slot_data(slot);
             }
 
-            const int a_start = A.row_ptr[row];
-            const int a_end = A.row_ptr[row + 1];
+            const int a_start = A.row_ptr()[row];
+            const int a_end = A.row_ptr()[row + 1];
             const double row_eps = threshold / std::max(1, a_end - a_start);
             const auto sym_begin = sym.c_col_ind.begin() + c_start;
             const auto sym_end = sym.c_col_ind.begin() + c_end;
@@ -67,16 +69,16 @@ struct CSRSpMMExecutor {
             for (int slot = a_start; slot < a_end; ++slot) {
                 const double norm_a = A_norms[slot];
                 const T a_value = *A.block_data(slot);
-                const int global_inner = A.graph->get_global_index(A.col_ind[slot]);
+                const int global_inner = A.graph->get_global_index(A.col_ind()[slot]);
 
                 if (A.graph->find_owner(global_inner) == A.graph->rank) {
                     const int local_row_b = B.graph->global_to_local.at(global_inner);
-                    for (int b_slot = B.row_ptr[local_row_b]; b_slot < B.row_ptr[local_row_b + 1]; ++b_slot) {
+                    for (int b_slot = B.row_ptr()[local_row_b]; b_slot < B.row_ptr()[local_row_b + 1]; ++b_slot) {
                         const double norm_b = B_local_norms[b_slot];
                         if (norm_a * norm_b < row_eps) {
                             continue;
                         }
-                        const int global_col = B.graph->get_global_index(B.col_ind[b_slot]);
+                        const int global_col = B.graph->get_global_index(B.col_ind()[b_slot]);
                         accumulate_entry(global_col, a_value * (*B.block_data(b_slot)));
                     }
                 } else {
@@ -97,7 +99,8 @@ struct CSRSpMMExecutor {
         Matrix C = Matrix::template materialize_from_builder<vbcsr::MatrixKind::CSR>(
             c_graph,
             true,
-            std::move(builder));
+            std::move(builder),
+            A.backend_page_settings());
         C.filter_blocks(threshold);
         return C;
     }

@@ -53,9 +53,9 @@ int main(int argc, char** argv) {
     BlockSpMat<double> mat2(&graph2);
     
     // Fill mat1 with 1.0
-    for(size_t i=0; i<mat1.row_ptr.size(); ++i) {
-        for(int k=mat1.row_ptr[i]; k<mat1.row_ptr[i+1]; ++k) {
-            int c = mat1.col_ind[k];
+    for(size_t i=0; i<mat1.row_ptr().size(); ++i) {
+        for(int k=mat1.row_ptr()[i]; k<mat1.row_ptr()[i+1]; ++k) {
+            int c = mat1.col_ind()[k];
             std::vector<double> blk(4, 1.0);
             mat1.add_block(i, c, blk.data(), 2, 2, AssemblyMode::INSERT);
         }
@@ -63,9 +63,9 @@ int main(int argc, char** argv) {
     mat1.assemble();
     
     // Fill mat2 with 2.0
-    for(size_t i=0; i<mat2.row_ptr.size(); ++i) {
-        for(int k=mat2.row_ptr[i]; k<mat2.row_ptr[i+1]; ++k) {
-            int c = mat2.col_ind[k];
+    for(size_t i=0; i<mat2.row_ptr().size(); ++i) {
+        for(int k=mat2.row_ptr()[i]; k<mat2.row_ptr()[i+1]; ++k) {
+            int c = mat2.col_ind()[k];
             std::vector<double> blk(4, 2.0);
             mat2.add_block(i, c, blk.data(), 2, 2, AssemblyMode::INSERT);
         }

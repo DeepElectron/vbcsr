@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -12,125 +13,157 @@
 namespace vbcsr::detail {
 
 template <typename T>
-struct PageSpan {
+struct PageSlice {
     T* data = nullptr;
-    uint32_t length = 0;
-    uint32_t page_id = 0;
-    uint64_t global_begin = 0;
+    uint32_t count = 0;
+    uint32_t page_index = 0;
+    uint64_t first_element = 0;
 };
 
 template <typename T>
-class PagedArray {
+class PagedBuffer {
 public:
     struct Page {
         std::unique_ptr<T[]> data;
         uint32_t used = 0;
     };
 
-    PagedArray()
-        : page_capacity_(default_page_capacity()) {}
+    PagedBuffer()
+        : elements_per_page_(default_elements_per_page()) {}
 
-    explicit PagedArray(uint32_t page_capacity)
-        : page_capacity_(std::max<uint32_t>(1, page_capacity)) {}
+    explicit PagedBuffer(uint32_t elements_per_page)
+        : elements_per_page_(std::max<uint32_t>(1, elements_per_page)) {}
 
     uint64_t size() const {
-        return logical_size_;
+        return size_;
+    }
+
+    uint64_t capacity() const {
+        return static_cast<uint64_t>(pages_.size()) * static_cast<uint64_t>(elements_per_page_);
     }
 
     bool empty() const {
-        return logical_size_ == 0;
+        return size_ == 0;
     }
 
     uint32_t page_count() const {
         return static_cast<uint32_t>(pages_.size());
     }
 
-    uint32_t page_capacity() const {
-        return page_capacity_;
+    uint32_t elements_per_page() const {
+        return elements_per_page_;
     }
 
     void clear() {
         pages_.clear();
-        logical_size_ = 0;
+        size_ = 0;
     }
 
-    void resize(uint64_t logical_size) {
-        clear();
-        logical_size_ = logical_size;
-        if (logical_size_ == 0) {
-            return;
-        }
+    void reserve(uint64_t element_capacity) {
+        ensure_capacity(element_capacity);
+    }
 
-        uint64_t remaining = logical_size_;
-        while (remaining > 0) {
-            const uint32_t used = static_cast<uint32_t>(
-                std::min<uint64_t>(remaining, page_capacity_));
-            append_page(used);
-            remaining -= used;
+    void resize(uint64_t element_count) {
+        if (element_count > capacity()) {
+            ensure_capacity(element_count);
         }
+        if (element_count > size_) {
+            zero_fill_range(size_, element_count);
+        }
+        size_ = element_count;
+        refresh_page_usage();
     }
 
     T& operator[](uint64_t index) {
-        return *ptr(index);
+        return *element_ptr(index);
     }
 
     const T& operator[](uint64_t index) const {
-        return *ptr(index);
+        return *element_ptr(index);
     }
 
-    T* ptr(uint64_t index) {
-        auto [page_id, offset] = locate(index);
-        return pages_[page_id].data.get() + offset;
+    T* element_ptr(uint64_t index) {
+        auto [page_index, offset] = locate(index);
+        return pages_[page_index].data.get() + offset;
     }
 
-    const T* ptr(uint64_t index) const {
-        auto [page_id, offset] = locate(index);
-        return pages_[page_id].data.get() + offset;
+    const T* element_ptr(uint64_t index) const {
+        auto [page_index, offset] = locate(index);
+        return pages_[page_index].data.get() + offset;
     }
 
-    PageSpan<T> page_span(uint32_t page_id) {
-        const auto& page = require_page(page_id);
-        return PageSpan<T>{
-            page.data.get(),
-            page.used,
-            page_id,
-            static_cast<uint64_t>(page_id) * static_cast<uint64_t>(page_capacity_)};
+    PageSlice<T> page(uint32_t page_index) {
+        const auto& storage_page = require_page(page_index);
+        return PageSlice<T>{
+            storage_page.data.get(),
+            storage_page.used,
+            page_index,
+            static_cast<uint64_t>(page_index) * static_cast<uint64_t>(elements_per_page_)};
     }
 
-    PageSpan<const T> page_span(uint32_t page_id) const {
-        const auto& page = require_page(page_id);
-        return PageSpan<const T>{
-            page.data.get(),
-            page.used,
-            page_id,
-            static_cast<uint64_t>(page_id) * static_cast<uint64_t>(page_capacity_)};
-    }
-
-    template <typename Fn>
-    void for_each_span(uint64_t begin, uint64_t end, Fn&& fn) {
-        for_each_span_impl(*this, begin, end, std::forward<Fn>(fn));
+    PageSlice<const T> page(uint32_t page_index) const {
+        const auto& storage_page = require_page(page_index);
+        return PageSlice<const T>{
+            storage_page.data.get(),
+            storage_page.used,
+            page_index,
+            static_cast<uint64_t>(page_index) * static_cast<uint64_t>(elements_per_page_)};
     }
 
     template <typename Fn>
-    void for_each_span(uint64_t begin, uint64_t end, Fn&& fn) const {
-        for_each_span_impl(*this, begin, end, std::forward<Fn>(fn));
+    void for_each_range(uint64_t begin, uint64_t end, Fn&& fn) {
+        walk_range(*this, begin, end, std::forward<Fn>(fn));
+    }
+
+    template <typename Fn>
+    void for_each_range(uint64_t begin, uint64_t end, Fn&& fn) const {
+        walk_range(*this, begin, end, std::forward<Fn>(fn));
     }
 
     template <typename U, typename Fn>
-    void for_each_zip_span(PagedArray<U>& other, uint64_t begin, uint64_t end, Fn&& fn) {
-        for_each_zip_span_impl(*this, other, begin, end, std::forward<Fn>(fn));
+    void for_each_zipped_range(PagedBuffer<U>& other, uint64_t begin, uint64_t end, Fn&& fn) {
+        walk_zipped_range(*this, other, begin, end, std::forward<Fn>(fn));
     }
 
     template <typename U, typename Fn>
-    void for_each_zip_span(const PagedArray<U>& other, uint64_t begin, uint64_t end, Fn&& fn) const {
-        for_each_zip_span_impl(*this, other, begin, end, std::forward<Fn>(fn));
+    void for_each_zipped_range(const PagedBuffer<U>& other, uint64_t begin, uint64_t end, Fn&& fn) {
+        walk_zipped_range(*this, other, begin, end, std::forward<Fn>(fn));
+    }
+
+    template <typename U, typename Fn>
+    void for_each_zipped_range(const PagedBuffer<U>& other, uint64_t begin, uint64_t end, Fn&& fn) const {
+        walk_zipped_range(*this, other, begin, end, std::forward<Fn>(fn));
+    }
+
+    template <typename U>
+    void copy_prefix_from(const PagedBuffer<U>& other, uint64_t count) {
+        if (count > other.size()) {
+            throw std::out_of_range("PagedBuffer::copy_prefix_from count out of bounds");
+        }
+        if (size() < count) {
+            resize(count);
+        }
+        if (count == 0) {
+            return;
+        }
+        if constexpr (std::is_same_v<T, U>) {
+            if (elements_per_page() == other.elements_per_page()) {
+            for_each_zipped_range(other, 0, count, [](auto dst, auto src) {
+                std::memcpy(dst.data, src.data, static_cast<size_t>(dst.count) * sizeof(T));
+            });
+            return;
+        }
+        }
+        for (uint64_t idx = 0; idx < count; ++idx) {
+            *element_ptr(idx) = static_cast<T>(*other.element_ptr(idx));
+        }
     }
 
 private:
-    template <typename ArrayLike, typename Fn>
-    static void for_each_span_impl(ArrayLike& array, uint64_t begin, uint64_t end, Fn&& fn) {
-        if (begin > end || end > array.size()) {
-            throw std::out_of_range("PagedArray::for_each_span range out of bounds");
+    template <typename BufferLike, typename Fn>
+    static void walk_range(BufferLike& buffer, uint64_t begin, uint64_t end, Fn&& fn) {
+        if (begin > end || end > buffer.size()) {
+            throw std::out_of_range("PagedBuffer::for_each_range range out of bounds");
         }
         if (begin == end) {
             return;
@@ -138,27 +171,19 @@ private:
 
         uint64_t current = begin;
         while (current < end) {
-            const uint32_t page_id = static_cast<uint32_t>(current / array.page_capacity_);
-            const uint32_t offset = static_cast<uint32_t>(current % array.page_capacity_);
-            auto span = array.page_span(page_id);
-            const uint32_t available = span.length - offset;
-            const uint32_t chunk = static_cast<uint32_t>(
-                std::min<uint64_t>(available, end - current));
-            span.data += offset;
-            span.length = chunk;
-            span.global_begin = current;
-            fn(span);
-            current += chunk;
+            auto slice = buffer.trimmed_page(current, end);
+            fn(slice);
+            current = slice.first_element + slice.count;
         }
     }
 
-    template <typename ArrayA, typename ArrayB, typename Fn>
-    static void for_each_zip_span_impl(ArrayA& lhs, ArrayB& rhs, uint64_t begin, uint64_t end, Fn&& fn) {
-        if (lhs.page_capacity() != rhs.page_capacity()) {
-            throw std::logic_error("PagedArray::for_each_zip_span requires matching page capacities");
+    template <typename Lhs, typename Rhs, typename Fn>
+    static void walk_zipped_range(Lhs& lhs, Rhs& rhs, uint64_t begin, uint64_t end, Fn&& fn) {
+        if (lhs.elements_per_page() != rhs.elements_per_page()) {
+            throw std::logic_error("PagedBuffer::for_each_zipped_range requires matching page sizes");
         }
         if (begin > end || end > lhs.size() || end > rhs.size()) {
-            throw std::out_of_range("PagedArray::for_each_zip_span range out of bounds");
+            throw std::out_of_range("PagedBuffer::for_each_zipped_range range out of bounds");
         }
         if (begin == end) {
             return;
@@ -166,56 +191,106 @@ private:
 
         uint64_t current = begin;
         while (current < end) {
-            const uint32_t page_id = static_cast<uint32_t>(current / lhs.page_capacity());
-            const uint32_t offset = static_cast<uint32_t>(current % lhs.page_capacity());
-            auto lhs_span = lhs.page_span(page_id);
-            auto rhs_span = rhs.page_span(page_id);
-            const uint32_t available = std::min(lhs_span.length, rhs_span.length) - offset;
-            const uint32_t chunk = static_cast<uint32_t>(
-                std::min<uint64_t>(available, end - current));
-            lhs_span.data += offset;
-            lhs_span.length = chunk;
-            lhs_span.global_begin = current;
-            rhs_span.data += offset;
-            rhs_span.length = chunk;
-            rhs_span.global_begin = current;
-            fn(lhs_span, rhs_span);
+            auto lhs_slice = lhs.trimmed_page(current, end);
+            auto rhs_slice = rhs.trimmed_page(current, end);
+            const uint32_t chunk = std::min(lhs_slice.count, rhs_slice.count);
+            lhs_slice.count = chunk;
+            rhs_slice.count = chunk;
+            fn(lhs_slice, rhs_slice);
             current += chunk;
         }
     }
 
-    static constexpr uint32_t default_page_capacity() {
+    static constexpr uint32_t default_elements_per_page() {
         constexpr size_t kTargetBytes = 1u << 20;
         constexpr size_t elems = kTargetBytes / sizeof(T);
         return static_cast<uint32_t>(elems > 0 ? elems : 1);
     }
 
-    const Page& require_page(uint32_t page_id) const {
-        if (page_id >= pages_.size()) {
-            throw std::out_of_range("PagedArray::page_span page_id out of bounds");
+    void ensure_capacity(uint64_t element_capacity) {
+        while (capacity() < element_capacity) {
+            append_page();
         }
-        return pages_[page_id];
+    }
+
+    void append_page() {
+        Page storage_page;
+        storage_page.data = std::make_unique<T[]>(elements_per_page_);
+        std::fill(storage_page.data.get(), storage_page.data.get() + elements_per_page_, T(0));
+        pages_.push_back(std::move(storage_page));
+    }
+
+    void refresh_page_usage() {
+        uint64_t remaining = size_;
+        for (auto& storage_page : pages_) {
+            storage_page.used = static_cast<uint32_t>(std::min<uint64_t>(remaining, elements_per_page_));
+            remaining -= storage_page.used;
+        }
+    }
+
+    void zero_fill_range(uint64_t begin, uint64_t end) {
+        if (begin > end || end > capacity()) {
+            throw std::out_of_range("PagedBuffer::zero_fill_range range out of bounds");
+        }
+        uint64_t current = begin;
+        while (current < end) {
+            const uint32_t page_index = static_cast<uint32_t>(current / elements_per_page_);
+            const uint32_t offset = static_cast<uint32_t>(current % elements_per_page_);
+            const uint32_t chunk = static_cast<uint32_t>(
+                std::min<uint64_t>(static_cast<uint64_t>(elements_per_page_ - offset), end - current));
+            auto& storage_page = pages_.at(page_index);
+            std::fill(storage_page.data.get() + offset, storage_page.data.get() + offset + chunk, T(0));
+            current += chunk;
+        }
     }
 
     std::pair<uint32_t, uint32_t> locate(uint64_t index) const {
-        if (index >= logical_size_) {
-            throw std::out_of_range("PagedArray index out of bounds");
+        if (index >= size_) {
+            throw std::out_of_range("PagedBuffer element index out of bounds");
         }
-        const uint32_t page_id = static_cast<uint32_t>(index / page_capacity_);
-        const uint32_t offset = static_cast<uint32_t>(index % page_capacity_);
-        return {page_id, offset};
+        return {
+            static_cast<uint32_t>(index / elements_per_page_),
+            static_cast<uint32_t>(index % elements_per_page_)};
     }
 
-    void append_page(uint32_t used) {
-        Page page;
-        page.used = used;
-        page.data = std::make_unique<T[]>(page_capacity_);
-        std::fill(page.data.get(), page.data.get() + page_capacity_, T(0));
-        pages_.push_back(std::move(page));
+    PageSlice<T> trimmed_page(uint64_t begin, uint64_t end) {
+        auto slice = page(static_cast<uint32_t>(begin / elements_per_page_));
+        const uint32_t offset = static_cast<uint32_t>(begin % elements_per_page_);
+        const uint32_t available = slice.count - offset;
+        const uint32_t chunk = static_cast<uint32_t>(std::min<uint64_t>(available, end - begin));
+        slice.data += offset;
+        slice.count = chunk;
+        slice.first_element = begin;
+        return slice; // if end is greater than the page end, this function returns the page slice end at the page end, and the caller is expected to call it again with the next page until the full range is covered
     }
 
-    uint64_t logical_size_ = 0;
-    uint32_t page_capacity_ = 1;
+    PageSlice<const T> trimmed_page(uint64_t begin, uint64_t end) const {
+        auto slice = page(static_cast<uint32_t>(begin / elements_per_page_));
+        const uint32_t offset = static_cast<uint32_t>(begin % elements_per_page_);
+        const uint32_t available = slice.count - offset;
+        const uint32_t chunk = static_cast<uint32_t>(std::min<uint64_t>(available, end - begin));
+        slice.data += offset;
+        slice.count = chunk;
+        slice.first_element = begin;
+        return slice;
+    }
+
+    Page& require_page(uint32_t page_index) {
+        if (page_index >= pages_.size()) {
+            throw std::out_of_range("PagedBuffer::page page index out of bounds");
+        }
+        return pages_[page_index];
+    }
+
+    const Page& require_page(uint32_t page_index) const {
+        if (page_index >= pages_.size()) {
+            throw std::out_of_range("PagedBuffer::page page index out of bounds");
+        }
+        return pages_[page_index];
+    }
+
+    uint64_t size_ = 0;
+    uint32_t elements_per_page_ = 1;
     std::vector<Page> pages_;
 };
 

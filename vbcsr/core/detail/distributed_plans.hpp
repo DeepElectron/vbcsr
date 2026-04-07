@@ -63,7 +63,7 @@ SymbolicMultiplyResult symbolic_multiply_filtered(
     const GhostMetadata& meta,
     double threshold) {
     SymbolicMultiplyResult res;
-    const int n_rows = static_cast<int>(A.row_ptr.size()) - 1;
+    const int n_rows = static_cast<int>(A.row_ptr().size()) - 1;
     res.c_row_ptr.resize(n_rows + 1);
     res.c_row_ptr[0] = 0;
 
@@ -107,10 +107,10 @@ SymbolicMultiplyResult symbolic_multiply_filtered(
             }
             touched.clear();
 
-            const int start = A.row_ptr[row];
-            const int end = A.row_ptr[row + 1];
+            const int start = A.row_ptr()[row];
+            const int end = A.row_ptr()[row + 1];
             for (int a_slot = start; a_slot < end; ++a_slot) {
-                const int global_col_A = A.graph->get_global_index(A.col_ind[a_slot]);
+                const int global_col_A = A.graph->get_global_index(A.col_ind()[a_slot]);
                 const double norm_A = A_norms[a_slot];
 
                 auto process_block = [&](int global_col_B, double norm_B) {
@@ -135,10 +135,10 @@ SymbolicMultiplyResult symbolic_multiply_filtered(
 
                 if (A.graph->find_owner(global_col_A) == A.graph->rank) {
                     const int local_row_B = B.graph->global_to_local.at(global_col_A);
-                    const int start_B = B.row_ptr[local_row_B];
-                    const int end_B = B.row_ptr[local_row_B + 1];
+                    const int start_B = B.row_ptr()[local_row_B];
+                    const int end_B = B.row_ptr()[local_row_B + 1];
                     for (int b_slot = start_B; b_slot < end_B; ++b_slot) {
-                        process_block(B.graph->get_global_index(B.col_ind[b_slot]), B_local_norms[b_slot]);
+                        process_block(B.graph->get_global_index(B.col_ind()[b_slot]), B_local_norms[b_slot]);
                     }
                 } else {
                     auto it = meta.find(global_col_A);
@@ -176,10 +176,10 @@ SymbolicMultiplyResult symbolic_multiply_filtered(
                 continue;
             }
 
-            const int start = A.row_ptr[row];
-            const int end = A.row_ptr[row + 1];
+            const int start = A.row_ptr()[row];
+            const int end = A.row_ptr()[row + 1];
             for (int a_slot = start; a_slot < end; ++a_slot) {
-                const int global_col_A = A.graph->get_global_index(A.col_ind[a_slot]);
+                const int global_col_A = A.graph->get_global_index(A.col_ind()[a_slot]);
                 if (A.graph->find_owner(global_col_A) == A.graph->rank) {
                     continue;
                 }
@@ -284,11 +284,11 @@ private:
                 continue;
             }
             const int lid = matrix.graph->global_to_local.at(gid);
-            const int start = matrix.row_ptr[lid];
-            const int end = matrix.row_ptr[lid + 1];
+            const int start = matrix.row_ptr()[lid];
+            const int end = matrix.row_ptr()[lid + 1];
 
             for (int slot = start; slot < end; ++slot) {
-                const int col_lid = matrix.col_ind[slot];
+                const int col_lid = matrix.col_ind()[slot];
                 const int col_gid = matrix.graph->get_global_index(col_lid);
                 if (!req_cols.count(col_gid)) {
                     continue;
@@ -354,12 +354,12 @@ private:
             const int lid = matrix.graph->global_to_local.at(gid);
             ctx.row_sizes[gid] = matrix.graph->block_sizes[lid];
 
-            const int start = matrix.row_ptr[lid];
-            const int end = matrix.row_ptr[lid + 1];
+            const int start = matrix.row_ptr()[lid];
+            const int end = matrix.row_ptr()[lid + 1];
             const auto& req_cols = required_cols_per_row[gid];
 
             for (int slot = start; slot < end; ++slot) {
-                const int col_lid = matrix.col_ind[slot];
+                const int col_lid = matrix.col_ind()[slot];
                 const int col_gid = matrix.graph->get_global_index(col_lid);
                 if (!req_cols.count(col_gid)) {
                     continue;

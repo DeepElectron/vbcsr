@@ -127,10 +127,10 @@ void test_image_container() {
         int l_col = data->graph->global_to_local.at(1);
         
         bool found = false;
-        int start = res0->row_ptr[l_row];
-        int end = res0->row_ptr[l_row+1];
+        int start = res0->row_ptr()[l_row];
+        int end = res0->row_ptr()[l_row+1];
         for (int k = start; k < end; ++k) {
-            if (res0->col_ind[k] == l_col) {
+            if (res0->col_ind()[k] == l_col) {
                 std::complex<double> val = res0->block_data(k)[0];
                 if (rank == 0) std::cout << "K=0 Val: " << val << std::endl;
                 assert(std::abs(val.real() - 3.0) < 1e-9);
@@ -152,10 +152,10 @@ void test_image_container() {
         int l_col = data->graph->global_to_local.at(1);
 
         bool found = false;
-        int start = weighted->row_ptr[l_row];
-        int end = weighted->row_ptr[l_row + 1];
+        int start = weighted->row_ptr()[l_row];
+        int end = weighted->row_ptr()[l_row + 1];
         for (int k = start; k < end; ++k) {
-            if (weighted->col_ind[k] == l_col) {
+            if (weighted->col_ind()[k] == l_col) {
                 double val = weighted->block_data(k)[0];
                 assert(std::abs(val - 2.0) < 1e-9);
                 found = true;
@@ -175,10 +175,10 @@ void test_image_container() {
         int l_col = data->graph->global_to_local.at(1);
         
         bool found = false;
-        int start = res1->row_ptr[l_row];
-        int end = res1->row_ptr[l_row+1];
+        int start = res1->row_ptr()[l_row];
+        int end = res1->row_ptr()[l_row+1];
         for (int k = start; k < end; ++k) {
-            if (res1->col_ind[k] == l_col) {
+            if (res1->col_ind()[k] == l_col) {
                 std::complex<double> val = res1->block_data(k)[0];
                 if (rank == 0) std::cout << "K=0.5 Val: " << val << std::endl;
                 assert(std::abs(val.real() - (-1.0)) < 1e-9);
@@ -205,10 +205,10 @@ void test_image_container() {
         int l_col = data->graph->global_to_local.at(1);
         
         bool found = false;
-        int start = res2->row_ptr[l_row];
-        int end = res2->row_ptr[l_row+1];
+        int start = res2->row_ptr()[l_row];
+        int end = res2->row_ptr()[l_row+1];
         for (int k = start; k < end; ++k) {
-            if (res2->col_ind[k] == l_col) {
+            if (res2->col_ind()[k] == l_col) {
                 std::complex<double> val = res2->block_data(k)[0];
                 if (rank == 0) std::cout << "K=0.5 Pos Val: " << val << std::endl;
                 assert(std::abs(val.real()) < 1e-9);
@@ -357,10 +357,10 @@ void test_multielement_multiorbital() {
         int l_col = data->graph->global_to_local.at(1); // 1 is ghost on rank 0 (if np=2)
         
         bool found = false;
-        int start = res->row_ptr[l_row];
-        int end = res->row_ptr[l_row+1];
+        int start = res->row_ptr()[l_row];
+        int end = res->row_ptr()[l_row+1];
         for (int k = start; k < end; ++k) {
-            if (res->col_ind[k] == l_col) {
+            if (res->col_ind()[k] == l_col) {
                 const std::complex<double>* data = res->block_data(k);
                 for (int i=0; i<2*3; ++i) {
                     std::complex<double> val = data[i];
@@ -380,10 +380,10 @@ void test_multielement_multiorbital() {
         int l_col = data->graph->global_to_local.at(0);
         
         bool found = false;
-        int start = res->row_ptr[l_row];
-        int end = res->row_ptr[l_row+1];
+        int start = res->row_ptr()[l_row];
+        int end = res->row_ptr()[l_row+1];
         for (int k = start; k < end; ++k) {
-            if (res->col_ind[k] == l_col) {
+            if (res->col_ind()[k] == l_col) {
                 const std::complex<double>* data = res->block_data(k);
                 for (int i=0; i<3*2; ++i) {
                     std::complex<double> val = data[i];
@@ -411,10 +411,10 @@ void test_multielement_multiorbital() {
         int l_col = data->graph->global_to_local.at(1);
         
         bool found = false;
-        int start = res2->row_ptr[l_row];
-        int end = res2->row_ptr[l_row+1];
+        int start = res2->row_ptr()[l_row];
+        int end = res2->row_ptr()[l_row+1];
         for (int k = start; k < end; ++k) {
-            if (res2->col_ind[k] == l_col) {
+            if (res2->col_ind()[k] == l_col) {
                 const std::complex<double>* data = res2->block_data(k);
                 std::complex<double> val = data[0]; // Check first element
                 std::cout << "0->1 Pos Val: " << val << " Expected: " << -1.0/s2 << " - " << 3.0/s2 << "i" << std::endl;
@@ -432,10 +432,10 @@ void test_multielement_multiorbital() {
         int l_col = data->graph->global_to_local.at(0);
         
         bool found = false;
-        int start = res2->row_ptr[l_row];
-        int end = res2->row_ptr[l_row+1];
+        int start = res2->row_ptr()[l_row];
+        int end = res2->row_ptr()[l_row+1];
         for (int k = start; k < end; ++k) {
-            if (res2->col_ind[k] == l_col) {
+            if (res2->col_ind()[k] == l_col) {
                 const std::complex<double>* data = res2->block_data(k);
                 std::complex<double> val = data[0];
                 std::cout << "1->0 Pos Val: " << val << " Expected: " << 3.0/s2 << " + " << 3.0/s2 << "i" << std::endl;

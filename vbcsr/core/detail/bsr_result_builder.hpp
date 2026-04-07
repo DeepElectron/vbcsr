@@ -5,6 +5,7 @@
 #include "../dist_graph.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -13,12 +14,16 @@ namespace vbcsr::detail {
 template <typename T>
 class BSRResultBuilder {
 public:
-    explicit BSRResultBuilder(DistGraph* graph, uint32_t blocks_per_page = 0)
-        : graph_(graph), block_size_(infer_block_size(graph)) {
+    explicit BSRResultBuilder(
+        DistGraph* graph,
+        uint32_t blocks_per_page = std::numeric_limits<uint32_t>::max())
+        : graph_(graph),
+          block_size_(infer_block_size(graph)),
+          backend_(block_size_, blocks_per_page) {
         if (graph_ == nullptr) {
             return;
         }
-        backend_.initialize_structure(graph_->adj_ind, block_size_, blocks_per_page);
+        backend_.initialize_structure(graph_->adj_ind.size(), block_size_);
     }
 
     static int infer_block_size(const DistGraph* graph) {

@@ -118,8 +118,8 @@ bool run_test(int rank, int block_size, double range_min, double range_max) {
     int n_owned = graph.owned_global_indices.size();
     
     for (int i = 0; i < n_owned; ++i) {
-        int start = mat.row_ptr[i];
-        int end = mat.row_ptr[i+1];
+        int start = mat.row_ptr()[i];
+        int end = mat.row_ptr()[i+1];
         for (int k = start; k < end; ++k) {
             double* data = mat.mutable_block_data(k);
             for (int j = 0; j < block_size * block_size; ++j) {
@@ -150,11 +150,11 @@ bool run_test(int rank, int block_size, double range_min, double range_max) {
     
     for (int i = 0; i < n_owned; ++i) {
         std::vector<double> y_ref(block_size, 0.0);
-        int start = mat.row_ptr[i];
-        int end = mat.row_ptr[i+1];
+        int start = mat.row_ptr()[i];
+        int end = mat.row_ptr()[i+1];
         
         for (int k = start; k < end; ++k) {
-            int col = mat.col_ind[k];
+            int col = mat.col_ind()[k];
             const double* block_val = mat.block_data(k);
             const double* x_block = x_full + mat.graph->block_offsets[col];
             
@@ -180,14 +180,14 @@ bool run_test(int rank, int block_size, double range_min, double range_max) {
     
     double max_err_mm = 0.0;
     for (int i = 0; i < n_owned; ++i) {
-        int start = mat.row_ptr[i];
-        int end = mat.row_ptr[i+1];
+        int start = mat.row_ptr()[i];
+        int end = mat.row_ptr()[i+1];
         
         // For each block row, compute reference for all vectors
         std::vector<double> y_ref(block_size * n_vecs, 0.0);
         
         for (int k = start; k < end; ++k) {
-            int col = mat.col_ind[k];
+            int col = mat.col_ind()[k];
             const double* block_val = mat.block_data(k);
             
             // Construct packed B for this block (K x N)
@@ -230,15 +230,15 @@ bool run_test(int rank, int block_size, double range_min, double range_max) {
     std::vector<double> y_adj_ref(n_owned * block_size, 0.0);
     
     for (int i = 0; i < n_owned; ++i) {
-        int start = mat.row_ptr[i];
-        int end = mat.row_ptr[i+1];
+        int start = mat.row_ptr()[i];
+        int end = mat.row_ptr()[i+1];
         const double* x_row = x_adj_ptr + i*block_size; // x is on rows for adjoint? No, x is on rows for A^T * x means x matches rows of A.
         // Wait, mult_adjoint(x, y): y = A^T * x.
         // A is M x N. x is M. y is N.
         // So x matches rows of A.
         
         for (int k = start; k < end; ++k) {
-            int col = mat.col_ind[k];
+            int col = mat.col_ind()[k];
             const double* block_val = mat.block_data(k);
             
             // y[col] += A^T * x[row]
@@ -274,7 +274,7 @@ bool run_test(int rank, int block_size, double range_min, double range_max) {
     // Let's use a simpler approach:
     // A^T * x.
     // We can compute y_ref by iterating over all blocks.
-    std::vector<double> y_ref_adj(mat.col_ind.size() > 0 ? mat.graph->block_sizes.size() * block_size : 0, 0.0); // Upper bound
+    std::vector<double> y_ref_adj(mat.col_ind().size() > 0 ? mat.graph->block_sizes.size() * block_size : 0, 0.0); // Upper bound
     // Actually y_ref needs to handle ghosts.
     // Let's just use a map or large vector.
     // The number of columns is x_offsets.size().
@@ -284,10 +284,10 @@ bool run_test(int rank, int block_size, double range_min, double range_max) {
     
     for (int i = 0; i < n_owned; ++i) {
         const double* x_row = x_adj_ptr + i*block_size;
-        int start = mat.row_ptr[i];
-        int end = mat.row_ptr[i+1];
+        int start = mat.row_ptr()[i];
+        int end = mat.row_ptr()[i+1];
         for (int k = start; k < end; ++k) {
-            int col = mat.col_ind[k];
+            int col = mat.col_ind()[k];
             const double* block_val = mat.block_data(k);
             double* y_target = y_ref_adj.data() + mat.graph->block_offsets[col];
             naive_gemv_trans(block_size, block_size, 1.0, block_val, x_row, 1.0, y_target);
@@ -408,8 +408,8 @@ bool run_test_complex(int rank, int block_size, double range_min, double range_m
     int n_owned = graph.owned_global_indices.size();
     
     for(int i=0; i<n_owned; ++i) {
-        int start = mat.row_ptr[i];
-        int end = mat.row_ptr[i+1];
+        int start = mat.row_ptr()[i];
+        int end = mat.row_ptr()[i+1];
         for(int k=start; k<end; ++k) {
             std::complex<double>* data = mat.mutable_block_data(k);
             for(int j=0; j<block_size*block_size; ++j) {
@@ -431,12 +431,12 @@ bool run_test_complex(int rank, int block_size, double range_min, double range_m
     const T* x_full = x.data.data();
     
     for(int i=0; i<n_owned; ++i) {
-        int start = mat.row_ptr[i];
-        int end = mat.row_ptr[i+1];
+        int start = mat.row_ptr()[i];
+        int end = mat.row_ptr()[i+1];
         std::vector<T> y_ref(block_size, T(0));
         
         for(int k=start; k<end; ++k) {
-            int col = mat.col_ind[k];
+            int col = mat.col_ind()[k];
             const T* block_val = mat.block_data(k);
             const T* x_block = x_full + mat.graph->block_offsets[col];
             naive_gemv(block_size, block_size, T(1), block_val, x_block, T(1), y_ref.data());
@@ -460,12 +460,12 @@ bool run_test_complex(int rank, int block_size, double range_min, double range_m
     
     double max_err_mm = 0.0;
     for(int i=0; i<n_owned; ++i) {
-        int start = mat.row_ptr[i];
-        int end = mat.row_ptr[i+1];
+        int start = mat.row_ptr()[i];
+        int end = mat.row_ptr()[i+1];
         std::vector<T> y_ref(block_size * n_vecs, T(0));
         
         for(int k=start; k<end; ++k) {
-            int col = mat.col_ind[k];
+            int col = mat.col_ind()[k];
             const T* block_val = mat.block_data(k);
             
             std::vector<T> B_packed(block_size * n_vecs);
@@ -499,10 +499,10 @@ bool run_test_complex(int rank, int block_size, double range_min, double range_m
     T* y_adj_ptr = y_adj.local_data();
     
     for(int i=0; i<n_owned; ++i) {
-        int start = mat.row_ptr[i];
-        int end = mat.row_ptr[i+1];
+        int start = mat.row_ptr()[i];
+        int end = mat.row_ptr()[i+1];
         for(int k=start; k<end; ++k) {
-            int col = mat.col_ind[k];
+            int col = mat.col_ind()[k];
             if (col == i) { // Local index match
                 const T* block_val = mat.block_data(k);
                 const T* x_row = x_adj_ptr + i*block_size;

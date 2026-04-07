@@ -36,10 +36,10 @@ struct BSRSpMMExecutor {
         const auto& A_norms = A.get_block_norms();
         const auto& B_local_norms = B.get_block_norms();
 
-        const int n_rows = static_cast<int>(A.row_ptr.size()) - 1;
+        const int n_rows = static_cast<int>(A.row_ptr().size()) - 1;
         DistGraph* c_graph = assembly_plan.construct_result_graph(A, "spmm");
 
-        BSRResultBuilder<T> builder(c_graph);
+        BSRResultBuilder<T> builder(c_graph, A.backend_page_settings().bsr_page_size);
         const int block_size = builder.block_size();
 
         #pragma omp parallel for
@@ -60,8 +60,8 @@ struct BSRSpMMExecutor {
 
             const auto sym_begin = sym.c_col_ind.begin() + c_start;
             const auto sym_end = sym.c_col_ind.begin() + c_end;
-            const int a_start = A.row_ptr[row];
-            const int a_end = A.row_ptr[row + 1];
+            const int a_start = A.row_ptr()[row];
+            const int a_end = A.row_ptr()[row + 1];
             const double row_eps = threshold / std::max(1, a_end - a_start);
 
             auto find_dest = [&](int global_col) -> T* {
@@ -75,16 +75,16 @@ struct BSRSpMMExecutor {
             for (int slot = a_start; slot < a_end; ++slot) {
                 const double norm_a = A_norms[slot];
                 const T* a_value = A.block_data(slot);
-                const int global_inner = A.graph->get_global_index(A.col_ind[slot]);
+                const int global_inner = A.graph->get_global_index(A.col_ind()[slot]);
 
                 if (A.graph->find_owner(global_inner) == A.graph->rank) {
                     const int local_row_b = B.graph->global_to_local.at(global_inner);
-                    for (int b_slot = B.row_ptr[local_row_b]; b_slot < B.row_ptr[local_row_b + 1]; ++b_slot) {
+                    for (int b_slot = B.row_ptr()[local_row_b]; b_slot < B.row_ptr()[local_row_b + 1]; ++b_slot) {
                         const double norm_b = B_local_norms[b_slot];
                         if (norm_a * norm_b < row_eps) {
                             continue;
                         }
-                        T* dest = find_dest(B.graph->get_global_index(B.col_ind[b_slot]));
+                        T* dest = find_dest(B.graph->get_global_index(B.col_ind()[b_slot]));
                         if (dest == nullptr) {
                             continue;
                         }
@@ -134,7 +134,8 @@ struct BSRSpMMExecutor {
         Matrix C = Matrix::template materialize_from_builder<vbcsr::MatrixKind::BSR>(
             c_graph,
             true,
-            std::move(builder));
+            std::move(builder),
+            A.backend_page_settings());
         C.filter_blocks(threshold);
         return C;
     }

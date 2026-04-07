@@ -12,16 +12,16 @@ bool check_value(const BlockSpMat<double, NaiveKernel<double>>& mat,
                  int global_row, int global_col, double expected_val,
                  double tol = 1e-12) {
     
-    int n_owned = mat.row_ptr.size() - 1;
+    int n_owned = mat.row_ptr().size() - 1;
     for (int i = 0; i < n_owned; ++i) {
         int gid_r = mat.graph->owned_global_indices[i];
         if (gid_r != global_row) continue;
         
-        int start = mat.row_ptr[i];
-        int end = mat.row_ptr[i+1];
+        int start = mat.row_ptr()[i];
+        int end = mat.row_ptr()[i+1];
         
         for (int k = start; k < end; ++k) {
-            int lid_c = mat.col_ind[k];
+            int lid_c = mat.col_ind()[k];
             int gid_c = mat.graph->get_global_index(lid_c);
             
             if (gid_c == global_col) {

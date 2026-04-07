@@ -101,7 +101,7 @@ int main(int argc, char** argv) {
         
         int nnz_blocks = 0;
         for(int i=0; i<5; ++i) {
-            nnz_blocks += sub1.row_ptr[i+1] - sub1.row_ptr[i];
+            nnz_blocks += sub1.row_ptr()[i+1] - sub1.row_ptr()[i];
         }
         std::cout << "Batch 1 NNZ Blocks: " << nnz_blocks << " (Expected 13)" << std::endl;
         assert(nnz_blocks == 13);
@@ -118,7 +118,7 @@ int main(int argc, char** argv) {
         
         nnz_blocks = 0;
         for(int i=0; i<5; ++i) {
-            nnz_blocks += sub2.row_ptr[i+1] - sub2.row_ptr[i];
+            nnz_blocks += sub2.row_ptr()[i+1] - sub2.row_ptr()[i];
         }
         std::cout << "Batch 2 NNZ Blocks: " << nnz_blocks << " (Expected 13)" << std::endl;
         assert(nnz_blocks == 13);

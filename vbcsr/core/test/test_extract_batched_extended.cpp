@@ -114,9 +114,9 @@ int main(int argc, char** argv) {
         // Verification Helper
         auto verify_submatrix = [&](int batch_idx, const std::vector<int>& indices, const BlockSpMat<double>& sub) {
             // 1. Check Dimensions
-            // sub.row_ptr size is M+1
-            if(sub.row_ptr.size() != indices.size() + 1) {
-                std::cout << "Batch " << batch_idx << ": Row ptr size mismatch. Expected " << indices.size() + 1 << ", Got " << sub.row_ptr.size() << std::endl;
+            // sub.row_ptr() size is M+1
+            if(sub.row_ptr().size() != indices.size() + 1) {
+                std::cout << "Batch " << batch_idx << ": Row ptr size mismatch. Expected " << indices.size() + 1 << ", Got " << sub.row_ptr().size() << std::endl;
                 return false;
             }
             
@@ -138,11 +138,11 @@ int main(int argc, char** argv) {
             int found_blocks = 0;
             for(size_t i=0; i<indices.size(); ++i) {
                 int row_gid = indices[i];
-                int start = sub.row_ptr[i];
-                int end = sub.row_ptr[i+1];
+                int start = sub.row_ptr()[i];
+                int end = sub.row_ptr()[i+1];
                 
                 for(int k=start; k<end; ++k) {
-                    int col_lid = sub.col_ind[k];
+                    int col_lid = sub.col_ind()[k];
                     int col_gid = indices[col_lid];
                     
                     // Verify this edge exists in our generation logic

@@ -167,11 +167,11 @@ void test_block_spmat(DistGraph& graph, int rank) {
     // Verify
     for (int i = 0; i < n_owned; ++i) {
         int gid = graph.owned_global_indices[i];
-        int start = mat.row_ptr[i];
-        int end = mat.row_ptr[i+1];
+        int start = mat.row_ptr()[i];
+        int end = mat.row_ptr()[i+1];
         bool found_diag = false;
         for (int k = start; k < end; ++k) {
-            int lid_c = mat.col_ind[k];
+            int lid_c = mat.col_ind()[k];
             if (graph.get_global_index(lid_c) == gid) {
                 found_diag = true;
                 const double* data = mat.block_data(k);
@@ -224,10 +224,10 @@ void test_block_spmat(DistGraph& graph, int rank) {
         // Need to find local row for 0.
         if (graph.global_to_local.count(0)) {
             int l_row = graph.global_to_local[0];
-            int start = C.row_ptr[l_row];
-            int end = C.row_ptr[l_row+1];
+            int start = C.row_ptr()[l_row];
+            int end = C.row_ptr()[l_row+1];
             for (int k = start; k < end; ++k) {
-                int lid_c = C.col_ind[k];
+                int lid_c = C.col_ind()[k];
                 if (graph.get_global_index(lid_c) == 1) {
                     const double* data = C.block_data(k);
                     if (std::abs(data[0] - 1.0) > 1e-12) {

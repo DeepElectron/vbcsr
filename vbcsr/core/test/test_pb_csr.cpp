@@ -25,10 +25,10 @@ template <typename U>
 struct has_blk_sizes_member<U, std::void_t<decltype(std::declval<U>().blk_sizes)>> : std::true_type {};
 
 using TestMatrix = BlockSpMat<double>;
-using TestRowPtrView = decltype(std::declval<TestMatrix&>().row_ptr);
+using TestRowPtrView = decltype(std::declval<TestMatrix&>().row_ptr());
 
-static_assert(std::is_const_v<std::remove_reference_t<decltype(std::declval<TestMatrix&>().row_ptr[0])>>);
-static_assert(!std::is_assignable_v<decltype(std::declval<TestMatrix&>().row_ptr[0]), int>);
+static_assert(std::is_const_v<std::remove_reference_t<decltype(std::declval<TestMatrix&>().row_ptr()[0])>>);
+static_assert(!std::is_assignable_v<decltype(std::declval<TestMatrix&>().row_ptr()[0]), int>);
 static_assert(!has_clear_member<TestRowPtrView>::value);
 static_assert(!has_blk_sizes_member<detail::BSRMatrixBackend<double>>::value);
 static_assert(!has_blk_sizes_member<detail::VBCSRMatrixBackend<double, DefaultKernel<double>>>::value);
@@ -198,7 +198,7 @@ void test_axpby_structure_mismatch() {
     
     // Filter Y to remove (0,0) -> Empty
     Y.filter_blocks(10.0); // Norm is sqrt(4)=2. Filter > 10 removes it.
-    assert(Y.col_ind.empty());
+    assert(Y.col_ind().empty());
     
     // Now Y is empty. X has (0,0).
     BlockSpMat<double> X(&graph); // X has (0,0)
@@ -210,14 +210,14 @@ void test_axpby_structure_mismatch() {
     Y.axpby(1.0, X, 1.0);
     
     if (Y.graph->owned_global_indices.size() > 0) {
-        assert(Y.col_ind.size() == 1);
-        assert(Y.col_ind[0] == 0);
+        assert(Y.col_ind().size() == 1);
+        assert(Y.col_ind()[0] == 0);
         
         // Check values
         const double* ptr = Y.block_data(0);
         assert(ptr[0] == 1.0);
     } else {
-        assert(Y.col_ind.empty());
+        assert(Y.col_ind().empty());
     }
     
     std::cout << "PASSED" << std::endl;
@@ -247,9 +247,9 @@ void test_memory_reuse() {
     mat.axpby(1.0, X, 0.0);
     
     if (mat.graph->owned_global_indices.size() > 0) {
-        assert(mat.col_ind.size() == 1);
+        assert(mat.col_ind().size() == 1);
     } else {
-        assert(mat.col_ind.empty());
+        assert(mat.col_ind().empty());
     }
     std::cout << "PASSED" << std::endl;
 }
@@ -268,12 +268,12 @@ void test_const_logical_views_and_family_rejection() {
     csr.add_block(1, 1, a11, 1, 1, AssemblyMode::INSERT, MatrixLayout::RowMajor);
     csr.assemble();
 
-    assert(csr.row_ptr == csr.logical_row_ptr());
-    assert(csr.col_ind == csr.logical_col_ind());
+    assert(csr.row_ptr() == csr.row_ptr());
+    assert(csr.col_ind() == csr.col_ind());
 
     BlockSpMat<double> csr_t = csr.transpose();
-    assert(csr_t.row_ptr == csr_t.logical_row_ptr());
-    assert(csr_t.col_ind == csr_t.logical_col_ind());
+    assert(csr_t.row_ptr() == csr_t.row_ptr());
+    assert(csr_t.col_ind() == csr_t.col_ind());
 
     DistGraph bsr_graph(MPI_COMM_SELF);
     bsr_graph.construct_serial(2, {2, 2}, {{0, 1}, {1}});
@@ -333,8 +333,11 @@ void test_const_logical_views_and_family_rejection() {
 void test_paged_storage_contracts() {
     std::cout << "Testing Paged Storage Contracts..." << std::endl;
 
-    detail::PagedArray<double> lhs(4);
-    detail::PagedArray<double> rhs(4);
+    detail::PagedBuffer<double> lhs(4);
+    detail::PagedBuffer<double> rhs(4);
+    lhs.reserve(10);
+    assert(lhs.capacity() == 12);
+    assert(lhs.size() == 0);
     lhs.resize(10);
     rhs.resize(10);
     for (uint64_t i = 0; i < 10; ++i) {
@@ -344,20 +347,33 @@ void test_paged_storage_contracts() {
     assert(lhs.page_count() == 3);
 
     std::vector<double> sliced;
-    lhs.for_each_span(2, 9, [&](auto span) {
-        for (uint32_t idx = 0; idx < span.length; ++idx) {
-            sliced.push_back(span.data[idx]);
+    lhs.for_each_range(2, 9, [&](auto slice) {
+        for (uint32_t idx = 0; idx < slice.count; ++idx) {
+            sliced.push_back(slice.data[idx]);
         }
     });
     assert((sliced == std::vector<double>({3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0})));
 
     std::vector<double> zipped;
-    lhs.for_each_zip_span(rhs, 1, 6, [&](auto lhs_span, auto rhs_span) {
-        for (uint32_t idx = 0; idx < lhs_span.length; ++idx) {
-            zipped.push_back(lhs_span.data[idx] + rhs_span.data[idx]);
+    lhs.for_each_zipped_range(rhs, 1, 6, [&](auto lhs_slice, auto rhs_slice) {
+        for (uint32_t idx = 0; idx < lhs_slice.count; ++idx) {
+            zipped.push_back(lhs_slice.data[idx] + rhs_slice.data[idx]);
         }
     });
     assert((zipped == std::vector<double>({22.0, 33.0, 44.0, 55.0, 66.0})));
+
+    lhs.resize(6);
+    lhs.resize(10);
+    for (uint64_t idx = 6; idx < 10; ++idx) {
+        assert(lhs[idx] == 0.0);
+    }
+
+    detail::PagedBuffer<double> copied(4);
+    copied.copy_prefix_from(rhs, 6);
+    assert(copied.size() == 6);
+    for (uint64_t idx = 0; idx < 6; ++idx) {
+        assert(copied[idx] == rhs[idx]);
+    }
 
     DistGraph csr_graph(MPI_COMM_SELF);
     csr_graph.construct_serial(3, {1, 1, 1}, {{0, 1, 2}, {1}, {2}});
@@ -372,17 +388,17 @@ void test_paged_storage_contracts() {
     auto csr_backend = std::move(csr_builder).commit();
     assert(csr_backend.values.size() == 5);
     assert(*csr_backend.value_ptr(1) == 5.0);
-    assert(csr_backend.page_view(0).nnz == 2);
-    assert(csr_backend.page_view(1).nnz == 2);
-    assert(csr_backend.page_view(2).nnz == 1);
+    assert(csr_backend.page(csr_graph.adj_ind, 0).nnz_count == 2);
+    assert(csr_backend.page(csr_graph.adj_ind, 1).nnz_count == 2);
+    assert(csr_backend.page(csr_graph.adj_ind, 2).nnz_count == 1);
     std::vector<int> csr_cols;
     std::vector<double> csr_vals;
     std::vector<uint32_t> csr_chunks;
-    csr_backend.for_each_row_segment(csr_graph.adj_ptr, 0, [&](auto page, auto segment) {
-        csr_chunks.push_back(segment.length);
-        for (uint32_t idx = 0; idx < page.nnz; ++idx) {
-            csr_cols.push_back(page.cols[idx]);
-            csr_vals.push_back(page.vals[idx]);
+    csr_backend.for_each_row_slice(csr_graph.adj_ptr, csr_graph.adj_ind, 0, [&](auto slice) {
+        csr_chunks.push_back(slice.nnz_count);
+        for (uint32_t idx = 0; idx < slice.nnz_count; ++idx) {
+            csr_cols.push_back(slice.cols[idx]);
+            csr_vals.push_back(slice.values[idx]);
         }
     });
     assert((csr_chunks == std::vector<uint32_t>{2u, 1u}));
@@ -408,17 +424,17 @@ void test_paged_storage_contracts() {
     assert(bsr_backend.block_size == 2);
     assert(bsr_backend.values.size() == 12);
     assert(bsr_backend.block_ptr(1)[0] == 7.0);
-    assert(bsr_backend.page_view(0).nblocks == 1);
-    assert(bsr_backend.page_view(1).nblocks == 1);
-    assert(bsr_backend.page_view(2).nblocks == 1);
+    assert(bsr_backend.page(bsr_graph.adj_ind, 0).block_count == 1);
+    assert(bsr_backend.page(bsr_graph.adj_ind, 1).block_count == 1);
+    assert(bsr_backend.page(bsr_graph.adj_ind, 2).block_count == 1);
     std::vector<int> bsr_cols;
     std::vector<double> bsr_first_entries;
     std::vector<uint32_t> bsr_chunks;
-    bsr_backend.for_each_row_segment(bsr_graph.adj_ptr, 0, [&](auto page, auto segment) {
-        bsr_chunks.push_back(segment.block_count);
-        for (uint32_t idx = 0; idx < page.nblocks; ++idx) {
-            bsr_cols.push_back(page.cols[idx]);
-            bsr_first_entries.push_back(page.vals[idx * page.block_elems]);
+    bsr_backend.for_each_row_slice(bsr_graph.adj_ptr, bsr_graph.adj_ind, 0, [&](auto slice) {
+        bsr_chunks.push_back(slice.block_count);
+        for (uint32_t idx = 0; idx < slice.block_count; ++idx) {
+            bsr_cols.push_back(slice.cols[idx]);
+            bsr_first_entries.push_back(slice.values[idx * slice.block_value_count]);
         }
     });
     assert((bsr_chunks == std::vector<uint32_t>{1u, 1u}));
@@ -462,7 +478,7 @@ void test_vbcsr_batch_views() {
     size_t total_blocks = 0;
     mat.for_each_shape_batch([&](const auto& batch) {
         using ExecKind = typename detail::VBCSRMatrixBackend<double, DefaultKernel<double>>::ExecutionKind;
-        assert(batch.page != nullptr);
+        assert(batch.page.data != nullptr);
         assert(batch.block_count() > 0);
         assert(batch.policy != nullptr);
         assert(batch.policy->preferred_execution.load(std::memory_order_relaxed) == ExecKind::StaticFallback);
@@ -567,12 +583,18 @@ void test_contiguous_api_and_vbcsr_packing() {
 
     size_t total_live_slots = 0;
     mat.for_each_shape_batch([&](const auto& batch) {
-        assert(batch.page != nullptr);
-        assert(batch.page->live_slots.size() == batch.block_count());
+        assert(batch.page.data != nullptr);
+        assert(batch.page.block_count == batch.block_count());
+        assert(batch.page.blocks_per_page >= batch.block_count());
         for (uint32_t idx = 0; idx < batch.block_count(); ++idx) {
-            assert(batch.page->live_slots[idx] == idx);
-            assert(batch.page->slot_live_pos[idx] == idx);
+            assert(batch.page.matrix_block(idx) == batch.logical_slot(idx));
+            assert(batch.page.block_ptr(idx) == batch.block_ptr(idx));
             assert(batch.logical_slot(idx) >= 0);
+            if (idx + 1 < batch.block_count()) {
+                assert(
+                    batch.block_ptr(idx + 1) - batch.block_ptr(idx) ==
+                    static_cast<std::ptrdiff_t>(batch.page.elements_per_block));
+            }
         }
         total_live_slots += batch.block_count();
     });
@@ -645,8 +667,8 @@ void test_transpose() {
     
     BlockSpMat<double> mat_T = mat.transpose();
     assert(mat_T.matrix_kind() == MatrixKind::BSR);
-    assert(mat_T.row_ptr == mat.row_ptr);
-    assert(mat_T.col_ind == mat.col_ind);
+    assert(mat_T.row_ptr() == mat.row_ptr());
+    assert(mat_T.col_ind() == mat.col_ind());
 
     auto check_block = [](const std::vector<double>& got, const std::vector<double>& expected) {
         assert(got.size() == expected.size());
@@ -684,8 +706,8 @@ void test_real_imag_extract() {
 
     assert(real.matrix_kind() == MatrixKind::BSR);
     assert(imag.matrix_kind() == MatrixKind::BSR);
-    assert(real.row_ptr == mat.row_ptr);
-    assert(imag.col_ind == mat.col_ind);
+    assert(real.row_ptr() == mat.row_ptr());
+    assert(imag.col_ind() == mat.col_ind());
 
     const std::vector<double> expected_real = {1.0, 3.0, 5.0, 7.0};
     const std::vector<double> expected_imag = {2.0, 4.0, 6.0, 8.0};
@@ -744,8 +766,8 @@ void test_bsr_backend_dispatch_kernels() {
 
     BlockSpMat<double> mat(&graph);
     assert(mat.matrix_kind() == MatrixKind::BSR);
-    assert(mat.row_ptr == std::vector<int>({0, 2, 4}));
-    assert(mat.col_ind == std::vector<int>({0, 1, 0, 1}));
+    assert(mat.row_ptr() == std::vector<int>({0, 2, 4}));
+    assert(mat.col_ind() == std::vector<int>({0, 1, 0, 1}));
 
     double a00[] = {1.0, 2.0, 3.0, 4.0};
     double a01[] = {5.0, 6.0, 7.0, 8.0};
@@ -874,8 +896,8 @@ void test_bsr_axpby_structure_change_preserves_family() {
     Y.axpby(2.0, X, 3.0);
 
     assert(Y.matrix_kind() == MatrixKind::BSR);
-    assert(Y.logical_row_ptr() == std::vector<int>({0, 2, 4}));
-    assert(Y.logical_col_ind() == std::vector<int>({0, 1, 0, 1}));
+    assert(Y.row_ptr() == std::vector<int>({0, 2, 4}));
+    assert(Y.col_ind() == std::vector<int>({0, 1, 0, 1}));
     assert(Y.get_block(0, 0) == std::vector<double>({3.0, 0.0, 0.0, 3.0}));
     assert(Y.get_block(0, 1) == std::vector<double>({6.0, 0.0, 0.0, 6.0}));
     assert(Y.get_block(1, 0) == std::vector<double>({8.0, 0.0, 0.0, 8.0}));
@@ -910,8 +932,8 @@ void test_bsr_backend_dispatch_distributed() {
     BlockSpMat<double> mat(graph);
     mat.owns_graph = true;
     assert(mat.matrix_kind() == MatrixKind::BSR);
-    assert(mat.row_ptr == mat.logical_row_ptr());
-    assert(mat.col_ind == mat.logical_col_ind());
+    assert(mat.row_ptr() == mat.row_ptr());
+    assert(mat.col_ind() == mat.col_ind());
 
     auto owns = [&](int gid) {
         return std::find(owned.begin(), owned.end(), gid) != owned.end();
@@ -1011,28 +1033,28 @@ void test_bsr_transpose_native_distributed() {
 
     BlockSpMat<double> mat_t = mat.transpose();
     assert(mat_t.matrix_kind() == MatrixKind::BSR);
-    assert(mat_t.row_ptr == mat_t.logical_row_ptr());
-    assert(mat_t.col_ind == mat_t.logical_col_ind());
+    assert(mat_t.row_ptr() == mat_t.row_ptr());
+    assert(mat_t.col_ind() == mat_t.col_ind());
 
     if (size == 1) {
-        assert(mat_t.row_ptr == std::vector<int>({0, 2, 3}));
-        assert(mat_t.col_ind == std::vector<int>({0, 1, 0}));
+        assert(mat_t.row_ptr() == std::vector<int>({0, 2, 3}));
+        assert(mat_t.col_ind() == std::vector<int>({0, 1, 0}));
         assert(mat_t.get_block(0, 0) == std::vector<double>({1.0, 3.0, 2.0, 4.0}));
         assert(mat_t.get_block(0, 1) == std::vector<double>({9.0, 11.0, 10.0, 12.0}));
         assert(mat_t.get_block(1, 0) == std::vector<double>({5.0, 7.0, 6.0, 8.0}));
     } else if (rank == 0) {
-        assert(mat_t.row_ptr == std::vector<int>({0, 2}));
+        assert(mat_t.row_ptr() == std::vector<int>({0, 2}));
         const int col0 = mat_t.graph->global_to_local.at(0);
         const int col1 = mat_t.graph->global_to_local.at(1);
         assert(mat_t.get_block(0, col0) == std::vector<double>({1.0, 3.0, 2.0, 4.0}));
         assert(mat_t.get_block(0, col1) == std::vector<double>({9.0, 11.0, 10.0, 12.0}));
     } else if (rank == 1) {
-        assert(mat_t.row_ptr == std::vector<int>({0, 1}));
+        assert(mat_t.row_ptr() == std::vector<int>({0, 1}));
         const int col0 = mat_t.graph->global_to_local.at(0);
         assert(mat_t.get_block(0, col0) == std::vector<double>({5.0, 7.0, 6.0, 8.0}));
     } else {
-        assert(mat_t.row_ptr == std::vector<int>({0}));
-        assert(mat_t.col_ind.empty());
+        assert(mat_t.row_ptr() == std::vector<int>({0}));
+        assert(mat_t.col_ind().empty());
     }
 
     std::cout << "PASSED" << std::endl;
@@ -1098,31 +1120,31 @@ void test_bsr_spmm_native_distributed() {
 
     BlockSpMat<double> C = A.spmm(B, 0.0);
     assert(C.matrix_kind() == MatrixKind::BSR);
-    assert(C.row_ptr == C.logical_row_ptr());
-    assert(C.col_ind == C.logical_col_ind());
+    assert(C.row_ptr() == C.row_ptr());
+    assert(C.col_ind() == C.col_ind());
 
     if (size == 1) {
-        assert(C.row_ptr == std::vector<int>({0, 2, 4}));
-        assert(C.col_ind == std::vector<int>({0, 1, 0, 1}));
+        assert(C.row_ptr() == std::vector<int>({0, 2, 4}));
+        assert(C.col_ind() == std::vector<int>({0, 1, 0, 1}));
         assert(C.get_block(0, 0) == std::vector<double>({14.0, 0.0, 0.0, 14.0}));
         assert(C.get_block(0, 1) == std::vector<double>({12.0, 0.0, 0.0, 12.0}));
         assert(C.get_block(1, 0) == std::vector<double>({15.0, 0.0, 0.0, 15.0}));
         assert(C.get_block(1, 1) == std::vector<double>({18.0, 0.0, 0.0, 18.0}));
     } else if (rank == 0) {
-        assert(C.row_ptr == std::vector<int>({0, 2}));
+        assert(C.row_ptr() == std::vector<int>({0, 2}));
         const int col0 = C.graph->global_to_local.at(0);
         const int col1 = C.graph->global_to_local.at(1);
         assert(C.get_block(0, col0) == std::vector<double>({14.0, 0.0, 0.0, 14.0}));
         assert(C.get_block(0, col1) == std::vector<double>({12.0, 0.0, 0.0, 12.0}));
     } else if (rank == 1) {
-        assert(C.row_ptr == std::vector<int>({0, 2}));
+        assert(C.row_ptr() == std::vector<int>({0, 2}));
         const int col0 = C.graph->global_to_local.at(0);
         const int col1 = C.graph->global_to_local.at(1);
         assert(C.get_block(0, col0) == std::vector<double>({15.0, 0.0, 0.0, 15.0}));
         assert(C.get_block(0, col1) == std::vector<double>({18.0, 0.0, 0.0, 18.0}));
     } else {
-        assert(C.row_ptr == std::vector<int>({0}));
-        assert(C.col_ind.empty());
+        assert(C.row_ptr() == std::vector<int>({0}));
+        assert(C.col_ind().empty());
     }
 
     std::cout << "PASSED" << std::endl;
@@ -1229,8 +1251,8 @@ void test_vbcsr_backend_shape_registry_and_family() {
     assert(filtered.matrix_kind() == MatrixKind::VBCSR);
     assert(filtered.shape_class_count() == 0);
     assert(filtered.local_scalar_nnz() == 0);
-    assert(filtered.row_ptr == std::vector<int>({0, 0, 0}));
-    assert(filtered.col_ind.empty());
+    assert(filtered.row_ptr() == std::vector<int>({0, 0, 0}));
+    assert(filtered.col_ind().empty());
 
     std::cout << "PASSED" << std::endl;
 }
@@ -1268,8 +1290,8 @@ void test_vbcsr_axpby_structure_change() {
 
     assert(Y.matrix_kind() == MatrixKind::VBCSR);
     assert(Y.shape_class_count() == 4);
-    assert(Y.logical_row_ptr() == std::vector<int>({0, 2, 4}));
-    assert(Y.logical_col_ind() == std::vector<int>({0, 1, 0, 1}));
+    assert(Y.row_ptr() == std::vector<int>({0, 2, 4}));
+    assert(Y.col_ind() == std::vector<int>({0, 1, 0, 1}));
 
     assert(Y.get_block(0, 0) == std::vector<double>({3.0, 6.0, 9.0, 12.0}));
     assert(Y.get_block(0, 1) == std::vector<double>({4.0, 8.0, 12.0, 16.0, 20.0, 24.0}));
@@ -1569,6 +1591,206 @@ void test_csr_backend_dispatch_kernels_complex() {
     std::cout << "PASSED" << std::endl;
 }
 
+void test_csr_page_cap_policy() {
+    std::cout << "Testing CSR Page-Cap Policy..." << std::endl;
+
+    DistGraph graph(MPI_COMM_SELF);
+    graph.construct_serial(3, {1, 1, 1}, {{0, 2}, {0, 1, 2}, {1}});
+
+    detail::CSRMatrixBackend<double> backend;
+    assert(backend.page_setting() == detail::CSRMatrixBackend<double>::page_size_limit());
+
+    backend.initialize_structure(graph.adj_ind.size());
+    assert(backend.page_size() == graph.adj_ind.size());
+    assert(backend.page_count() == 1);
+
+    backend.initialize_structure(graph.adj_ind.size(), 2);
+    assert(backend.page_setting() == 2);
+    assert(backend.page_size() == 2);
+    assert(backend.page_count() == 3);
+
+    backend.initialize_structure(
+        graph.adj_ind.size(),
+        detail::CSRMatrixBackend<double>::page_size_limit());
+    assert(backend.page_setting() == detail::CSRMatrixBackend<double>::page_size_limit());
+    assert(backend.page_size() == graph.adj_ind.size());
+    assert(backend.page_count() == 1);
+
+    std::cout << "PASSED" << std::endl;
+}
+
+void test_blockspmat_csr_page_cap_repack_and_propagation() {
+    std::cout << "Testing BlockSpMat CSR Page-Cap Repack And Propagation..." << std::endl;
+
+    DistGraph graph(MPI_COMM_SELF);
+    graph.construct_serial(2, {1, 1}, {{0, 1}, {0, 1}});
+
+    BlockSpMat<double> mat(&graph);
+    assert(mat.matrix_kind() == MatrixKind::CSR);
+    assert(mat.backend_page_settings().csr_page_size == detail::CSRMatrixBackend<double>::page_size_limit());
+
+    double a00[] = {2.0};
+    double a01[] = {3.0};
+    double a10[] = {4.0};
+    double a11[] = {5.0};
+    mat.add_block(0, 0, a00, 1, 1, AssemblyMode::INSERT, MatrixLayout::RowMajor);
+    mat.add_block(0, 1, a01, 1, 1, AssemblyMode::INSERT, MatrixLayout::RowMajor);
+    mat.add_block(1, 0, a10, 1, 1, AssemblyMode::INSERT, MatrixLayout::RowMajor);
+    mat.add_block(1, 1, a11, 1, 1, AssemblyMode::INSERT, MatrixLayout::RowMajor);
+    mat.assemble();
+
+    assert(mat.active_page_size() == mat.local_block_nnz());
+
+    DistVector<double> x(&graph);
+    DistVector<double> y_before(&graph);
+    DistVector<double> y_after(&graph);
+    x.local_data()[0] = 7.0;
+    x.local_data()[1] = 11.0;
+    mat.mult(x, y_before);
+    assert(std::abs(y_before.local_data()[0] - 47.0) < 1e-12);
+    assert(std::abs(y_before.local_data()[1] - 83.0) < 1e-12);
+
+    mat.set_csr_page_size(1);
+    assert(mat.backend_page_settings().csr_page_size == 1);
+    assert(mat.active_page_size() == 1);
+    assert(std::abs(*mat.block_data(0) - 2.0) < 1e-12);
+    assert(std::abs(*mat.block_data(1) - 3.0) < 1e-12);
+    assert(std::abs(*mat.block_data(2) - 4.0) < 1e-12);
+    assert(std::abs(*mat.block_data(3) - 5.0) < 1e-12);
+
+    mat.mult(x, y_after);
+    assert(std::abs(y_after.local_data()[0] - 47.0) < 1e-12);
+    assert(std::abs(y_after.local_data()[1] - 83.0) < 1e-12);
+
+    BlockSpMat<double> duplicate = mat.duplicate();
+    assert(duplicate.backend_page_settings().csr_page_size == 1);
+    assert(duplicate.active_page_size() == 1);
+
+    BlockSpMat<double> transpose = mat.transpose();
+    assert(transpose.backend_page_settings().csr_page_size == 1);
+    assert(transpose.active_page_size() == 1);
+
+    BlockSpMat<double> product = mat.spmm_self(0.0);
+    assert(product.backend_page_settings().csr_page_size == 1);
+    assert(product.active_page_size() == 1);
+
+    std::cout << "PASSED" << std::endl;
+}
+
+void test_blockspmat_bsr_page_settings_repack_and_propagation() {
+    std::cout << "Testing BlockSpMat BSR Page Settings Repack And Propagation..." << std::endl;
+
+    DistGraph graph(MPI_COMM_SELF);
+    graph.construct_serial(2, {2, 2}, {{0, 1}, {0, 1}});
+
+    BlockSpMat<double> mat(&graph);
+    assert(mat.matrix_kind() == MatrixKind::BSR);
+
+    double a00[] = {1.0, 3.0, 2.0, 4.0};
+    double a01[] = {5.0, 7.0, 6.0, 8.0};
+    double a10[] = {9.0, 11.0, 10.0, 12.0};
+    double a11[] = {13.0, 15.0, 14.0, 16.0};
+    mat.add_block(0, 0, a00, 2, 2, AssemblyMode::INSERT, MatrixLayout::RowMajor);
+    mat.add_block(0, 1, a01, 2, 2, AssemblyMode::INSERT, MatrixLayout::RowMajor);
+    mat.add_block(1, 0, a10, 2, 2, AssemblyMode::INSERT, MatrixLayout::RowMajor);
+    mat.add_block(1, 1, a11, 2, 2, AssemblyMode::INSERT, MatrixLayout::RowMajor);
+    mat.assemble();
+
+    assert(mat.active_page_size() == mat.local_block_nnz());
+
+    DistVector<double> x(&graph);
+    DistVector<double> y_before(&graph);
+    DistVector<double> y_after(&graph);
+    for (int i = 0; i < 4; ++i) {
+        x.local_data()[i] = 1.0 + i;
+    }
+    mat.mult(x, y_before);
+
+    mat.set_bsr_page_size(1);
+    assert(mat.backend_page_settings().bsr_page_size == 1);
+    assert(mat.active_page_size() == 1);
+
+    mat.mult(x, y_after);
+    assert(std::abs(y_after.local_data()[0] - y_before.local_data()[0]) < 1e-12);
+    assert(std::abs(y_after.local_data()[1] - y_before.local_data()[1]) < 1e-12);
+    assert(std::abs(y_after.local_data()[2] - y_before.local_data()[2]) < 1e-12);
+    assert(std::abs(y_after.local_data()[3] - y_before.local_data()[3]) < 1e-12);
+
+    BlockSpMat<double> duplicate = mat.duplicate();
+    assert(duplicate.backend_page_settings().bsr_page_size == 1);
+    assert(duplicate.active_page_size() == 1);
+
+    BlockSpMat<double> transpose = mat.transpose();
+    assert(transpose.backend_page_settings().bsr_page_size == 1);
+    assert(transpose.active_page_size() == 1);
+
+    BlockSpMat<double> product = mat.spmm_self(0.0);
+    assert(product.backend_page_settings().bsr_page_size == 1);
+    assert(product.active_page_size() == 1);
+
+    std::cout << "PASSED" << std::endl;
+}
+
+void test_blockspmat_vbcsr_page_settings_repack_and_propagation() {
+    std::cout << "Testing BlockSpMat VBCSR Page Settings Repack And Propagation..." << std::endl;
+
+    std::vector<int> block_sizes = {2, 2, 3};
+    std::vector<std::vector<int>> adj = {{0, 1, 2}, {0, 1, 2}, {0, 1, 2}};
+    DistGraph graph(MPI_COMM_SELF);
+    graph.construct_serial(3, block_sizes, adj);
+
+    BlockSpMat<double> mat(&graph);
+    assert(mat.matrix_kind() == MatrixKind::VBCSR);
+
+    for (int row = 0; row < 3; ++row) {
+        for (int col : adj[row]) {
+            const int r_dim = block_sizes[row];
+            const int c_dim = block_sizes[col];
+            std::vector<double> block(static_cast<size_t>(r_dim) * c_dim);
+            const double base = 1.0 + 10.0 * row + 3.0 * col;
+            for (int r = 0; r < r_dim; ++r) {
+                for (int c = 0; c < c_dim; ++c) {
+                    block[static_cast<size_t>(r) * c_dim + c] = base + 0.5 * r + 0.25 * c;
+                }
+            }
+            mat.add_block(row, col, block.data(), r_dim, c_dim, AssemblyMode::INSERT, MatrixLayout::RowMajor);
+        }
+    }
+    mat.assemble();
+
+    size_t default_batches = 0;
+    mat.for_each_shape_batch([&](const auto& batch) {
+        ++default_batches;
+        assert(batch.block_capacity() == batch.block_count());
+    });
+    assert(default_batches == 4);
+
+    const std::vector<double> dense_before = mat.to_dense();
+
+    mat.set_vbcsr_page_size(1);
+    assert(mat.backend_page_settings().vbcsr_page_size == 1);
+
+    size_t repacked_batches = 0;
+    mat.for_each_shape_batch([&](const auto& batch) {
+        ++repacked_batches;
+        assert(batch.block_capacity() == 1);
+        assert(batch.block_count() == 1);
+    });
+    assert(repacked_batches == mat.local_block_nnz());
+    assert_close(mat.to_dense(), dense_before);
+
+    BlockSpMat<double> duplicate = mat.duplicate();
+    assert(duplicate.backend_page_settings().vbcsr_page_size == 1);
+
+    BlockSpMat<double> transpose = mat.transpose();
+    assert(transpose.backend_page_settings().vbcsr_page_size == 1);
+
+    BlockSpMat<double> product = mat.spmm_self(0.0);
+    assert(product.backend_page_settings().vbcsr_page_size == 1);
+
+    std::cout << "PASSED" << std::endl;
+}
+
 void test_csr_vendor_page_cache_metadata() {
     std::cout << "Testing CSR Vendor Page Cache Metadata..." << std::endl;
 
@@ -1576,26 +1798,29 @@ void test_csr_vendor_page_cache_metadata() {
     graph.construct_serial(3, {1, 1, 1}, {{0, 2}, {0, 1, 2}, {1}});
 
     detail::CSRMatrixBackend<double> backend;
-    backend.initialize_structure(graph.adj_ind, 3);
+    backend.initialize_structure(graph.adj_ind.size(), 3);
     for (int slot = 0; slot < static_cast<int>(graph.adj_ind.size()); ++slot) {
         *backend.value_ptr(slot) = 1.0 + slot;
     }
 
-    const auto& cache = backend.ensure_vendor_cache(graph.adj_ptr, static_cast<int>(graph.block_sizes.size()));
+    const auto& cache = backend.ensure_vendor_cache(
+        graph.adj_ptr,
+        graph.adj_ind,
+        static_cast<int>(graph.block_sizes.size()));
     assert(cache.pages.size() == 2);
 
     const auto& page0 = cache.pages[0];
-    assert(page0.metadata.page_id == 0);
-    assert(page0.metadata.global_nnz_begin == 0);
-    assert(page0.metadata.nnz == 3);
+    assert(page0.metadata.page_index == 0);
+    assert(page0.metadata.first_nnz == 0);
+    assert(page0.metadata.nnz_count == 3);
     assert(page0.metadata.row_begin == 0);
     assert(page0.metadata.row_end == 2);
     assert(page0.row_ptr == std::vector<int>({0, 2, 3}));
 
     const auto& page1 = cache.pages[1];
-    assert(page1.metadata.page_id == 1);
-    assert(page1.metadata.global_nnz_begin == 3);
-    assert(page1.metadata.nnz == 3);
+    assert(page1.metadata.page_index == 1);
+    assert(page1.metadata.first_nnz == 3);
+    assert(page1.metadata.nnz_count == 3);
     assert(page1.metadata.row_begin == 1);
     assert(page1.metadata.row_end == 3);
     assert(page1.row_ptr == std::vector<int>({0, 2, 3}));
@@ -1621,7 +1846,7 @@ void test_csr_vendor_dispatch_selection() {
     graph.construct_serial(2, {1, 1}, {{0, 1}, {0, 1}});
 
     detail::CSRMatrixBackend<double> backend;
-    backend.initialize_structure(graph.adj_ind, 1);
+    backend.initialize_structure(graph.adj_ind.size(), 1);
     const double vals[] = {2.0, 3.0, 4.0, 5.0};
     for (int slot = 0; slot < 4; ++slot) {
         *backend.value_ptr(slot) = vals[slot];
@@ -1674,6 +1899,202 @@ void test_csr_vendor_dispatch_selection() {
     std::cout << "PASSED" << std::endl;
 }
 
+void test_csr_vendor_cache_reuse_repeated_apply() {
+    std::cout << "Testing CSR Vendor Cache Reuse Across Repeated Apply..." << std::endl;
+
+    DistGraph graph(MPI_COMM_SELF);
+    graph.construct_serial(2, {1, 1}, {{0, 1}, {0, 1}});
+
+    detail::CSRMatrixBackend<double> backend;
+    backend.initialize_structure(graph.adj_ind.size(), 1);
+    const double vals[] = {2.0, 3.0, 4.0, 5.0};
+    for (int slot = 0; slot < 4; ++slot) {
+        *backend.value_ptr(slot) = vals[slot];
+    }
+
+    assert(backend.vendor_cache_identity() == nullptr);
+    backend.reset_vendor_launch_count();
+
+    DistVector<double> x1(&graph);
+    DistVector<double> y1(&graph);
+    x1.local_data()[0] = 7.0;
+    x1.local_data()[1] = 11.0;
+    detail::csr_mult(&graph, backend, x1, y1);
+    assert(std::abs(y1.local_data()[0] - 47.0) < 1e-12);
+    assert(std::abs(y1.local_data()[1] - 83.0) < 1e-12);
+
+    const void* cache_after_first_apply = backend.vendor_cache_identity();
+    assert(cache_after_first_apply != nullptr);
+
+    DistVector<double> y1_repeat(&graph);
+    detail::csr_mult(&graph, backend, x1, y1_repeat);
+    assert(std::abs(y1_repeat.local_data()[0] - 47.0) < 1e-12);
+    assert(std::abs(y1_repeat.local_data()[1] - 83.0) < 1e-12);
+    assert(backend.vendor_cache_identity() == cache_after_first_apply);
+
+    DistVector<double> x2(&graph);
+    DistVector<double> y2(&graph);
+    x2.local_data()[0] = -1.0;
+    x2.local_data()[1] = 2.0;
+    detail::csr_mult(&graph, backend, x2, y2);
+    assert(std::abs(y2.local_data()[0] - 4.0) < 1e-12);
+    assert(std::abs(y2.local_data()[1] - 6.0) < 1e-12);
+    assert(backend.vendor_cache_identity() == cache_after_first_apply);
+
+    DistMultiVector<double> X1(&graph, 2);
+    DistMultiVector<double> Y1(&graph, 2);
+    X1(0, 0) = 1.0;
+    X1(1, 0) = 2.0;
+    X1(0, 1) = 3.0;
+    X1(1, 1) = 4.0;
+    detail::csr_mult_dense(&graph, backend, X1, Y1);
+    assert(std::abs(Y1(0, 0) - 8.0) < 1e-12);
+    assert(std::abs(Y1(1, 0) - 14.0) < 1e-12);
+    assert(std::abs(Y1(0, 1) - 18.0) < 1e-12);
+    assert(std::abs(Y1(1, 1) - 32.0) < 1e-12);
+    assert(backend.vendor_cache_identity() == cache_after_first_apply);
+
+    DistMultiVector<double> Y1_repeat(&graph, 2);
+    detail::csr_mult_dense(&graph, backend, X1, Y1_repeat);
+    assert(std::abs(Y1_repeat(0, 0) - 8.0) < 1e-12);
+    assert(std::abs(Y1_repeat(1, 0) - 14.0) < 1e-12);
+    assert(std::abs(Y1_repeat(0, 1) - 18.0) < 1e-12);
+    assert(std::abs(Y1_repeat(1, 1) - 32.0) < 1e-12);
+    assert(backend.vendor_cache_identity() == cache_after_first_apply);
+
+    DistMultiVector<double> X2(&graph, 2);
+    DistMultiVector<double> Y2(&graph, 2);
+    X2(0, 0) = -2.0;
+    X2(1, 0) = 1.0;
+    X2(0, 1) = 0.5;
+    X2(1, 1) = -1.5;
+    detail::csr_mult_dense(&graph, backend, X2, Y2);
+    assert(std::abs(Y2(0, 0) - (-1.0)) < 1e-12);
+    assert(std::abs(Y2(1, 0) - (-3.0)) < 1e-12);
+    assert(std::abs(Y2(0, 1) - (-3.5)) < 1e-12);
+    assert(std::abs(Y2(1, 1) - (-5.5)) < 1e-12);
+    assert(backend.vendor_cache_identity() == cache_after_first_apply);
+
+    DistVector<double> x_adj1(&graph);
+    DistVector<double> y_adj1(&graph);
+    x_adj1.local_data()[0] = 13.0;
+    x_adj1.local_data()[1] = 17.0;
+    detail::csr_mult_adjoint(&graph, backend, x_adj1, y_adj1);
+    assert(std::abs(y_adj1.local_data()[0] - 94.0) < 1e-12);
+    assert(std::abs(y_adj1.local_data()[1] - 124.0) < 1e-12);
+    assert(backend.vendor_cache_identity() == cache_after_first_apply);
+
+    DistVector<double> y_adj1_repeat(&graph);
+    detail::csr_mult_adjoint(&graph, backend, x_adj1, y_adj1_repeat);
+    assert(std::abs(y_adj1_repeat.local_data()[0] - 94.0) < 1e-12);
+    assert(std::abs(y_adj1_repeat.local_data()[1] - 124.0) < 1e-12);
+    assert(backend.vendor_cache_identity() == cache_after_first_apply);
+
+    DistVector<double> x_adj2(&graph);
+    DistVector<double> y_adj2(&graph);
+    x_adj2.local_data()[0] = -2.0;
+    x_adj2.local_data()[1] = 1.0;
+    detail::csr_mult_adjoint(&graph, backend, x_adj2, y_adj2);
+    assert(std::abs(y_adj2.local_data()[0] - 0.0) < 1e-12);
+    assert(std::abs(y_adj2.local_data()[1] - (-1.0)) < 1e-12);
+    assert(backend.vendor_cache_identity() == cache_after_first_apply);
+
+    DistMultiVector<double> X_adj1(&graph, 2);
+    DistMultiVector<double> Y_adj1(&graph, 2);
+    X_adj1(0, 0) = 5.0;
+    X_adj1(1, 0) = 7.0;
+    X_adj1(0, 1) = 11.0;
+    X_adj1(1, 1) = 13.0;
+    detail::csr_mult_dense_adjoint(&graph, backend, X_adj1, Y_adj1);
+    assert(std::abs(Y_adj1(0, 0) - 38.0) < 1e-12);
+    assert(std::abs(Y_adj1(1, 0) - 50.0) < 1e-12);
+    assert(std::abs(Y_adj1(0, 1) - 74.0) < 1e-12);
+    assert(std::abs(Y_adj1(1, 1) - 98.0) < 1e-12);
+    assert(backend.vendor_cache_identity() == cache_after_first_apply);
+
+    DistMultiVector<double> Y_adj1_repeat(&graph, 2);
+    detail::csr_mult_dense_adjoint(&graph, backend, X_adj1, Y_adj1_repeat);
+    assert(std::abs(Y_adj1_repeat(0, 0) - 38.0) < 1e-12);
+    assert(std::abs(Y_adj1_repeat(1, 0) - 50.0) < 1e-12);
+    assert(std::abs(Y_adj1_repeat(0, 1) - 74.0) < 1e-12);
+    assert(std::abs(Y_adj1_repeat(1, 1) - 98.0) < 1e-12);
+    assert(backend.vendor_cache_identity() == cache_after_first_apply);
+
+    DistMultiVector<double> X_adj2(&graph, 2);
+    DistMultiVector<double> Y_adj2(&graph, 2);
+    X_adj2(0, 0) = 1.0;
+    X_adj2(1, 0) = -3.0;
+    X_adj2(0, 1) = -2.0;
+    X_adj2(1, 1) = 4.0;
+    detail::csr_mult_dense_adjoint(&graph, backend, X_adj2, Y_adj2);
+    assert(std::abs(Y_adj2(0, 0) - (-10.0)) < 1e-12);
+    assert(std::abs(Y_adj2(1, 0) - (-12.0)) < 1e-12);
+    assert(std::abs(Y_adj2(0, 1) - 12.0) < 1e-12);
+    assert(std::abs(Y_adj2(1, 1) - 14.0) < 1e-12);
+    assert(backend.vendor_cache_identity() == cache_after_first_apply);
+
+#if defined(VBCSR_HAVE_MKL_SPARSE) || defined(VBCSR_HAVE_AOCL_SPARSE)
+    assert(backend.get_vendor_launch_count() > 0);
+#endif
+
+    std::cout << "PASSED" << std::endl;
+}
+
+void test_csr_vendor_cache_invalidation_on_structure_change() {
+    std::cout << "Testing CSR Vendor Cache Invalidation On Structure Change..." << std::endl;
+
+    DistGraph graph_a(MPI_COMM_SELF);
+    graph_a.construct_serial(2, {1, 1}, {{0, 1}, {1}});
+
+    detail::CSRMatrixBackend<double> backend;
+    backend.initialize_structure(graph_a.adj_ind.size(), 2);
+    const double vals_a[] = {2.0, 3.0, 5.0};
+    for (int slot = 0; slot < 3; ++slot) {
+        *backend.value_ptr(slot) = vals_a[slot];
+    }
+
+    DistVector<double> x_a(&graph_a);
+    DistVector<double> y_a(&graph_a);
+    x_a.local_data()[0] = 1.0;
+    x_a.local_data()[1] = 2.0;
+    detail::csr_mult(&graph_a, backend, x_a, y_a);
+    assert(std::abs(y_a.local_data()[0] - 8.0) < 1e-12);
+    assert(std::abs(y_a.local_data()[1] - 10.0) < 1e-12);
+
+    const void* cache_a = backend.vendor_cache_identity();
+    assert(cache_a != nullptr);
+
+    DistGraph graph_b(MPI_COMM_SELF);
+    graph_b.construct_serial(2, {1, 1}, {{0}, {0, 1}});
+
+    backend.initialize_structure(graph_b.adj_ind.size(), 2);
+    assert(backend.vendor_cache_identity() == nullptr);
+    const double vals_b[] = {7.0, 11.0, 13.0};
+    for (int slot = 0; slot < 3; ++slot) {
+        *backend.value_ptr(slot) = vals_b[slot];
+    }
+
+    DistVector<double> x_b(&graph_b);
+    DistVector<double> y_b(&graph_b);
+    x_b.local_data()[0] = 2.0;
+    x_b.local_data()[1] = 3.0;
+    detail::csr_mult(&graph_b, backend, x_b, y_b);
+    assert(std::abs(y_b.local_data()[0] - 14.0) < 1e-12);
+    assert(std::abs(y_b.local_data()[1] - 61.0) < 1e-12);
+
+    const void* cache_b = backend.vendor_cache_identity();
+    assert(cache_b != nullptr);
+    assert(cache_b != cache_a);
+
+    const auto& rebuilt_cache = backend.ensure_vendor_cache(
+        graph_b.adj_ptr,
+        graph_b.adj_ind,
+        static_cast<int>(graph_b.block_sizes.size()));
+    assert(rebuilt_cache.pages.size() == 2);
+
+    std::cout << "PASSED" << std::endl;
+}
+
 void test_csr_transpose_native_serial() {
     std::cout << "Testing CSR Transpose (Serial Native)..." << std::endl;
 
@@ -1695,12 +2116,12 @@ void test_csr_transpose_native_serial() {
 
     BlockSpMat<double> mat_t = mat.transpose();
     assert(mat_t.matrix_kind() == MatrixKind::CSR);
-    assert(mat_t.row_ptr == std::vector<int>({0, 2, 3, 4}));
-    assert(mat_t.col_ind == std::vector<int>({0, 1, 2, 0}));
-    assert(mat_t.logical_row_ptr() == std::vector<int>({0, 2, 3, 4}));
-    assert(mat_t.logical_col_ind() == std::vector<int>({0, 1, 2, 0}));
-    assert(mat_t.row_ptr == mat_t.logical_row_ptr());
-    assert(mat_t.col_ind == mat_t.logical_col_ind());
+    assert(mat_t.row_ptr() == std::vector<int>({0, 2, 3, 4}));
+    assert(mat_t.col_ind() == std::vector<int>({0, 1, 2, 0}));
+    assert(mat_t.row_ptr() == std::vector<int>({0, 2, 3, 4}));
+    assert(mat_t.col_ind() == std::vector<int>({0, 1, 2, 0}));
+    assert(mat_t.row_ptr() == mat_t.row_ptr());
+    assert(mat_t.col_ind() == mat_t.col_ind());
     assert(mat_t.get_block(0, 0) == std::vector<double>({2.0}));
     assert(mat_t.get_block(0, 1) == std::vector<double>({5.0}));
     assert(mat_t.get_block(1, 2) == std::vector<double>({7.0}));
@@ -1753,29 +2174,29 @@ void test_csr_transpose_native_distributed() {
 
     BlockSpMat<double> mat_t = mat.transpose();
     assert(mat_t.matrix_kind() == MatrixKind::CSR);
-    assert(mat_t.row_ptr == mat_t.logical_row_ptr());
-    assert(mat_t.col_ind == mat_t.logical_col_ind());
+    assert(mat_t.row_ptr() == mat_t.row_ptr());
+    assert(mat_t.col_ind() == mat_t.col_ind());
 
     if (size == 1) {
-        assert(mat_t.row_ptr == std::vector<int>({0, 2, 3}));
-        assert(mat_t.col_ind == std::vector<int>({0, 1, 0}));
+        assert(mat_t.row_ptr() == std::vector<int>({0, 2, 3}));
+        assert(mat_t.col_ind() == std::vector<int>({0, 1, 0}));
         assert(mat_t.get_block(0, 0) == std::vector<double>({2.0}));
         assert(mat_t.get_block(0, 1) == std::vector<double>({4.0}));
         assert(mat_t.get_block(1, 0) == std::vector<double>({3.0}));
     } else if (rank == 0) {
-        assert(mat_t.row_ptr == std::vector<int>({0, 2}));
-        assert(mat_t.col_ind.size() == 2);
+        assert(mat_t.row_ptr() == std::vector<int>({0, 2}));
+        assert(mat_t.col_ind().size() == 2);
         const int col0 = mat_t.graph->global_to_local.at(0);
         const int col1 = mat_t.graph->global_to_local.at(1);
         assert(mat_t.get_block(0, col0) == std::vector<double>({2.0}));
         assert(mat_t.get_block(0, col1) == std::vector<double>({4.0}));
     } else if (rank == 1) {
-        assert(mat_t.row_ptr == std::vector<int>({0, 1}));
+        assert(mat_t.row_ptr() == std::vector<int>({0, 1}));
         const int col0 = mat_t.graph->global_to_local.at(0);
         assert(mat_t.get_block(0, col0) == std::vector<double>({3.0}));
     } else {
-        assert(mat_t.row_ptr == std::vector<int>({0}));
-        assert(mat_t.col_ind.empty());
+        assert(mat_t.row_ptr() == std::vector<int>({0}));
+        assert(mat_t.col_ind().empty());
     }
 
     std::cout << "PASSED" << std::endl;
@@ -1848,10 +2269,10 @@ void test_csr_axpby_structure_change_native() {
     Y.axpby(2.0, X, 3.0);
 
     assert(Y.matrix_kind() == MatrixKind::CSR);
-    assert(Y.logical_row_ptr() == std::vector<int>({0, 2, 4}));
-    assert(Y.logical_col_ind() == std::vector<int>({0, 1, 0, 1}));
-    assert(Y.row_ptr == Y.logical_row_ptr());
-    assert(Y.col_ind == Y.logical_col_ind());
+    assert(Y.row_ptr() == std::vector<int>({0, 2, 4}));
+    assert(Y.col_ind() == std::vector<int>({0, 1, 0, 1}));
+    assert(Y.row_ptr() == Y.row_ptr());
+    assert(Y.col_ind() == Y.col_ind());
     assert(Y.get_block(0, 0) == std::vector<double>({3.0}));
     assert(Y.get_block(0, 1) == std::vector<double>({20.0}));
     assert(Y.get_block(1, 0) == std::vector<double>({40.0}));
@@ -1919,31 +2340,31 @@ void test_csr_spmm_native_distributed() {
 
     BlockSpMat<double> C = A.spmm(B, 0.0);
     assert(C.matrix_kind() == MatrixKind::CSR);
-    assert(C.row_ptr == C.logical_row_ptr());
-    assert(C.col_ind == C.logical_col_ind());
+    assert(C.row_ptr() == C.row_ptr());
+    assert(C.col_ind() == C.col_ind());
 
     if (size == 1) {
-        assert(C.row_ptr == std::vector<int>({0, 2, 4}));
-        assert(C.col_ind == std::vector<int>({0, 1, 0, 1}));
+        assert(C.row_ptr() == std::vector<int>({0, 2, 4}));
+        assert(C.col_ind() == std::vector<int>({0, 1, 0, 1}));
         assert(C.get_block(0, 0) == std::vector<double>({47.0}));
         assert(C.get_block(0, 1) == std::vector<double>({39.0}));
         assert(C.get_block(1, 0) == std::vector<double>({55.0}));
         assert(C.get_block(1, 1) == std::vector<double>({65.0}));
     } else if (rank == 0) {
-        assert(C.row_ptr == std::vector<int>({0, 2}));
+        assert(C.row_ptr() == std::vector<int>({0, 2}));
         const int col0 = C.graph->global_to_local.at(0);
         const int col1 = C.graph->global_to_local.at(1);
         assert(C.get_block(0, col0) == std::vector<double>({47.0}));
         assert(C.get_block(0, col1) == std::vector<double>({39.0}));
     } else if (rank == 1) {
-        assert(C.row_ptr == std::vector<int>({0, 2}));
+        assert(C.row_ptr() == std::vector<int>({0, 2}));
         const int col0 = C.graph->global_to_local.at(0);
         const int col1 = C.graph->global_to_local.at(1);
         assert(C.get_block(0, col0) == std::vector<double>({55.0}));
         assert(C.get_block(0, col1) == std::vector<double>({65.0}));
     } else {
-        assert(C.row_ptr == std::vector<int>({0}));
-        assert(C.col_ind.empty());
+        assert(C.row_ptr() == std::vector<int>({0}));
+        assert(C.col_ind().empty());
     }
 
     std::cout << "PASSED" << std::endl;
@@ -1996,13 +2417,13 @@ void test_spmm() {
     // Should have same structure as A (which is I)
     // So local size should match owned size
     
-    if (C.col_ind.size() != owned.size()) {
-        std::cout << "Rank " << rank << " C size: " << C.col_ind.size() 
+    if (C.col_ind().size() != owned.size()) {
+        std::cout << "Rank " << rank << " C size: " << C.col_ind().size() 
                   << " Expected: " << owned.size() << std::endl;
     }
-    assert(C.col_ind.size() == owned.size());
+    assert(C.col_ind().size() == owned.size());
     
-    for(size_t k=0; k<C.col_ind.size(); ++k) {
+    for(size_t k=0; k<C.col_ind().size(); ++k) {
         // Check diagonal values
         const double* d = C.block_data(static_cast<int>(k));
         assert(d[0] == 1.0 && d[3] == 1.0); // Diagonal
@@ -2048,8 +2469,14 @@ int main(int argc, char** argv) {
     test_vbcsr_shape_batched_spmm();
     test_csr_backend_dispatch_kernels();
     test_csr_backend_dispatch_kernels_complex();
+    test_csr_page_cap_policy();
+    test_blockspmat_csr_page_cap_repack_and_propagation();
+    test_blockspmat_bsr_page_settings_repack_and_propagation();
+    test_blockspmat_vbcsr_page_settings_repack_and_propagation();
     test_csr_vendor_page_cache_metadata();
     test_csr_vendor_dispatch_selection();
+    test_csr_vendor_cache_reuse_repeated_apply();
+    test_csr_vendor_cache_invalidation_on_structure_change();
     test_csr_transpose_native_serial();
     test_csr_transpose_native_distributed();
     test_csr_axpby_same_structure_native();

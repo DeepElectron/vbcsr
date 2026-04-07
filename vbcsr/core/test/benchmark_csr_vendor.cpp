@@ -46,9 +46,9 @@ void csr_mult_native_benchmark(
     #pragma omp parallel for schedule(static)
     for (int row = 0; row < n_rows; ++row) {
         T sum = T(0);
-        backend.for_each_row_segment(row_ptr, row, [&](auto page, auto) {
-            for (uint32_t idx = 0; idx < page.nnz; ++idx) {
-                sum += page.vals[idx] * x_data[block_offsets[page.cols[idx]]];
+        backend.for_each_row_slice(row_ptr, graph->adj_ind, row, [&](auto slice) {
+            for (uint32_t idx = 0; idx < slice.nnz_count; ++idx) {
+                sum += slice.values[idx] * x_data[block_offsets[slice.cols[idx]]];
             }
         });
         y_data[block_offsets[row]] = sum;
@@ -81,12 +81,12 @@ void csr_mult_dense_native_benchmark(
         #pragma omp for schedule(static)
         for (int row = 0; row < n_rows; ++row) {
             std::fill(sums.begin(), sums.end(), T(0));
-            backend.for_each_row_segment(row_ptr, row, [&](auto page, auto) {
-                for (uint32_t idx = 0; idx < page.nnz; ++idx) {
-                    const int col_offset = block_offsets[page.cols[idx]];
+            backend.for_each_row_slice(row_ptr, graph->adj_ind, row, [&](auto slice) {
+                for (uint32_t idx = 0; idx < slice.nnz_count; ++idx) {
+                    const int col_offset = block_offsets[slice.cols[idx]];
                     for (int vec = 0; vec < num_vecs; ++vec) {
                         sums[static_cast<size_t>(vec)] +=
-                            page.vals[idx] * x_data[static_cast<size_t>(vec * x_ld + col_offset)];
+                            slice.values[idx] * x_data[static_cast<size_t>(vec * x_ld + col_offset)];
                     }
                 }
             });
@@ -129,13 +129,16 @@ int main(int argc, char** argv) {
     graph.construct_serial(n_rows, std::vector<int>(static_cast<size_t>(n_rows), 1), adj);
 
     detail::CSRMatrixBackend<double> backend;
-    backend.initialize_structure(graph.adj_ind, nnz_per_page);
+    backend.initialize_structure(graph.adj_ind.size(), nnz_per_page);
     for (int slot = 0; slot < static_cast<int>(graph.adj_ind.size()); ++slot) {
         const int col = graph.adj_ind[static_cast<size_t>(slot)];
         *backend.value_ptr(slot) = 1.0 / (1.0 + std::abs(col - (slot % n_rows)));
     }
 
-    const auto& cache = backend.ensure_vendor_cache(graph.adj_ptr, static_cast<int>(graph.block_sizes.size()));
+    const auto& cache = backend.ensure_vendor_cache(
+        graph.adj_ptr,
+        graph.adj_ind,
+        static_cast<int>(graph.block_sizes.size()));
 
     DistVector<double> x(&graph);
     DistVector<double> y_native(&graph);
