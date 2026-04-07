@@ -127,6 +127,93 @@ void assert_close(const std::vector<double>& got, const std::vector<double>& exp
     }
 }
 
+template <typename T>
+T conjugate_if_needed(const T& value) {
+    return value;
+}
+
+template <typename T>
+std::complex<T> conjugate_if_needed(const std::complex<T>& value) {
+    return std::conj(value);
+}
+
+template <typename T>
+std::vector<T> dense_matvec_adjoint_generic(
+    const std::vector<T>& A,
+    int rows,
+    int cols,
+    const std::vector<T>& x) {
+    std::vector<T> y(cols, T(0));
+    for (int row = 0; row < rows; ++row) {
+        for (int col = 0; col < cols; ++col) {
+            y[col] += conjugate_if_needed(A[row * cols + col]) * x[row];
+        }
+    }
+    return y;
+}
+
+template <typename T>
+std::vector<T> dense_matvec_generic(
+    const std::vector<T>& A,
+    int rows,
+    int cols,
+    const std::vector<T>& x) {
+    std::vector<T> y(rows, T(0));
+    for (int row = 0; row < rows; ++row) {
+        for (int col = 0; col < cols; ++col) {
+            y[row] += A[row * cols + col] * x[col];
+        }
+    }
+    return y;
+}
+
+template <typename T>
+std::vector<T> dense_matmat_generic(
+    const std::vector<T>& A,
+    int rows,
+    int cols,
+    const std::vector<T>& X,
+    int x_ld,
+    int num_vecs) {
+    std::vector<T> Y(static_cast<size_t>(rows) * num_vecs, T(0));
+    for (int vec = 0; vec < num_vecs; ++vec) {
+        for (int row = 0; row < rows; ++row) {
+            for (int col = 0; col < cols; ++col) {
+                Y[static_cast<size_t>(vec) * rows + row] += A[row * cols + col] * X[static_cast<size_t>(vec) * x_ld + col];
+            }
+        }
+    }
+    return Y;
+}
+
+template <typename T>
+std::vector<T> dense_matmat_adjoint_generic(
+    const std::vector<T>& A,
+    int rows,
+    int cols,
+    const std::vector<T>& X,
+    int x_ld,
+    int num_vecs) {
+    std::vector<T> Y(static_cast<size_t>(cols) * num_vecs, T(0));
+    for (int vec = 0; vec < num_vecs; ++vec) {
+        for (int row = 0; row < rows; ++row) {
+            for (int col = 0; col < cols; ++col) {
+                Y[static_cast<size_t>(vec) * cols + col] +=
+                    conjugate_if_needed(A[row * cols + col]) * X[static_cast<size_t>(vec) * x_ld + row];
+            }
+        }
+    }
+    return Y;
+}
+
+template <typename T>
+void assert_close_generic(const std::vector<T>& got, const std::vector<T>& expected, double tol = 1e-12) {
+    assert(got.size() == expected.size());
+    for (size_t i = 0; i < got.size(); ++i) {
+        assert(std::abs(got[i] - expected[i]) < tol);
+    }
+}
+
 void test_basic_spmv() {
     std::cout << "Testing Basic SpMV..." << std::endl;
     
@@ -427,16 +514,49 @@ void test_paged_storage_contracts() {
     assert(bsr_backend.page(bsr_graph.adj_ind, 0).block_count == 1);
     assert(bsr_backend.page(bsr_graph.adj_ind, 1).block_count == 1);
     assert(bsr_backend.page(bsr_graph.adj_ind, 2).block_count == 1);
+    const auto& bsr_plan = bsr_backend.ensure_apply_plan(bsr_graph.adj_ptr, bsr_graph.adj_ind);
+    assert(bsr_backend.active_blocks_per_page() == 1);
+    assert(bsr_plan.batches.size() == 3);
+    assert(bsr_plan.batches[0].batch.page_index == 0);
+    assert(bsr_plan.batches[0].batch.first_block == 0);
+    assert(bsr_plan.batches[0].batch.block_count == 1);
+    assert(bsr_plan.batches[0].batch.row_begin == 0);
+    assert(bsr_plan.batches[0].batch.row_end == 1);
+    assert((bsr_plan.batches[0].row_block_offsets_storage == std::vector<int>{0, 1}));
+    assert(bsr_plan.batches[1].batch.page_index == 1);
+    assert(bsr_plan.batches[1].batch.first_block == 1);
+    assert(bsr_plan.batches[1].batch.block_count == 1);
+    assert(bsr_plan.batches[1].batch.row_begin == 0);
+    assert(bsr_plan.batches[1].batch.row_end == 1);
+    assert((bsr_plan.batches[1].row_block_offsets_storage == std::vector<int>{0, 1}));
+    assert(bsr_plan.batches[2].batch.page_index == 2);
+    assert(bsr_plan.batches[2].batch.first_block == 2);
+    assert(bsr_plan.batches[2].batch.block_count == 1);
+    assert(bsr_plan.batches[2].batch.row_begin == 1);
+    assert(bsr_plan.batches[2].batch.row_end == 2);
+    assert((bsr_plan.batches[2].row_block_offsets_storage == std::vector<int>{0, 1}));
+    const auto& batch0 = bsr_plan.batches[0].batch;
+    const auto& batch1 = bsr_plan.batches[1].batch;
+    const auto& batch2 = bsr_plan.batches[2].batch;
+    assert(batch0.row_count() == 1);
+    assert(batch0.row_block_start(0) == 0);
+    assert(batch0.row_block_end(0) == 1);
+    assert(batch1.row_count() == 1);
+    assert(batch1.row_block_start(0) == 0);
+    assert(batch1.row_block_end(0) == 1);
+    assert(batch2.row_count() == 1);
+    assert(batch2.row_block_start(1) == 0);
+    assert(batch2.row_block_end(1) == 1);
     std::vector<int> bsr_cols;
     std::vector<double> bsr_first_entries;
     std::vector<uint32_t> bsr_chunks;
-    bsr_backend.for_each_row_slice(bsr_graph.adj_ptr, bsr_graph.adj_ind, 0, [&](auto slice) {
-        bsr_chunks.push_back(slice.block_count);
-        for (uint32_t idx = 0; idx < slice.block_count; ++idx) {
-            bsr_cols.push_back(slice.cols[idx]);
-            bsr_first_entries.push_back(slice.values[idx * slice.block_value_count]);
+    for (const auto* batch : {&batch0, &batch1}) {
+        bsr_chunks.push_back(batch->block_count);
+        for (uint32_t idx = 0; idx < batch->block_count; ++idx) {
+            bsr_cols.push_back(batch->cols[idx]);
+            bsr_first_entries.push_back(batch->values[idx * batch->block_value_count]);
         }
-    });
+    }
     assert((bsr_chunks == std::vector<uint32_t>{1u, 1u}));
     assert((bsr_cols == std::vector<int>{0, 1}));
     assert((bsr_first_entries == std::vector<double>{1.0, 7.0}));
@@ -449,17 +569,20 @@ void test_vbcsr_execution_registry_scaffold() {
 
     detail::VBCSRMatrixBackend<double, DefaultKernel<double>> backend;
     const int shape_id = backend.ensure_shape(2, 3);
-    assert((
-        backend.execution_kind_for_shape(shape_id) ==
-        detail::VBCSRMatrixBackend<double, DefaultKernel<double>>::ExecutionKind::StaticFallback));
-    backend.record_apply_batch(shape_id, 5);
-    assert(backend.shape_apply_batch_count(shape_id) == 1);
+    using ApplyMode = detail::VBCSRMatrixBackend<double, DefaultKernel<double>>::ApplyMode;
+    backend.record_apply_batch(shape_id, ApplyMode::Scalar, 1);
+    backend.record_apply_batch(shape_id, ApplyMode::Batched, 5);
+    assert(backend.shape_scalar_apply_batch_count(shape_id) == 1);
+    assert(backend.shape_batched_apply_batch_count(shape_id) == 1);
+    assert(backend.total_scalar_apply_batch_count() == 1);
+    assert(backend.total_batched_apply_batch_count() == 1);
 
-    assert((
-        backend.execution_kind_for_spmm_triple(2, 3, 4) ==
-        detail::VBCSRMatrixBackend<double, DefaultKernel<double>>::ExecutionKind::StaticFallback));
     backend.record_spmm_batch(2, 3, 4, 7);
     assert(backend.spmm_batch_count(2, 3, 4) == 1);
+
+    backend.reset_apply_counters();
+    assert(backend.total_scalar_apply_batch_count() == 0);
+    assert(backend.total_batched_apply_batch_count() == 0);
 
     std::cout << "PASSED" << std::endl;
 }
@@ -477,11 +600,8 @@ void test_vbcsr_batch_views() {
 
     size_t total_blocks = 0;
     mat.for_each_shape_batch([&](const auto& batch) {
-        using ExecKind = typename detail::VBCSRMatrixBackend<double, DefaultKernel<double>>::ExecutionKind;
         assert(batch.page.data != nullptr);
         assert(batch.block_count() > 0);
-        assert(batch.policy != nullptr);
-        assert(batch.policy->preferred_execution.load(std::memory_order_relaxed) == ExecKind::StaticFallback);
         for (uint32_t idx = 0; idx < batch.block_count(); ++idx) {
             const int logical_slot = batch.logical_slot(idx);
             assert(batch.block_ptr(idx) == mat.block_data(logical_slot));
@@ -1348,6 +1468,16 @@ void test_vbcsr_shape_batched_apply_kernels() {
     const std::vector<double> dense = mat.to_dense();
     const int rows = graph.block_offsets[graph.owned_global_indices.size()];
     const int cols = graph.block_offsets.back();
+    auto total_batched_apply_count = [&](const auto& matrix) {
+        std::set<int> seen_shapes;
+        size_t total = 0;
+        matrix.for_each_shape_batch([&](const auto& batch) {
+            if (seen_shapes.insert(batch.shape_id).second) {
+                total += static_cast<size_t>(batch.batched_apply_batch_count());
+            }
+        });
+        return total;
+    };
 
     DistVector<double> x(&graph);
     for (int i = 0; i < cols; ++i) {
@@ -1356,6 +1486,9 @@ void test_vbcsr_shape_batched_apply_kernels() {
     DistVector<double> y(&graph);
     mat.mult(x, y);
     assert_close(std::vector<double>(y.data.begin(), y.data.begin() + rows), dense_matvec(dense, rows, cols, x.data));
+    if (SmartKernel<double>::supports_batched_gemv()) {
+        assert(total_batched_apply_count(mat) > 0);
+    }
 
     DistMultiVector<double> X(&graph, 2);
     for (int vec = 0; vec < 2; ++vec) {
@@ -1366,6 +1499,9 @@ void test_vbcsr_shape_batched_apply_kernels() {
     DistMultiVector<double> Y(&graph, 2);
     mat.mult_dense(X, Y);
     assert_close(Y.data, dense_matmat(dense, rows, cols, X.data, cols, 2));
+    if (SmartKernel<double>::supports_batched_gemm()) {
+        assert(total_batched_apply_count(mat) > 0);
+    }
 
     DistVector<double> x_adj(&graph);
     for (int i = 0; i < rows; ++i) {
@@ -1374,6 +1510,9 @@ void test_vbcsr_shape_batched_apply_kernels() {
     DistVector<double> y_adj(&graph);
     mat.mult_adjoint(x_adj, y_adj);
     assert_close(std::vector<double>(y_adj.data.begin(), y_adj.data.begin() + cols), dense_matvec_transpose(dense, rows, cols, x_adj.data));
+    if (SmartKernel<double>::supports_batched_gemv()) {
+        assert(total_batched_apply_count(mat) > 0);
+    }
 
     DistMultiVector<double> X_adj(&graph, 2);
     for (int vec = 0; vec < 2; ++vec) {
@@ -1384,6 +1523,9 @@ void test_vbcsr_shape_batched_apply_kernels() {
     DistMultiVector<double> Y_adj(&graph, 2);
     mat.mult_dense_adjoint(X_adj, Y_adj);
     assert_close(Y_adj.data, dense_matmat_transpose(dense, rows, cols, X_adj.data, rows, 2));
+    if (SmartKernel<double>::supports_batched_gemm()) {
+        assert(total_batched_apply_count(mat) > 0);
+    }
 
     mat.contiguous();
     assert(mat.is_contiguous());
@@ -1405,6 +1547,121 @@ void test_vbcsr_shape_batched_apply_kernels() {
     DistMultiVector<double> Y_adj_packed(&graph, 2);
     mat.mult_dense_adjoint(X_adj, Y_adj_packed);
     assert_close(Y_adj_packed.data, dense_matmat_transpose(dense, rows, cols, X_adj.data, rows, 2));
+
+    double overwrite01[] = {
+        1.0, 3.0,
+        2.0, 4.0
+    };
+    mat.add_block(0, 1, overwrite01, 2, 2, AssemblyMode::INSERT, MatrixLayout::ColMajor);
+    mat.assemble();
+    assert(!mat.is_contiguous());
+    const std::vector<double> dense_after_update = mat.to_dense();
+    DistVector<double> y_after_update(&graph);
+    mat.mult(x, y_after_update);
+    assert_close(
+        std::vector<double>(y_after_update.data.begin(), y_after_update.data.begin() + rows),
+        dense_matvec(dense_after_update, rows, cols, x.data));
+    if (SmartKernel<double>::supports_batched_gemv()) {
+        assert(total_batched_apply_count(mat) > 0);
+    }
+
+    std::cout << "PASSED" << std::endl;
+}
+
+void test_vbcsr_shape_batched_apply_kernels_complex() {
+    std::cout << "Testing VBCSR Shape-Batched Apply Kernels (Complex)..." << std::endl;
+
+    using T = std::complex<double>;
+    std::vector<int> block_sizes = {2, 2, 3};
+    std::vector<std::vector<int>> adj = {{0, 1, 2}, {0, 1, 2}, {0, 1, 2}};
+    DistGraph graph(MPI_COMM_SELF);
+    graph.construct_serial(3, block_sizes, adj);
+
+    BlockSpMat<T> mat(&graph);
+    for (int row = 0; row < 3; ++row) {
+        for (int col : adj[row]) {
+            const int r_dim = block_sizes[row];
+            const int c_dim = block_sizes[col];
+            std::vector<T> block(static_cast<size_t>(r_dim) * c_dim);
+            const double real_base = 1.0 + 3.0 * row + 1.5 * col;
+            const double imag_base = -0.5 + 0.75 * row - 0.25 * col;
+            for (int r = 0; r < r_dim; ++r) {
+                for (int c = 0; c < c_dim; ++c) {
+                    block[static_cast<size_t>(r) * c_dim + c] = T(
+                        real_base + 0.2 * r + 0.1 * c,
+                        imag_base + 0.15 * r - 0.05 * c);
+                }
+            }
+            mat.add_block(row, col, block.data(), r_dim, c_dim, AssemblyMode::INSERT, MatrixLayout::RowMajor);
+        }
+    }
+    mat.assemble();
+
+    const std::vector<T> dense = mat.to_dense();
+    const int rows = graph.block_offsets[graph.owned_global_indices.size()];
+    const int cols = graph.block_offsets.back();
+    auto total_batched_apply_count = [&](const auto& matrix) {
+        std::set<int> seen_shapes;
+        size_t total = 0;
+        matrix.for_each_shape_batch([&](const auto& batch) {
+            if (seen_shapes.insert(batch.shape_id).second) {
+                total += static_cast<size_t>(batch.batched_apply_batch_count());
+            }
+        });
+        return total;
+    };
+
+    DistVector<T> x(&graph);
+    for (int i = 0; i < cols; ++i) {
+        x.local_data()[i] = T(1.0 + 0.25 * i, -0.5 + 0.1 * i);
+    }
+    DistVector<T> y(&graph);
+    mat.mult(x, y);
+    assert_close_generic(
+        std::vector<T>(y.data.begin(), y.data.begin() + rows),
+        dense_matvec_generic(dense, rows, cols, x.data));
+    if (SmartKernel<T>::supports_batched_gemv()) {
+        assert(total_batched_apply_count(mat) > 0);
+    }
+
+    DistMultiVector<T> X(&graph, 2);
+    for (int vec = 0; vec < 2; ++vec) {
+        for (int i = 0; i < cols; ++i) {
+            X(i, vec) = T(0.5 * (vec + 1) + i, 0.25 * vec - 0.2 * i);
+        }
+    }
+    DistMultiVector<T> Y(&graph, 2);
+    mat.mult_dense(X, Y);
+    assert_close_generic(Y.data, dense_matmat_generic(dense, rows, cols, X.data, cols, 2));
+    if (SmartKernel<T>::supports_batched_gemm()) {
+        assert(total_batched_apply_count(mat) > 0);
+    }
+
+    DistVector<T> x_adj(&graph);
+    for (int i = 0; i < rows; ++i) {
+        x_adj.local_data()[i] = T(2.0 + 0.1 * i, -1.0 + 0.2 * i);
+    }
+    DistVector<T> y_adj(&graph);
+    mat.mult_adjoint(x_adj, y_adj);
+    assert_close_generic(
+        std::vector<T>(y_adj.data.begin(), y_adj.data.begin() + cols),
+        dense_matvec_adjoint_generic(dense, rows, cols, x_adj.data));
+    if (SmartKernel<T>::supports_batched_gemv()) {
+        assert(total_batched_apply_count(mat) > 0);
+    }
+
+    DistMultiVector<T> X_adj(&graph, 2);
+    for (int vec = 0; vec < 2; ++vec) {
+        for (int i = 0; i < rows; ++i) {
+            X_adj(i, vec) = T(1.0 + 0.3 * i, 0.5 * vec - 0.1 * i);
+        }
+    }
+    DistMultiVector<T> Y_adj(&graph, 2);
+    mat.mult_dense_adjoint(X_adj, Y_adj);
+    assert_close_generic(Y_adj.data, dense_matmat_adjoint_generic(dense, rows, cols, X_adj.data, rows, 2));
+    if (SmartKernel<T>::supports_batched_gemm()) {
+        assert(total_batched_apply_count(mat) > 0);
+    }
 
     std::cout << "PASSED" << std::endl;
 }
@@ -1598,22 +1855,22 @@ void test_csr_page_cap_policy() {
     graph.construct_serial(3, {1, 1, 1}, {{0, 2}, {0, 1, 2}, {1}});
 
     detail::CSRMatrixBackend<double> backend;
-    assert(backend.page_setting() == detail::CSRMatrixBackend<double>::page_size_limit());
+    assert(backend.configured_page_size() == detail::CSRMatrixBackend<double>::max_page_size());
 
     backend.initialize_structure(graph.adj_ind.size());
-    assert(backend.page_size() == graph.adj_ind.size());
+    assert(backend.active_page_size() == graph.adj_ind.size());
     assert(backend.page_count() == 1);
 
     backend.initialize_structure(graph.adj_ind.size(), 2);
-    assert(backend.page_setting() == 2);
-    assert(backend.page_size() == 2);
+    assert(backend.configured_page_size() == 2);
+    assert(backend.active_page_size() == 2);
     assert(backend.page_count() == 3);
 
     backend.initialize_structure(
         graph.adj_ind.size(),
-        detail::CSRMatrixBackend<double>::page_size_limit());
-    assert(backend.page_setting() == detail::CSRMatrixBackend<double>::page_size_limit());
-    assert(backend.page_size() == graph.adj_ind.size());
+        detail::CSRMatrixBackend<double>::max_page_size());
+    assert(backend.configured_page_size() == detail::CSRMatrixBackend<double>::max_page_size());
+    assert(backend.active_page_size() == graph.adj_ind.size());
     assert(backend.page_count() == 1);
 
     std::cout << "PASSED" << std::endl;
@@ -1627,7 +1884,7 @@ void test_blockspmat_csr_page_cap_repack_and_propagation() {
 
     BlockSpMat<double> mat(&graph);
     assert(mat.matrix_kind() == MatrixKind::CSR);
-    assert(mat.backend_page_settings().csr_page_size == detail::CSRMatrixBackend<double>::page_size_limit());
+    assert(mat.backend_page_settings().csr_page_size == detail::CSRMatrixBackend<double>::max_page_size());
 
     double a00[] = {2.0};
     double a01[] = {3.0};
@@ -1810,20 +2067,20 @@ void test_csr_vendor_page_cache_metadata() {
     assert(cache.pages.size() == 2);
 
     const auto& page0 = cache.pages[0];
-    assert(page0.metadata.page_index == 0);
-    assert(page0.metadata.first_nnz == 0);
-    assert(page0.metadata.nnz_count == 3);
-    assert(page0.metadata.row_begin == 0);
-    assert(page0.metadata.row_end == 2);
-    assert(page0.row_ptr == std::vector<int>({0, 2, 3}));
+    assert(page0.batch.page_index == 0);
+    assert(page0.batch.first_nnz == 0);
+    assert(page0.batch.nnz_count == 3);
+    assert(page0.batch.row_begin == 0);
+    assert(page0.batch.row_end == 2);
+    assert(page0.row_offsets_storage == std::vector<int>({0, 2, 3}));
 
     const auto& page1 = cache.pages[1];
-    assert(page1.metadata.page_index == 1);
-    assert(page1.metadata.first_nnz == 3);
-    assert(page1.metadata.nnz_count == 3);
-    assert(page1.metadata.row_begin == 1);
-    assert(page1.metadata.row_end == 3);
-    assert(page1.row_ptr == std::vector<int>({0, 2, 3}));
+    assert(page1.batch.page_index == 1);
+    assert(page1.batch.first_nnz == 3);
+    assert(page1.batch.nnz_count == 3);
+    assert(page1.batch.row_begin == 1);
+    assert(page1.batch.row_end == 3);
+    assert(page1.row_offsets_storage == std::vector<int>({0, 2, 3}));
 
 #ifdef VBCSR_HAVE_MKL_SPARSE
     assert(cache.kind == detail::CSRVendorBackendKind::MKL);
@@ -1838,6 +2095,399 @@ void test_csr_vendor_page_cache_metadata() {
 
     std::cout << "PASSED" << std::endl;
 }
+
+void test_bsr_vendor_batch_cache_metadata() {
+    std::cout << "Testing BSR Vendor Batch Cache Metadata..." << std::endl;
+
+    DistGraph graph(MPI_COMM_SELF);
+    graph.construct_serial(2, {2, 2}, {{0, 1}, {0, 1}});
+
+    detail::BSRMatrixBackend<double> backend;
+    backend.initialize_structure(graph.adj_ind.size(), 2, 1);
+    const double blocks[][4] = {
+        {1.0, 3.0, 2.0, 4.0},
+        {5.0, 7.0, 6.0, 8.0},
+        {2.0, 1.0, 0.0, 2.0},
+        {0.0, 4.0, 1.0, 3.0},
+    };
+    for (int slot = 0; slot < 4; ++slot) {
+        std::memcpy(backend.block_ptr(slot), blocks[slot], sizeof(blocks[slot]));
+    }
+
+    const auto& cache = backend.ensure_vendor_cache(
+        graph.adj_ptr,
+        graph.adj_ind,
+        static_cast<int>(graph.block_sizes.size()));
+    assert(cache.batches.size() == 4);
+
+    const auto& batch0 = cache.batches[0];
+    assert(batch0.batch.page_index == 0);
+    assert(batch0.batch.first_block == 0);
+    assert(batch0.batch.block_count == 1);
+    assert(batch0.batch.row_begin == 0);
+    assert(batch0.batch.row_end == 1);
+    assert(batch0.row_block_offsets_storage == std::vector<int>({0, 1}));
+
+    const auto& batch1 = cache.batches[1];
+    assert(batch1.batch.page_index == 1);
+    assert(batch1.batch.first_block == 1);
+    assert(batch1.batch.block_count == 1);
+    assert(batch1.batch.row_begin == 0);
+    assert(batch1.batch.row_end == 1);
+    assert(batch1.row_block_offsets_storage == std::vector<int>({0, 1}));
+
+    const auto& batch2 = cache.batches[2];
+    assert(batch2.batch.page_index == 2);
+    assert(batch2.batch.first_block == 2);
+    assert(batch2.batch.block_count == 1);
+    assert(batch2.batch.row_begin == 1);
+    assert(batch2.batch.row_end == 2);
+    assert(batch2.row_block_offsets_storage == std::vector<int>({0, 1}));
+
+    const auto& batch3 = cache.batches[3];
+    assert(batch3.batch.page_index == 3);
+    assert(batch3.batch.first_block == 3);
+    assert(batch3.batch.block_count == 1);
+    assert(batch3.batch.row_begin == 1);
+    assert(batch3.batch.row_end == 2);
+    assert(batch3.row_block_offsets_storage == std::vector<int>({0, 1}));
+
+#ifdef VBCSR_HAVE_MKL_BSR_SPARSE
+    assert(cache.kind == detail::BSRVendorBackendKind::MKL);
+    assert(backend.vendor_backend_name() == "mkl");
+    assert((batch0.mm_rows_start_one == std::vector<MKL_INT>{1}));
+    assert((batch0.mm_rows_end_one == std::vector<MKL_INT>{2}));
+    assert((batch0.mm_cols_one == std::vector<MKL_INT>{1}));
+    assert((batch3.mm_rows_start_one == std::vector<MKL_INT>{1}));
+    assert((batch3.mm_rows_end_one == std::vector<MKL_INT>{2}));
+    assert((batch3.mm_cols_one == std::vector<MKL_INT>{2}));
+#else
+    assert(cache.kind == detail::BSRVendorBackendKind::None);
+    assert(backend.vendor_backend_name() == "none");
+#endif
+
+    std::cout << "PASSED" << std::endl;
+}
+
+void test_bsr_vendor_dispatch_selection() {
+    std::cout << "Testing BSR Vendor Dispatch Selection..." << std::endl;
+
+    DistGraph graph(MPI_COMM_SELF);
+    graph.construct_serial(2, {2, 2}, {{0, 1}, {0, 1}});
+
+    detail::BSRMatrixBackend<double> backend;
+    backend.initialize_structure(graph.adj_ind.size(), 2, 1);
+    const double blocks[][4] = {
+        {1.0, 3.0, 2.0, 4.0},
+        {5.0, 7.0, 6.0, 8.0},
+        {2.0, 1.0, 0.0, 2.0},
+        {0.0, 4.0, 1.0, 3.0},
+    };
+    for (int slot = 0; slot < 4; ++slot) {
+        std::memcpy(backend.block_ptr(slot), blocks[slot], sizeof(blocks[slot]));
+    }
+
+    const std::vector<double> dense = {
+        1.0, 2.0, 5.0, 6.0,
+        3.0, 4.0, 7.0, 8.0,
+        2.0, 0.0, 0.0, 1.0,
+        1.0, 2.0, 4.0, 3.0,
+    };
+
+    backend.reset_vendor_launch_count();
+
+    DistVector<double> x(&graph);
+    DistVector<double> y(&graph);
+    x.local_data()[0] = 1.0;
+    x.local_data()[1] = 2.0;
+    x.local_data()[2] = 3.0;
+    x.local_data()[3] = 4.0;
+    detail::bsr_mult(&graph, backend, x, y);
+    assert_close(
+        std::vector<double>(y.local_data(), y.local_data() + 4),
+        dense_matvec(dense, 4, 4, std::vector<double>(x.local_data(), x.local_data() + 4)));
+
+    DistMultiVector<double> X(&graph, 2);
+    DistMultiVector<double> Y(&graph, 2);
+    X(0, 0) = 1.0;
+    X(1, 0) = 2.0;
+    X(2, 0) = 3.0;
+    X(3, 0) = 4.0;
+    X(0, 1) = 5.0;
+    X(1, 1) = 6.0;
+    X(2, 1) = 7.0;
+    X(3, 1) = 8.0;
+    detail::bsr_mult_dense(&graph, backend, X, Y);
+    const auto expected_dense = dense_matmat_generic(dense, 4, 4, X.data, 4, 2);
+    assert_close(
+        std::vector<double>(Y.data.begin(), Y.data.begin() + 8),
+        expected_dense);
+
+    DistVector<double> x_adj(&graph);
+    DistVector<double> y_adj(&graph);
+    x_adj.local_data()[0] = 2.0;
+    x_adj.local_data()[1] = -1.0;
+    x_adj.local_data()[2] = 4.0;
+    x_adj.local_data()[3] = 3.0;
+    detail::bsr_mult_adjoint(&graph, backend, x_adj, y_adj);
+    assert_close_generic(
+        std::vector<double>(y_adj.local_data(), y_adj.local_data() + 4),
+        dense_matvec_adjoint_generic(dense, 4, 4, std::vector<double>(x_adj.local_data(), x_adj.local_data() + 4)));
+
+    DistMultiVector<double> X_adj(&graph, 2);
+    DistMultiVector<double> Y_adj(&graph, 2);
+    X_adj(0, 0) = 2.0;
+    X_adj(1, 0) = -1.0;
+    X_adj(2, 0) = 4.0;
+    X_adj(3, 0) = 3.0;
+    X_adj(0, 1) = 1.0;
+    X_adj(1, 1) = 0.0;
+    X_adj(2, 1) = -2.0;
+    X_adj(3, 1) = 5.0;
+    detail::bsr_mult_dense_adjoint(&graph, backend, X_adj, Y_adj);
+    const auto expected_dense_adj = dense_matmat_adjoint_generic(dense, 4, 4, X_adj.data, 4, 2);
+    assert_close_generic(
+        std::vector<double>(Y_adj.data.begin(), Y_adj.data.begin() + 8),
+        expected_dense_adj);
+
+#ifdef VBCSR_HAVE_MKL_BSR_SPARSE
+    assert(backend.get_vendor_launch_count() > 0);
+#else
+    assert(backend.get_vendor_launch_count() == 0);
+#endif
+
+    std::cout << "PASSED" << std::endl;
+}
+
+void test_bsr_vendor_cache_reuse_repeated_apply() {
+    std::cout << "Testing BSR Vendor Cache Reuse Across Repeated Apply..." << std::endl;
+
+    DistGraph graph(MPI_COMM_SELF);
+    graph.construct_serial(2, {2, 2}, {{0, 1}, {0, 1}});
+
+    detail::BSRMatrixBackend<double> backend;
+    backend.initialize_structure(graph.adj_ind.size(), 2, 1);
+    const double blocks[][4] = {
+        {1.0, 0.0, 0.0, 1.0},
+        {2.0, 0.0, 0.0, 2.0},
+        {3.0, 0.0, 0.0, 3.0},
+        {4.0, 0.0, 0.0, 4.0},
+    };
+    for (int slot = 0; slot < 4; ++slot) {
+        std::memcpy(backend.block_ptr(slot), blocks[slot], sizeof(blocks[slot]));
+    }
+
+    assert(backend.vendor_cache_identity() == nullptr);
+    backend.reset_vendor_launch_count();
+
+    DistVector<double> x(&graph);
+    DistVector<double> y(&graph);
+    x.local_data()[0] = 1.0;
+    x.local_data()[1] = 2.0;
+    x.local_data()[2] = 3.0;
+    x.local_data()[3] = 4.0;
+    detail::bsr_mult(&graph, backend, x, y);
+
+#ifdef VBCSR_HAVE_MKL_BSR_SPARSE
+    const void* cache_after_first_apply = backend.vendor_cache_identity();
+    assert(cache_after_first_apply != nullptr);
+    detail::bsr_mult(&graph, backend, x, y);
+    assert(backend.vendor_cache_identity() == cache_after_first_apply);
+
+    DistMultiVector<double> X2(&graph, 2);
+    DistMultiVector<double> Y2(&graph, 2);
+    X2(0, 0) = 1.0;
+    X2(1, 0) = 2.0;
+    X2(2, 0) = 3.0;
+    X2(3, 0) = 4.0;
+    X2(0, 1) = 5.0;
+    X2(1, 1) = 6.0;
+    X2(2, 1) = 7.0;
+    X2(3, 1) = 8.0;
+    backend.reset_vendor_launch_count();
+    detail::bsr_mult_dense(&graph, backend, X2, Y2);
+    const auto& cache_after_dense = backend.ensure_vendor_cache(
+        graph.adj_ptr,
+        graph.adj_ind,
+        static_cast<int>(graph.block_sizes.size()));
+    assert(backend.get_vendor_launch_count() > 0);
+    assert(cache_after_dense.batches[0].mkl.mm_variants.size() == 1);
+    detail::bsr_mult_dense(&graph, backend, X2, Y2);
+    assert(cache_after_dense.batches[0].mkl.mm_variants.size() == 1);
+
+    DistMultiVector<double> X3(&graph, 3);
+    DistMultiVector<double> Y3(&graph, 3);
+    for (int vec = 0; vec < 3; ++vec) {
+        for (int row = 0; row < 4; ++row) {
+            X3(row, vec) = static_cast<double>(vec * 10 + row + 1);
+        }
+    }
+    detail::bsr_mult_dense(&graph, backend, X3, Y3);
+    assert(cache_after_dense.batches[0].mkl.mm_variants.size() == 2);
+    assert(backend.vendor_cache_identity() == cache_after_first_apply);
+    assert(backend.get_vendor_launch_count() > 0);
+#else
+    assert(backend.vendor_cache_identity() == nullptr);
+    assert(backend.get_vendor_launch_count() == 0);
+#endif
+
+    std::cout << "PASSED" << std::endl;
+}
+
+void test_bsr_vendor_cache_invalidation_on_structure_change() {
+    std::cout << "Testing BSR Vendor Cache Invalidation On Structure Change..." << std::endl;
+
+    DistGraph graph_a(MPI_COMM_SELF);
+    graph_a.construct_serial(2, {2, 2}, {{0, 1}, {1}});
+
+    detail::BSRMatrixBackend<double> backend;
+    backend.initialize_structure(graph_a.adj_ind.size(), 2, 1);
+    const double blocks_a[][4] = {
+        {1.0, 0.0, 0.0, 1.0},
+        {2.0, 0.0, 0.0, 2.0},
+        {3.0, 0.0, 0.0, 3.0},
+    };
+    for (int slot = 0; slot < 3; ++slot) {
+        std::memcpy(backend.block_ptr(slot), blocks_a[slot], sizeof(blocks_a[slot]));
+    }
+
+    DistVector<double> x_a(&graph_a);
+    DistVector<double> y_a(&graph_a);
+    x_a.local_data()[0] = 1.0;
+    x_a.local_data()[1] = 2.0;
+    x_a.local_data()[2] = 3.0;
+    x_a.local_data()[3] = 4.0;
+    detail::bsr_mult(&graph_a, backend, x_a, y_a);
+
+#ifdef VBCSR_HAVE_MKL_BSR_SPARSE
+    const void* cache_a = backend.vendor_cache_identity();
+    assert(cache_a != nullptr);
+#else
+    assert(backend.vendor_cache_identity() == nullptr);
+#endif
+
+    DistGraph graph_b(MPI_COMM_SELF);
+    graph_b.construct_serial(2, {2, 2}, {{0}, {0, 1}});
+
+    backend.initialize_structure(graph_b.adj_ind.size(), 2, 1);
+    assert(backend.vendor_cache_identity() == nullptr);
+    const double blocks_b[][4] = {
+        {4.0, 0.0, 0.0, 4.0},
+        {5.0, 0.0, 0.0, 5.0},
+        {6.0, 0.0, 0.0, 6.0},
+    };
+    for (int slot = 0; slot < 3; ++slot) {
+        std::memcpy(backend.block_ptr(slot), blocks_b[slot], sizeof(blocks_b[slot]));
+    }
+
+    DistVector<double> x_b(&graph_b);
+    DistVector<double> y_b(&graph_b);
+    x_b.local_data()[0] = 2.0;
+    x_b.local_data()[1] = 1.0;
+    x_b.local_data()[2] = -1.0;
+    x_b.local_data()[3] = 3.0;
+    detail::bsr_mult(&graph_b, backend, x_b, y_b);
+
+#ifdef VBCSR_HAVE_MKL_BSR_SPARSE
+    const void* cache_b = backend.vendor_cache_identity();
+    assert(cache_b != nullptr);
+    assert(cache_b != cache_a);
+    const auto& rebuilt_cache = backend.ensure_vendor_cache(
+        graph_b.adj_ptr,
+        graph_b.adj_ind,
+        static_cast<int>(graph_b.block_sizes.size()));
+    assert(rebuilt_cache.batches.size() == 3);
+#else
+    assert(backend.vendor_cache_identity() == nullptr);
+#endif
+
+    std::cout << "PASSED" << std::endl;
+}
+
+#ifdef VBCSR_HAVE_MKL_BSR_SPARSE
+void test_bsr_vendor_complex_dispatch_selection() {
+    std::cout << "Testing BSR Vendor Complex Dispatch Selection..." << std::endl;
+
+    using C = std::complex<double>;
+
+    DistGraph graph(MPI_COMM_SELF);
+    graph.construct_serial(2, {2, 2}, {{0, 1}, {0, 1}});
+
+    detail::BSRMatrixBackend<C> backend;
+    backend.initialize_structure(graph.adj_ind.size(), 2, 1);
+    const C blocks[][4] = {
+        {C(1.0, 1.0), C(0.0, 0.0), C(0.0, 0.0), C(1.0, 1.0)},
+        {C(2.0, -1.0), C(0.0, 0.0), C(0.0, 0.0), C(2.0, -1.0)},
+        {C(-1.0, 0.5), C(0.0, 0.0), C(0.0, 0.0), C(-1.0, 0.5)},
+        {C(0.0, 2.0), C(0.0, 0.0), C(0.0, 0.0), C(0.0, 2.0)},
+    };
+    for (int slot = 0; slot < 4; ++slot) {
+        std::memcpy(backend.block_ptr(slot), blocks[slot], sizeof(blocks[slot]));
+    }
+
+    const std::vector<C> dense = {
+        C(1.0, 1.0), C(0.0, 0.0), C(2.0, -1.0), C(0.0, 0.0),
+        C(0.0, 0.0), C(1.0, 1.0), C(0.0, 0.0), C(2.0, -1.0),
+        C(-1.0, 0.5), C(0.0, 0.0), C(0.0, 2.0), C(0.0, 0.0),
+        C(0.0, 0.0), C(-1.0, 0.5), C(0.0, 0.0), C(0.0, 2.0),
+    };
+
+    DistVector<C> x(&graph);
+    DistVector<C> y(&graph);
+    x.local_data()[0] = C(1.0, -1.0);
+    x.local_data()[1] = C(2.0, 0.5);
+    x.local_data()[2] = C(-3.0, 1.0);
+    x.local_data()[3] = C(4.0, -2.0);
+    detail::bsr_mult(&graph, backend, x, y);
+    assert_close_generic(
+        std::vector<C>(y.local_data(), y.local_data() + 4),
+        dense_matvec_generic(dense, 4, 4, std::vector<C>(x.local_data(), x.local_data() + 4)));
+
+    DistMultiVector<C> X(&graph, 2);
+    DistMultiVector<C> Y(&graph, 2);
+    X(0, 0) = C(1.0, 0.0);
+    X(1, 0) = C(0.0, 1.0);
+    X(2, 0) = C(2.0, -1.0);
+    X(3, 0) = C(-3.0, 0.5);
+    X(0, 1) = C(4.0, -2.0);
+    X(1, 1) = C(1.0, 3.0);
+    X(2, 1) = C(-1.0, 2.0);
+    X(3, 1) = C(0.5, -0.5);
+    detail::bsr_mult_dense(&graph, backend, X, Y);
+    assert_close_generic(
+        std::vector<C>(Y.data.begin(), Y.data.end()),
+        dense_matmat_generic(dense, 4, 4, X.data, 4, 2));
+
+    DistVector<C> x_adj(&graph);
+    DistVector<C> y_adj(&graph);
+    x_adj.local_data()[0] = C(2.0, 1.0);
+    x_adj.local_data()[1] = C(-1.0, 0.5);
+    x_adj.local_data()[2] = C(0.0, -2.0);
+    x_adj.local_data()[3] = C(3.0, 4.0);
+    detail::bsr_mult_adjoint(&graph, backend, x_adj, y_adj);
+    assert_close_generic(
+        std::vector<C>(y_adj.local_data(), y_adj.local_data() + 4),
+        dense_matvec_adjoint_generic(dense, 4, 4, std::vector<C>(x_adj.local_data(), x_adj.local_data() + 4)));
+
+    DistMultiVector<C> X_adj(&graph, 2);
+    DistMultiVector<C> Y_adj(&graph, 2);
+    X_adj(0, 0) = C(2.0, 1.0);
+    X_adj(1, 0) = C(-1.0, 0.5);
+    X_adj(2, 0) = C(0.0, -2.0);
+    X_adj(3, 0) = C(3.0, 4.0);
+    X_adj(0, 1) = C(1.0, -3.0);
+    X_adj(1, 1) = C(0.5, 0.25);
+    X_adj(2, 1) = C(-4.0, 2.0);
+    X_adj(3, 1) = C(2.5, -1.5);
+    detail::bsr_mult_dense_adjoint(&graph, backend, X_adj, Y_adj);
+    assert_close_generic(
+        std::vector<C>(Y_adj.data.begin(), Y_adj.data.end()),
+        dense_matmat_adjoint_generic(dense, 4, 4, X_adj.data, 4, 2));
+
+    assert(backend.get_vendor_launch_count() > 0);
+    std::cout << "PASSED" << std::endl;
+}
+#endif
 
 void test_csr_vendor_dispatch_selection() {
     std::cout << "Testing CSR Vendor Dispatch Selection..." << std::endl;
@@ -2466,6 +3116,7 @@ int main(int argc, char** argv) {
     test_vbcsr_backend_shape_registry_and_family();
     test_vbcsr_axpby_structure_change();
     test_vbcsr_shape_batched_apply_kernels();
+    test_vbcsr_shape_batched_apply_kernels_complex();
     test_vbcsr_shape_batched_spmm();
     test_csr_backend_dispatch_kernels();
     test_csr_backend_dispatch_kernels_complex();
@@ -2473,6 +3124,13 @@ int main(int argc, char** argv) {
     test_blockspmat_csr_page_cap_repack_and_propagation();
     test_blockspmat_bsr_page_settings_repack_and_propagation();
     test_blockspmat_vbcsr_page_settings_repack_and_propagation();
+    test_bsr_vendor_batch_cache_metadata();
+    test_bsr_vendor_dispatch_selection();
+    test_bsr_vendor_cache_reuse_repeated_apply();
+    test_bsr_vendor_cache_invalidation_on_structure_change();
+#ifdef VBCSR_HAVE_MKL_BSR_SPARSE
+    test_bsr_vendor_complex_dispatch_selection();
+#endif
     test_csr_vendor_page_cache_metadata();
     test_csr_vendor_dispatch_selection();
     test_csr_vendor_cache_reuse_repeated_apply();

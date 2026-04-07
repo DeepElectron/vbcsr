@@ -14,12 +14,13 @@ namespace vbcsr::detail {
 template <typename Matrix>
 struct VBCSRShapeBatchExecutor {
     using T = typename Matrix::value_type;
+    using ApplyMode = typename Matrix::VBCSRBackendStorage::ApplyMode;
     using ShapeBatch = typename Matrix::VBCSRBackendStorage::ShapeBatchView;
 
     // One ApplyTask is a contiguous subrange of one shape page batch. We keep the
-    // batch/page identity, then optionally split a large packed page into multiple
-    // tasks so outer OpenMP still has enough work when contiguous() collapses many
-    // same-shape blocks into only a few large pages.
+    // batch/page identity, then optionally split a large batched page into multiple
+    // tasks so the outer OpenMP loop still has enough work when a few repeated-shape
+    // pages dominate the matrix.
     struct ApplyTask {
         int batch_index = -1;
         uint32_t begin = 0;
@@ -32,11 +33,10 @@ struct VBCSRShapeBatchExecutor {
         x.sync_ghosts();
         std::fill(y.data.begin(), y.data.end(), T(0));
 
-        const auto batches = collect_batches(matrix);
-        record_apply_batches(matrix, batches);
+        const auto& batches = matrix.active_vbcsr_backend().ensure_apply_plan().batches;
         const auto tasks = build_apply_tasks(
             batches,
-            static_cast<bool>(matrix.is_contiguous() && SmartKernel<T>::supports_batched_gemv()),
+            SmartKernel<T>::supports_batched_gemv(),
             [](const ShapeBatch& batch) {
                 return static_cast<size_t>(batch.row_dim + batch.col_dim);
             });
@@ -48,7 +48,9 @@ struct VBCSRShapeBatchExecutor {
             auto& accum = thread_acc[tid];
             const auto& task = tasks[task_idx];
             const auto& batch = batches[task.batch_index];
-            run_mult_batch(matrix, batch, task.begin, task.count, x, accum.data());
+            const ApplyMode mode = select_vector_apply_mode(task.count);
+            matrix.active_vbcsr_backend().record_apply_batch(batch.shape_id, mode, task.count);
+            run_mult_batch(matrix, batch, task.begin, task.count, mode, x, accum.data());
         }
         
         reduce_thread_accumulators(thread_acc, y.data);
@@ -60,15 +62,14 @@ struct VBCSRShapeBatchExecutor {
         X.sync_ghosts();
         std::fill(Y.data.begin(), Y.data.end(), T(0));
 
-        const auto batches = collect_batches(matrix);
-        record_apply_batches(matrix, batches);
+        const auto& batches = matrix.active_vbcsr_backend().ensure_apply_plan().batches;
         auto thread_acc = make_thread_accumulators(static_cast<int>(Y.data.size()));
         const int ldb = X.local_rows + X.ghost_rows;
         const int ldc = Y.local_rows + Y.ghost_rows;
         const int num_vecs = X.num_vectors;
         const auto tasks = build_apply_tasks(
             batches,
-            static_cast<bool>(matrix.is_contiguous() && SmartKernel<T>::supports_batched_gemm()),
+            SmartKernel<T>::supports_batched_gemm(),
             [num_vecs](const ShapeBatch& batch) {
                 return static_cast<size_t>(num_vecs) *
                        static_cast<size_t>(batch.row_dim + batch.col_dim);
@@ -80,7 +81,9 @@ struct VBCSRShapeBatchExecutor {
             auto& accum = thread_acc[tid];
             const auto& task = tasks[task_idx];
             const auto& batch = batches[task.batch_index];
-            run_mult_dense_batch(matrix, batch, task.begin, task.count, X, ldb, num_vecs, ldc, accum.data());
+            const ApplyMode mode = select_dense_apply_mode(task.count);
+            matrix.active_vbcsr_backend().record_apply_batch(batch.shape_id, mode, task.count);
+            run_mult_dense_batch(matrix, batch, task.begin, task.count, mode, X, ldb, num_vecs, ldc, accum.data());
         }
 
         reduce_thread_accumulators(thread_acc, Y.data);
@@ -91,11 +94,10 @@ struct VBCSRShapeBatchExecutor {
         y.bind_to_graph(matrix.graph);
         std::fill(y.data.begin(), y.data.end(), T(0));
 
-        const auto batches = collect_batches(matrix);
-        record_apply_batches(matrix, batches);
+        const auto& batches = matrix.active_vbcsr_backend().ensure_apply_plan().batches;
         const auto tasks = build_apply_tasks(
             batches,
-            static_cast<bool>(matrix.is_contiguous() && SmartKernel<T>::supports_batched_gemv()),
+            SmartKernel<T>::supports_batched_gemv(),
             [](const ShapeBatch& batch) {
                 return static_cast<size_t>(batch.row_dim + batch.col_dim);
             });
@@ -107,7 +109,9 @@ struct VBCSRShapeBatchExecutor {
             auto& accum = thread_acc[tid];
             const auto& task = tasks[task_idx];
             const auto& batch = batches[task.batch_index];
-            run_mult_adjoint_batch(matrix, batch, task.begin, task.count, x, accum.data());
+            const ApplyMode mode = select_vector_apply_mode(task.count);
+            matrix.active_vbcsr_backend().record_apply_batch(batch.shape_id, mode, task.count);
+            run_mult_adjoint_batch(matrix, batch, task.begin, task.count, mode, x, accum.data());
         }
 
         reduce_thread_accumulators(thread_acc, y.data);
@@ -119,15 +123,14 @@ struct VBCSRShapeBatchExecutor {
         Y.bind_to_graph(matrix.graph);
         std::fill(Y.data.begin(), Y.data.end(), T(0));
 
-        const auto batches = collect_batches(matrix);
-        record_apply_batches(matrix, batches);
+        const auto& batches = matrix.active_vbcsr_backend().ensure_apply_plan().batches;
         auto thread_acc = make_thread_accumulators(static_cast<int>(Y.data.size()));
         const int ldb = X.local_rows + X.ghost_rows;
         const int ldc = Y.local_rows + Y.ghost_rows;
         const int num_vecs = X.num_vectors;
         const auto tasks = build_apply_tasks(
             batches,
-            static_cast<bool>(matrix.is_contiguous() && SmartKernel<T>::supports_batched_gemm()),
+            SmartKernel<T>::supports_batched_gemm(),
             [num_vecs](const ShapeBatch& batch) {
                 return static_cast<size_t>(num_vecs) *
                        static_cast<size_t>(batch.row_dim + batch.col_dim);
@@ -139,7 +142,9 @@ struct VBCSRShapeBatchExecutor {
             auto& accum = thread_acc[tid];
             const auto& task = tasks[task_idx];
             const auto& batch = batches[task.batch_index];
-            run_mult_dense_adjoint_batch(matrix, batch, task.begin, task.count, X, ldb, num_vecs, ldc, accum.data());
+            const ApplyMode mode = select_dense_apply_mode(task.count);
+            matrix.active_vbcsr_backend().record_apply_batch(batch.shape_id, mode, task.count);
+            run_mult_dense_adjoint_batch(matrix, batch, task.begin, task.count, mode, X, ldb, num_vecs, ldc, accum.data());
         }
 
         reduce_thread_accumulators(thread_acc, Y.data);
@@ -147,7 +152,7 @@ struct VBCSRShapeBatchExecutor {
     }
 
 private:
-    // Target scratch budget for one packed micro-batch. This currently controls
+    // Target scratch budget for one batched micro-batch. This currently controls
     // both temporary buffer size and, when packed page splitting is enabled,
     // the granularity of ApplyTask subdivision.
     static constexpr size_t kTargetScratchBytes = 1u << 20;
@@ -157,12 +162,13 @@ private:
         const ShapeBatch& batch,
         uint32_t begin,
         uint32_t count,
+        ApplyMode mode,
         DistVector<T>& x,
         T* accum) {
         if (count == 0) {
             return;
         }
-        if (matrix.is_contiguous() && SmartKernel<T>::supports_batched_gemv()) {
+        if (mode == ApplyMode::Batched) {
             run_mult_batch_packed(matrix, batch, begin, count, x, accum);
             return;
         }
@@ -203,6 +209,7 @@ private:
         const ShapeBatch& batch,
         uint32_t begin,
         uint32_t count,
+        ApplyMode mode,
         DistMultiVector<T>& X,
         int ldb,
         int num_vecs,
@@ -211,7 +218,7 @@ private:
         if (count == 0) {
             return;
         }
-        if (matrix.is_contiguous() && SmartKernel<T>::supports_batched_gemm()) {
+        if (mode == ApplyMode::Batched) {
             run_mult_dense_batch_packed(matrix, batch, begin, count, X, ldb, num_vecs, ldc, accum);
             return;
         }
@@ -256,12 +263,13 @@ private:
         const ShapeBatch& batch,
         uint32_t begin,
         uint32_t count,
+        ApplyMode mode,
         DistVector<T>& x,
         T* accum) {
         if (count == 0) {
             return;
         }
-        if (matrix.is_contiguous() && SmartKernel<T>::supports_batched_gemv()) {
+        if (mode == ApplyMode::Batched) {
             run_mult_adjoint_batch_packed(matrix, batch, begin, count, x, accum);
             return;
         }
@@ -302,6 +310,7 @@ private:
         const ShapeBatch& batch,
         uint32_t begin,
         uint32_t count,
+        ApplyMode mode,
         DistMultiVector<T>& X,
         int ldb,
         int num_vecs,
@@ -310,7 +319,7 @@ private:
         if (count == 0) {
             return;
         }
-        if (matrix.is_contiguous() && SmartKernel<T>::supports_batched_gemm()) {
+        if (mode == ApplyMode::Batched) {
             run_mult_dense_adjoint_batch_packed(matrix, batch, begin, count, X, ldb, num_vecs, ldc, accum);
             return;
         }
@@ -594,24 +603,10 @@ private:
         }
     }
 
-    static std::vector<ShapeBatch> collect_batches(const Matrix& matrix) {
-        std::vector<ShapeBatch> batches;
-        matrix.for_each_shape_batch([&](const ShapeBatch& batch) {
-            batches.push_back(batch);
-        });
-        return batches;
-    }
-
-    static void record_apply_batches(const Matrix& matrix, const std::vector<ShapeBatch>& batches) {
-        for (const auto& batch : batches) {
-            matrix.active_vbcsr_backend().record_apply_batch(batch.shape_id, batch.block_count());
-        }
-    }
-
     template <typename ScratchFn>
     static std::vector<ApplyTask> build_apply_tasks(
         const std::vector<ShapeBatch>& batches,
-        bool split_large_packed_batches,
+        bool batched_supported,
         ScratchFn&& scratch_elems_for_batch) {
         std::vector<ApplyTask> tasks;
         if (batches.empty()) {
@@ -619,10 +614,10 @@ private:
         }
 
         // Default scheduling unit is one non-empty shape page. We only split a page
-        // when the packed path is active and the total batch count is too small to
-        // feed the OpenMP team, because unpacked per-block kernels already expose
-        // enough work at the page level.
-        const bool should_split = split_large_packed_batches && should_split_apply_batches(batches.size());
+        // when batched apply is available and the total batch count is too small to
+        // feed the OpenMP team, because the scalar path already exposes work at the
+        // page level.
+        const bool should_split = batched_supported && should_split_apply_batches(batches.size());
         if (!should_split) {
             tasks.reserve(batches.size());
             for (int batch_index = 0; batch_index < static_cast<int>(batches.size()); ++batch_index) {
@@ -656,6 +651,18 @@ private:
             }
         }
         return tasks;
+    }
+
+    static ApplyMode select_vector_apply_mode(uint32_t block_count) {
+        return block_count > 1 && SmartKernel<T>::supports_batched_gemv()
+            ? ApplyMode::Batched
+            : ApplyMode::Scalar;
+    }
+
+    static ApplyMode select_dense_apply_mode(uint32_t block_count) {
+        return block_count > 1 && SmartKernel<T>::supports_batched_gemm()
+            ? ApplyMode::Batched
+            : ApplyMode::Scalar;
     }
 
     static bool should_split_apply_batches(size_t batch_count) {

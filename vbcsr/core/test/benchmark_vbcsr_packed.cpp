@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cmath>
 #include <iostream>
+#include <set>
 #include <vector>
 
 using namespace vbcsr;
@@ -108,6 +109,17 @@ int main(int argc, char** argv) {
     DistVector<double> y_packed(&graph);
     DistMultiVector<double> Y_unpacked(&graph, n_vecs);
     DistMultiVector<double> Y_packed(&graph, n_vecs);
+    auto apply_counts = [](const auto& matrix) {
+        std::set<int> seen_shapes;
+        std::pair<size_t, size_t> counts{0, 0};
+        matrix.for_each_shape_batch([&](const auto& batch) {
+            if (seen_shapes.insert(batch.shape_id).second) {
+                counts.first += static_cast<size_t>(batch.scalar_apply_batch_count());
+                counts.second += static_cast<size_t>(batch.batched_apply_batch_count());
+            }
+        });
+        return counts;
+    };
 
     unpacked.mult(x, y_unpacked);
     packed.mult(x, y_packed);
@@ -121,10 +133,30 @@ int main(int argc, char** argv) {
     const double matmat_diff = max_abs_diff(Y_unpacked.data, Y_packed.data);
     const double spmm_diff = max_abs_diff(spmm_unpacked.to_dense(), spmm_packed.to_dense());
 
+    const auto unpacked_matvec_before = apply_counts(unpacked);
     const double unpacked_matvec_s = benchmark_seconds([&] { unpacked.mult(x, y_unpacked); }, n_apply_iters);
+    const auto unpacked_matvec_after = apply_counts(unpacked);
+    const size_t unpacked_matvec_scalar = unpacked_matvec_after.first - unpacked_matvec_before.first;
+    const size_t unpacked_matvec_batched = unpacked_matvec_after.second - unpacked_matvec_before.second;
+
+    const auto packed_matvec_before = apply_counts(packed);
     const double packed_matvec_s = benchmark_seconds([&] { packed.mult(x, y_packed); }, n_apply_iters);
+    const auto packed_matvec_after = apply_counts(packed);
+    const size_t packed_matvec_scalar = packed_matvec_after.first - packed_matvec_before.first;
+    const size_t packed_matvec_batched = packed_matvec_after.second - packed_matvec_before.second;
+
+    const auto unpacked_matmat_before = apply_counts(unpacked);
     const double unpacked_matmat_s = benchmark_seconds([&] { unpacked.mult_dense(X, Y_unpacked); }, n_apply_iters);
+    const auto unpacked_matmat_after = apply_counts(unpacked);
+    const size_t unpacked_matmat_scalar = unpacked_matmat_after.first - unpacked_matmat_before.first;
+    const size_t unpacked_matmat_batched = unpacked_matmat_after.second - unpacked_matmat_before.second;
+
+    const auto packed_matmat_before = apply_counts(packed);
     const double packed_matmat_s = benchmark_seconds([&] { packed.mult_dense(X, Y_packed); }, n_apply_iters);
+    const auto packed_matmat_after = apply_counts(packed);
+    const size_t packed_matmat_scalar = packed_matmat_after.first - packed_matmat_before.first;
+    const size_t packed_matmat_batched = packed_matmat_after.second - packed_matmat_before.second;
+
     const double unpacked_spmm_s = benchmark_seconds([&] {
         BlockSpMat<double> tmp = unpacked.spmm_self(0.0);
         (void)tmp;
@@ -139,16 +171,27 @@ int main(int argc, char** argv) {
         std::cout << "  Blocks: " << n_blocks << std::endl;
         std::cout << "  RHS vectors: " << n_vecs << std::endl;
         std::cout << "  Matrix kind: " << static_cast<int>(unpacked.matrix_kind()) << std::endl;
+        std::cout << "  Unpacked contiguous: " << unpacked.is_contiguous() << std::endl;
         std::cout << "  Packed contiguous: " << packed.is_contiguous() << std::endl;
-        std::cout << "  Strided GEMM available: " << BLASKernel::supports_strided_gemm() << std::endl;
-        std::cout << "  Strided GEMV available: " << BLASKernel::supports_strided_gemv() << std::endl;
+        std::cout << "  Batched GEMM available: " << SmartKernel<double>::supports_batched_gemm() << std::endl;
+        std::cout << "  Batched GEMV available: " << SmartKernel<double>::supports_batched_gemv() << std::endl;
+        std::cout << "  Unpacked auto-batched mult: " << (unpacked_matvec_batched > 0) << std::endl;
+        std::cout << "  Unpacked auto-batched mult_dense: " << (unpacked_matmat_batched > 0) << std::endl;
         std::cout << "  Max diff (mult): " << matvec_diff << std::endl;
         std::cout << "  Max diff (mult_dense): " << matmat_diff << std::endl;
         std::cout << "  Max diff (spmm_self): " << spmm_diff << std::endl;
         std::cout << "  mult unpacked avg s: " << unpacked_matvec_s << std::endl;
+        std::cout << "  mult unpacked scalar launches: " << unpacked_matvec_scalar << std::endl;
+        std::cout << "  mult unpacked batched launches: " << unpacked_matvec_batched << std::endl;
         std::cout << "  mult packed avg s: " << packed_matvec_s << std::endl;
+        std::cout << "  mult packed scalar launches: " << packed_matvec_scalar << std::endl;
+        std::cout << "  mult packed batched launches: " << packed_matvec_batched << std::endl;
         std::cout << "  mult_dense unpacked avg s: " << unpacked_matmat_s << std::endl;
+        std::cout << "  mult_dense unpacked scalar launches: " << unpacked_matmat_scalar << std::endl;
+        std::cout << "  mult_dense unpacked batched launches: " << unpacked_matmat_batched << std::endl;
         std::cout << "  mult_dense packed avg s: " << packed_matmat_s << std::endl;
+        std::cout << "  mult_dense packed scalar launches: " << packed_matmat_scalar << std::endl;
+        std::cout << "  mult_dense packed batched launches: " << packed_matmat_batched << std::endl;
         std::cout << "  spmm_self unpacked avg s: " << unpacked_spmm_s << std::endl;
         std::cout << "  spmm_self packed avg s: " << packed_spmm_s << std::endl;
     }

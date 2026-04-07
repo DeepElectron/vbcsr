@@ -6,6 +6,8 @@
 #include <chrono>
 #include <cmath>
 #include <algorithm>
+#include <cstdlib>
+#include <limits>
 
 using namespace vbcsr;
 
@@ -23,6 +25,30 @@ double get_vec_val(int global_col, int c_idx, int vec_idx = 0) {
     return std::cos(global_col * 1000.0 + c_idx + vec_idx);
 }
 
+template <typename T>
+void bsr_mult_native_benchmark(
+    DistGraph* graph,
+    const detail::BSRMatrixBackend<T>& backend,
+    DistVector<T>& x,
+    DistVector<T>& y) {
+    detail::bsr_dispatch_block_size(backend.block_size, [&](auto block_tag) {
+        constexpr int BlockSize = decltype(block_tag)::value;
+        detail::bsr_mult_impl<BlockSize>(graph, backend, x, y);
+    });
+}
+
+template <typename T>
+void bsr_mult_dense_native_benchmark(
+    DistGraph* graph,
+    const detail::BSRMatrixBackend<T>& backend,
+    DistMultiVector<T>& x,
+    DistMultiVector<T>& y) {
+    detail::bsr_dispatch_block_size(backend.block_size, [&](auto block_tag) {
+        constexpr int BlockSize = decltype(block_tag)::value;
+        detail::bsr_mult_dense_impl<BlockSize>(graph, backend, x, y);
+    });
+}
+
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
 
@@ -35,9 +61,13 @@ int main(int argc, char** argv) {
     int block_size = 50;        
     int n_vecs = 5;             
     int n_iter = 10;            
+    uint32_t page_size = std::numeric_limits<uint32_t>::max();
 
     if (argc > 1) n_global_blocks = std::atoi(argv[1]);
     if (argc > 2) block_size = std::atoi(argv[2]);
+    if (argc > 3) n_vecs = std::atoi(argv[3]);
+    if (argc > 4) page_size = static_cast<uint32_t>(std::strtoul(argv[4], nullptr, 10));
+    if (argc > 5) n_iter = std::atoi(argv[5]);
 
     if (rank == 0) {
         std::cout << "Benchmark & Verification Configuration:" << std::endl;
@@ -45,6 +75,9 @@ int main(int argc, char** argv) {
         std::cout << "  Global Blocks: " << n_global_blocks << std::endl;
         std::cout << "  Block Size: " << block_size << std::endl;
         std::cout << "  RHS Vectors: " << n_vecs << std::endl;
+        std::cout << "  Requested Page Size: "
+                  << (page_size == std::numeric_limits<uint32_t>::max() ? std::string("max") : std::to_string(page_size))
+                  << std::endl;
         std::cout << "  Iterations: " << n_iter << std::endl;
     }
 
@@ -79,8 +112,9 @@ int main(int argc, char** argv) {
     
     if (rank == 0) std::cout << "Graph Construction Time: " << t_graph << " s" << std::endl;
 
-    // 2. Matrix Assembly
-    BlockSpMat<double, Kernel> mat(&graph);
+    // 2. Backend Assembly
+    detail::BSRMatrixBackend<double> backend;
+    backend.initialize_structure(graph.adj_ind.size(), block_size, page_size);
     
     // Fill with deterministic values
     int n_owned = graph.owned_global_indices.size();
@@ -88,11 +122,11 @@ int main(int argc, char** argv) {
     t0 = MPI_Wtime();
     for (int i = 0; i < n_owned; ++i) {
         int gid_r = graph.owned_global_indices[i];
-        int start = mat.row_ptr()[i];
-        int end = mat.row_ptr()[i+1];
+        int start = graph.adj_ptr[i];
+        int end = graph.adj_ptr[i + 1];
         for (int k = start; k < end; ++k) {
-            double* data = mat.mutable_block_data(k);
-            int lid_c = mat.col_ind()[k];
+            double* data = backend.block_ptr(k);
+            int lid_c = graph.adj_ind[k];
             
             // Resolve GID for column
             int gid_c;
@@ -115,6 +149,18 @@ int main(int argc, char** argv) {
     double t_assembly = MPI_Wtime() - t0;
     if (rank == 0) std::cout << "Matrix Assembly Time: " << t_assembly << " s" << std::endl;
 
+    const auto& cache = backend.ensure_vendor_cache(
+        graph.adj_ptr,
+        graph.adj_ind,
+        static_cast<int>(graph.block_sizes.size()));
+
+    if (rank == 0) {
+        std::cout << "  Matrix Kind: BSR" << std::endl;
+        std::cout << "  Active Blocks Per Page: " << backend.active_blocks_per_page() << std::endl;
+        std::cout << "  Vendor Backend: " << backend.vendor_backend_name() << std::endl;
+        std::cout << "  Vendor Batches: " << cache.batches.size() << std::endl;
+    }
+
     // 3. MatVec Benchmark & Verify
     DistVector<double> x(&graph), y(&graph);
     
@@ -129,7 +175,7 @@ int main(int argc, char** argv) {
     y.set_constant(0.0);
     
     // Warmup & Verify
-    mat.mult_optimized(x, y);
+    detail::bsr_mult(&graph, backend, x, y);
     
     // Verification
     double max_err = 0.0;
@@ -173,12 +219,22 @@ int main(int argc, char** argv) {
 
     t0 = MPI_Wtime();
     for (int i = 0; i < n_iter; ++i) {
-        mat.mult_optimized(x, y);
+        detail::bsr_mult(&graph, backend, x, y);
     }
     double t_matvec = MPI_Wtime() - t0;
     double avg_matvec = t_matvec / n_iter;
+
+    backend.reset_vendor_launch_count();
+    const double native_vec_seconds = [&] {
+        const double start = MPI_Wtime();
+        for (int i = 0; i < n_iter; ++i) {
+            bsr_mult_native_benchmark(&graph, backend, x, y);
+        }
+        return MPI_Wtime() - start;
+    }();
     
     if (rank == 0) {
+        std::cout << "MatVec Native Time (avg): " << (native_vec_seconds / n_iter) << " s" << std::endl;
         std::cout << "MatVec Time (avg): " << avg_matvec << " s" << std::endl;
         double flops = (double)n_global_blocks * 3.0 * 2.0 * block_size * block_size;
         std::cout << "MatVec GFLOPS: " << (flops / avg_matvec) * 1e-9 << std::endl;
@@ -200,7 +256,7 @@ int main(int argc, char** argv) {
     }
     
     // Warmup & Verify
-    mat.mult_dense(X, Y);
+    detail::bsr_mult_dense(&graph, backend, X, Y);
     
     // Verification
     max_err = 0.0;
@@ -243,15 +299,25 @@ int main(int argc, char** argv) {
     
     t0 = MPI_Wtime();
     for (int i = 0; i < n_iter; ++i) {
-        mat.mult_dense(X, Y);
+        detail::bsr_mult_dense(&graph, backend, X, Y);
     }
     double t_matmat = MPI_Wtime() - t0;
     double avg_matmat = t_matmat / n_iter;
+
+    const double native_dense_seconds = [&] {
+        const double start = MPI_Wtime();
+        for (int i = 0; i < n_iter; ++i) {
+            bsr_mult_dense_native_benchmark(&graph, backend, X, Y);
+        }
+        return MPI_Wtime() - start;
+    }();
     
     if (rank == 0) {
+        std::cout << "MatMat Native Time (avg): " << (native_dense_seconds / n_iter) << " s" << std::endl;
         std::cout << "MatMat Time (avg): " << avg_matmat << " s" << std::endl;
         double flops = (double)n_global_blocks * 3.0 * 2.0 * block_size * block_size * n_vecs;
         std::cout << "MatMat GFLOPS: " << (flops / avg_matmat) * 1e-9 << std::endl;
+        std::cout << "Vendor Launch Count: " << backend.get_vendor_launch_count() << std::endl;
     }
 
     MPI_Finalize();

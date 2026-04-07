@@ -17,6 +17,39 @@ template <typename Matrix>
 struct BSRSpMMExecutor {
     using T = typename Matrix::value_type;
 
+    template <int BlockSize>
+    static void accumulate_product(
+        int runtime_block_size,
+        const T* a_block,
+        const T* b_block,
+        T* dest) {
+        if constexpr (BlockSize == 0) {
+            SmartKernel<T>::gemm(
+                runtime_block_size,
+                runtime_block_size,
+                runtime_block_size,
+                T(1),
+                a_block,
+                runtime_block_size,
+                b_block,
+                runtime_block_size,
+                T(1),
+                dest,
+                runtime_block_size);
+        } else {
+            FixedBlockKernel<T, BlockSize, BlockSize>::gemm(
+                BlockSize,
+                a_block,
+                BlockSize,
+                b_block,
+                BlockSize,
+                dest,
+                BlockSize,
+                T(1),
+                T(1));
+        }
+    }
+
     static Matrix run(const Matrix& A, const Matrix& B, double threshold) {
         const auto& A_backend = require_bsr_backend<T, typename Matrix::KernelType>(A.backend_handle_);
         const auto& B_backend = require_bsr_backend<T, typename Matrix::KernelType>(B.backend_handle_);
@@ -42,94 +75,89 @@ struct BSRSpMMExecutor {
         BSRResultBuilder<T> builder(c_graph, A.backend_page_settings().bsr_page_size);
         const int block_size = builder.block_size();
 
-        #pragma omp parallel for
-        for (int row = 0; row < n_rows; ++row) {
-            const int c_start = sym.c_row_ptr[row];
-            const int c_end = sym.c_row_ptr[row + 1];
-            if (c_start == c_end) {
-                continue;
-            }
+        bsr_dispatch_block_size(block_size, [&](auto block_tag) {
+            constexpr int BlockSize = decltype(block_tag)::value;
 
-            std::vector<T*> dest_ptrs(c_end - c_start);
-            for (int idx = c_start; idx < c_end; ++idx) {
-                const int global_col = sym.c_col_ind[idx];
-                const int local_col = c_graph->global_to_local.at(global_col);
-                const int slot = builder.find_slot(row, local_col);
-                dest_ptrs[idx - c_start] = builder.slot_data(slot);
-            }
-
-            const auto sym_begin = sym.c_col_ind.begin() + c_start;
-            const auto sym_end = sym.c_col_ind.begin() + c_end;
-            const int a_start = A.row_ptr()[row];
-            const int a_end = A.row_ptr()[row + 1];
-            const double row_eps = threshold / std::max(1, a_end - a_start);
-
-            auto find_dest = [&](int global_col) -> T* {
-                auto it = std::lower_bound(sym_begin, sym_end, global_col);
-                if (it == sym_end || *it != global_col) {
-                    return nullptr;
+            #pragma omp parallel for
+            for (int row = 0; row < n_rows; ++row) {
+                const int c_start = sym.c_row_ptr[row];
+                const int c_end = sym.c_row_ptr[row + 1];
+                if (c_start == c_end) {
+                    continue;
                 }
-                return dest_ptrs[static_cast<size_t>(std::distance(sym_begin, it))];
-            };
 
-            for (int slot = a_start; slot < a_end; ++slot) {
-                const double norm_a = A_norms[slot];
-                const T* a_value = A.block_data(slot);
-                const int global_inner = A.graph->get_global_index(A.col_ind()[slot]);
+                std::vector<int> dest_cols(c_end - c_start);
+                std::vector<T*> dest_ptrs(c_end - c_start);
+                for (int idx = c_start; idx < c_end; ++idx) {
+                    const int global_col = sym.c_col_ind[idx];
+                    const int local_col = c_graph->global_to_local.at(global_col);
+                    const int slot = builder.find_slot(row, local_col);
+                    dest_cols[static_cast<size_t>(idx - c_start)] = global_col;
+                    dest_ptrs[static_cast<size_t>(idx - c_start)] = builder.slot_data(slot);
+                }
 
-                if (A.graph->find_owner(global_inner) == A.graph->rank) {
-                    const int local_row_b = B.graph->global_to_local.at(global_inner);
-                    for (int b_slot = B.row_ptr()[local_row_b]; b_slot < B.row_ptr()[local_row_b + 1]; ++b_slot) {
-                        const double norm_b = B_local_norms[b_slot];
-                        if (norm_a * norm_b < row_eps) {
+                const int a_start = A.row_ptr()[row];
+                const int a_end = A.row_ptr()[row + 1];
+                const double row_eps = threshold / std::max(1, a_end - a_start);
+
+                for (int slot = a_start; slot < a_end; ++slot) {
+                    const double norm_a = A_norms[slot];
+                    const T* a_value = A.block_data(slot);
+                    const int global_inner = A.graph->get_global_index(A.col_ind()[slot]);
+
+                    if (A.graph->find_owner(global_inner) == A.graph->rank) {
+                        const int local_row_b = B.graph->global_to_local.at(global_inner);
+                        size_t dest_index = 0;
+                        for (int b_slot = B.row_ptr()[local_row_b]; b_slot < B.row_ptr()[local_row_b + 1]; ++b_slot) {
+                            const int global_col = B.graph->get_global_index(B.col_ind()[b_slot]);
+                            while (dest_index < dest_cols.size() && dest_cols[dest_index] < global_col) {
+                                ++dest_index;
+                            }
+                            if (dest_index == dest_cols.size()) {
+                                break;
+                            }
+                            if (dest_cols[dest_index] != global_col) {
+                                continue;
+                            }
+                            const double norm_b = B_local_norms[b_slot];
+                            if (norm_a * norm_b < row_eps) {
+                                continue;
+                            }
+                            accumulate_product<BlockSize>(
+                                block_size,
+                                a_value,
+                                B.block_data(b_slot),
+                                dest_ptrs[dest_index]);
+                        }
+                    } else {
+                        auto ghost_it = assembly_plan.ghost_rows().find(global_inner);
+                        if (ghost_it == assembly_plan.ghost_rows().end()) {
                             continue;
                         }
-                        T* dest = find_dest(B.graph->get_global_index(B.col_ind()[b_slot]));
-                        if (dest == nullptr) {
-                            continue;
+                        size_t dest_index = 0;
+                        for (const auto& block : ghost_it->second) {
+                            while (dest_index < dest_cols.size() && dest_cols[dest_index] < block.col) {
+                                ++dest_index;
+                            }
+                            if (dest_index == dest_cols.size()) {
+                                break;
+                            }
+                            if (dest_cols[dest_index] != block.col) {
+                                continue;
+                            }
+                            if (norm_a * block.norm < row_eps) {
+                                continue;
+                            }
+                            accumulate_product<BlockSize>(
+                                block_size,
+                                a_value,
+                                block.data,
+                                dest_ptrs[dest_index]);
                         }
-                        SmartKernel<T>::gemm(
-                            block_size,
-                            block_size,
-                            block_size,
-                            T(1),
-                            a_value,
-                            block_size,
-                            B.block_data(b_slot),
-                            block_size,
-                            T(1),
-                            dest,
-                            block_size);
-                    }
-                } else {
-                    auto ghost_it = assembly_plan.ghost_rows().find(global_inner);
-                    if (ghost_it == assembly_plan.ghost_rows().end()) {
-                        continue;
-                    }
-                    for (const auto& block : ghost_it->second) {
-                        if (norm_a * block.norm < row_eps) {
-                            continue;
-                        }
-                        T* dest = find_dest(block.col);
-                        if (dest == nullptr) {
-                            continue;
-                        }
-                        SmartKernel<T>::gemm(
-                            block_size,
-                            block_size,
-                            block_size,
-                            T(1),
-                            a_value,
-                            block_size,
-                            block.data,
-                            block_size,
-                            T(1),
-                            dest,
-                            block_size);
                     }
                 }
             }
-        }
+        });
 
         Matrix C = Matrix::template materialize_from_builder<vbcsr::MatrixKind::BSR>(
             c_graph,

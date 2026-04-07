@@ -96,7 +96,6 @@ private:
         double threshold,
         const std::vector<double>& A_norms,
         const std::vector<double>& B_local_norms) {
-        using ExecutionKind = typename Matrix::VBCSRBackendStorage::ExecutionKind;
         const int n_rows = static_cast<int>(A.row_ptr().size()) - 1;
 
         const int max_threads = omp_get_max_threads();
@@ -215,19 +214,10 @@ private:
                     key.inner_dim,
                     key.col_dim,
                     tasks.size());
-                switch (A.active_vbcsr_backend().execution_kind_for_spmm_triple(
-                    key.row_dim,
-                    key.inner_dim,
-                    key.col_dim)) {
-                    case ExecutionKind::StaticFallback:
-                    case ExecutionKind::BatchedFallback:
-                    case ExecutionKind::JIT:
-                        if (A.is_contiguous() && B.is_contiguous() && SmartKernel<T>::supports_batched_gemm()) {
-                            run_product_batch_packed(key, tasks);
-                        } else {
-                            run_product_batch_fallback(key, tasks);
-                        }
-                        break;
+                if (A.is_contiguous() && B.is_contiguous() && SmartKernel<T>::supports_batched_gemm()) {
+                    run_product_batch_packed(key, tasks);
+                } else {
+                    run_product_batch_fallback(key, tasks);
                 }
             }
         }

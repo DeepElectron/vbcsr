@@ -195,6 +195,44 @@ else()
             if(VBCSR_HAVE_MKL_SPARSE)
                 list(APPEND VBCSR_SPARSE_VENDOR_INCLUDE_DIRS ${VBCSR_MKL_SPARSE_INCLUDE_DIR})
                 message(STATUS "MKL sparse CSR backend enabled.")
+
+                set(_vbcsr_saved_required_libs "${CMAKE_REQUIRED_LIBRARIES}")
+                set(_vbcsr_saved_required_includes "${CMAKE_REQUIRED_INCLUDES}")
+                set(CMAKE_REQUIRED_LIBRARIES ${BLAS_LIBRARIES})
+                set(CMAKE_REQUIRED_INCLUDES ${VBCSR_MKL_SPARSE_INCLUDE_DIR})
+                check_cxx_source_compiles([=[
+                    #include <mkl_spblas.h>
+                    int main() {
+                        sparse_matrix_t A = nullptr;
+                        MKL_INT rows_start[1] = {0};
+                        MKL_INT rows_end[1] = {1};
+                        MKL_INT cols[1] = {0};
+                        double vals[1] = {1.0};
+                        const sparse_status_t status = mkl_sparse_d_create_bsr(
+                            &A,
+                            SPARSE_INDEX_BASE_ZERO,
+                            SPARSE_LAYOUT_COLUMN_MAJOR,
+                            1,
+                            1,
+                            1,
+                            rows_start,
+                            rows_end,
+                            cols,
+                            vals);
+                        if (A != nullptr) {
+                            mkl_sparse_destroy(A);
+                        }
+                        return status == SPARSE_STATUS_SUCCESS ? 0 : 1;
+                    }
+                ]=] VBCSR_HAVE_MKL_BSR_SPARSE)
+                set(CMAKE_REQUIRED_LIBRARIES "${_vbcsr_saved_required_libs}")
+                set(CMAKE_REQUIRED_INCLUDES "${_vbcsr_saved_required_includes}")
+                unset(_vbcsr_saved_required_libs)
+                unset(_vbcsr_saved_required_includes)
+
+                if(VBCSR_HAVE_MKL_BSR_SPARSE)
+                    message(STATUS "MKL sparse BSR backend enabled.")
+                endif()
             endif()
         endif()
     endif()
@@ -402,6 +440,9 @@ if(VBCSR_HAVE_CBLAS_DGEMV_BATCH_STRIDED)
 endif()
 if(VBCSR_HAVE_MKL_SPARSE)
     target_compile_definitions(vbcsr INTERFACE $<BUILD_INTERFACE:VBCSR_HAVE_MKL_SPARSE>)
+endif()
+if(VBCSR_HAVE_MKL_BSR_SPARSE)
+    target_compile_definitions(vbcsr INTERFACE $<BUILD_INTERFACE:VBCSR_HAVE_MKL_BSR_SPARSE>)
 endif()
 if(VBCSR_HAVE_AOCL_SPARSE)
     target_compile_definitions(vbcsr INTERFACE $<BUILD_INTERFACE:VBCSR_HAVE_AOCL_SPARSE>)

@@ -90,7 +90,7 @@ struct MMWriter<std::complex<T>> {
 };
 
 struct BackendPageSettings {
-    uint32_t csr_page_size = detail::CSRMatrixBackend<double>::page_size_limit();
+    uint32_t csr_page_size = detail::CSRMatrixBackend<double>::max_page_size();
     uint32_t bsr_page_size = std::numeric_limits<uint32_t>::max();
     uint32_t vbcsr_page_size =
         detail::VBCSRMatrixBackend<double, DefaultKernel<double>>::hard_safe_slots_per_page();
@@ -252,9 +252,9 @@ public:
     uint32_t active_page_size() const {
         switch (kind) {
         case MatrixKind::CSR:
-            return active_csr_backend().page_size();
+            return active_csr_backend().active_page_size();
         case MatrixKind::BSR:
-            return active_bsr_backend().page_size();
+            return active_bsr_backend().active_blocks_per_page();
         case MatrixKind::VBCSR:
             return active_vbcsr_backend().configured_max_slots_per_page();
         }
@@ -273,7 +273,7 @@ public:
         if (kind != MatrixKind::VBCSR) {
             return;
         }
-        active_vbcsr_backend().pack_contiguous(graph, graph->adj_ptr, graph->adj_ind);
+        active_vbcsr_backend().pack_contiguous();
     }
 
     size_t local_scalar_nnz() const {
@@ -281,7 +281,7 @@ public:
             return static_cast<size_t>(active_csr_backend().nnz_count());
         }
         if (kind == MatrixKind::BSR) {
-            return static_cast<size_t>(active_bsr_backend().value_count());
+            return static_cast<size_t>(active_bsr_backend().scalar_value_count());
         }
         return active_vbcsr_backend().local_scalar_nnz();
     }
@@ -371,7 +371,7 @@ public:
             return 1;
         }
         if (kind == MatrixKind::BSR) {
-            return active_bsr_backend().block_value_count();
+            return active_bsr_backend().values_per_block();
         }
         if (kind == MatrixKind::VBCSR) {
             return active_vbcsr_backend().block_size_elements(slot);
@@ -1852,11 +1852,11 @@ BackendPageSettings BlockSpMat<T, Kernel>::default_page_settings_for(
     MatrixKind matrix_kind,
     const DistGraph* graph) {
     BackendPageSettings settings;
-    settings.csr_page_size = CSRBackendStorage::page_size_limit();
+    settings.csr_page_size = CSRBackendStorage::max_page_size();
     settings.vbcsr_page_size = VBCSRBackendStorage::hard_safe_slots_per_page();
     if (matrix_kind == MatrixKind::BSR && graph != nullptr) {
         settings.bsr_page_size =
-            BSRBackendStorage::page_size_limit(detail::BSRResultBuilder<T>::infer_block_size(graph));
+            BSRBackendStorage::max_blocks_per_page(detail::BSRResultBuilder<T>::infer_block_size(graph));
     }
     return settings;
 }
@@ -1867,7 +1867,7 @@ BackendPageSettings BlockSpMat<T, Kernel>::normalize_backend_page_settings(
     MatrixKind matrix_kind,
     const DistGraph* graph) {
     BackendPageSettings normalized = settings;
-    normalized.csr_page_size = CSRBackendStorage::clamp_page_size(settings.csr_page_size);
+    normalized.csr_page_size = CSRBackendStorage::normalize_page_size(settings.csr_page_size);
     normalized.vbcsr_page_size =
         VBCSRBackendStorage::normalize_configured_max_slots_per_page(settings.vbcsr_page_size);
     if (settings.bsr_page_size == 0) {
@@ -1875,7 +1875,7 @@ BackendPageSettings BlockSpMat<T, Kernel>::normalize_backend_page_settings(
     }
     if (matrix_kind == MatrixKind::BSR && graph != nullptr) {
         normalized.bsr_page_size =
-            BSRBackendStorage::clamp_page_size(
+            BSRBackendStorage::normalize_blocks_per_page(
                 settings.bsr_page_size,
                 detail::BSRResultBuilder<T>::infer_block_size(graph));
     } else {
@@ -1961,7 +1961,7 @@ void BlockSpMat<T, Kernel>::attach_backend(VBCSRBackendStorage backend) {
 
 template <typename T, typename Kernel>
 void BlockSpMat<T, Kernel>::attach_backend(CSRBackendStorage backend) {
-    page_settings_.csr_page_size = backend.page_setting();
+    page_settings_.csr_page_size = backend.configured_page_size();
     backend_handle_ = detail::make_csr_backend_handle<T, Kernel>(std::move(backend));
     block_norms.clear();
     norms_valid = false;
@@ -1969,7 +1969,7 @@ void BlockSpMat<T, Kernel>::attach_backend(CSRBackendStorage backend) {
 
 template <typename T, typename Kernel>
 void BlockSpMat<T, Kernel>::attach_backend(BSRBackendStorage backend) {
-    page_settings_.bsr_page_size = backend.page_setting();
+    page_settings_.bsr_page_size = backend.configured_blocks_per_page();
     backend_handle_ = detail::make_bsr_backend_handle<T, Kernel>(std::move(backend));
     block_norms.clear();
     norms_valid = false;
