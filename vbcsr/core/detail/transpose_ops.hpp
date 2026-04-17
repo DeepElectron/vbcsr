@@ -2,8 +2,9 @@
 #define VBCSR_DETAIL_TRANSPOSE_OPS_HPP
 
 #include "distributed_plans.hpp"
-#include "vbcsr_result_builder.hpp"
 
+#include <algorithm>
+#include <stdexcept>
 #include <vector>
 
 namespace vbcsr::detail {
@@ -33,7 +34,10 @@ struct CSRTransposeExecutor {
 
         DistGraph* graph_C = new DistGraph(matrix.graph->comm);
         graph_C->construct_distributed(c_owned_globals, c_block_sizes, c_adj);
-        CSRResultBuilder<T> builder(graph_C, matrix.backend_page_settings().csr_page_size);
+        Matrix result(graph_C);
+        result.owns_graph = true;
+        result.graph->enable_matrix_lifetime_management();
+        result.set_page_size(matrix.configured_page_size());
 
         for (int row = 0; row < n_rows; ++row) {
             const int global_row = matrix.graph->get_global_index(row);
@@ -43,16 +47,22 @@ struct CSRTransposeExecutor {
                 }
                 const int dest_row = matrix.col_ind()[slot];
                 const int dest_col = graph_C->global_to_local.at(global_row);
-                const int dest_slot = builder.find_slot(dest_row, dest_col);
-                *builder.slot_data(dest_slot) = ScalarTraits<T>::conjugate(*matrix.block_data(slot));
+                const int dest_start = graph_C->adj_ptr[dest_row];
+                const int dest_end = graph_C->adj_ptr[dest_row + 1];
+                auto begin = graph_C->adj_ind.begin() + dest_start;
+                auto end = graph_C->adj_ind.begin() + dest_end;
+                auto it = std::lower_bound(begin, end, dest_col);
+                if (it == end || *it != dest_col) {
+                    throw std::runtime_error("CSR transpose could not locate destination block");
+                }
+                const int dest_graph_block =
+                    static_cast<int>(std::distance(graph_C->adj_ind.begin(), it));
+                *result.mutable_block_data(dest_graph_block) =
+                    ScalarTraits<T>::conjugate(*matrix.block_data(slot));
             }
         }
 
-        return Matrix::template materialize_from_builder<vbcsr::MatrixKind::CSR>(
-            graph_C,
-            true,
-            std::move(builder),
-            matrix.backend_page_settings());
+        return result;
     }
 
     static Matrix distributed(const Matrix& matrix) {
@@ -62,7 +72,10 @@ struct CSRTransposeExecutor {
             payload_plan.ghost_sizes());
         DistGraph* graph_C = assembly_plan.construct_result_graph(matrix, "transpose");
 
-        CSRResultBuilder<T> builder(graph_C, matrix.backend_page_settings().csr_page_size);
+        Matrix result(graph_C);
+        result.owns_graph = true;
+        result.graph->enable_matrix_lifetime_management();
+        result.set_page_size(matrix.configured_page_size());
         const int* meta_ptr = payload_plan.recv_meta().data();
         const int* meta_end = payload_plan.recv_meta().data() + payload_plan.recv_meta().size();
         const T* value_ptr = payload_plan.recv_values().data();
@@ -77,15 +90,21 @@ struct CSRTransposeExecutor {
 
             const int local_row = graph_C->global_to_local.at(global_row);
             const int local_col = graph_C->global_to_local.at(global_col);
-            const int slot = builder.find_slot(local_row, local_col);
-            *builder.slot_data(slot) = ScalarTraits<T>::conjugate(*value_ptr++);
+            const int dest_start = graph_C->adj_ptr[local_row];
+            const int dest_end = graph_C->adj_ptr[local_row + 1];
+            auto begin = graph_C->adj_ind.begin() + dest_start;
+            auto end = graph_C->adj_ind.begin() + dest_end;
+            auto it = std::lower_bound(begin, end, local_col);
+            if (it == end || *it != local_col) {
+                throw std::runtime_error("Distributed CSR transpose could not locate destination block");
+            }
+            const int graph_block_index =
+                static_cast<int>(std::distance(graph_C->adj_ind.begin(), it));
+            *result.mutable_block_data(graph_block_index) =
+                ScalarTraits<T>::conjugate(*value_ptr++);
         }
 
-        return Matrix::template materialize_from_builder<vbcsr::MatrixKind::CSR>(
-            graph_C,
-            true,
-            std::move(builder),
-            matrix.backend_page_settings());
+        return result;
     }
 
     static Matrix run(const Matrix& matrix) {
@@ -121,28 +140,36 @@ struct BSRTransposeExecutor {
 
         DistGraph* graph_C = new DistGraph(matrix.graph->comm);
         graph_C->construct_distributed(c_owned_globals, c_block_sizes, c_adj);
-        BSRResultBuilder<T> builder(graph_C, matrix.backend_page_settings().bsr_page_size);
+        Matrix result(graph_C);
+        result.owns_graph = true;
+        result.graph->enable_matrix_lifetime_management();
+        result.set_page_size(matrix.configured_page_size());
 
         #pragma omp parallel for
         for (int row = 0; row < n_rows; ++row) {
-            const int global_row = matrix.graph->get_global_index(row);
-            for (int slot = matrix.row_ptr()[row]; slot < matrix.row_ptr()[row + 1]; ++slot) {
+                const int global_row = matrix.graph->get_global_index(row);
+                for (int slot = matrix.row_ptr()[row]; slot < matrix.row_ptr()[row + 1]; ++slot) {
                 const int dest_row = matrix.col_ind()[slot];
                 const int dest_col = graph_C->global_to_local.at(global_row);
-                const int dest_slot = builder.find_slot(dest_row, dest_col);
+                const int dest_start = graph_C->adj_ptr[dest_row];
+                const int dest_end = graph_C->adj_ptr[dest_row + 1];
+                auto begin = graph_C->adj_ind.begin() + dest_start;
+                auto end = graph_C->adj_ind.begin() + dest_end;
+                auto it = std::lower_bound(begin, end, dest_col);
+                if (it == end || *it != dest_col) {
+                    throw std::runtime_error("BSR transpose could not locate destination block");
+                }
+                const int dest_graph_block =
+                    static_cast<int>(std::distance(graph_C->adj_ind.begin(), it));
                 Matrix::write_transposed_conjugate_values(
-                    builder.slot_data(dest_slot),
+                    result.mutable_block_data(dest_graph_block),
                     matrix.block_data(slot),
                     matrix.graph->block_sizes[row],
                     matrix.graph->block_sizes[matrix.col_ind()[slot]]);
             }
         }
 
-        return Matrix::template materialize_from_builder<vbcsr::MatrixKind::BSR>(
-            graph_C,
-            true,
-            std::move(builder),
-            matrix.backend_page_settings());
+        return result;
     }
 
     static Matrix distributed(const Matrix& matrix) {
@@ -152,7 +179,10 @@ struct BSRTransposeExecutor {
             payload_plan.ghost_sizes());
         DistGraph* graph_C = assembly_plan.construct_result_graph(matrix, "transpose");
 
-        BSRResultBuilder<T> builder(graph_C, matrix.backend_page_settings().bsr_page_size);
+        Matrix result(graph_C);
+        result.owns_graph = true;
+        result.graph->enable_matrix_lifetime_management();
+        result.set_page_size(matrix.configured_page_size());
         const int* meta_ptr = payload_plan.recv_meta().data();
         const int* meta_end = payload_plan.recv_meta().data() + payload_plan.recv_meta().size();
         const T* value_ptr = payload_plan.recv_values().data();
@@ -164,16 +194,25 @@ struct BSRTransposeExecutor {
 
             const int local_row = graph_C->global_to_local.at(global_row);
             const int local_col = graph_C->global_to_local.at(global_col);
-            const int slot = builder.find_slot(local_row, local_col);
-            Matrix::write_transposed_conjugate_values(builder.slot_data(slot), value_ptr, col_dim, row_dim);
+            const int dest_start = graph_C->adj_ptr[local_row];
+            const int dest_end = graph_C->adj_ptr[local_row + 1];
+            auto begin = graph_C->adj_ind.begin() + dest_start;
+            auto end = graph_C->adj_ind.begin() + dest_end;
+            auto it = std::lower_bound(begin, end, local_col);
+            if (it == end || *it != local_col) {
+                throw std::runtime_error("Distributed BSR transpose could not locate destination block");
+            }
+            const int graph_block_index =
+                static_cast<int>(std::distance(graph_C->adj_ind.begin(), it));
+            Matrix::write_transposed_conjugate_values(
+                result.mutable_block_data(graph_block_index),
+                value_ptr,
+                col_dim,
+                row_dim);
             value_ptr += static_cast<size_t>(row_dim) * col_dim;
         }
 
-        return Matrix::template materialize_from_builder<vbcsr::MatrixKind::BSR>(
-            graph_C,
-            true,
-            std::move(builder),
-            matrix.backend_page_settings());
+        return result;
     }
 
     static Matrix run(const Matrix& matrix) {
@@ -220,28 +259,34 @@ private:
         DistGraph* graph_C = new DistGraph(matrix.graph->comm);
         graph_C->construct_distributed(c_owned_globals, c_block_sizes, c_adj);
 
-        VBCSRResultBuilder<T, Kernel> builder(
-            graph_C,
-            matrix.backend_page_settings().vbcsr_page_size);
+        Matrix result(graph_C);
+        result.owns_graph = true;
+        result.graph->enable_matrix_lifetime_management();
+        result.set_page_size(matrix.configured_page_size());
         #pragma omp parallel for
         for (int row = 0; row < n_rows; ++row) {
             const int global_row = matrix.graph->get_global_index(row);
             for (int slot = matrix.row_ptr()[row]; slot < matrix.row_ptr()[row + 1]; ++slot) {
                 const int dest_row = matrix.col_ind()[slot];
                 const int dest_col = graph_C->global_to_local.at(global_row);
-                const int dest_slot = builder.find_slot(dest_row, dest_col);
+                const int dest_start = graph_C->adj_ptr[dest_row];
+                const int dest_end = graph_C->adj_ptr[dest_row + 1];
+                auto begin = graph_C->adj_ind.begin() + dest_start;
+                auto end = graph_C->adj_ind.begin() + dest_end;
+                auto it = std::lower_bound(begin, end, dest_col);
+                if (it == end || *it != dest_col) {
+                    throw std::runtime_error("VBCSR transpose could not locate destination block");
+                }
+                const int dest_graph_block =
+                    static_cast<int>(std::distance(graph_C->adj_ind.begin(), it));
                 Matrix::write_transposed_conjugate_values(
-                    builder.slot_data(dest_slot),
+                    result.mutable_block_data(dest_graph_block),
                     matrix.block_data(slot),
                     matrix.graph->block_sizes[row],
                     matrix.graph->block_sizes[matrix.col_ind()[slot]]);
             }
         }
-        return Matrix::template materialize_from_builder<vbcsr::MatrixKind::VBCSR>(
-            graph_C,
-            true,
-            std::move(builder),
-            matrix.backend_page_settings());
+        return result;
     }
 
     static Matrix distributed(const Matrix& matrix) {
@@ -251,9 +296,10 @@ private:
             payload_plan.ghost_sizes());
         DistGraph* graph_C = assembly_plan.construct_result_graph(matrix, "transpose");
 
-        VBCSRResultBuilder<T, Kernel> builder(
-            graph_C,
-            matrix.backend_page_settings().vbcsr_page_size);
+        Matrix result(graph_C);
+        result.owns_graph = true;
+        result.graph->enable_matrix_lifetime_management();
+        result.set_page_size(matrix.configured_page_size());
         const int* meta_ptr = payload_plan.recv_meta().data();
         const int* meta_end = payload_plan.recv_meta().data() + payload_plan.recv_meta().size();
         const T* value_ptr = payload_plan.recv_values().data();
@@ -264,15 +310,24 @@ private:
             const int col_dim = *meta_ptr++;
             const int local_row = graph_C->global_to_local.at(global_row);
             const int local_col = graph_C->global_to_local.at(global_col);
-            const int slot = builder.find_slot(local_row, local_col);
-            Matrix::write_transposed_conjugate_values(builder.slot_data(slot), value_ptr, col_dim, row_dim);
+            const int dest_start = graph_C->adj_ptr[local_row];
+            const int dest_end = graph_C->adj_ptr[local_row + 1];
+            auto begin = graph_C->adj_ind.begin() + dest_start;
+            auto end = graph_C->adj_ind.begin() + dest_end;
+            auto it = std::lower_bound(begin, end, local_col);
+            if (it == end || *it != local_col) {
+                throw std::runtime_error("Distributed VBCSR transpose could not locate destination block");
+            }
+            const int graph_block_index =
+                static_cast<int>(std::distance(graph_C->adj_ind.begin(), it));
+            Matrix::write_transposed_conjugate_values(
+                result.mutable_block_data(graph_block_index),
+                value_ptr,
+                col_dim,
+                row_dim);
             value_ptr += static_cast<size_t>(row_dim) * col_dim;
         }
-        return Matrix::template materialize_from_builder<vbcsr::MatrixKind::VBCSR>(
-            graph_C,
-            true,
-            std::move(builder),
-            matrix.backend_page_settings());
+        return result;
     }
 };
 
