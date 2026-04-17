@@ -2,10 +2,7 @@
 #define VBCSR_DETAIL_AXPBY_OPS_HPP
 
 #include "../dist_graph.hpp"
-#include "bsr_result_builder.hpp"
-#include "csr_result_builder.hpp"
 #include "distributed_result_graph.hpp"
-#include "vbcsr_result_builder.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -41,16 +38,16 @@ struct CSRAxpbyExecutor {
 
         if (beta == T(0)) {
             DistGraph* new_graph = X.graph->duplicate();
-            CSRResultBuilder<T> builder(new_graph, X.backend_page_settings().csr_page_size);
+            Matrix result(new_graph);
+            result.owns_graph = true;
+            result.graph->enable_matrix_lifetime_management();
+            result.set_page_size(X.configured_page_size());
             #pragma omp parallel for
             for (size_t slot = 0; slot < X.local_block_nnz(); ++slot) {
-                *builder.slot_data(static_cast<int>(slot)) = alpha * (*X.block_data(static_cast<int>(slot)));
+                *result.mutable_block_data(static_cast<int>(slot)) =
+                    alpha * (*X.block_data(static_cast<int>(slot)));
             }
-            self.template replace_with_builder<vbcsr::MatrixKind::CSR>(
-                new_graph,
-                true,
-                std::move(builder),
-                X.backend_page_settings());
+            self = std::move(result);
             return;
         }
 
@@ -76,7 +73,10 @@ struct CSRAxpbyExecutor {
             owned_block_sizes(*self.graph),
             new_adj);
 
-        CSRResultBuilder<T> builder(new_graph, self.backend_page_settings().csr_page_size);
+        Matrix result(new_graph);
+        result.owns_graph = true;
+        result.graph->enable_matrix_lifetime_management();
+        result.set_page_size(self.configured_page_size());
         #pragma omp parallel for
         for (int row = 0; row < n_rows; ++row) {
             std::map<int, T> row_values;
@@ -88,16 +88,21 @@ struct CSRAxpbyExecutor {
             }
             for (const auto& [global_col, value] : row_values) {
                 const int local_col = new_graph->global_to_local.at(global_col);
-                const int dest_slot = builder.find_slot(row, local_col);
-                *builder.slot_data(dest_slot) = value;
+                const int dest_start = new_graph->adj_ptr[row];
+                const int dest_end = new_graph->adj_ptr[row + 1];
+                auto begin = new_graph->adj_ind.begin() + dest_start;
+                auto end = new_graph->adj_ind.begin() + dest_end;
+                auto it = std::lower_bound(begin, end, local_col);
+                if (it == end || *it != local_col) {
+                    throw std::runtime_error("CSR axpby could not locate destination block");
+                }
+                const int dest_graph_block =
+                    static_cast<int>(std::distance(new_graph->adj_ind.begin(), it));
+                *result.mutable_block_data(dest_graph_block) = value;
             }
         }
 
-        self.template replace_with_builder<vbcsr::MatrixKind::CSR>(
-            new_graph,
-            true,
-            std::move(builder),
-            self.backend_page_settings());
+        self = std::move(result);
     }
 };
 
@@ -130,21 +135,20 @@ struct BSRAxpbyExecutor {
 
         if (beta == T(0)) {
             DistGraph* new_graph = X.graph->duplicate();
-            BSRResultBuilder<T> builder(new_graph, X.backend_page_settings().bsr_page_size);
+            Matrix result(new_graph);
+            result.owns_graph = true;
+            result.graph->enable_matrix_lifetime_management();
+            result.set_page_size(X.configured_page_size());
             #pragma omp parallel for
             for (size_t slot = 0; slot < X.local_block_nnz(); ++slot) {
-                T* dest = builder.slot_data(static_cast<int>(slot));
+                T* dest = result.mutable_block_data(static_cast<int>(slot));
                 const T* src = X.block_data(static_cast<int>(slot));
                 const size_t size = X.block_size_elements(static_cast<int>(slot));
                 for (size_t idx = 0; idx < size; ++idx) {
                     dest[idx] = alpha * src[idx];
                 }
             }
-            self.template replace_with_builder<vbcsr::MatrixKind::BSR>(
-                new_graph,
-                true,
-                std::move(builder),
-                X.backend_page_settings());
+            self = std::move(result);
             return;
         }
 
@@ -170,13 +174,25 @@ struct BSRAxpbyExecutor {
             owned_block_sizes(*self.graph),
             new_adj);
 
-        BSRResultBuilder<T> builder(new_graph, self.backend_page_settings().bsr_page_size);
+        Matrix result(new_graph);
+        result.owns_graph = true;
+        result.graph->enable_matrix_lifetime_management();
+        result.set_page_size(self.configured_page_size());
         #pragma omp parallel for
         for (int row = 0; row < n_rows; ++row) {
             for (int slot = self.row_ptr()[row]; slot < self.row_ptr()[row + 1]; ++slot) {
                 const int local_col = new_graph->global_to_local.at(self.graph->get_global_index(self.col_ind()[slot]));
-                const int dest_slot = builder.find_slot(row, local_col);
-                T* dest = builder.slot_data(dest_slot);
+                const int dest_start = new_graph->adj_ptr[row];
+                const int dest_end = new_graph->adj_ptr[row + 1];
+                auto begin = new_graph->adj_ind.begin() + dest_start;
+                auto end = new_graph->adj_ind.begin() + dest_end;
+                auto it = std::lower_bound(begin, end, local_col);
+                if (it == end || *it != local_col) {
+                    throw std::runtime_error("BSR axpby could not locate destination block");
+                }
+                const int dest_graph_block =
+                    static_cast<int>(std::distance(new_graph->adj_ind.begin(), it));
+                T* dest = result.mutable_block_data(dest_graph_block);
                 const T* src = self.block_data(slot);
                 const size_t size = self.block_size_elements(slot);
                 for (size_t idx = 0; idx < size; ++idx) {
@@ -186,8 +202,17 @@ struct BSRAxpbyExecutor {
 
             for (int slot = X.row_ptr()[row]; slot < X.row_ptr()[row + 1]; ++slot) {
                 const int local_col = new_graph->global_to_local.at(X.graph->get_global_index(X.col_ind()[slot]));
-                const int dest_slot = builder.find_slot(row, local_col);
-                T* dest = builder.slot_data(dest_slot);
+                const int dest_start = new_graph->adj_ptr[row];
+                const int dest_end = new_graph->adj_ptr[row + 1];
+                auto begin = new_graph->adj_ind.begin() + dest_start;
+                auto end = new_graph->adj_ind.begin() + dest_end;
+                auto it = std::lower_bound(begin, end, local_col);
+                if (it == end || *it != local_col) {
+                    throw std::runtime_error("BSR axpby could not locate destination block");
+                }
+                const int dest_graph_block =
+                    static_cast<int>(std::distance(new_graph->adj_ind.begin(), it));
+                T* dest = result.mutable_block_data(dest_graph_block);
                 const T* src = X.block_data(slot);
                 const size_t size = X.block_size_elements(slot);
                 for (size_t idx = 0; idx < size; ++idx) {
@@ -196,11 +221,7 @@ struct BSRAxpbyExecutor {
             }
         }
 
-        self.template replace_with_builder<vbcsr::MatrixKind::BSR>(
-            new_graph,
-            true,
-            std::move(builder),
-            self.backend_page_settings());
+        self = std::move(result);
     }
 };
 
@@ -400,9 +421,10 @@ struct VBCSRAxpbyExecutor {
         std::vector<int> new_row_ptr;
         std::vector<int> new_col_ind;
         new_graph->get_matrix_structure(new_row_ptr, new_col_ind);
-        VBCSRResultBuilder<T, typename Matrix::KernelType> builder(
-            new_graph,
-            self.backend_page_settings().vbcsr_page_size);
+        Matrix result(new_graph);
+        result.owns_graph = true;
+        result.graph->enable_matrix_lifetime_management();
+        result.set_page_size(self.configured_page_size());
 
         #pragma omp parallel for
         for (int row = 0; row < n_rows; ++row) {
@@ -429,7 +451,7 @@ struct VBCSRAxpbyExecutor {
                 }
                 const bool in_x = (x_k < x_end && !canonical_less(col, new_graph, X.col_ind()[x_k], X.graph));
 
-                T* dest_ptr = builder.slot_data(slot);
+                T* dest_ptr = result.mutable_block_data(slot);
                 const size_t sz = static_cast<size_t>(new_graph->block_sizes[row]) *
                                   static_cast<size_t>(new_graph->block_sizes[col]);
 
@@ -459,11 +481,7 @@ struct VBCSRAxpbyExecutor {
             }
         }
 
-        self.template replace_with_builder<vbcsr::MatrixKind::VBCSR>(
-            new_graph,
-            true,
-            std::move(builder),
-            self.backend_page_settings());
+        self = std::move(result);
     }
 
 private:
