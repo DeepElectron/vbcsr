@@ -15,7 +15,7 @@ template <typename Matrix>
 struct VBCSRShapeBatchExecutor {
     using T = typename Matrix::value_type;
     using ApplyMode = typename Matrix::VBCSRBackendStorage::ApplyMode;
-    using ShapeBatch = typename Matrix::VBCSRBackendStorage::ShapeBatchView;
+    using PageBatch = typename Matrix::VBCSRBackendStorage::PageBatch;
 
     // One ApplyTask is a contiguous subrange of one shape page batch. We keep the
     // batch/page identity, then optionally split a large batched page into multiple
@@ -34,13 +34,18 @@ struct VBCSRShapeBatchExecutor {
         x.sync_ghosts();
         std::fill(y.data.begin(), y.data.end(), T(0));
 
-        const auto& batches = matrix.active_vbcsr_backend().ensure_apply_plan().batches;
+        // the initial batches number dependent on the page number, which is the number of shape and the number of page in each shape
+        const auto& batches = matrix.active_vbcsr_backend()
+                                  .ensure_apply_plan(matrix.graph->adj_ptr, matrix.graph->adj_ind)
+                                  .batches;
         const auto tasks = build_apply_tasks(
             batches,
             SmartKernel<T>::supports_batched_gemv(),
-            [](const ShapeBatch& batch) {
+            [](const PageBatch& batch) {
                 return static_cast<size_t>(batch.row_dim + batch.col_dim);
             });
+        
+        // thread_acc - [n_thread, n_dim] array, accumulate each threads MVP result and summed them up.
         auto thread_acc = make_thread_accumulators(static_cast<int>(y.data.size()));
 
         #pragma omp parallel for schedule(dynamic)
@@ -50,7 +55,7 @@ struct VBCSRShapeBatchExecutor {
             const auto& task = tasks[task_idx];
             const auto& batch = batches[task.batch_index];
             const ApplyMode mode = select_vector_apply_mode(task.count);
-            matrix.active_vbcsr_backend().record_apply_batch(batch.shape_id, mode, task.count);
+            matrix.active_vbcsr_backend().record_apply_batch(batch.shape_id, mode);
             run_mult_batch(matrix, batch, task.begin, task.count, mode, x, accum.data());
         }
         
@@ -64,7 +69,9 @@ struct VBCSRShapeBatchExecutor {
         X.sync_ghosts();
         std::fill(Y.data.begin(), Y.data.end(), T(0));
 
-        const auto& batches = matrix.active_vbcsr_backend().ensure_apply_plan().batches;
+        const auto& batches = matrix.active_vbcsr_backend()
+                                  .ensure_apply_plan(matrix.graph->adj_ptr, matrix.graph->adj_ind)
+                                  .batches;
         auto thread_acc = make_thread_accumulators(static_cast<int>(Y.data.size()));
         const int ldb = X.local_rows + X.ghost_rows;
         const int ldc = Y.local_rows + Y.ghost_rows;
@@ -72,7 +79,7 @@ struct VBCSRShapeBatchExecutor {
         const auto tasks = build_apply_tasks(
             batches,
             SmartKernel<T>::supports_batched_gemm(),
-            [num_vecs](const ShapeBatch& batch) {
+            [num_vecs](const PageBatch& batch) {
                 return static_cast<size_t>(num_vecs) *
                        static_cast<size_t>(batch.row_dim + batch.col_dim);
             });
@@ -84,7 +91,7 @@ struct VBCSRShapeBatchExecutor {
             const auto& task = tasks[task_idx];
             const auto& batch = batches[task.batch_index];
             const ApplyMode mode = select_dense_apply_mode(task.count);
-            matrix.active_vbcsr_backend().record_apply_batch(batch.shape_id, mode, task.count);
+            matrix.active_vbcsr_backend().record_apply_batch(batch.shape_id, mode);
             run_mult_dense_batch(matrix, batch, task.begin, task.count, mode, X, ldb, num_vecs, ldc, accum.data());
         }
 
@@ -97,11 +104,13 @@ struct VBCSRShapeBatchExecutor {
         y.bind_to_graph(matrix.graph);
         std::fill(y.data.begin(), y.data.end(), T(0));
 
-        const auto& batches = matrix.active_vbcsr_backend().ensure_apply_plan().batches;
+        const auto& batches = matrix.active_vbcsr_backend()
+                                  .ensure_apply_plan(matrix.graph->adj_ptr, matrix.graph->adj_ind)
+                                  .batches;
         const auto tasks = build_apply_tasks(
             batches,
             SmartKernel<T>::supports_batched_gemv(),
-            [](const ShapeBatch& batch) {
+            [](const PageBatch& batch) {
                 return static_cast<size_t>(batch.row_dim + batch.col_dim);
             });
         auto thread_acc = make_thread_accumulators(static_cast<int>(y.data.size()));
@@ -113,7 +122,7 @@ struct VBCSRShapeBatchExecutor {
             const auto& task = tasks[task_idx];
             const auto& batch = batches[task.batch_index];
             const ApplyMode mode = select_vector_apply_mode(task.count);
-            matrix.active_vbcsr_backend().record_apply_batch(batch.shape_id, mode, task.count);
+            matrix.active_vbcsr_backend().record_apply_batch(batch.shape_id, mode);
             run_mult_adjoint_batch(matrix, batch, task.begin, task.count, mode, x, accum.data());
         }
 
@@ -127,7 +136,9 @@ struct VBCSRShapeBatchExecutor {
         Y.bind_to_graph(matrix.graph);
         std::fill(Y.data.begin(), Y.data.end(), T(0));
 
-        const auto& batches = matrix.active_vbcsr_backend().ensure_apply_plan().batches;
+        const auto& batches = matrix.active_vbcsr_backend()
+                                  .ensure_apply_plan(matrix.graph->adj_ptr, matrix.graph->adj_ind)
+                                  .batches;
         auto thread_acc = make_thread_accumulators(static_cast<int>(Y.data.size()));
         const int ldb = X.local_rows + X.ghost_rows;
         const int ldc = Y.local_rows + Y.ghost_rows;
@@ -135,7 +146,7 @@ struct VBCSRShapeBatchExecutor {
         const auto tasks = build_apply_tasks(
             batches,
             SmartKernel<T>::supports_batched_gemm(),
-            [num_vecs](const ShapeBatch& batch) {
+            [num_vecs](const PageBatch& batch) {
                 return static_cast<size_t>(num_vecs) *
                        static_cast<size_t>(batch.row_dim + batch.col_dim);
             });
@@ -147,7 +158,7 @@ struct VBCSRShapeBatchExecutor {
             const auto& task = tasks[task_idx];
             const auto& batch = batches[task.batch_index];
             const ApplyMode mode = select_dense_apply_mode(task.count);
-            matrix.active_vbcsr_backend().record_apply_batch(batch.shape_id, mode, task.count);
+            matrix.active_vbcsr_backend().record_apply_batch(batch.shape_id, mode);
             run_mult_dense_adjoint_batch(matrix, batch, task.begin, task.count, mode, X, ldb, num_vecs, ldc, accum.data());
         }
 
@@ -156,14 +167,15 @@ struct VBCSRShapeBatchExecutor {
     }
 
 private:
-    // Target scratch budget for one batched micro-batch. This currently controls
-    // both temporary buffer size and, when packed page splitting is enabled,
-    // the granularity of ApplyTask subdivision.
+    // Target scratch budget for one batched micro-kernel launch. This currently
+    // controls both temporary buffer size and the granularity of ApplyTask
+    // subdivision when a large page batch is split.
     static constexpr size_t kTargetScratchBytes = 1u << 20;
 
+    // this is a serial kernel that runs for each task
     static void run_mult_batch(
         const Matrix& matrix,
-        const ShapeBatch& batch,
+        const PageBatch& batch,
         uint32_t begin,
         uint32_t count,
         ApplyMode mode,
@@ -173,7 +185,7 @@ private:
             return;
         }
         if (mode == ApplyMode::Batched) {
-            run_mult_batch_packed(matrix, batch, begin, count, x, accum);
+            run_mult_batch_batched(matrix, batch, begin, count, x, accum);
             return;
         }
         run_mult_batch_fallback(matrix, batch, begin, count, x, accum);
@@ -181,16 +193,15 @@ private:
 
     static void run_mult_batch_fallback(
         const Matrix& matrix,
-        const ShapeBatch& batch,
+        const PageBatch& batch,
         uint32_t begin,
         uint32_t count,
         DistVector<T>& x,
         T* accum) {
         for (uint32_t offset = 0; offset < count; ++offset) {
             const uint32_t idx = begin + offset;
-            const int slot = batch.logical_slot(idx);
-            const int row = matrix.block_row_from_slot(slot);
-            const int col = matrix.block_col_from_slot(slot);
+            const int row = batch.row_block_index(idx);
+            const int col = batch.col_block_index(idx);
             const T* block = batch.block_ptr(idx);
             const T* x_ptr = x.data.data() + matrix.graph->block_offsets[col];
             T* y_ptr = accum + matrix.graph->block_offsets[row];
@@ -210,7 +221,7 @@ private:
 
     static void run_mult_dense_batch(
         const Matrix& matrix,
-        const ShapeBatch& batch,
+        const PageBatch& batch,
         uint32_t begin,
         uint32_t count,
         ApplyMode mode,
@@ -223,7 +234,7 @@ private:
             return;
         }
         if (mode == ApplyMode::Batched) {
-            run_mult_dense_batch_packed(matrix, batch, begin, count, X, ldb, num_vecs, ldc, accum);
+            run_mult_dense_batch_batched(matrix, batch, begin, count, X, ldb, num_vecs, ldc, accum);
             return;
         }
         run_mult_dense_batch_fallback(matrix, batch, begin, count, X, ldb, num_vecs, ldc, accum);
@@ -231,7 +242,7 @@ private:
 
     static void run_mult_dense_batch_fallback(
         const Matrix& matrix,
-        const ShapeBatch& batch,
+        const PageBatch& batch,
         uint32_t begin,
         uint32_t count,
         DistMultiVector<T>& X,
@@ -241,9 +252,8 @@ private:
         T* accum) {
         for (uint32_t offset = 0; offset < count; ++offset) {
             const uint32_t idx = begin + offset;
-            const int slot = batch.logical_slot(idx);
-            const int row = matrix.block_row_from_slot(slot);
-            const int col = matrix.block_col_from_slot(slot);
+            const int row = batch.row_block_index(idx);
+            const int col = batch.col_block_index(idx);
             const T* block = batch.block_ptr(idx);
             const T* x_ptr = &X(matrix.graph->block_offsets[col], 0);
             T* y_ptr = accum + matrix.graph->block_offsets[row];
@@ -264,7 +274,7 @@ private:
 
     static void run_mult_adjoint_batch(
         const Matrix& matrix,
-        const ShapeBatch& batch,
+        const PageBatch& batch,
         uint32_t begin,
         uint32_t count,
         ApplyMode mode,
@@ -274,7 +284,7 @@ private:
             return;
         }
         if (mode == ApplyMode::Batched) {
-            run_mult_adjoint_batch_packed(matrix, batch, begin, count, x, accum);
+            run_mult_adjoint_batch_batched(matrix, batch, begin, count, x, accum);
             return;
         }
         run_mult_adjoint_batch_fallback(matrix, batch, begin, count, x, accum);
@@ -282,16 +292,15 @@ private:
 
     static void run_mult_adjoint_batch_fallback(
         const Matrix& matrix,
-        const ShapeBatch& batch,
+        const PageBatch& batch,
         uint32_t begin,
         uint32_t count,
         DistVector<T>& x,
         T* accum) {
         for (uint32_t offset = 0; offset < count; ++offset) {
             const uint32_t idx = begin + offset;
-            const int slot = batch.logical_slot(idx);
-            const int row = matrix.block_row_from_slot(slot);
-            const int col = matrix.block_col_from_slot(slot);
+            const int row = batch.row_block_index(idx);
+            const int col = batch.col_block_index(idx);
             const T* block = batch.block_ptr(idx);
             const T* x_ptr = x.local_data() + matrix.graph->block_offsets[row];
             T* y_ptr = accum + matrix.graph->block_offsets[col];
@@ -311,7 +320,7 @@ private:
 
     static void run_mult_dense_adjoint_batch(
         const Matrix& matrix,
-        const ShapeBatch& batch,
+        const PageBatch& batch,
         uint32_t begin,
         uint32_t count,
         ApplyMode mode,
@@ -324,7 +333,7 @@ private:
             return;
         }
         if (mode == ApplyMode::Batched) {
-            run_mult_dense_adjoint_batch_packed(matrix, batch, begin, count, X, ldb, num_vecs, ldc, accum);
+            run_mult_dense_adjoint_batch_batched(matrix, batch, begin, count, X, ldb, num_vecs, ldc, accum);
             return;
         }
         run_mult_dense_adjoint_batch_fallback(matrix, batch, begin, count, X, ldb, num_vecs, ldc, accum);
@@ -332,7 +341,7 @@ private:
 
     static void run_mult_dense_adjoint_batch_fallback(
         const Matrix& matrix,
-        const ShapeBatch& batch,
+        const PageBatch& batch,
         uint32_t begin,
         uint32_t count,
         DistMultiVector<T>& X,
@@ -342,9 +351,8 @@ private:
         T* accum) {
         for (uint32_t offset = 0; offset < count; ++offset) {
             const uint32_t idx = begin + offset;
-            const int slot = batch.logical_slot(idx);
-            const int row = matrix.block_row_from_slot(slot);
-            const int col = matrix.block_col_from_slot(slot);
+            const int row = batch.row_block_index(idx);
+            const int col = batch.col_block_index(idx);
             const T* block = batch.block_ptr(idx);
             const T* x_ptr = &X(matrix.graph->block_offsets[row], 0);
             T* y_ptr = accum + matrix.graph->block_offsets[col];
@@ -363,9 +371,9 @@ private:
         }
     }
 
-    static void run_mult_batch_packed(
+    static void run_mult_batch_batched(
         const Matrix& matrix,
-        const ShapeBatch& batch,
+        const PageBatch& batch,
         uint32_t begin,
         uint32_t count,
         DistVector<T>& x,
@@ -386,8 +394,7 @@ private:
             y_scratch.assign(static_cast<size_t>(local_count) * batch.row_dim, T(0));
 
             for (uint32_t idx = 0; idx < local_count; ++idx) {
-                const int slot = batch.logical_slot(begin + offset + idx);
-                const int col = matrix.block_col_from_slot(slot);
+                const int col = batch.col_block_index(begin + offset + idx);
                 const T* x_ptr = x.data.data() + matrix.graph->block_offsets[col];
                 std::memcpy(
                     x_scratch.data() + static_cast<size_t>(idx) * batch.col_dim,
@@ -412,8 +419,7 @@ private:
                 static_cast<int>(local_count));
 
             for (uint32_t idx = 0; idx < local_count; ++idx) {
-                const int slot = batch.logical_slot(begin + offset + idx);
-                const int row = matrix.block_row_from_slot(slot);
+                const int row = batch.row_block_index(begin + offset + idx);
                 T* y_ptr = accum + matrix.graph->block_offsets[row];
                 const T* y_local = y_scratch.data() + static_cast<size_t>(idx) * batch.row_dim;
                 for (int i = 0; i < batch.row_dim; ++i) {
@@ -423,9 +429,9 @@ private:
         }
     }
 
-    static void run_mult_dense_batch_packed(
+    static void run_mult_dense_batch_batched(
         const Matrix& matrix,
-        const ShapeBatch& batch,
+        const PageBatch& batch,
         uint32_t begin,
         uint32_t count,
         DistMultiVector<T>& X,
@@ -451,8 +457,7 @@ private:
             c_scratch.assign(static_cast<size_t>(local_count) * c_stride, T(0));
 
             for (uint32_t idx = 0; idx < local_count; ++idx) {
-                const int slot = batch.logical_slot(begin + offset + idx);
-                const int col = matrix.block_col_from_slot(slot);
+                const int col = batch.col_block_index(begin + offset + idx);
                 const T* x_ptr = &X(matrix.graph->block_offsets[col], 0);
                 T* packed_b = b_scratch.data() + static_cast<size_t>(idx) * b_stride;
                 pack_multivector_block(x_ptr, ldb, batch.col_dim, num_vecs, packed_b);
@@ -476,8 +481,7 @@ private:
                 static_cast<int>(local_count));
 
             for (uint32_t idx = 0; idx < local_count; ++idx) {
-                const int slot = batch.logical_slot(begin + offset + idx);
-                const int row = matrix.block_row_from_slot(slot);
+                const int row = batch.row_block_index(begin + offset + idx);
                 T* y_ptr = accum + matrix.graph->block_offsets[row];
                 const T* y_local = c_scratch.data() + static_cast<size_t>(idx) * c_stride;
                 accumulate_multivector_block(y_ptr, ldc, y_local, batch.row_dim, num_vecs);
@@ -485,9 +489,9 @@ private:
         }
     }
 
-    static void run_mult_adjoint_batch_packed(
+    static void run_mult_adjoint_batch_batched(
         const Matrix& matrix,
-        const ShapeBatch& batch,
+        const PageBatch& batch,
         uint32_t begin,
         uint32_t count,
         DistVector<T>& x,
@@ -508,8 +512,7 @@ private:
             y_scratch.assign(static_cast<size_t>(local_count) * batch.col_dim, T(0));
 
             for (uint32_t idx = 0; idx < local_count; ++idx) {
-                const int slot = batch.logical_slot(begin + offset + idx);
-                const int row = matrix.block_row_from_slot(slot);
+                const int row = batch.row_block_index(begin + offset + idx);
                 const T* x_ptr = x.local_data() + matrix.graph->block_offsets[row];
                 std::memcpy(
                     x_scratch.data() + static_cast<size_t>(idx) * batch.row_dim,
@@ -534,8 +537,7 @@ private:
                 static_cast<int>(local_count));
 
             for (uint32_t idx = 0; idx < local_count; ++idx) {
-                const int slot = batch.logical_slot(begin + offset + idx);
-                const int col = matrix.block_col_from_slot(slot);
+                const int col = batch.col_block_index(begin + offset + idx);
                 T* y_ptr = accum + matrix.graph->block_offsets[col];
                 const T* y_local = y_scratch.data() + static_cast<size_t>(idx) * batch.col_dim;
                 for (int i = 0; i < batch.col_dim; ++i) {
@@ -545,9 +547,9 @@ private:
         }
     }
 
-    static void run_mult_dense_adjoint_batch_packed(
+    static void run_mult_dense_adjoint_batch_batched(
         const Matrix& matrix,
-        const ShapeBatch& batch,
+        const PageBatch& batch,
         uint32_t begin,
         uint32_t count,
         DistMultiVector<T>& X,
@@ -573,8 +575,7 @@ private:
             c_scratch.assign(static_cast<size_t>(local_count) * c_stride, T(0));
 
             for (uint32_t idx = 0; idx < local_count; ++idx) {
-                const int slot = batch.logical_slot(begin + offset + idx);
-                const int row = matrix.block_row_from_slot(slot);
+                const int row = batch.row_block_index(begin + offset + idx);
                 const T* x_ptr = &X(matrix.graph->block_offsets[row], 0);
                 T* packed_b = b_scratch.data() + static_cast<size_t>(idx) * b_stride;
                 pack_multivector_block(x_ptr, ldb, batch.row_dim, num_vecs, packed_b);
@@ -598,8 +599,7 @@ private:
                 static_cast<int>(local_count));
 
             for (uint32_t idx = 0; idx < local_count; ++idx) {
-                const int slot = batch.logical_slot(begin + offset + idx);
-                const int col = matrix.block_col_from_slot(slot);
+                const int col = batch.col_block_index(begin + offset + idx);
                 T* y_ptr = accum + matrix.graph->block_offsets[col];
                 const T* y_local = c_scratch.data() + static_cast<size_t>(idx) * c_stride;
                 accumulate_multivector_block(y_ptr, ldc, y_local, batch.col_dim, num_vecs);
@@ -609,7 +609,7 @@ private:
 
     template <typename ScratchFn>
     static std::vector<ApplyTask> build_apply_tasks(
-        const std::vector<ShapeBatch>& batches,
+        const std::vector<PageBatch>& batches,
         bool batched_supported,
         ScratchFn&& scratch_elems_for_batch) {
         std::vector<ApplyTask> tasks;
@@ -635,6 +635,8 @@ private:
 
         size_t estimated_tasks = 0;
         for (const auto& batch : batches) {
+            // choose chunk size choose the largest task size allowed by the memory budget for each batch
+            // given by kTargetScratchBytes
             const uint32_t task_size = choose_chunk_size(
                 scratch_elems_for_batch(batch),
                 batch.block_count());
@@ -674,9 +676,9 @@ private:
                batch_count < static_cast<size_t>(2 * max_parallel_threads());
     }
 
-    // Estimate how many same-shape blocks fit in one packed micro-batch without
-    // growing operand/output scratch beyond the target scratch budget. This is a
-    // memory-oriented heuristic, not a full performance model.
+    // Estimate how many same-shape blocks fit in one batched micro-kernel launch
+    // without growing operand/output scratch beyond the target scratch budget.
+    // This is a memory-oriented heuristic, not a full performance model.
     static uint32_t choose_chunk_size(size_t per_block_scratch_elems, uint32_t total_blocks) {
         if (total_blocks == 0) {
             return 1;
