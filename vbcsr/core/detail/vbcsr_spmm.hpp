@@ -2,7 +2,6 @@
 #define VBCSR_DETAIL_VBCSR_SPMM_HPP
 
 #include "distributed_plans.hpp"
-#include "vbcsr_result_builder.hpp"
 
 #include <cstring>
 #include <map>
@@ -26,7 +25,7 @@ private:
 
     struct HashEntry {
         int key;
-        int slot;
+        int graph_block_index;
         int tag;
     };
 
@@ -62,14 +61,10 @@ public:
         const auto& B_local_norms = B.get_block_norms();
 
         DistGraph* c_graph = assembly_plan.construct_result_graph(A, "spmm");
-        VBCSRResultBuilder<T, Kernel> builder(
-            c_graph,
-            A.backend_page_settings().vbcsr_page_size);
-        Matrix C = Matrix::template materialize_from_builder<vbcsr::MatrixKind::VBCSR>(
-            c_graph,
-            true,
-            std::move(builder),
-            A.backend_page_settings());
+        Matrix C(c_graph);
+        C.owns_graph = true;
+        C.graph->enable_matrix_lifetime_management();
+        C.set_page_size(A.configured_page_size());
 
         numeric_multiply(A, B, assembly_plan.ghost_rows(), C, threshold, A_norms, B_local_norms);
         C.filter_blocks(threshold);
@@ -126,8 +121,8 @@ private:
 
                 const int c_start = C.row_ptr()[row];
                 const int c_end = C.row_ptr()[row + 1];
-                for (int slot = c_start; slot < c_end; ++slot) {
-                    const int local_col = C.col_ind()[slot];
+                for (int graph_block_index = c_start; graph_block_index < c_end; ++graph_block_index) {
+                    const int local_col = C.col_ind()[graph_block_index];
                     const int global_col = C.graph->get_global_index(local_col);
 
                     size_t h = static_cast<size_t>(global_col) & HASH_MASK;
@@ -138,36 +133,36 @@ private:
                             throw std::runtime_error("Hash table is full during VBCSR SpMM population");
                         }
                     }
-                    table[h] = {global_col, slot, tag};
+                    table[h] = {global_col, graph_block_index, tag};
                 }
 
                 const int a_start = A.row_ptr()[row];
                 const int a_end = A.row_ptr()[row + 1];
                 const int r_dim = A.graph->block_sizes[row];
 
-                for (int a_slot = a_start; a_slot < a_end; ++a_slot) {
+                for (int a_graph_block = a_start; a_graph_block < a_end; ++a_graph_block) {
                     const int row_count = a_end - a_start;
                     const double row_eps = threshold / std::max(1, row_count);
 
-                    const int local_col_A = A.col_ind()[a_slot];
+                    const int local_col_A = A.col_ind()[a_graph_block];
                     const int global_col_A = A.graph->get_global_index(local_col_A);
-                    const T* a_val = A.block_data(a_slot);
+                    const T* a_val = A.block_data(a_graph_block);
                     const int inner_dim = A.graph->block_sizes[local_col_A];
-                    const double norm_A = A_norms[a_slot];
+                    const double norm_A = A_norms[a_graph_block];
 
                     if (A.graph->find_owner(global_col_A) == A.graph->rank) {
                         const int local_row_B = B.graph->global_to_local.at(global_col_A);
                         const int b_start = B.row_ptr()[local_row_B];
                         const int b_end = B.row_ptr()[local_row_B + 1];
-                        for (int b_slot = b_start; b_slot < b_end; ++b_slot) {
-                            const double norm_B = B_local_norms[b_slot];
+                        for (int b_graph_block = b_start; b_graph_block < b_end; ++b_graph_block) {
+                            const double norm_B = B_local_norms[b_graph_block];
                             if (norm_A * norm_B < row_eps) {
                                 continue;
                             }
 
-                            const int local_col_B = B.col_ind()[b_slot];
+                            const int local_col_B = B.col_ind()[b_graph_block];
                             const int global_col_B = B.graph->get_global_index(local_col_B);
-                            const T* b_val = B.block_data(b_slot);
+                            const T* b_val = B.block_data(b_graph_block);
                             const int c_dim = B.graph->block_sizes[local_col_B];
 
                             accumulate_product(
@@ -176,9 +171,9 @@ private:
                                 HASH_MASK,
                                 HASH_SIZE,
                                 global_col_B,
-                                [&](int c_slot) {
+                                [&](int c_graph_block) {
                                     product_batches[ProductBatchKey{r_dim, inner_dim, c_dim}].push_back(
-                                        ProductTask{a_val, b_val, C.mutable_block_data(c_slot)});
+                                        ProductTask{a_val, b_val, C.mutable_block_data(c_graph_block)});
                                 },
                                 "local");
                         }
@@ -198,9 +193,9 @@ private:
                                 HASH_MASK,
                                 HASH_SIZE,
                                 block.col,
-                                [&](int c_slot) {
+                                [&](int c_graph_block) {
                                     product_batches[ProductBatchKey{r_dim, inner_dim, block.c_dim}].push_back(
-                                        ProductTask{a_val, block.data, C.mutable_block_data(c_slot)});
+                                        ProductTask{a_val, block.data, C.mutable_block_data(c_graph_block)});
                                 },
                                 "ghost");
                         }
@@ -209,16 +204,11 @@ private:
             }
 
             for (auto& [key, tasks] : product_batches) {
-                A.active_vbcsr_backend().record_spmm_batch(
-                    key.row_dim,
-                    key.inner_dim,
-                    key.col_dim,
-                    tasks.size());
-                if (A.is_contiguous() && B.is_contiguous() && SmartKernel<T>::supports_batched_gemm()) {
-                    run_product_batch_packed(key, tasks);
-                } else {
-                    run_product_batch_fallback(key, tasks);
+                if (SmartKernel<T>::supports_batched_gemm()) {
+                    run_product_batch_batched(key, tasks);
+                    continue;
                 }
+                run_product_batch_fallback(key, tasks);
             }
         }
     }
@@ -236,7 +226,7 @@ private:
         size_t count = 0;
         while (table[h].tag == tag) {
             if (table[h].key == global_col) {
-                update(table[h].slot);
+                update(table[h].graph_block_index);
                 break;
             }
             h = (h + 1) & hash_mask;
@@ -264,7 +254,7 @@ private:
         }
     }
 
-    static void run_product_batch_packed(const ProductBatchKey& key, const std::vector<ProductTask>& tasks) {
+    static void run_product_batch_batched(const ProductBatchKey& key, const std::vector<ProductTask>& tasks) {
         if (tasks.empty()) {
             return;
         }

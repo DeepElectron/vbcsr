@@ -1,7 +1,6 @@
 #ifndef VBCSR_DETAIL_CSR_SPMM_HPP
 #define VBCSR_DETAIL_CSR_SPMM_HPP
 
-#include "csr_result_builder.hpp"
 #include "distributed_plans.hpp"
 #include "distributed_result_graph.hpp"
 #include "spmm_exchange.hpp"
@@ -34,7 +33,10 @@ struct CSRSpMMExecutor {
         const int n_rows = static_cast<int>(A.row_ptr().size()) - 1;
         DistGraph* c_graph = assembly_plan.construct_result_graph(A, "spmm");
 
-        CSRResultBuilder<T> builder(c_graph, A.backend_page_settings().csr_page_size);
+        Matrix C(c_graph);
+        C.owns_graph = true;
+        C.graph->enable_matrix_lifetime_management();
+        C.set_page_size(A.configured_page_size());
 
         #pragma omp parallel for
         for (int row = 0; row < n_rows; ++row) {
@@ -48,8 +50,17 @@ struct CSRSpMMExecutor {
             for (int idx = c_start; idx < c_end; ++idx) {
                 const int global_col = sym.c_col_ind[idx];
                 const int local_col = c_graph->global_to_local.at(global_col);
-                const int slot = builder.find_slot(row, local_col);
-                dest_ptrs[idx - c_start] = builder.slot_data(slot);
+                const int dest_start = c_graph->adj_ptr[row];
+                const int dest_end = c_graph->adj_ptr[row + 1];
+                auto begin = c_graph->adj_ind.begin() + dest_start;
+                auto end = c_graph->adj_ind.begin() + dest_end;
+                auto it = std::lower_bound(begin, end, local_col);
+                if (it == end || *it != local_col) {
+                    throw std::runtime_error("CSR SpMM could not locate destination block");
+                }
+                const int graph_block_index =
+                    static_cast<int>(std::distance(c_graph->adj_ind.begin(), it));
+                dest_ptrs[idx - c_start] = C.mutable_block_data(graph_block_index);
             }
 
             const int a_start = A.row_ptr()[row];
@@ -96,11 +107,6 @@ struct CSRSpMMExecutor {
             }
         }
 
-        Matrix C = Matrix::template materialize_from_builder<vbcsr::MatrixKind::CSR>(
-            c_graph,
-            true,
-            std::move(builder),
-            A.backend_page_settings());
         C.filter_blocks(threshold);
         return C;
     }

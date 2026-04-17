@@ -2,7 +2,6 @@
 #define VBCSR_DETAIL_BSR_SPMM_HPP
 
 #include "bsr_kernels.hpp"
-#include "bsr_result_builder.hpp"
 #include "distributed_plans.hpp"
 #include "distributed_result_graph.hpp"
 #include "spmm_exchange.hpp"
@@ -72,8 +71,11 @@ struct BSRSpMMExecutor {
         const int n_rows = static_cast<int>(A.row_ptr().size()) - 1;
         DistGraph* c_graph = assembly_plan.construct_result_graph(A, "spmm");
 
-        BSRResultBuilder<T> builder(c_graph, A.backend_page_settings().bsr_page_size);
-        const int block_size = builder.block_size();
+        Matrix C(c_graph);
+        C.owns_graph = true;
+        C.graph->enable_matrix_lifetime_management();
+        C.set_page_size(A.configured_page_size());
+        const int block_size = A_backend.block_size;
 
         bsr_dispatch_block_size(block_size, [&](auto block_tag) {
             constexpr int BlockSize = decltype(block_tag)::value;
@@ -86,19 +88,44 @@ struct BSRSpMMExecutor {
                     continue;
                 }
 
-                std::vector<int> dest_cols(c_end - c_start);
                 std::vector<T*> dest_ptrs(c_end - c_start);
                 for (int idx = c_start; idx < c_end; ++idx) {
                     const int global_col = sym.c_col_ind[idx];
                     const int local_col = c_graph->global_to_local.at(global_col);
-                    const int slot = builder.find_slot(row, local_col);
-                    dest_cols[static_cast<size_t>(idx - c_start)] = global_col;
-                    dest_ptrs[static_cast<size_t>(idx - c_start)] = builder.slot_data(slot);
+                    const int dest_start = c_graph->adj_ptr[row];
+                    const int dest_end = c_graph->adj_ptr[row + 1];
+                    auto begin = c_graph->adj_ind.begin() + dest_start;
+                    auto end = c_graph->adj_ind.begin() + dest_end;
+                    auto it = std::lower_bound(begin, end, local_col);
+                    if (it == end || *it != local_col) {
+                        throw std::runtime_error("BSR SpMM could not locate destination block");
+                    }
+                    const int graph_block_index =
+                        static_cast<int>(std::distance(c_graph->adj_ind.begin(), it));
+                    dest_ptrs[static_cast<size_t>(idx - c_start)] =
+                        C.mutable_block_data(graph_block_index);
                 }
 
                 const int a_start = A.row_ptr()[row];
                 const int a_end = A.row_ptr()[row + 1];
                 const double row_eps = threshold / std::max(1, a_end - a_start);
+                const auto sym_begin = sym.c_col_ind.begin() + c_start;
+                const auto sym_end = sym.c_col_ind.begin() + c_end;
+
+                auto accumulate_entry = [&](int global_col, const T* a_block, double norm_a, const T* b_block, double norm_b) {
+                    if (norm_a * norm_b < row_eps) {
+                        return;
+                    }
+                    auto it = std::lower_bound(sym_begin, sym_end, global_col);
+                    if (it == sym_end || *it != global_col) {
+                        return;
+                    }
+                    accumulate_product<BlockSize>(
+                        block_size,
+                        a_block,
+                        b_block,
+                        dest_ptrs[static_cast<size_t>(std::distance(sym_begin, it))]);
+                };
 
                 for (int slot = a_start; slot < a_end; ++slot) {
                     const double norm_a = A_norms[slot];
@@ -107,63 +134,39 @@ struct BSRSpMMExecutor {
 
                     if (A.graph->find_owner(global_inner) == A.graph->rank) {
                         const int local_row_b = B.graph->global_to_local.at(global_inner);
-                        size_t dest_index = 0;
+                        // DistGraph rows are sorted by local IDs, and ghost local IDs are
+                        // owner-grouped, so local traversal order is not guaranteed to be
+                        // globally sorted once ghosts are present. Look up each result
+                        // destination through the symbolic row instead of assuming a
+                        // monotone global-column walk.
                         for (int b_slot = B.row_ptr()[local_row_b]; b_slot < B.row_ptr()[local_row_b + 1]; ++b_slot) {
                             const int global_col = B.graph->get_global_index(B.col_ind()[b_slot]);
-                            while (dest_index < dest_cols.size() && dest_cols[dest_index] < global_col) {
-                                ++dest_index;
-                            }
-                            if (dest_index == dest_cols.size()) {
-                                break;
-                            }
-                            if (dest_cols[dest_index] != global_col) {
-                                continue;
-                            }
                             const double norm_b = B_local_norms[b_slot];
-                            if (norm_a * norm_b < row_eps) {
-                                continue;
-                            }
-                            accumulate_product<BlockSize>(
-                                block_size,
+                            accumulate_entry(
+                                global_col,
                                 a_value,
+                                norm_a,
                                 B.block_data(b_slot),
-                                dest_ptrs[dest_index]);
+                                norm_b);
                         }
                     } else {
                         auto ghost_it = assembly_plan.ghost_rows().find(global_inner);
                         if (ghost_it == assembly_plan.ghost_rows().end()) {
                             continue;
                         }
-                        size_t dest_index = 0;
                         for (const auto& block : ghost_it->second) {
-                            while (dest_index < dest_cols.size() && dest_cols[dest_index] < block.col) {
-                                ++dest_index;
-                            }
-                            if (dest_index == dest_cols.size()) {
-                                break;
-                            }
-                            if (dest_cols[dest_index] != block.col) {
-                                continue;
-                            }
-                            if (norm_a * block.norm < row_eps) {
-                                continue;
-                            }
-                            accumulate_product<BlockSize>(
-                                block_size,
+                            accumulate_entry(
+                                block.col,
                                 a_value,
+                                norm_a,
                                 block.data,
-                                dest_ptrs[dest_index]);
+                                block.norm);
                         }
                     }
                 }
             }
         });
 
-        Matrix C = Matrix::template materialize_from_builder<vbcsr::MatrixKind::BSR>(
-            c_graph,
-            true,
-            std::move(builder),
-            A.backend_page_settings());
         C.filter_blocks(threshold);
         return C;
     }
