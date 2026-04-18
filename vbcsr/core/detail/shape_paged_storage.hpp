@@ -34,8 +34,8 @@ public:
         uint32_t blocks_per_page = 0;
         size_t used_blocks = 0;
         size_t reserved_blocks = 0;
-        PagedBuffer<T> values;
-        std::vector<int> matrix_block_indices;
+        PagedBuffer<T> values; // use the PagedBuffer as internal storage
+        std::vector<int> graph_block_indices;
     };
 
     struct ShapePage {
@@ -44,7 +44,7 @@ public:
         int col_dim = 0;
         int page_id = -1;
         const T* data = nullptr;
-        const int* matrix_block_indices = nullptr;
+        const int* graph_block_indices = nullptr;
         uint32_t block_count = 0;
         uint32_t blocks_per_page = 0;
         size_t elements_per_block = 0;
@@ -55,13 +55,6 @@ public:
                 throw std::out_of_range("ShapeBlockStore::ShapePage block index out of bounds");
             }
             return data + static_cast<size_t>(block_index) * elements_per_block;
-        }
-
-        int matrix_block(uint32_t block_index) const {
-            if (block_index >= block_count) {
-                throw std::out_of_range("ShapeBlockStore::ShapePage matrix block index out of bounds");
-            }
-            return matrix_block_indices[block_index];
         }
     };
 
@@ -103,16 +96,16 @@ public:
         record.elements_per_block = static_cast<size_t>(row_dim) * static_cast<size_t>(col_dim);
         record.blocks_per_page = effective_blocks_per_page(record.elements_per_block, reserve_blocks);
         record.values = PagedBuffer<T>(page_size_elements(record.elements_per_block, record.blocks_per_page));
-        ensure_reserved_blocks(record, reserve_blocks);
+        ensure_reserved_blocks(record, reserve_blocks); // same as above worry
 
         shapes_.push_back(std::move(record));
         shape_lookup_.emplace(key, shape_id);
         return shape_id;
     }
 
-    uint64_t append(int shape_id, int matrix_block_index) {
-        if (matrix_block_index < 0) {
-            throw std::logic_error("ShapeBlockStore matrix block index cannot be negative");
+    uint64_t append(int shape_id, int graph_block_index) {
+        if (graph_block_index < 0) {
+            throw std::logic_error("ShapeBlockStore graph block index cannot be negative");
         }
 
         auto& record = require_shape(shape_id);
@@ -120,13 +113,13 @@ public:
             const size_t grown_blocks =
                 record.reserved_blocks == 0
                     ? static_cast<size_t>(record.blocks_per_page)
-                    : record.reserved_blocks * 2;
+                    : record.reserved_blocks * 2; // will this expode or create too many unused memory?
             ensure_reserved_blocks(record, std::max(record.used_blocks + 1, grown_blocks));
         }
 
         const size_t shape_block_index = record.used_blocks;
         ++record.used_blocks;
-        record.matrix_block_indices.push_back(matrix_block_index);
+        record.graph_block_indices.push_back(graph_block_index);
         record.values.resize(live_value_count(record));
         return encode_handle(
             shape_id,
@@ -229,42 +222,11 @@ public:
                     record.col_dim,
                     static_cast<int>(page_index),
                     value_page.data,
-                    record.matrix_block_indices.data() + first_shape_block,
+                    record.graph_block_indices.data() + first_shape_block,
                     visible_blocks,
                     record.blocks_per_page,
                     record.elements_per_block,
                     first_shape_block});
-            }
-        }
-    }
-
-    void rebuild_handles(std::vector<uint64_t>& out_handles) const {
-        size_t max_matrix_block = 0;
-        bool have_blocks = false;
-        for (const auto& record : shapes_) {
-            for (int matrix_block_index : record.matrix_block_indices) {
-                if (matrix_block_index < 0) {
-                    throw std::logic_error("ShapeBlockStore encountered negative matrix block index");
-                }
-                max_matrix_block = std::max(max_matrix_block, static_cast<size_t>(matrix_block_index));
-                have_blocks = true;
-            }
-        }
-
-        const size_t required_size = have_blocks ? max_matrix_block + 1 : 0;
-        if (out_handles.size() < required_size) {
-            out_handles.resize(required_size, 0);
-        }
-        std::fill(out_handles.begin(), out_handles.end(), 0);
-
-        for (const auto& record : shapes_) {
-            for (size_t shape_block_index = 0; shape_block_index < record.used_blocks; ++shape_block_index) {
-                const int matrix_block_index = record.matrix_block_indices.at(shape_block_index);
-                out_handles.at(static_cast<size_t>(matrix_block_index)) =
-                    encode_handle(
-                        record.shape_id,
-                        page_id_from_shape_block(record, shape_block_index),
-                        page_block_index_from_shape_block(record, shape_block_index));
             }
         }
     }
@@ -328,7 +290,7 @@ private:
         record.values.reserve(
             static_cast<uint64_t>(reserve_blocks) * static_cast<uint64_t>(record.elements_per_block));
         record.reserved_blocks = reserve_blocks;
-        record.matrix_block_indices.reserve(reserve_blocks);
+        record.graph_block_indices.reserve(reserve_blocks);
     }
 
     static int page_id_from_shape_block(const ShapeRecord& record, size_t shape_block_index) {
