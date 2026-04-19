@@ -262,7 +262,7 @@
 ### Batch View Metadata
 
 - Batched execution metadata is temporary and must not be stored in steady-state matrix storage.
-- For one numeric launch, a `ShapeBatchView` or equivalent function-local descriptor should contain:
+- For one numeric launch, a `VBCSRPageBatch` or equivalent function-local descriptor should contain:
 - `shape_id`
 - `count`
 - array of `A` pointers or slot descriptors
@@ -272,7 +272,7 @@
 - optional scalar coefficients such as `alpha`, `beta`
 - optional operation flags such as transpose/adjoint mode
 - For true `VBCSR` `spmm`, the batch key must be `(r_dim, inner_dim, c_dim)`, not only `(r_dim, c_dim)`, because GEMM specialization depends on the reduction dimension too.
-- Building a `ShapeBatchView` may assemble pointer arrays or slot-descriptor arrays, but it must not repack dense payload into a new contiguous numeric buffer just to satisfy batching.
+- Building a `VBCSRPageBatch` may assemble pointer arrays or slot-descriptor arrays, but it must not repack dense payload into a new contiguous numeric buffer just to satisfy batching.
 
 ### Builders and Mutation Path
 

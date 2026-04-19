@@ -52,7 +52,7 @@ void bind_atomic_module(py::module& m);
 template<typename T>
 void bind_dist_vector(py::module& m, const std::string& name) {
     py::class_<DistVector<T>>(m, name.c_str(), py::buffer_protocol())
-        .def(py::init<DistGraph*>())
+        .def(py::init<DistGraph*>(), py::keep_alive<1, 2>())
         .def("sync_ghosts", &DistVector<T>::sync_ghosts)
         .def("reduce_ghosts", &DistVector<T>::reduce_ghosts)
         .def("set_constant", &DistVector<T>::set_constant)
@@ -83,7 +83,7 @@ void bind_dist_vector(py::module& m, const std::string& name) {
 template<typename T>
 void bind_dist_multivector(py::module& m, const std::string& name) {
     py::class_<DistMultiVector<T>>(m, name.c_str(), py::buffer_protocol())
-        .def(py::init<DistGraph*, int>())
+        .def(py::init<DistGraph*, int>(), py::keep_alive<1, 2>())
         .def("sync_ghosts", &DistMultiVector<T>::sync_ghosts)
         .def("reduce_ghosts", &DistMultiVector<T>::reduce_ghosts)
         .def("set_constant", &DistMultiVector<T>::set_constant)
@@ -134,8 +134,11 @@ BlockSpMat<T> py_graph_matrix_function(BlockSpMat<T>& self, const std::string& f
 template<typename T>
 void bind_block_spmat(py::module& m, const std::string& name) {
     py::class_<BlockSpMat<T>>(m, name.c_str())
-        .def(py::init<DistGraph*>())
-        .def_readonly("graph", &BlockSpMat<T>::graph)
+        .def(py::init<DistGraph*>(), py::keep_alive<1, 2>())
+        .def_property_readonly(
+            "graph",
+            [](BlockSpMat<T>& self) { return self.graph; },
+            py::return_value_policy::reference_internal)
         .def("add_block", [](BlockSpMat<T>& mat, int g_row, int g_col, py::array_t<T> data, AssemblyMode mode) {
             py::buffer_info info = data.request();
             if (info.ndim != 2) throw std::runtime_error("Data must be 2D");

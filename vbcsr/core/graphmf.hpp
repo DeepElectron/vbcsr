@@ -101,7 +101,7 @@ void graph_matrix_function(BlockSpMat<T, Kernel>& A, BlockSpMat<T, Kernel>* Resu
             }
         }
         
-        auto batch_blocks = detail::BlockPayloadExchangePlan<BlockSpMat<T, Kernel>>::fetch_batch(A, batch_indices);
+        auto batch_blocks = detail::fetch_batched_block_payloads(A, batch_indices);
 
         #pragma omp parallel for schedule(dynamic)
         for (int i=0; i < batch_size; ++i) {

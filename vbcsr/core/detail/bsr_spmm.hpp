@@ -2,12 +2,13 @@
 #define VBCSR_DETAIL_BSR_SPMM_HPP
 
 #include "bsr_kernels.hpp"
-#include "distributed_plans.hpp"
+#include "block_payload_exchange.hpp"
 #include "distributed_result_graph.hpp"
-#include "spmm_exchange.hpp"
+#include "spmm_common.hpp"
 
 #include <algorithm>
 #include <map>
+#include <utility>
 #include <vector>
 
 namespace vbcsr::detail {
@@ -56,20 +57,17 @@ struct BSRSpMMExecutor {
             throw std::runtime_error("BSR SpMM requires matching uniform block sizes");
         }
 
-        auto metadata_plan = RowMetadataExchangePlan<Matrix, Matrix>::build(A, B);
-        auto sym = symbolic_multiply_filtered(A, B, metadata_plan.metadata(), threshold);
-        auto payload_plan = BlockPayloadExchangePlan<Matrix>::fetch_required(B, sym.required_blocks);
-        auto assembly_plan = ResultAssemblyPlan<Matrix>::for_spmm(
-            A,
-            sym,
-            metadata_plan.metadata(),
-            std::move(payload_plan));
+        auto metadata = exchange_ghost_metadata(A, B);
+        auto sym = symbolic_multiply_filtered(A, B, metadata, threshold);
+        auto payload_ctx = fetch_required_block_payloads(B, sym.required_blocks);
+        auto ghost_blocks = build_spmm_ghost_blocks(metadata, std::move(payload_ctx));
+        auto adjacency = build_spmm_result_adjacency(A, sym);
 
         const auto& A_norms = A.get_block_norms();
         const auto& B_local_norms = B.get_block_norms();
 
         const int n_rows = static_cast<int>(A.row_ptr().size()) - 1;
-        DistGraph* c_graph = assembly_plan.construct_result_graph(A, "spmm");
+        DistGraph* c_graph = construct_result_graph(A, adjacency, ghost_blocks.sizes, "spmm");
 
         Matrix C(c_graph);
         C.owns_graph = true;
@@ -150,8 +148,8 @@ struct BSRSpMMExecutor {
                                 norm_b);
                         }
                     } else {
-                        auto ghost_it = assembly_plan.ghost_rows().find(global_inner);
-                        if (ghost_it == assembly_plan.ghost_rows().end()) {
+                        auto ghost_it = ghost_blocks.rows.find(global_inner);
+                        if (ghost_it == ghost_blocks.rows.end()) {
                             continue;
                         }
                         for (const auto& block : ghost_it->second) {

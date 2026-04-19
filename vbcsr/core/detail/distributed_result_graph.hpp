@@ -58,6 +58,21 @@ DistGraph* construct_result_graph(
     return graph;
 }
 
+template <typename Matrix, typename GhostSizeMap>
+DistGraph* construct_result_graph(
+    const Matrix& matrix,
+    const std::vector<std::vector<int>>& adjacency,
+    const GhostSizeMap& ghost_sizes,
+    const char* context) {
+    return construct_result_graph(
+        matrix.graph->comm,
+        matrix.graph->owned_global_indices,
+        owned_block_sizes(*matrix.graph),
+        adjacency,
+        ghost_sizes,
+        context);
+}
+
 } // namespace vbcsr::detail
 
 #endif

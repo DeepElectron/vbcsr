@@ -2,7 +2,6 @@
 
 #include <cmath>
 #include <iostream>
-#include <vector>
 
 using vbcsr::detail::ShapeBlockStore;
 
@@ -73,10 +72,10 @@ int main() {
     storage.for_each_shape([&](const auto& entry) {
         ++shape_entries;
         if (entry.shape_id == shape_a) {
-            check(entry.matrix_block_indices.size() == 3, "shape A matrix block index list mismatch");
-            check(entry.matrix_block_indices[0] == 4, "shape A matrix block index order mismatch (0)");
-            check(entry.matrix_block_indices[1] == 8, "shape A matrix block index order mismatch (1)");
-            check(entry.matrix_block_indices[2] == 10, "shape A matrix block index order mismatch (2)");
+            check(entry.graph_block_indices.size() == 3, "shape A graph block index list mismatch");
+            check(entry.graph_block_indices[0] == 4, "shape A graph block index order mismatch (0)");
+            check(entry.graph_block_indices[1] == 8, "shape A graph block index order mismatch (1)");
+            check(entry.graph_block_indices[2] == 10, "shape A graph block index order mismatch (2)");
         }
     });
     if (!check(shape_entries == 2, "for_each_shape count mismatch")) {
@@ -92,28 +91,18 @@ int main() {
         if (page.page_id == 0) {
             check(page.block_count == 2, "shape A first page block count mismatch");
             check(page.blocks_per_page == 2, "shape A first page block capacity mismatch");
-            check(page.matrix_block(0) == 4, "shape A first page matrix block index 0 mismatch");
-            check(page.matrix_block(1) == 8, "shape A first page matrix block index 1 mismatch");
+            check(page.graph_block_indices[0] == 4, "shape A first page graph block index 0 mismatch");
+            check(page.graph_block_indices[1] == 8, "shape A first page graph block index 1 mismatch");
             check(std::abs(page.block_ptr(0)[0] - 10.0) < 1e-12, "shape A first page value 0 mismatch");
             check(std::abs(page.block_ptr(1)[0] - 20.0) < 1e-12, "shape A first page value 1 mismatch");
         } else if (page.page_id == 1) {
             check(page.block_count == 1, "shape A second page block count mismatch");
             check(page.first_shape_block == 2, "shape A second page first block index mismatch");
-            check(page.matrix_block(0) == 10, "shape A second page matrix block index mismatch");
+            check(page.graph_block_indices[0] == 10, "shape A second page graph block index mismatch");
             check(std::abs(page.block_ptr(0)[0] - 30.0) < 1e-12, "shape A second page value mismatch");
         }
     });
     if (!check(shape_a_page_count == 2, "shape A page count mismatch")) {
-        return 1;
-    }
-
-    std::vector<uint64_t> rebuilt_handles(12, 1234);
-    storage.rebuild_handles(rebuilt_handles);
-    if (!check(rebuilt_handles[4] == handle_a0, "rebuilt handle A0 mismatch") ||
-        !check(rebuilt_handles[8] == handle_a1, "rebuilt handle A1 mismatch") ||
-        !check(rebuilt_handles[10] == handle_a2, "rebuilt handle A2 mismatch") ||
-        !check(rebuilt_handles[1] == handle_b0, "rebuilt handle B0 mismatch") ||
-        !check(rebuilt_handles[0] == 0, "rebuilt handle unused slot should be zero")) {
         return 1;
     }
 

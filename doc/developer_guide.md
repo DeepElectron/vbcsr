@@ -35,25 +35,24 @@ Because ghosts are sorted by owner, **local indices do not necessarily correspon
 `BlockSpMat` builds upon `DistGraph` to store matrix values.
 
 -   **Storage**: Values are stored in backend-owned paged payload arrays. CSR and BSR use `PagedArray`, while true VBCSR uses shape-bucketed pages owned by the VBCSR backend.
--   **Handles**: `blk_handles` store offsets/pointers into the arena.
+-   **Handles**: the backend stores one graph-block handle per local nonzero block so graph traversal and shape-page storage remain decoupled.
 -   **Thread Safety**: `BlockSpMat` is designed for OpenMP threading. Temporary buffers in operations like `axpby` or `spmm` should be thread-local to avoid contention and allocation overhead.
 
-## Packed VBCSR Apply Execution
+## VBCSR Apply Execution
 
-The mixed-size VBCSR backend has two execution modes for `mult`, `mult_dense`, `mult_adjoint`, and `mult_dense_adjoint`:
+The mixed-size VBCSR backend stores blocks in shape-bucketed pages. Each page is already physically contiguous in memory, so apply execution no longer has a separate packed-vs-unpacked layout mode.
 
--   **Unpacked path**: iterate the logical blocks in one shape page and launch one scalar/microkernel call per block.
--   **Packed path**: require an explicit `contiguous()` call first, then use shape-page-local contiguous block payloads plus operand scratch to launch strided batched BLAS or fixed-shape kernels.
+For `mult`, `mult_dense`, `mult_adjoint`, and `mult_dense_adjoint`, the executor chooses between:
 
-### `contiguous()` and Shape Pages
+-   **Scalar path**: iterate one graph block at a time inside a same-shape page batch.
+-   **Batched path**: use the same page-local block payloads plus operand scratch to launch strided batched BLAS or fixed-shape kernels.
 
-`contiguous()` is an explicit performance preparation step for true VBCSR. It repacks each shape class into dense, hole-free pages:
+### Shape Pages and Batch Metadata
 
 -   every page contains blocks of exactly one shape `(row_dim, col_dim)`
--   live slots are packed into `0..live_count-1`
--   the matrix-side block payloads become page-local contiguous storage
-
-`CSR` and `BSR` report contiguous by default. For VBCSR, the packed state is invalidated by structure-changing operations such as `assemble`, `filter_blocks`, `transpose`, and `spmm`.
+-   live blocks are stored in `0..live_count-1`
+-   the matrix-side block payloads are page-local contiguous storage
+-   page batches carry graph-block indices and row/column block metadata so kernels do not need to reconstruct that information elsewhere
 
 ### What One Apply Batch Means
 
@@ -65,9 +64,9 @@ The mixed-size VBCSR backend has two execution modes for `mult`, `mult_dense`, `
 
 So a batch is not a matrix row batch. It is a **same-shape page batch**.
 
-### Packed Apply Pipeline
+### Batched Apply Pipeline
 
-In the packed path, the block payloads are read directly from the packed VBCSR page, but the dense operands are still packed into operation-local scratch:
+In the batched path, the block payloads are read directly from the VBCSR page, but the dense operands are still packed into operation-local scratch:
 
 -   `mult`: pack one `x` segment per block and a zeroed `y` scratch buffer
 -   `mult_dense`: pack one dense RHS tile per block and a zeroed output scratch buffer
@@ -75,7 +74,7 @@ In the packed path, the block payloads are read directly from the packed VBCSR p
 
 After the batched GEMV/GEMM call completes, each task scatters its scratch result back into the thread-local output accumulator.
 
-This means packed VBCSR avoids repacking matrix blocks for apply, but still pays for operand packing because the logical destination/source rows of the RHS data are not globally strided.
+This means VBCSR avoids repacking matrix blocks for apply, but still pays for operand packing because the logical destination/source rows of the RHS data are not globally strided.
 
 ### Threading Model
 
@@ -87,26 +86,26 @@ Apply parallelism is in the outer OpenMP loop. The intended model is:
 
 The current code exposes a helper to pin MKL/OpenBLAS to one thread, but VBCSR callers should still treat "outer OpenMP threads, inner BLAS thread = 1" as the supported execution model.
 
-### Why Large Packed Pages May Need Splitting
+### Why Large Page Batches May Need Splitting
 
-Packed VBCSR parallelizes primarily across shape pages. This works well when there are many non-empty pages, but it can underutilize threads when:
+VBCSR parallelizes primarily across shape pages. This works well when there are many non-empty pages, but it can underutilize threads when:
 
 -   the matrix has only a few repeated shapes, and
--   `contiguous()` packs each shape into one or a small number of very large pages
+-   one shape owns one or a small number of very large pages
 
-To avoid that starvation, the packed apply executor can split one large page batch into multiple `ApplyTask`s. Each task is a contiguous subrange of one shape page:
+To avoid that starvation, the apply executor can split one large page batch into multiple `ApplyTask`s. Each task is a contiguous subrange of one shape page:
 
 -   `batch_index`: which shape page batch owns the task
 -   `begin`: first live block inside that page
 -   `count`: number of blocks in the task
 
-The matrix data remain contiguous inside the page, so each task can still launch a single packed batched kernel on its subrange.
+The matrix data remain contiguous inside the page, so each task can still launch a single batched kernel on its subrange.
 
 ### `choose_chunk_size()` and `kTargetScratchBytes`
 
-`choose_chunk_size()` is currently the key heuristic controlling both scratch size and packed apply task granularity.
+`choose_chunk_size()` is currently the key heuristic controlling both scratch size and apply task granularity.
 
--   `kTargetScratchBytes` is the target scratch budget per packed micro-batch
+-   `kTargetScratchBytes` is the target scratch budget per batched micro-kernel launch
 -   the executor estimates scratch needed **per block**
 -   chunk size is chosen so `chunk_size * per_block_scratch ~= kTargetScratchBytes`
 
@@ -117,13 +116,13 @@ The per-block scratch estimate depends on block shape:
 
 Implications:
 
--   larger blocks or more RHS vectors produce smaller packed chunks
--   smaller blocks produce larger packed chunks
--   when packed page splitting is enabled, the same chunk size also becomes the apply task size
+-   larger blocks or more RHS vectors produce smaller chunks
+-   smaller blocks produce larger chunks
+-   when page splitting is enabled, the same chunk size also becomes the apply task size
 
 So `kTargetScratchBytes` is currently both:
 
 -   the scratch-memory budget knob, and
--   an indirect parallelization-granularity knob for packed VBCSR apply
+-   an indirect parallelization-granularity knob for VBCSR apply
 
 This is a deliberate simplification for now. A future refinement may separate "scratch budget" from "parallel task size" into different tuning parameters.

@@ -23,13 +23,13 @@ int main(int argc, char** argv) {
     int blocks_per_row = 200;
     double threshold = 3e3;
     int iterations = 3;
-    bool make_contiguous = false;
+    int legacy_contiguous_flag = 0;
 
     if (argc > 1) n_blocks = std::atoi(argv[1]);
     if (argc > 2) blocks_per_row = std::atoi(argv[2]);
     if (argc > 3) threshold = std::atof(argv[3]);
     if (argc > 4) iterations = std::max(1, std::atoi(argv[4]));
-    if (argc > 5) make_contiguous = std::atoi(argv[5]) != 0;
+    if (argc > 5) legacy_contiguous_flag = std::atoi(argv[5]);
 
     std::mt19937 gen_struct(12345);
 
@@ -84,10 +84,7 @@ int main(int argc, char** argv) {
     A.assemble();
     B.assemble();
 
-    if (make_contiguous) {
-        A.contiguous();
-        B.contiguous();
-    }
+    (void)legacy_contiguous_flag;
 
     if (rank == 0) {
         std::cout << "Starting complex SpMM benchmark..." << std::endl;
@@ -97,8 +94,6 @@ int main(int argc, char** argv) {
         std::cout << "  Threshold: " << threshold << std::endl;
         std::cout << "  Iterations: " << iterations << std::endl;
         std::cout << "  A kind: " << static_cast<int>(A.matrix_kind()) << std::endl;
-        std::cout << "  A contiguous: " << A.is_contiguous() << std::endl;
-        std::cout << "  B contiguous: " << B.is_contiguous() << std::endl;
         std::cout << "  Strided GEMM available: " << BLASKernel::supports_strided_gemm() << std::endl;
     }
 

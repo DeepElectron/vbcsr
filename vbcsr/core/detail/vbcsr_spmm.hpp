@@ -1,11 +1,14 @@
 #ifndef VBCSR_DETAIL_VBCSR_SPMM_HPP
 #define VBCSR_DETAIL_VBCSR_SPMM_HPP
 
-#include "distributed_plans.hpp"
+#include "block_payload_exchange.hpp"
+#include "distributed_result_graph.hpp"
+#include "spmm_common.hpp"
 
 #include <cstring>
 #include <map>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #ifdef _OPENMP
@@ -48,25 +51,22 @@ private:
 
 public:
     static Matrix run(const Matrix& A, const Matrix& B, double threshold) {
-        auto metadata_plan = RowMetadataExchangePlan<Matrix, Matrix>::build(A, B);
-        auto sym = symbolic_multiply_filtered(A, B, metadata_plan.metadata(), threshold);
-        auto payload_plan = BlockPayloadExchangePlan<Matrix>::fetch_required(B, sym.required_blocks);
-        auto assembly_plan = ResultAssemblyPlan<Matrix>::for_spmm(
-            A,
-            sym,
-            metadata_plan.metadata(),
-            std::move(payload_plan));
+        auto metadata = exchange_ghost_metadata(A, B);
+        auto sym = symbolic_multiply_filtered(A, B, metadata, threshold);
+        auto payload_ctx = fetch_required_block_payloads(B, sym.required_blocks);
+        auto ghost_blocks = build_spmm_ghost_blocks(metadata, std::move(payload_ctx));
+        auto adjacency = build_spmm_result_adjacency(A, sym);
 
         const auto& A_norms = A.get_block_norms();
         const auto& B_local_norms = B.get_block_norms();
 
-        DistGraph* c_graph = assembly_plan.construct_result_graph(A, "spmm");
+        DistGraph* c_graph = construct_result_graph(A, adjacency, ghost_blocks.sizes, "spmm");
         Matrix C(c_graph);
         C.owns_graph = true;
         C.graph->enable_matrix_lifetime_management();
         C.set_page_size(A.configured_page_size());
 
-        numeric_multiply(A, B, assembly_plan.ghost_rows(), C, threshold, A_norms, B_local_norms);
+        numeric_multiply(A, B, ghost_blocks.rows, C, threshold, A_norms, B_local_norms);
         C.filter_blocks(threshold);
         return C;
     }
