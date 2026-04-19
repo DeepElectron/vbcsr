@@ -13,8 +13,6 @@ struct RemoteAssemblyState {
     using T = typename Matrix::value_type;
 
     struct PendingBlock {
-        int g_row = -1;
-        int g_col = -1;
         int rows = 0;
         int cols = 0;
         int mode_code = 0;
