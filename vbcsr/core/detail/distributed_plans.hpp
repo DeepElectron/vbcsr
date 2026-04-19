@@ -216,13 +216,15 @@ public:
 
     static BlockPayloadExchangePlan fetch_required(const Matrix& matrix, const std::vector<BlockID>& required_blocks) {
         BlockPayloadExchangePlan plan;
+        // unpack the tuple
         std::tie(plan.ghost_data_, plan.ghost_sizes_) = fetch_ghost_blocks(matrix, required_blocks);
-        return plan;
+        return plan; // plan is a wrapper that have ghost_data and sizes, ghost data is a map from block id to the block data
     }
 
     static FetchedBlockContext<T> fetch_batch(const Matrix& matrix, const std::vector<std::vector<int>>& batch_indices) {
         return fetch_blocks_impl(matrix, batch_indices);
     }
+    // the fetchedBlockContext is another type of block data format
 
     const GhostBlockData<T>& ghost_data() const {
         return ghost_data_;
