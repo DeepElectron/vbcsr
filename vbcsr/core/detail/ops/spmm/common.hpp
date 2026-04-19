@@ -1,8 +1,8 @@
-#ifndef VBCSR_DETAIL_SPMM_COMMON_HPP
-#define VBCSR_DETAIL_SPMM_COMMON_HPP
+#ifndef VBCSR_DETAIL_OPS_SPMM_COMMON_HPP
+#define VBCSR_DETAIL_OPS_SPMM_COMMON_HPP
 
-#include "block_payload_types.hpp"
-#include "../mpi_utils.hpp"
+#include "../../distributed/block_payload_types.hpp"
+#include "../../distributed/mpi_utils.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -376,4 +376,4 @@ SpMMGhostBlocks<T> build_spmm_ghost_blocks(
 } // namespace detail
 } // namespace vbcsr
 
-#endif // VBCSR_DETAIL_SPMM_COMMON_HPP
+#endif // VBCSR_DETAIL_OPS_SPMM_COMMON_HPP

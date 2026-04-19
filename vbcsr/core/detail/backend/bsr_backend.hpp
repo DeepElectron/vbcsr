@@ -1,7 +1,7 @@
-#ifndef VBCSR_DETAIL_BSR_BACKEND_HANDLE_HPP
-#define VBCSR_DETAIL_BSR_BACKEND_HANDLE_HPP
+#ifndef VBCSR_DETAIL_BACKEND_BSR_BACKEND_HPP
+#define VBCSR_DETAIL_BACKEND_BSR_BACKEND_HPP
 
-#include "backend_handle_common.hpp"
+#include "backend_common.hpp"
 
 namespace vbcsr::detail {
 
@@ -741,4 +741,4 @@ public:
 
 } // namespace vbcsr::detail
 
-#endif // VBCSR_DETAIL_BSR_BACKEND_HANDLE_HPP
+#endif // VBCSR_DETAIL_BACKEND_BSR_BACKEND_HPP

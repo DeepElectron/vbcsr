@@ -1,9 +1,9 @@
-#ifndef VBCSR_CALC_LANMF_HPP
-#define VBCSR_CALC_LANMF_HPP
+#ifndef VBCSR_DETAIL_OPS_SPMF_SUBSPACE_HPP
+#define VBCSR_DETAIL_OPS_SPMF_SUBSPACE_HPP
 
-#include "lapack_types.hpp"
-#include "block_csr.hpp"
-#include "dist_multivector.hpp"
+#include "../../../block_csr.hpp"
+#include "../../../dist_multivector.hpp"
+#include "../../kernels/lapack_api.hpp"
 #include <vector>
 #include <cmath>
 #include <complex>
@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <set>
 #include <functional>
+#include <mpi.h>
+#include <type_traits>
 
 namespace vbcsr {
 
@@ -420,4 +422,4 @@ void lanczos_matrix_function(BlockSpMat<T, Kernel>& S, DistMultiVector<T>& X, st
 
 } // namespace vbcsr
 
-#endif // VBCSR_CALC_LANMF_HPP
+#endif // VBCSR_DETAIL_OPS_SPMF_SUBSPACE_HPP

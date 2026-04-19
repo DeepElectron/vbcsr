@@ -1,8 +1,8 @@
-#ifndef VBCSR_DETAIL_AXPBY_OPS_HPP
-#define VBCSR_DETAIL_AXPBY_OPS_HPP
+#ifndef VBCSR_DETAIL_OPS_AXPBY_HPP
+#define VBCSR_DETAIL_OPS_AXPBY_HPP
 
-#include "../dist_graph.hpp"
-#include "distributed_result_graph.hpp"
+#include "../../dist_graph.hpp"
+#include "../distributed/result_graph.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -557,4 +557,4 @@ private:
 
 } // namespace vbcsr::detail
 
-#endif // VBCSR_DETAIL_AXPBY_OPS_HPP
+#endif // VBCSR_DETAIL_OPS_AXPBY_HPP

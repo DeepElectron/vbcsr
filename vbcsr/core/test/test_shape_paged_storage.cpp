@@ -1,4 +1,4 @@
-#include "../detail/shape_paged_storage.hpp"
+#include "../detail/storage/shape_paged_storage.hpp"
 
 #include <cmath>
 #include <iostream>

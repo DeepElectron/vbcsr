@@ -1,9 +1,9 @@
-#ifndef VBCSR_DETAIL_BACKEND_HANDLE_HPP
-#define VBCSR_DETAIL_BACKEND_HANDLE_HPP
+#ifndef VBCSR_DETAIL_BACKEND_MATRIX_BACKEND_HPP
+#define VBCSR_DETAIL_BACKEND_MATRIX_BACKEND_HPP
 
-#include "bsr_backend_handle.hpp"
-#include "csr_backend_handle.hpp"
-#include "vbcsr_backend_handle.hpp"
+#include "bsr_backend.hpp"
+#include "csr_backend.hpp"
+#include "vbcsr_backend.hpp"
 
 namespace vbcsr::detail {
 
@@ -107,4 +107,4 @@ const VBCSRMatrixBackend<T, Kernel>& require_vbcsr_backend(
 
 } // namespace vbcsr::detail
 
-#endif // VBCSR_DETAIL_BACKEND_HANDLE_HPP
+#endif // VBCSR_DETAIL_BACKEND_MATRIX_BACKEND_HPP

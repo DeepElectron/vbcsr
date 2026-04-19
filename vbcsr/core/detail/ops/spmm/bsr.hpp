@@ -1,10 +1,10 @@
-#ifndef VBCSR_DETAIL_BSR_SPMM_HPP
-#define VBCSR_DETAIL_BSR_SPMM_HPP
+#ifndef VBCSR_DETAIL_OPS_SPMM_BSR_HPP
+#define VBCSR_DETAIL_OPS_SPMM_BSR_HPP
 
-#include "bsr_kernels.hpp"
-#include "block_payload_exchange.hpp"
-#include "distributed_result_graph.hpp"
-#include "spmm_common.hpp"
+#include "../../kernels/bsr_apply.hpp"
+#include "../../distributed/block_payload_exchange.hpp"
+#include "../../distributed/result_graph.hpp"
+#include "common.hpp"
 
 #include <algorithm>
 #include <map>
@@ -172,4 +172,4 @@ struct BSRSpMMExecutor {
 
 } // namespace vbcsr::detail
 
-#endif // VBCSR_DETAIL_BSR_SPMM_HPP
+#endif // VBCSR_DETAIL_OPS_SPMM_BSR_HPP

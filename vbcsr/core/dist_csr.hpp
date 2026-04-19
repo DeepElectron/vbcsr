@@ -5,7 +5,6 @@
 #include <vector>
 #include <mpi.h>
 #include <algorithm>
-#include "mpi_utils.hpp"
 #include <numeric>
 
 namespace vbcsr {

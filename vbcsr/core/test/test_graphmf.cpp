@@ -1,4 +1,4 @@
-#include "../graphmf.hpp"
+#include "../detail/ops/spmf/graph_function.hpp"
 #include <iostream>
 #include <cassert>
 #include <cmath>

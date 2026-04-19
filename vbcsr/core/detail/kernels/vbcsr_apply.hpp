@@ -1,5 +1,5 @@
-#ifndef VBCSR_DETAIL_VBCSR_KERNELS_HPP
-#define VBCSR_DETAIL_VBCSR_KERNELS_HPP
+#ifndef VBCSR_DETAIL_KERNELS_VBCSR_APPLY_HPP
+#define VBCSR_DETAIL_KERNELS_VBCSR_APPLY_HPP
 
 #include <algorithm>
 #include <cstring>
@@ -741,4 +741,4 @@ private:
 
 } // namespace vbcsr::detail
 
-#endif // VBCSR_DETAIL_VBCSR_KERNELS_HPP
+#endif // VBCSR_DETAIL_KERNELS_VBCSR_APPLY_HPP

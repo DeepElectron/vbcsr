@@ -1,13 +1,13 @@
-#ifndef VBCSR_DETAIL_BSR_KERNELS_HPP
-#define VBCSR_DETAIL_BSR_KERNELS_HPP
+#ifndef VBCSR_DETAIL_KERNELS_BSR_APPLY_HPP
+#define VBCSR_DETAIL_KERNELS_BSR_APPLY_HPP
 
 // TODO: the native kernels can be optimized to use batched GEMM for acceleration
 // But since we have vendor MKL path, the priority is less than other features.
 
-#include "../dist_multivector.hpp"
-#include "../dist_vector.hpp"
-#include "../kernels.hpp"
-#include "backend_handle.hpp"
+#include "../../dist_multivector.hpp"
+#include "../../dist_vector.hpp"
+#include "dense_kernels.hpp"
+#include "../backend/matrix_backend.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -710,4 +710,4 @@ void bsr_mult_dense_adjoint(
 
 } // namespace vbcsr::detail
 
-#endif // VBCSR_DETAIL_BSR_KERNELS_HPP
+#endif // VBCSR_DETAIL_KERNELS_BSR_APPLY_HPP

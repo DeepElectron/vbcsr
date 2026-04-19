@@ -1,7 +1,7 @@
-#ifndef VBCSR_DETAIL_CSR_BACKEND_HANDLE_HPP
-#define VBCSR_DETAIL_CSR_BACKEND_HANDLE_HPP
+#ifndef VBCSR_DETAIL_BACKEND_CSR_BACKEND_HPP
+#define VBCSR_DETAIL_BACKEND_CSR_BACKEND_HPP
 
-#include "backend_handle_common.hpp"
+#include "backend_common.hpp"
 
 namespace vbcsr::detail {
 
@@ -371,7 +371,7 @@ struct CSRMatrixBackend {
         }
     }
 
-    // Vendor execution support used by csr_kernels.hpp.
+    // Vendor execution support used by kernels/csr_apply.hpp.
     const CSRVendorCache<T>& ensure_vendor_cache(
         const std::vector<int>& row_ptr,
         const std::vector<int>& col_ind,
@@ -753,4 +753,4 @@ public:
 
 } // namespace vbcsr::detail
 
-#endif // VBCSR_DETAIL_CSR_BACKEND_HANDLE_HPP
+#endif // VBCSR_DETAIL_BACKEND_CSR_BACKEND_HPP

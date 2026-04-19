@@ -1,5 +1,5 @@
-#ifndef VBCSR_MPI_UTILS_HPP
-#define VBCSR_MPI_UTILS_HPP
+#ifndef VBCSR_DETAIL_DISTRIBUTED_MPI_UTILS_HPP
+#define VBCSR_DETAIL_DISTRIBUTED_MPI_UTILS_HPP
 
 #include <mpi.h>
 #include <vector>
@@ -86,4 +86,4 @@ inline void safe_alltoallv(const void* sendbuf, const std::vector<size_t>& sendc
 
 } // namespace vbcsr
 
-#endif
+#endif // VBCSR_DETAIL_DISTRIBUTED_MPI_UTILS_HPP

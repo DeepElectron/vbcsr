@@ -463,7 +463,7 @@
 - Keep backend determination at matrix-construction boundaries only. External constructors such as `from_scipy` choose the backend once; subsequent matrix operations preserve that backend family and do not trigger backend switching.
 - Add a backend-neutral block-value access layer for pybind, tests, and internal algorithms so they can inspect or export blocks without depending on `arena`, handles, or contiguous value slabs directly.
 - Make pybind bind only facade methods and facade inspection views, not backend storage internals. `vbcsr/matrix.py` continues to use the same uniform Python wrapper.
-- Extract the current distributed `spmm` communication helpers from `vbcsr/core/block_csr.hpp` into reusable distributed-plan utilities before adding backend-specific distributed execution paths. This is the key implementation step that connects today's working MPI code to the new multi-backend design.
+- Keep shared distributed communication helpers under `vbcsr/core/detail/distributed/` before adding backend-specific distributed execution paths. This is the key implementation step that connects today's working MPI code to the new multi-backend design.
 
 ## Rollout
 

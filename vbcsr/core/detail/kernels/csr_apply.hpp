@@ -1,10 +1,10 @@
-#ifndef VBCSR_DETAIL_CSR_KERNELS_HPP
-#define VBCSR_DETAIL_CSR_KERNELS_HPP
+#ifndef VBCSR_DETAIL_KERNELS_CSR_APPLY_HPP
+#define VBCSR_DETAIL_KERNELS_CSR_APPLY_HPP
 
-#include "../dist_multivector.hpp"
-#include "../dist_vector.hpp"
-#include "../scalar_traits.hpp"
-#include "backend_handle.hpp"
+#include "../../dist_multivector.hpp"
+#include "../../dist_vector.hpp"
+#include "../../scalar_traits.hpp"
+#include "../backend/matrix_backend.hpp"
 
 #include <algorithm>
 #include <vector>
@@ -670,4 +670,4 @@ void csr_mult_dense_adjoint(
 
 } // namespace vbcsr::detail
 
-#endif // VBCSR_DETAIL_CSR_KERNELS_HPP
+#endif // VBCSR_DETAIL_KERNELS_CSR_APPLY_HPP

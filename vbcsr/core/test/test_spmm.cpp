@@ -7,7 +7,7 @@
 #include <random>
 #include <complex>
 #include "../block_csr.hpp"
-#include "../kernels.hpp"
+#include "../detail/kernels/dense_kernels.hpp"
 
 using namespace vbcsr;
 

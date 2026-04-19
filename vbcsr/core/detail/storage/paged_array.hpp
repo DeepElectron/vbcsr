@@ -1,5 +1,5 @@
-#ifndef VBCSR_DETAIL_PAGED_ARRAY_HPP
-#define VBCSR_DETAIL_PAGED_ARRAY_HPP
+#ifndef VBCSR_DETAIL_STORAGE_PAGED_ARRAY_HPP
+#define VBCSR_DETAIL_STORAGE_PAGED_ARRAY_HPP
 
 #include <algorithm>
 #include <cstdint>
@@ -296,4 +296,4 @@ private:
 
 } // namespace vbcsr::detail
 
-#endif // VBCSR_DETAIL_PAGED_ARRAY_HPP
+#endif // VBCSR_DETAIL_STORAGE_PAGED_ARRAY_HPP

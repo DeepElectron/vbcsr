@@ -1,9 +1,9 @@
-#ifndef VBCSR_DETAIL_VBCSR_SPMM_HPP
-#define VBCSR_DETAIL_VBCSR_SPMM_HPP
+#ifndef VBCSR_DETAIL_OPS_SPMM_VBCSR_HPP
+#define VBCSR_DETAIL_OPS_SPMM_VBCSR_HPP
 
-#include "block_payload_exchange.hpp"
-#include "distributed_result_graph.hpp"
-#include "spmm_common.hpp"
+#include "../../distributed/block_payload_exchange.hpp"
+#include "../../distributed/result_graph.hpp"
+#include "common.hpp"
 
 #include <cstring>
 #include <map>
@@ -332,4 +332,4 @@ private:
 
 } // namespace vbcsr::detail
 
-#endif // VBCSR_DETAIL_VBCSR_SPMM_HPP
+#endif // VBCSR_DETAIL_OPS_SPMM_VBCSR_HPP

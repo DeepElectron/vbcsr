@@ -1,8 +1,11 @@
-#ifndef VBCSR_CALC_GRAPHMF_HPP
-#define VBCSR_CALC_GRAPHMF_HPP
+#ifndef VBCSR_DETAIL_OPS_SPMF_GRAPH_FUNCTION_HPP
+#define VBCSR_DETAIL_OPS_SPMF_GRAPH_FUNCTION_HPP
 
-#include "block_csr.hpp"
-#include "dist_multivector.hpp"
+#include "../../../block_csr.hpp"
+#include "../../../dist_multivector.hpp"
+#include "../../kernels/blas_api.hpp"
+#include "../../kernels/lapack_api.hpp"
+#include "subspace.hpp"
 #include <vector>
 #include <cmath>
 #include <complex>
@@ -10,7 +13,9 @@
 #include <algorithm>
 #include <set>
 #include <functional>
-#include "submf.hpp"
+#include <stdexcept>
+#include <string>
+#include <omp.h>
 
 namespace vbcsr {
 
@@ -203,4 +208,4 @@ void graph_matrix_function(BlockSpMat<T, Kernel>& A, BlockSpMat<T, Kernel>* Resu
 
 }
 
-#endif // VBCSR_CALC_GRAPHMF_HPP
+#endif // VBCSR_DETAIL_OPS_SPMF_GRAPH_FUNCTION_HPP

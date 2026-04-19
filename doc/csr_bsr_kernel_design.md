@@ -18,10 +18,10 @@ for the internal `CSR` and `BSR` backends used by `BlockSpMat<T, Kernel>`.
 
 The main code entry points today are:
 
-- `vbcsr/core/detail/csr_kernels.hpp`
-- `vbcsr/core/detail/bsr_kernels.hpp`
-- `vbcsr/core/detail/csr_spmm.hpp`
-- `vbcsr/core/detail/bsr_spmm.hpp`
+- `vbcsr/core/detail/kernels/csr_apply.hpp`
+- `vbcsr/core/detail/kernels/bsr_apply.hpp`
+- `vbcsr/core/detail/ops/spmm/csr.hpp`
+- `vbcsr/core/detail/ops/spmm/bsr.hpp`
 - `vbcsr/core/block_csr.hpp`
 
 ## Current Baseline
@@ -178,7 +178,7 @@ This means:
 - dispatch to specialized microkernels for hot block sizes
 - keep the generic `SmartKernel` fallback for cold or large block sizes
 
-This is already close to the current structure in `vbcsr/core/detail/bsr_kernels.hpp`, so the path forward is evolutionary rather than a full rewrite.
+This is already close to the current structure in `vbcsr/core/detail/kernels/bsr_apply.hpp`, so the path forward is evolutionary rather than a full rewrite.
 
 ### `mult`
 
@@ -331,5 +331,5 @@ If the goal is highest immediate speed with the least risk, prefer this order of
 As of this note:
 
 - VBCSR has the new packed apply path and explicit `contiguous()` preparation
-- CSR and BSR still use the current native kernels in `csr_kernels.hpp`, `bsr_kernels.hpp`, `csr_spmm.hpp`, and `bsr_spmm.hpp`
+- CSR and BSR still use the current native kernels in `csr_apply.hpp`, `bsr_apply.hpp`, `ops/spmm/csr.hpp`, and `ops/spmm/bsr.hpp`
 - this document describes the preferred next-generation direction for CSR / BSR performance work

@@ -1,8 +1,8 @@
-#ifndef VBCSR_DETAIL_BACKEND_HANDLE_COMMON_HPP
-#define VBCSR_DETAIL_BACKEND_HANDLE_COMMON_HPP
+#ifndef VBCSR_DETAIL_BACKEND_BACKEND_COMMON_HPP
+#define VBCSR_DETAIL_BACKEND_BACKEND_COMMON_HPP
 
-#include "paged_array.hpp"
-#include "shape_paged_storage.hpp"
+#include "../storage/paged_array.hpp"
+#include "../storage/shape_paged_storage.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -271,4 +271,4 @@ bool ensure_mkl_mm_variant_with_lru( // LRU: Least recently used
 
 } // namespace vbcsr::detail
 
-#endif // VBCSR_DETAIL_BACKEND_HANDLE_COMMON_HPP
+#endif // VBCSR_DETAIL_BACKEND_BACKEND_COMMON_HPP

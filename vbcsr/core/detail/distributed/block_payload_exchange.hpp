@@ -1,9 +1,9 @@
-#ifndef VBCSR_DETAIL_BLOCK_PAYLOAD_EXCHANGE_HPP
-#define VBCSR_DETAIL_BLOCK_PAYLOAD_EXCHANGE_HPP
+#ifndef VBCSR_DETAIL_DISTRIBUTED_BLOCK_PAYLOAD_EXCHANGE_HPP
+#define VBCSR_DETAIL_DISTRIBUTED_BLOCK_PAYLOAD_EXCHANGE_HPP
 
 #include "block_payload_types.hpp"
 
-#include "../mpi_utils.hpp"
+#include "mpi_utils.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -413,4 +413,4 @@ FetchedBlockContext<typename Matrix::value_type> fetch_batched_block_payloads(
 
 } // namespace vbcsr::detail
 
-#endif // VBCSR_DETAIL_BLOCK_PAYLOAD_EXCHANGE_HPP
+#endif // VBCSR_DETAIL_DISTRIBUTED_BLOCK_PAYLOAD_EXCHANGE_HPP

@@ -1,7 +1,7 @@
 #ifndef VBCSR_DETAIL_DISTRIBUTED_RESULT_GRAPH_HPP
 #define VBCSR_DETAIL_DISTRIBUTED_RESULT_GRAPH_HPP
 
-#include "../dist_graph.hpp"
+#include "../../dist_graph.hpp"
 
 #include <algorithm>
 #include <map>

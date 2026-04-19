@@ -1,9 +1,9 @@
-#ifndef VBCSR_DETAIL_TRANSPOSE_OPS_HPP
-#define VBCSR_DETAIL_TRANSPOSE_OPS_HPP
+#ifndef VBCSR_DETAIL_OPS_TRANSPOSE_HPP
+#define VBCSR_DETAIL_OPS_TRANSPOSE_HPP
 
-#include "distributed_result_graph.hpp"
+#include "../distributed/result_graph.hpp"
 
-#include "../mpi_utils.hpp"
+#include "../distributed/mpi_utils.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -466,4 +466,4 @@ private:
 
 } // namespace vbcsr::detail
 
-#endif // VBCSR_DETAIL_TRANSPOSE_OPS_HPP
+#endif // VBCSR_DETAIL_OPS_TRANSPOSE_HPP
