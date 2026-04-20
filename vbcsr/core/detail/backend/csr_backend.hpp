@@ -434,14 +434,13 @@ private:
         const int begin = static_cast<int>(page_slice.first_nnz);
         const int end = begin + static_cast<int>(page_slice.nnz_count);
         // A storage page can begin or end in the middle of a CSR row, so vendor
-        // batches need a row window plus row_ptr values rebased into page-local
-        // NNZ offsets.
-        const RebasedRowSpan row_span = find_rebased_row_span(row_ptr, begin, end);
+        // batches need a row window plus page-local row_ptr offsets.
+        const PageRowSpan row_span = find_page_row_span(row_ptr, begin, end);
         entry.batch.row_begin = row_span.row_begin;
         entry.batch.row_end = row_span.row_end;
         entry.row_offsets_storage.reserve(static_cast<size_t>(row_span.row_count() + 1));
-        emit_rebased_row_offsets(row_ptr, begin, end, row_span, [&](int rebased_offset) {
-            entry.row_offsets_storage.push_back(rebased_offset);
+        emit_page_local_row_ptr(row_ptr, begin, end, row_span, [&](int page_local_offset) {
+            entry.row_offsets_storage.push_back(page_local_offset);
         });
         entry.batch.row_offsets = entry.row_offsets_storage.data();
         return entry;

@@ -4,7 +4,7 @@
 #include "../../dist_multivector.hpp"
 #include "../../dist_vector.hpp"
 #include "../../scalar_traits.hpp"
-#include "../backend/matrix_backend.hpp"
+#include "../backend/csr_backend.hpp"
 
 #include <algorithm>
 #include <vector>

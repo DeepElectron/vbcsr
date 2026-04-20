@@ -11,8 +11,7 @@ which public operations dispatch into backend-specific implementations.
 
 Then read the internals in this order:
 
-1. `detail/backend/matrix_backend.hpp` for backend selection and storage
-   dispatch.
+1. `vbcsr/core/block_csr.hpp` for backend selection and storage dispatch.
 2. One concrete backend, such as `detail/backend/csr_backend.hpp`,
    `detail/backend/bsr_backend.hpp`, or `detail/backend/vbcsr_backend.hpp`.
 3. `detail/kernels/dense_kernels.hpp` for local dense block kernels, plus
@@ -28,8 +27,7 @@ Then read the internals in this order:
 
 - `detail/storage/` contains low-level paged storage utilities shared by
   backends.
-- `detail/backend/` contains CSR, BSR, and VBCSR storage backends plus the
-  backend variant handle used by `BlockSpMat`.
+- `detail/backend/` contains CSR, BSR, and VBCSR storage backends.
 - `detail/kernels/` contains BLAS/LAPACK declarations, dense block kernels, and
   sparse apply implementations.
 - `detail/ops/` contains operation-level algorithms. Keep shared symbolic or

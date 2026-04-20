@@ -51,8 +51,8 @@ struct BSRSpMMExecutor {
     }
 
     static Matrix run(const Matrix& A, const Matrix& B, double threshold) {
-        const auto& A_backend = require_bsr_backend<T, typename Matrix::KernelType>(A.backend_handle_);
-        const auto& B_backend = require_bsr_backend<T, typename Matrix::KernelType>(B.backend_handle_);
+        const auto& A_backend = A.active_bsr_backend();
+        const auto& B_backend = B.active_bsr_backend();
         if (A_backend.block_size != B_backend.block_size) {
             throw std::runtime_error("BSR SpMM requires matching uniform block sizes");
         }

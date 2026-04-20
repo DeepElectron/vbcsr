@@ -37,7 +37,9 @@ inline const char* matrix_kind_name(MatrixKind kind) {
 #include "dist_vector.hpp"
 #include "dist_multivector.hpp"
 #include "detail/kernels/dense_kernels.hpp"
-#include "detail/backend/matrix_backend.hpp"
+#include "detail/backend/bsr_backend.hpp"
+#include "detail/backend/csr_backend.hpp"
+#include "detail/backend/vbcsr_backend.hpp"
 #include "detail/kernels/bsr_apply.hpp"
 #include "detail/kernels/csr_apply.hpp"
 #include "detail/kernels/vbcsr_apply.hpp"
@@ -57,7 +59,9 @@ inline const char* matrix_kind_name(MatrixKind kind) {
 #include <complex>
 #include <limits>
 #include <string>
+#include <stdexcept>
 #include <type_traits>
+#include <variant>
 #include <set>
 #include <map>
 #include <cstring>
@@ -112,7 +116,11 @@ private:
     using VBCSRBackendStorage = detail::VBCSRMatrixBackend<T, Kernel>;
     using CSRBackendStorage = detail::CSRMatrixBackend<T>;
     using BSRBackendStorage = detail::BSRMatrixBackend<T>;
-    using BackendHandle = detail::MatrixBackendHandle<T, Kernel>;
+    using BackendHandle = std::variant<
+        std::monostate,
+        CSRBackendStorage,
+        BSRBackendStorage,
+        VBCSRBackendStorage>;
 
     struct ConstructionToken {};
 
@@ -635,14 +643,14 @@ public:
     // Matrix-Vector Multiplication
     void mult(DistVector<T>& x, DistVector<T>& y) {
         if (kind == MatrixKind::CSR) {
-            detail::csr_mult(graph, detail::require_csr_backend<T, Kernel>(backend_handle_), x, y);
+            detail::csr_mult(graph, active_csr_backend(), x, y);
             return;
         }
         if (kind == MatrixKind::BSR) {
-            detail::bsr_mult(graph, detail::require_bsr_backend<T, Kernel>(backend_handle_), x, y);
+            detail::bsr_mult(graph, active_bsr_backend(), x, y);
             return;
         }
-        detail::vbcsr_mult(graph, detail::require_vbcsr_backend<T, Kernel>(backend_handle_), x, y);
+        detail::vbcsr_mult(graph, active_vbcsr_backend(), x, y);
     }
     
     // Refined mult with offsets
@@ -653,40 +661,40 @@ public:
     // Matrix-Matrix Multiplication (Dense RHS)
     void mult_dense(DistMultiVector<T>& X, DistMultiVector<T>& Y) {
         if (kind == MatrixKind::CSR) {
-            detail::csr_mult_dense(graph, detail::require_csr_backend<T, Kernel>(backend_handle_), X, Y);
+            detail::csr_mult_dense(graph, active_csr_backend(), X, Y);
             return;
         }
         if (kind == MatrixKind::BSR) {
-            detail::bsr_mult_dense(graph, detail::require_bsr_backend<T, Kernel>(backend_handle_), X, Y);
+            detail::bsr_mult_dense(graph, active_bsr_backend(), X, Y);
             return;
         }
-        detail::vbcsr_mult_dense(graph, detail::require_vbcsr_backend<T, Kernel>(backend_handle_), X, Y);
+        detail::vbcsr_mult_dense(graph, active_vbcsr_backend(), X, Y);
     }
 
     // Adjoint Matrix-Vector Multiplication: y = A^dagger * x
     void mult_adjoint(DistVector<T>& x, DistVector<T>& y) {
         if (kind == MatrixKind::CSR) {
-            detail::csr_mult_adjoint(graph, detail::require_csr_backend<T, Kernel>(backend_handle_), x, y);
+            detail::csr_mult_adjoint(graph, active_csr_backend(), x, y);
             return;
         }
         if (kind == MatrixKind::BSR) {
-            detail::bsr_mult_adjoint(graph, detail::require_bsr_backend<T, Kernel>(backend_handle_), x, y);
+            detail::bsr_mult_adjoint(graph, active_bsr_backend(), x, y);
             return;
         }
-        detail::vbcsr_mult_adjoint(graph, detail::require_vbcsr_backend<T, Kernel>(backend_handle_), x, y);
+        detail::vbcsr_mult_adjoint(graph, active_vbcsr_backend(), x, y);
     }
 
     // Adjoint Matrix-Matrix Multiplication: Y = A^dagger * X
     void mult_dense_adjoint(DistMultiVector<T>& X, DistMultiVector<T>& Y) {
         if (kind == MatrixKind::CSR) {
-            detail::csr_mult_dense_adjoint(graph, detail::require_csr_backend<T, Kernel>(backend_handle_), X, Y);
+            detail::csr_mult_dense_adjoint(graph, active_csr_backend(), X, Y);
             return;
         }
         if (kind == MatrixKind::BSR) {
-            detail::bsr_mult_dense_adjoint(graph, detail::require_bsr_backend<T, Kernel>(backend_handle_), X, Y);
+            detail::bsr_mult_dense_adjoint(graph, active_bsr_backend(), X, Y);
             return;
         }
-        detail::vbcsr_mult_dense_adjoint(graph, detail::require_vbcsr_backend<T, Kernel>(backend_handle_), X, Y);
+        detail::vbcsr_mult_dense_adjoint(graph, active_vbcsr_backend(), X, Y);
     }
 
     // Utilities
@@ -1476,6 +1484,10 @@ private:
     const CSRBackendStorage& active_csr_backend() const;
     BSRBackendStorage& active_bsr_backend();
     const BSRBackendStorage& active_bsr_backend() const;
+    template <typename Backend>
+    Backend& active_backend_storage();
+    template <typename Backend>
+    const Backend& active_backend_storage() const;
     RemoteThreadBuffers& remote_assembly_buffers() const;
     static bool has_pending_remote_assembly(const BlockSpMat* matrix);
     static void transfer_remote_assembly_state(const BlockSpMat* from, const BlockSpMat* to);
@@ -1659,33 +1671,53 @@ BlockSpMat<T, Kernel>::BlockSpMat(
 }
 
 template <typename T, typename Kernel>
+template <typename Backend>
+Backend& BlockSpMat<T, Kernel>::active_backend_storage() {
+    auto* storage = std::get_if<Backend>(&backend_handle_);
+    if (storage == nullptr) {
+        throw std::logic_error("Active backend does not match requested storage path");
+    }
+    return *storage;
+}
+
+template <typename T, typename Kernel>
+template <typename Backend>
+const Backend& BlockSpMat<T, Kernel>::active_backend_storage() const {
+    const auto* storage = std::get_if<Backend>(&backend_handle_);
+    if (storage == nullptr) {
+        throw std::logic_error("Active backend does not match requested storage path");
+    }
+    return *storage;
+}
+
+template <typename T, typename Kernel>
 typename BlockSpMat<T, Kernel>::VBCSRBackendStorage& BlockSpMat<T, Kernel>::active_vbcsr_backend() {
-    return detail::require_vbcsr_backend<T, Kernel>(backend_handle_);
+    return active_backend_storage<VBCSRBackendStorage>();
 }
 
 template <typename T, typename Kernel>
 const typename BlockSpMat<T, Kernel>::VBCSRBackendStorage& BlockSpMat<T, Kernel>::active_vbcsr_backend() const {
-    return detail::require_vbcsr_backend<T, Kernel>(backend_handle_);
+    return active_backend_storage<VBCSRBackendStorage>();
 }
 
 template <typename T, typename Kernel>
 typename BlockSpMat<T, Kernel>::CSRBackendStorage& BlockSpMat<T, Kernel>::active_csr_backend() {
-    return detail::require_csr_backend<T, Kernel>(backend_handle_);
+    return active_backend_storage<CSRBackendStorage>();
 }
 
 template <typename T, typename Kernel>
 const typename BlockSpMat<T, Kernel>::CSRBackendStorage& BlockSpMat<T, Kernel>::active_csr_backend() const {
-    return detail::require_csr_backend<T, Kernel>(backend_handle_);
+    return active_backend_storage<CSRBackendStorage>();
 }
 
 template <typename T, typename Kernel>
 typename BlockSpMat<T, Kernel>::BSRBackendStorage& BlockSpMat<T, Kernel>::active_bsr_backend() {
-    return detail::require_bsr_backend<T, Kernel>(backend_handle_);
+    return active_backend_storage<BSRBackendStorage>();
 }
 
 template <typename T, typename Kernel>
 const typename BlockSpMat<T, Kernel>::BSRBackendStorage& BlockSpMat<T, Kernel>::active_bsr_backend() const {
-    return detail::require_bsr_backend<T, Kernel>(backend_handle_);
+    return active_backend_storage<BSRBackendStorage>();
 }
 
 template <typename T, typename Kernel>
@@ -2005,8 +2037,8 @@ void BlockSpMat<T, Kernel>::ensure_bsr_binary_compatibility(const BlockSpMat& lh
     if (lhs.graph->owned_global_indices != rhs.graph->owned_global_indices) {
         throw std::runtime_error("BSR binary operation requires matching owned row distribution");
     }
-    const int lhs_block_size = detail::require_bsr_backend<T, Kernel>(lhs.backend_handle_).block_size;
-    const int rhs_block_size = detail::require_bsr_backend<T, Kernel>(rhs.backend_handle_).block_size;
+    const int lhs_block_size = lhs.active_bsr_backend().block_size;
+    const int rhs_block_size = rhs.active_bsr_backend().block_size;
     if (lhs_block_size != rhs_block_size) {
         throw std::runtime_error("BSR binary operation requires matching uniform block sizes");
     }

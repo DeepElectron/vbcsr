@@ -4,7 +4,7 @@
 #include "../../dist_graph.hpp"
 #include "../../dist_multivector.hpp"
 #include "../../dist_vector.hpp"
-#include "../backend/matrix_backend.hpp"
+#include "../backend/vbcsr_backend.hpp"
 #include "dense_kernels.hpp"
 
 #include <algorithm>

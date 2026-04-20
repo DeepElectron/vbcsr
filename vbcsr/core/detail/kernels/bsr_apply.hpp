@@ -7,7 +7,7 @@
 #include "../../dist_multivector.hpp"
 #include "../../dist_vector.hpp"
 #include "dense_kernels.hpp"
-#include "../backend/matrix_backend.hpp"
+#include "../backend/bsr_backend.hpp"
 
 #include <algorithm>
 #include <cstring>

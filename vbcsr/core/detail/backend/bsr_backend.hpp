@@ -400,18 +400,18 @@ struct BSRMatrixBackend {
 
                 const int begin = static_cast<int>(page_slice.first_block);
                 const int end = begin + static_cast<int>(page_slice.block_count);
-                const RebasedRowSpan row_span = find_rebased_row_span(row_ptr, begin, end);
+                const PageRowSpan row_span = find_page_row_span(row_ptr, begin, end);
                 batch_entry.batch.row_begin = row_span.row_begin;
                 batch_entry.batch.row_end = row_span.row_end;
                 batch_entry.row_block_offsets_storage.reserve(
                     static_cast<size_t>(row_span.row_count() + 1));
-                emit_rebased_row_offsets(
+                emit_page_local_row_ptr(
                     row_ptr,
                     begin,
                     end,
                     row_span,
-                    [&](int rebased_offset) {
-                        batch_entry.row_block_offsets_storage.push_back(rebased_offset);
+                    [&](int page_local_offset) {
+                        batch_entry.row_block_offsets_storage.push_back(page_local_offset);
                     });
                 batch_entry.batch.row_block_offsets =
                     batch_entry.row_block_offsets_storage.data();
