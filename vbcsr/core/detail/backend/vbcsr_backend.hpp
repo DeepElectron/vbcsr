@@ -207,6 +207,11 @@ struct VBCSRMatrixBackend {
         return storage.elements_per_block(shape_id_for_graph_block(graph_block_index));
     }
 
+    // ShapeBlockStore keeps values packed by (shape, page), while apply kernels
+    // still need graph-row and graph-column metadata for each packed block. The
+    // apply plan is the cached bridge: graph_block_rows_storage reconstructs the
+    // row for each flat graph block, and each PageBatch points at that row table,
+    // the graph col_ind array, and the contiguous same-shape page payload.
     const ApplyPlan& ensure_apply_plan(
         const std::vector<int>& row_ptr,
         const std::vector<int>& col_ind) const {

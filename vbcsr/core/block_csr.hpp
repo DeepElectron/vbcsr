@@ -107,8 +107,6 @@ private:
     friend struct detail::VBCSRAxpbyExecutor;
     template <typename>
     friend struct detail::VBCSRSpMMExecutor;
-    template <typename>
-    friend struct detail::VBCSRShapeBatchExecutor;
 
     MatrixKind kind = MatrixKind::CSR;
     using VBCSRBackendStorage = detail::VBCSRMatrixBackend<T, Kernel>;
@@ -309,6 +307,9 @@ public:
     }
 
     // Lifetime and copy/move semantics.
+    // Every BlockSpMat registers with its graph, even when the graph remains
+    // user-owned. Matrix-owned result graphs are promoted to delete-on-last
+    // release; externally owned graphs are only reference-counted.
     BlockSpMat(DistGraph* g)
         : BlockSpMat(
               require_live_graph(g, "BlockSpMat"),
@@ -319,11 +320,14 @@ public:
     }
 
     ~BlockSpMat() {
+        // Remote assembly buffers are keyed by this matrix address, so they
+        // must be cleared before the address can be reused by another object.
         clear_remote_assembly_state(this);
         release_graph_reference();
     }
 
-    // Move constructor
+    // Move constructor. Pending remote assembly state follows the matrix
+    // address that now owns the backend and graph reference.
     BlockSpMat(BlockSpMat&& other) noexcept : 
         kind(other.kind),
         backend_handle_(std::move(other.backend_handle_)),
@@ -339,7 +343,8 @@ public:
         other.backend_handle_ = std::monostate{};
     }
 
-    // Move assignment
+    // Move assignment first releases this object's current graph/reference and
+    // address-keyed assembly buffers, then adopts the moved-from state.
     BlockSpMat& operator=(BlockSpMat&& other) noexcept {
         if (this != &other) {
             clear_remote_assembly_state(this);
@@ -373,7 +378,9 @@ public:
             new_graph = graph->duplicate();
             new_owns_graph = true;
         } else {
-            // Matrix-owned graphs become delete-on-last-release before sharing.
+            // duplicate(false) shares this graph with another matrix. If this
+            // matrix had owned the graph outright, promote it to managed
+            // delete-on-last-release before exposing the shared pointer.
             prepare_graph_for_shared_use();
         }
         BlockSpMat<T, Kernel> new_mat(new_graph);
@@ -636,7 +643,7 @@ public:
             detail::bsr_mult(graph, detail::require_bsr_backend<T, Kernel>(backend_handle_), x, y);
             return;
         }
-        detail::VBCSRShapeBatchExecutor<BlockSpMat<T, Kernel>>::mult(*this, x, y);
+        detail::vbcsr_mult(graph, detail::require_vbcsr_backend<T, Kernel>(backend_handle_), x, y);
     }
     
     // Refined mult with offsets
@@ -654,7 +661,7 @@ public:
             detail::bsr_mult_dense(graph, detail::require_bsr_backend<T, Kernel>(backend_handle_), X, Y);
             return;
         }
-        detail::VBCSRShapeBatchExecutor<BlockSpMat<T, Kernel>>::mult_dense(*this, X, Y);
+        detail::vbcsr_mult_dense(graph, detail::require_vbcsr_backend<T, Kernel>(backend_handle_), X, Y);
     }
 
     // Adjoint Matrix-Vector Multiplication: y = A^dagger * x
@@ -667,7 +674,7 @@ public:
             detail::bsr_mult_adjoint(graph, detail::require_bsr_backend<T, Kernel>(backend_handle_), x, y);
             return;
         }
-        detail::VBCSRShapeBatchExecutor<BlockSpMat<T, Kernel>>::mult_adjoint(*this, x, y);
+        detail::vbcsr_mult_adjoint(graph, detail::require_vbcsr_backend<T, Kernel>(backend_handle_), x, y);
     }
 
     // Adjoint Matrix-Matrix Multiplication: Y = A^dagger * X
@@ -680,7 +687,7 @@ public:
             detail::bsr_mult_dense_adjoint(graph, detail::require_bsr_backend<T, Kernel>(backend_handle_), X, Y);
             return;
         }
-        detail::VBCSRShapeBatchExecutor<BlockSpMat<T, Kernel>>::mult_dense_adjoint(*this, X, Y);
+        detail::vbcsr_mult_dense_adjoint(graph, detail::require_vbcsr_backend<T, Kernel>(backend_handle_), X, Y);
     }
 
     // Utilities
@@ -740,6 +747,8 @@ public:
     // Actually we need to return BlockSpMat<RealType>
     auto get_real() const {
         using RealT = typename ScalarTraits<T>::real_type;
+        // The result reuses the same graph with a different scalar type, so a
+        // matrix-owned graph must be promoted before the pointer is shared.
         prepare_graph_for_shared_use();
         BlockSpMat<RealT, DefaultKernel<RealT>> res(graph);
         res.set_page_size(configured_page_size_);
@@ -763,6 +772,8 @@ public:
 
     auto get_imag() const {
         using RealT = typename ScalarTraits<T>::real_type;
+        // As in get_real(), the graph is shared between two matrix objects with
+        // independent value storage.
         prepare_graph_for_shared_use();
         BlockSpMat<RealT, DefaultKernel<RealT>> res(graph);
         res.set_page_size(configured_page_size_);
@@ -979,6 +990,7 @@ public:
             result = this->duplicate(false);
             result.fill(T(0));
         }
+        result.norms_valid = false;
 
         const std::vector<T>& R = diag.data; // Includes ghosts
         
@@ -1046,30 +1058,19 @@ public:
         const auto copy_kept_blocks = [&](auto& result) {
             #pragma omp parallel for
             for (int row = 0; row < n_rows; ++row) {
-                size_t kept_index = 0;
-                const auto& kept_globals = new_adj_global[row];
+                int dest_graph_block = new_graph->adj_ptr[row];
                 for (int slot = graph->adj_ptr[row]; slot < graph->adj_ptr[row + 1]; ++slot) {
                     if (block_norms[slot] < threshold) {
                         continue;
                     }
-                    const int global_col = kept_globals[kept_index++];
-                    const int dest_col = new_graph->global_to_local.at(global_col);
-                    const int dest_start = new_graph->adj_ptr[row];
-                    const int dest_end = new_graph->adj_ptr[row + 1];
-                    auto begin = new_graph->adj_ind.begin() + dest_start;
-                    auto end = new_graph->adj_ind.begin() + dest_end;
-                    auto it = std::lower_bound(begin, end, dest_col);
-                    if (it == end || *it != dest_col) {
-                        throw std::runtime_error("filter_blocks could not locate destination block");
-                    }
-                    const int dest_graph_block =
-                        static_cast<int>(std::distance(new_graph->adj_ind.begin(), it));
+
                     const size_t size = block_size_elements(slot);
                     std::memcpy(
                         result.mutable_block_data(dest_graph_block),
                         block_data(slot),
                         size * sizeof(T));
                     new_norms[dest_graph_block] = block_norms[slot];
+                    ++dest_graph_block;
                 }
             }
         };
@@ -1088,6 +1089,7 @@ public:
     BlockSpMat spmm(const BlockSpMat& B, double threshold, bool transA = false, bool transB = false) const {
         ensure_same_backend_family(*this, B, "spmm");
 
+        // TODO: optimizable for direct branching on the trans condition without explicitly form the transpose matrix
         if (transA) {
             BlockSpMat A_T = this->transpose();
             return A_T.spmm(B, threshold, false, transB);
@@ -1217,80 +1219,6 @@ public:
         }
     }
 
-    using GhostBlockRef = detail::GhostBlockRef<T>;
-
-    // void numeric_multiply(
-    //     const BlockSpMat& B,
-    //     const std::map<int, std::vector<GhostBlockRef>>& ghost_rows,
-    //     BlockSpMat& C,
-    //     double threshold,
-    //     const std::vector<double>& A_norms,
-    //     const std::vector<double>& B_local_norms) const {
-    //     detail::VBCSRSpMMExecutor<BlockSpMat<T, Kernel>>::run_numeric(
-    //         *this,
-    //         B,
-    //         ghost_rows,
-    //         C,
-    //         threshold,
-    //         A_norms,
-    //         B_local_norms);
-    // }
-
-    using BlockData = detail::FetchedBlock<T>;
-    using FetchContext = detail::FetchedBlockContext<T>;
-
-    // Construct a submatrix from fetched data
-    BlockSpMat<T, Kernel> construct_submatrix(const std::vector<int>& global_indices, const FetchContext& ctx) {
-        // 1. Map global index to local index in the submatrix (0 to M-1)
-        std::map<int, int> global_to_sub;
-        for(size_t i=0; i<global_indices.size(); ++i) {
-            global_to_sub[global_indices[i]] = i;
-        }
-
-        int M = global_indices.size();
-        std::vector<int> sub_block_sizes(M, 0);
-        std::vector<std::vector<int>> sub_adj(M);
-        
-        // 2. Fill sizes
-        for(int gid : global_indices) {
-            if(ctx.row_sizes.count(gid)) {
-                sub_block_sizes[global_to_sub[gid]] = ctx.row_sizes.at(gid);
-            }
-        }
-        
-        // 3. Filter blocks and build adjacency
-        std::vector<const BlockData*> relevant_blocks;
-        for(const auto& bd : ctx.blocks) {
-            if(global_to_sub.count(bd.global_row) && global_to_sub.count(bd.global_col)) {
-                relevant_blocks.push_back(&bd);
-                int sub_row = global_to_sub[bd.global_row];
-                int sub_col = global_to_sub[bd.global_col];
-                sub_adj[sub_row].push_back(sub_col);
-            }
-        }
-        
-        // 4. Construct Matrix
-        DistGraph* sub_graph = new DistGraph(this->graph->comm == MPI_COMM_NULL ? MPI_COMM_NULL : MPI_COMM_SELF); // this make this method thread safe
-        sub_graph->construct_serial(M, sub_block_sizes, sub_adj);
-        
-        BlockSpMat<T, Kernel> sub_mat(sub_graph);
-        sub_mat.owns_graph = true;
-        sub_mat.graph->enable_matrix_lifetime_management();
-        
-        for(const auto* bd : relevant_blocks) {
-            int sub_row = global_to_sub[bd->global_row];
-            int sub_col = global_to_sub[bd->global_col];
-            
-            // printf("Rank %d: Adding block (%d, %d)\n", rank, sub_row, sub_col);
-            // fflush(stdout);
-            
-            sub_mat.add_block(sub_row, sub_col, bd->data.data(), bd->r_dim, bd->c_dim, AssemblyMode::INSERT, MatrixLayout::ColMajor);
-        }
-        
-        sub_mat.assemble();
-        return sub_mat;
-    }
-
     // Extract submatrix defined by global_indices
     BlockSpMat<T, Kernel> extract_submatrix(const std::vector<int>& global_indices) {
         auto ctx = detail::fetch_batched_block_payloads(*this, {global_indices});
@@ -1302,6 +1230,7 @@ public:
         auto ctx = detail::fetch_batched_block_payloads(*this, batch_indices);
         std::vector<BlockSpMat<T, Kernel>> results;
         results.reserve(batch_indices.size());
+        // TODO: threading?
         for(const auto& indices : batch_indices) {
             results.push_back(construct_submatrix(indices, ctx));
         }
@@ -1427,6 +1356,8 @@ public:
     }
     // Calculate block density (global nnz blocks / total global blocks^2)
     double get_block_density() const {
+        // TODO: can switch to a more precise method to targeting per element fidelity?
+        // need to use a weighted row based percentage average method.
         long long local_nnz = graph->adj_ind.size();
         long long global_nnz = 0;
         
@@ -1521,6 +1452,10 @@ private:
     using RemoteOwnerBlocks = std::map<int, std::map<std::pair<int, int>, PendingBlock>>;
     using RemoteThreadBuffers = std::vector<RemoteOwnerBlocks>;
 
+    // Remote add_block calls can arrive before assemble_remote_blocks() folds
+    // them into local storage. The buffers live outside the object and are keyed
+    // by BlockSpMat address, so move construction/assignment must transfer them
+    // and destruction must clear them.
     struct RemoteAssemblyRegistry {
         std::mutex mutex;
         std::map<const BlockSpMat*, RemoteThreadBuffers> buffers;
@@ -1571,7 +1506,61 @@ private:
     static void ensure_vbcsr_binary_compatibility(const BlockSpMat& lhs, const BlockSpMat& rhs);
     bool has_same_logical_structure(const BlockSpMat& other) const;
 
-    static void write_transposed_conjugate_values(T* dest, const T* src, int src_rows, int src_cols);
+    using GhostBlockRef = detail::GhostBlockRef<T>;
+    using BlockData = detail::FetchedBlock<T>;
+    using FetchContext = detail::FetchedBlockContext<T>;
+
+    // Construct a submatrix from fetched data
+    BlockSpMat<T, Kernel> construct_submatrix(const std::vector<int>& global_indices, const FetchContext& ctx) {
+        // 1. Map global index to local index in the submatrix (0 to M-1)
+        std::map<int, int> global_to_sub;
+        for(size_t i=0; i<global_indices.size(); ++i) {
+            global_to_sub[global_indices[i]] = i;
+        }
+
+        int M = global_indices.size();
+        std::vector<int> sub_block_sizes(M, 0);
+        std::vector<std::vector<int>> sub_adj(M);
+
+        // 2. Fill sizes
+        for(int gid : global_indices) {
+            if(ctx.row_sizes.count(gid)) {
+                sub_block_sizes[global_to_sub[gid]] = ctx.row_sizes.at(gid);
+            }
+        }
+
+        // 3. Filter blocks and build adjacency
+        std::vector<const BlockData*> relevant_blocks;
+        for(const auto& bd : ctx.blocks) {
+            if(global_to_sub.count(bd.global_row) && global_to_sub.count(bd.global_col)) {
+                relevant_blocks.push_back(&bd);
+                int sub_row = global_to_sub[bd.global_row];
+                int sub_col = global_to_sub[bd.global_col];
+                sub_adj[sub_row].push_back(sub_col);
+            }
+        }
+
+        // 4. Construct Matrix
+        DistGraph* sub_graph = new DistGraph(this->graph->comm == MPI_COMM_NULL ? MPI_COMM_NULL : MPI_COMM_SELF); // this make this method thread safe
+        sub_graph->construct_serial(M, sub_block_sizes, sub_adj);
+
+        BlockSpMat<T, Kernel> sub_mat(sub_graph);
+        sub_mat.owns_graph = true;
+        sub_mat.graph->enable_matrix_lifetime_management();
+
+        for(const auto* bd : relevant_blocks) {
+            int sub_row = global_to_sub[bd->global_row];
+            int sub_col = global_to_sub[bd->global_col];
+
+            // printf("Rank %d: Adding block (%d, %d)\n", rank, sub_row, sub_col);
+            // fflush(stdout);
+
+            sub_mat.add_block(sub_row, sub_col, bd->data.data(), bd->r_dim, bd->c_dim, AssemblyMode::INSERT, MatrixLayout::ColMajor);
+        }
+
+        sub_mat.assemble();
+        return sub_mat;
+    }
 };
 
 template <typename T, typename Kernel>
@@ -1623,6 +1612,9 @@ void BlockSpMat<T, Kernel>::release_graph_reference() const {
         return;
     }
     if (owns_graph) {
+        // Whether a graph has lifetime management enabled is determined by whether it have
+        // at least one owner. During its release, it will promote the graph to the lifetime management
+        // so the release of the matrix who referred to the graph will trigger the graph deletion.
         graph->enable_matrix_lifetime_management();
     }
     if (graph->release_matrix_reference()) {
@@ -1659,6 +1651,8 @@ BlockSpMat<T, Kernel>::BlockSpMat(
       configured_page_size_(default_page_size_for(matrix_kind, require_live_graph(g, "BlockSpMat"))),
       graph(require_live_graph(g, "BlockSpMat")),
       owns_graph(owns_graph) {
+    // Reference accounting is unconditional. Ownership only controls whether
+    // the graph is eligible for deletion when the final matrix releases it.
     graph->acquire_matrix_reference();
     if (owns_graph) {
         graph->enable_matrix_lifetime_management();
@@ -1905,6 +1899,7 @@ typename BlockSpMat<T, Kernel>::CommittedBackendStorage BlockSpMat<T, Kernel>::b
         const size_t nnz = graph->adj_ind.size();
         backend.initialize_graph_block_handles(nnz);
 
+        // count the #matrices per shape
         std::map<std::pair<int, int>, size_t> shape_counts;
         const int n_rows = static_cast<int>(graph->owned_global_indices.size());
         for (int row = 0; row < n_rows; ++row) {
@@ -1936,7 +1931,7 @@ typename BlockSpMat<T, Kernel>::CommittedBackendStorage BlockSpMat<T, Kernel>::b
                     backend.append_block_for_shape(shape_id, graph_block_index));
             }
         }
-
+        // TODO: the logic behind this switch is too complex, need optimization
         return detail::make_vbcsr_backend_handle<T, Kernel>(std::move(backend));
     }
     }
@@ -2038,20 +2033,6 @@ bool BlockSpMat<T, Kernel>::has_same_logical_structure(const BlockSpMat& other) 
            graph->block_sizes == other.graph->block_sizes &&
            graph->adj_ptr == other.graph->adj_ptr &&
            graph->adj_ind == other.graph->adj_ind;
-}
-
-template <typename T, typename Kernel>
-void BlockSpMat<T, Kernel>::write_transposed_conjugate_values(
-    T* dest,
-    const T* src,
-    int src_rows,
-    int src_cols) {
-    for (int dest_col = 0; dest_col < src_rows; ++dest_col) {
-        for (int dest_row = 0; dest_row < src_cols; ++dest_row) {
-            dest[dest_col * src_cols + dest_row] =
-                ConjHelper<T>::apply(src[dest_row * src_rows + dest_col]);
-        }
-    }
 }
 
 template <typename T, typename Kernel>

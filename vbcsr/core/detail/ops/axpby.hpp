@@ -229,6 +229,14 @@ template <typename Matrix>
 struct VBCSRAxpbyExecutor {
     using T = typename Matrix::value_type;
 
+    // VBCSR AXPBY uses a fast-path ladder before falling back to graph union.
+    // If beta is zero, self contributes no values, so the result can copy or
+    // duplicate X's structure and scale only X. If the two matrices share the
+    // same graph structure, values update slot-by-slot in place. Otherwise, a
+    // subset path maps X's local owned and ghost columns into self, verifies on
+    // every rank that X's sparsity is contained in self, scales self once, and
+    // adds only matching X blocks. The general fallback builds the union graph
+    // and merges rows using canonical ordering across local/ghost columns.
     static void run(Matrix& self, const Matrix& X, T alpha, T beta) {
         if (beta == T(0)) {
             if (self.graph == X.graph) {
@@ -283,6 +291,9 @@ struct VBCSRAxpbyExecutor {
         std::vector<int> x_to_this(x_total_cols, -1);
         bool x_is_subset = true;
 
+        // X rows can reference both owned and ghost column IDs. The subset path
+        // needs a complete local-column remap before it can compare row sparsity
+        // or accumulate X blocks into self's storage slots.
         for (int i = 0; i < x_n_owned; ++i) {
             const int gid = X.graph->owned_global_indices[i];
             if (self.graph->global_to_local.count(gid)) {
@@ -300,6 +311,8 @@ struct VBCSRAxpbyExecutor {
             }
         }
 
+        // The chosen path must be identical on all MPI ranks. One rank missing a
+        // column or row entry invalidates the subset optimization globally.
         int local_subset = x_is_subset ? 1 : 0;
         int global_subset = 0;
         if (self.graph->size > 1) {
@@ -336,6 +349,8 @@ struct VBCSRAxpbyExecutor {
                 }
             }
 
+            // Sparsity containment is also a distributed predicate: all ranks
+            // must agree before self can be scaled in place.
             int local_ss = sparsity_subset ? 1 : 0;
             int global_ss = 0;
             if (self.graph->size > 1) {
@@ -441,6 +456,9 @@ struct VBCSRAxpbyExecutor {
             for (int slot = start; slot < end; ++slot) {
                 const int col = new_col_ind[slot];
 
+                // Local row entries are sorted by local IDs, but ghost IDs are
+                // owner-grouped and may differ between graphs. Compare columns
+                // through canonical_less when merging old and new graph rows.
                 while (y_k < y_end && canonical_less(self.col_ind()[y_k], self.graph, col, new_graph)) {
                     ++y_k;
                 }
@@ -529,6 +547,10 @@ private:
     }
 
     static bool canonical_less(int col_local, DistGraph* graph, int col_other_local, DistGraph* graph_other) {
+        // DistGraph keeps owned local IDs first, then ghosts grouped by owner
+        // rank for communication. This comparator gives row merges a stable
+        // order even when two graphs use different local IDs for the same
+        // global columns.
         const int n_owned = static_cast<int>(graph->owned_global_indices.size());
         const int n_owned_other = static_cast<int>(graph_other->owned_global_indices.size());
 

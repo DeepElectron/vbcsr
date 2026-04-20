@@ -70,6 +70,11 @@ public:
     MPI_Comm neighbor_comm = MPI_COMM_NULL;
 
 private:
+    // Matrix references and deletion permission are intentionally separate.
+    // Matrices always acquire/release references so shared graphs know when the
+    // last matrix handle disappears, but only graphs promoted to managed
+    // lifetime are deleted by that final release. User-owned input graphs can
+    // therefore be shared safely without BlockSpMat taking ownership.
     mutable std::atomic<int> matrix_ref_count_{0};
     mutable std::atomic<bool> matrix_lifetime_managed_{false};
 

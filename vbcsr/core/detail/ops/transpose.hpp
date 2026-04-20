@@ -1,6 +1,7 @@
 #ifndef VBCSR_DETAIL_OPS_TRANSPOSE_HPP
 #define VBCSR_DETAIL_OPS_TRANSPOSE_HPP
 
+#include "../../scalar_traits.hpp"
 #include "../distributed/result_graph.hpp"
 
 #include "../distributed/mpi_utils.hpp"
@@ -12,6 +13,20 @@
 #include <vector>
 
 namespace vbcsr::detail {
+
+template <typename T>
+void write_transposed_conjugate_block(
+    T* dest,
+    const T* src,
+    int src_rows,
+    int src_cols) {
+    for (int dest_col = 0; dest_col < src_rows; ++dest_col) {
+        for (int dest_row = 0; dest_row < src_cols; ++dest_row) {
+            dest[dest_col * src_cols + dest_row] =
+                ScalarTraits<T>::conjugate(src[dest_row * src_rows + dest_col]);
+        }
+    }
+}
 
 template <typename T>
 struct TransposeExchangeResult {
@@ -292,7 +307,7 @@ struct BSRTransposeExecutor {
                 }
                 const int dest_graph_block =
                     static_cast<int>(std::distance(graph_C->adj_ind.begin(), it));
-                Matrix::write_transposed_conjugate_values(
+                write_transposed_conjugate_block(
                     result.mutable_block_data(dest_graph_block),
                     matrix.block_data(slot),
                     matrix.graph->block_sizes[row],
@@ -336,7 +351,7 @@ struct BSRTransposeExecutor {
             }
             const int graph_block_index =
                 static_cast<int>(std::distance(graph_C->adj_ind.begin(), it));
-            Matrix::write_transposed_conjugate_values(
+            write_transposed_conjugate_block(
                 result.mutable_block_data(graph_block_index),
                 value_ptr,
                 col_dim,
@@ -411,7 +426,7 @@ private:
                 }
                 const int dest_graph_block =
                     static_cast<int>(std::distance(graph_C->adj_ind.begin(), it));
-                Matrix::write_transposed_conjugate_values(
+                write_transposed_conjugate_block(
                     result.mutable_block_data(dest_graph_block),
                     matrix.block_data(slot),
                     matrix.graph->block_sizes[row],
@@ -453,7 +468,7 @@ private:
             }
             const int graph_block_index =
                 static_cast<int>(std::distance(graph_C->adj_ind.begin(), it));
-            Matrix::write_transposed_conjugate_values(
+            write_transposed_conjugate_block(
                 result.mutable_block_data(graph_block_index),
                 value_ptr,
                 col_dim,

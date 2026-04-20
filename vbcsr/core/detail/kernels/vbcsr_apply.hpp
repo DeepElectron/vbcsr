@@ -1,6 +1,12 @@
 #ifndef VBCSR_DETAIL_KERNELS_VBCSR_APPLY_HPP
 #define VBCSR_DETAIL_KERNELS_VBCSR_APPLY_HPP
 
+#include "../../dist_graph.hpp"
+#include "../../dist_multivector.hpp"
+#include "../../dist_vector.hpp"
+#include "../backend/matrix_backend.hpp"
+#include "dense_kernels.hpp"
+
 #include <algorithm>
 #include <cstring>
 #include <vector>
@@ -10,33 +16,37 @@
 #endif
 
 namespace vbcsr::detail {
+namespace vbcsr_apply_detail {
 
-template <typename Matrix>
-struct VBCSRShapeBatchExecutor {
-    using T = typename Matrix::value_type;
-    using ApplyMode = typename Matrix::VBCSRBackendStorage::ApplyMode;
-    using PageBatch = typename Matrix::VBCSRBackendStorage::PageBatch;
+template <typename T, typename Kernel>
+struct ShapeBatchKernel {
+    using Backend = VBCSRMatrixBackend<T, Kernel>;
+    using ApplyMode = typename Backend::ApplyMode;
+    using PageBatch = typename Backend::PageBatch;
 
-    // One ApplyTask is a contiguous subrange of one shape page batch. We keep the
-    // batch/page identity, then optionally split a large batched page into multiple
-    // tasks so the outer OpenMP loop still has enough work when a few repeated-shape
-    // pages dominate the matrix.
+    // VBCSR apply works in the storage order: blocks are grouped first by
+    // shape, then by storage page. A task therefore records both the page batch
+    // and the subrange within that batch so large same-shape pages can be split
+    // without losing access to compact batched GEMV/GEMM operands.
+    //
+    // Accumulation uses per-thread output buffers because different tasks may
+    // write the same destination row, and adjoint apply writes through columns.
+    // The final reduction is cheaper and less fragile than fine-grained locks.
     struct ApplyTask {
         int batch_index = -1;
         uint32_t begin = 0;
         uint32_t count = 0;
     };
 
-    static void mult(const Matrix& matrix, DistVector<T>& x, DistVector<T>& y) {
+    static void mult(DistGraph* graph, const Backend& backend, DistVector<T>& x, DistVector<T>& y) {
         BLASKernel::configure_native_threading();
-        x.bind_to_graph(matrix.graph);
-        y.bind_to_graph(matrix.graph);
+        x.bind_to_graph(graph);
+        y.bind_to_graph(graph);
         x.sync_ghosts();
         std::fill(y.data.begin(), y.data.end(), T(0));
 
-        // the initial batches number dependent on the page number, which is the number of shape and the number of page in each shape
-        const auto& batches = matrix.active_vbcsr_backend()
-                                  .ensure_apply_plan(matrix.graph->adj_ptr, matrix.graph->adj_ind)
+        const auto& batches = backend
+                                  .ensure_apply_plan(graph->adj_ptr, graph->adj_ind)
                                   .batches;
         const auto tasks = build_apply_tasks(
             batches,
@@ -45,7 +55,6 @@ struct VBCSRShapeBatchExecutor {
                 return static_cast<size_t>(batch.row_dim + batch.col_dim);
             });
         
-        // thread_acc - [n_thread, n_dim] array, accumulate each threads MVP result and summed them up.
         auto thread_acc = make_thread_accumulators(static_cast<int>(y.data.size()));
 
         #pragma omp parallel for schedule(dynamic)
@@ -55,22 +64,22 @@ struct VBCSRShapeBatchExecutor {
             const auto& task = tasks[task_idx];
             const auto& batch = batches[task.batch_index];
             const ApplyMode mode = select_vector_apply_mode(task.count);
-            matrix.active_vbcsr_backend().record_apply_batch(batch.shape_id, mode);
-            run_mult_batch(matrix, batch, task.begin, task.count, mode, x, accum.data());
+            backend.record_apply_batch(batch.shape_id, mode);
+            run_mult_batch(graph, batch, task.begin, task.count, mode, x, accum.data());
         }
         
         reduce_thread_accumulators(thread_acc, y.data);
     }
 
-    static void mult_dense(const Matrix& matrix, DistMultiVector<T>& X, DistMultiVector<T>& Y) {
+    static void mult_dense(DistGraph* graph, const Backend& backend, DistMultiVector<T>& X, DistMultiVector<T>& Y) {
         BLASKernel::configure_native_threading();
-        X.bind_to_graph(matrix.graph);
-        Y.bind_to_graph(matrix.graph);
+        X.bind_to_graph(graph);
+        Y.bind_to_graph(graph);
         X.sync_ghosts();
         std::fill(Y.data.begin(), Y.data.end(), T(0));
 
-        const auto& batches = matrix.active_vbcsr_backend()
-                                  .ensure_apply_plan(matrix.graph->adj_ptr, matrix.graph->adj_ind)
+        const auto& batches = backend
+                                  .ensure_apply_plan(graph->adj_ptr, graph->adj_ind)
                                   .batches;
         auto thread_acc = make_thread_accumulators(static_cast<int>(Y.data.size()));
         const int ldb = X.local_rows + X.ghost_rows;
@@ -91,21 +100,21 @@ struct VBCSRShapeBatchExecutor {
             const auto& task = tasks[task_idx];
             const auto& batch = batches[task.batch_index];
             const ApplyMode mode = select_dense_apply_mode(task.count);
-            matrix.active_vbcsr_backend().record_apply_batch(batch.shape_id, mode);
-            run_mult_dense_batch(matrix, batch, task.begin, task.count, mode, X, ldb, num_vecs, ldc, accum.data());
+            backend.record_apply_batch(batch.shape_id, mode);
+            run_mult_dense_batch(graph, batch, task.begin, task.count, mode, X, ldb, num_vecs, ldc, accum.data());
         }
 
         reduce_thread_accumulators(thread_acc, Y.data);
     }
 
-    static void mult_adjoint(const Matrix& matrix, DistVector<T>& x, DistVector<T>& y) {
+    static void mult_adjoint(DistGraph* graph, const Backend& backend, DistVector<T>& x, DistVector<T>& y) {
         BLASKernel::configure_native_threading();
-        x.bind_to_graph(matrix.graph);
-        y.bind_to_graph(matrix.graph);
+        x.bind_to_graph(graph);
+        y.bind_to_graph(graph);
         std::fill(y.data.begin(), y.data.end(), T(0));
 
-        const auto& batches = matrix.active_vbcsr_backend()
-                                  .ensure_apply_plan(matrix.graph->adj_ptr, matrix.graph->adj_ind)
+        const auto& batches = backend
+                                  .ensure_apply_plan(graph->adj_ptr, graph->adj_ind)
                                   .batches;
         const auto tasks = build_apply_tasks(
             batches,
@@ -122,22 +131,22 @@ struct VBCSRShapeBatchExecutor {
             const auto& task = tasks[task_idx];
             const auto& batch = batches[task.batch_index];
             const ApplyMode mode = select_vector_apply_mode(task.count);
-            matrix.active_vbcsr_backend().record_apply_batch(batch.shape_id, mode);
-            run_mult_adjoint_batch(matrix, batch, task.begin, task.count, mode, x, accum.data());
+            backend.record_apply_batch(batch.shape_id, mode);
+            run_mult_adjoint_batch(graph, batch, task.begin, task.count, mode, x, accum.data());
         }
 
         reduce_thread_accumulators(thread_acc, y.data);
         y.reduce_ghosts();
     }
 
-    static void mult_dense_adjoint(const Matrix& matrix, DistMultiVector<T>& X, DistMultiVector<T>& Y) {
+    static void mult_dense_adjoint(DistGraph* graph, const Backend& backend, DistMultiVector<T>& X, DistMultiVector<T>& Y) {
         BLASKernel::configure_native_threading();
-        X.bind_to_graph(matrix.graph);
-        Y.bind_to_graph(matrix.graph);
+        X.bind_to_graph(graph);
+        Y.bind_to_graph(graph);
         std::fill(Y.data.begin(), Y.data.end(), T(0));
 
-        const auto& batches = matrix.active_vbcsr_backend()
-                                  .ensure_apply_plan(matrix.graph->adj_ptr, matrix.graph->adj_ind)
+        const auto& batches = backend
+                                  .ensure_apply_plan(graph->adj_ptr, graph->adj_ind)
                                   .batches;
         auto thread_acc = make_thread_accumulators(static_cast<int>(Y.data.size()));
         const int ldb = X.local_rows + X.ghost_rows;
@@ -158,8 +167,8 @@ struct VBCSRShapeBatchExecutor {
             const auto& task = tasks[task_idx];
             const auto& batch = batches[task.batch_index];
             const ApplyMode mode = select_dense_apply_mode(task.count);
-            matrix.active_vbcsr_backend().record_apply_batch(batch.shape_id, mode);
-            run_mult_dense_adjoint_batch(matrix, batch, task.begin, task.count, mode, X, ldb, num_vecs, ldc, accum.data());
+            backend.record_apply_batch(batch.shape_id, mode);
+            run_mult_dense_adjoint_batch(graph, batch, task.begin, task.count, mode, X, ldb, num_vecs, ldc, accum.data());
         }
 
         reduce_thread_accumulators(thread_acc, Y.data);
@@ -174,7 +183,7 @@ private:
 
     // this is a serial kernel that runs for each task
     static void run_mult_batch(
-        const Matrix& matrix,
+        DistGraph* graph,
         const PageBatch& batch,
         uint32_t begin,
         uint32_t count,
@@ -185,14 +194,14 @@ private:
             return;
         }
         if (mode == ApplyMode::Batched) {
-            run_mult_batch_batched(matrix, batch, begin, count, x, accum);
+            run_mult_batch_batched(graph, batch, begin, count, x, accum);
             return;
         }
-        run_mult_batch_fallback(matrix, batch, begin, count, x, accum);
+        run_mult_batch_fallback(graph, batch, begin, count, x, accum);
     }
 
     static void run_mult_batch_fallback(
-        const Matrix& matrix,
+        DistGraph* graph,
         const PageBatch& batch,
         uint32_t begin,
         uint32_t count,
@@ -203,8 +212,8 @@ private:
             const int row = batch.row_block_index(idx);
             const int col = batch.col_block_index(idx);
             const T* block = batch.block_ptr(idx);
-            const T* x_ptr = x.data.data() + matrix.graph->block_offsets[col];
-            T* y_ptr = accum + matrix.graph->block_offsets[row];
+            const T* x_ptr = x.data.data() + graph->block_offsets[col];
+            T* y_ptr = accum + graph->block_offsets[row];
             SmartKernel<T>::gemv(
                 batch.row_dim,
                 batch.col_dim,
@@ -220,7 +229,7 @@ private:
     }
 
     static void run_mult_dense_batch(
-        const Matrix& matrix,
+        DistGraph* graph,
         const PageBatch& batch,
         uint32_t begin,
         uint32_t count,
@@ -234,14 +243,14 @@ private:
             return;
         }
         if (mode == ApplyMode::Batched) {
-            run_mult_dense_batch_batched(matrix, batch, begin, count, X, ldb, num_vecs, ldc, accum);
+            run_mult_dense_batch_batched(graph, batch, begin, count, X, ldb, num_vecs, ldc, accum);
             return;
         }
-        run_mult_dense_batch_fallback(matrix, batch, begin, count, X, ldb, num_vecs, ldc, accum);
+        run_mult_dense_batch_fallback(graph, batch, begin, count, X, ldb, num_vecs, ldc, accum);
     }
 
     static void run_mult_dense_batch_fallback(
-        const Matrix& matrix,
+        DistGraph* graph,
         const PageBatch& batch,
         uint32_t begin,
         uint32_t count,
@@ -255,8 +264,8 @@ private:
             const int row = batch.row_block_index(idx);
             const int col = batch.col_block_index(idx);
             const T* block = batch.block_ptr(idx);
-            const T* x_ptr = &X(matrix.graph->block_offsets[col], 0);
-            T* y_ptr = accum + matrix.graph->block_offsets[row];
+            const T* x_ptr = &X(graph->block_offsets[col], 0);
+            T* y_ptr = accum + graph->block_offsets[row];
             SmartKernel<T>::gemm(
                 batch.row_dim,
                 num_vecs,
@@ -273,7 +282,7 @@ private:
     }
 
     static void run_mult_adjoint_batch(
-        const Matrix& matrix,
+        DistGraph* graph,
         const PageBatch& batch,
         uint32_t begin,
         uint32_t count,
@@ -284,14 +293,14 @@ private:
             return;
         }
         if (mode == ApplyMode::Batched) {
-            run_mult_adjoint_batch_batched(matrix, batch, begin, count, x, accum);
+            run_mult_adjoint_batch_batched(graph, batch, begin, count, x, accum);
             return;
         }
-        run_mult_adjoint_batch_fallback(matrix, batch, begin, count, x, accum);
+        run_mult_adjoint_batch_fallback(graph, batch, begin, count, x, accum);
     }
 
     static void run_mult_adjoint_batch_fallback(
-        const Matrix& matrix,
+        DistGraph* graph,
         const PageBatch& batch,
         uint32_t begin,
         uint32_t count,
@@ -302,8 +311,8 @@ private:
             const int row = batch.row_block_index(idx);
             const int col = batch.col_block_index(idx);
             const T* block = batch.block_ptr(idx);
-            const T* x_ptr = x.local_data() + matrix.graph->block_offsets[row];
-            T* y_ptr = accum + matrix.graph->block_offsets[col];
+            const T* x_ptr = x.local_data() + graph->block_offsets[row];
+            T* y_ptr = accum + graph->block_offsets[col];
             SmartKernel<T>::gemv_trans(
                 batch.row_dim,
                 batch.col_dim,
@@ -319,7 +328,7 @@ private:
     }
 
     static void run_mult_dense_adjoint_batch(
-        const Matrix& matrix,
+        DistGraph* graph,
         const PageBatch& batch,
         uint32_t begin,
         uint32_t count,
@@ -333,14 +342,14 @@ private:
             return;
         }
         if (mode == ApplyMode::Batched) {
-            run_mult_dense_adjoint_batch_batched(matrix, batch, begin, count, X, ldb, num_vecs, ldc, accum);
+            run_mult_dense_adjoint_batch_batched(graph, batch, begin, count, X, ldb, num_vecs, ldc, accum);
             return;
         }
-        run_mult_dense_adjoint_batch_fallback(matrix, batch, begin, count, X, ldb, num_vecs, ldc, accum);
+        run_mult_dense_adjoint_batch_fallback(graph, batch, begin, count, X, ldb, num_vecs, ldc, accum);
     }
 
     static void run_mult_dense_adjoint_batch_fallback(
-        const Matrix& matrix,
+        DistGraph* graph,
         const PageBatch& batch,
         uint32_t begin,
         uint32_t count,
@@ -354,8 +363,8 @@ private:
             const int row = batch.row_block_index(idx);
             const int col = batch.col_block_index(idx);
             const T* block = batch.block_ptr(idx);
-            const T* x_ptr = &X(matrix.graph->block_offsets[row], 0);
-            T* y_ptr = accum + matrix.graph->block_offsets[col];
+            const T* x_ptr = &X(graph->block_offsets[row], 0);
+            T* y_ptr = accum + graph->block_offsets[col];
             SmartKernel<T>::gemm_trans(
                 batch.row_dim,
                 num_vecs,
@@ -372,7 +381,7 @@ private:
     }
 
     static void run_mult_batch_batched(
-        const Matrix& matrix,
+        DistGraph* graph,
         const PageBatch& batch,
         uint32_t begin,
         uint32_t count,
@@ -395,7 +404,7 @@ private:
 
             for (uint32_t idx = 0; idx < local_count; ++idx) {
                 const int col = batch.col_block_index(begin + offset + idx);
-                const T* x_ptr = x.data.data() + matrix.graph->block_offsets[col];
+                const T* x_ptr = x.data.data() + graph->block_offsets[col];
                 std::memcpy(
                     x_scratch.data() + static_cast<size_t>(idx) * batch.col_dim,
                     x_ptr,
@@ -420,7 +429,7 @@ private:
 
             for (uint32_t idx = 0; idx < local_count; ++idx) {
                 const int row = batch.row_block_index(begin + offset + idx);
-                T* y_ptr = accum + matrix.graph->block_offsets[row];
+                T* y_ptr = accum + graph->block_offsets[row];
                 const T* y_local = y_scratch.data() + static_cast<size_t>(idx) * batch.row_dim;
                 for (int i = 0; i < batch.row_dim; ++i) {
                     y_ptr[i] += y_local[i];
@@ -430,7 +439,7 @@ private:
     }
 
     static void run_mult_dense_batch_batched(
-        const Matrix& matrix,
+        DistGraph* graph,
         const PageBatch& batch,
         uint32_t begin,
         uint32_t count,
@@ -458,7 +467,7 @@ private:
 
             for (uint32_t idx = 0; idx < local_count; ++idx) {
                 const int col = batch.col_block_index(begin + offset + idx);
-                const T* x_ptr = &X(matrix.graph->block_offsets[col], 0);
+                const T* x_ptr = &X(graph->block_offsets[col], 0);
                 T* packed_b = b_scratch.data() + static_cast<size_t>(idx) * b_stride;
                 pack_multivector_block(x_ptr, ldb, batch.col_dim, num_vecs, packed_b);
             }
@@ -482,7 +491,7 @@ private:
 
             for (uint32_t idx = 0; idx < local_count; ++idx) {
                 const int row = batch.row_block_index(begin + offset + idx);
-                T* y_ptr = accum + matrix.graph->block_offsets[row];
+                T* y_ptr = accum + graph->block_offsets[row];
                 const T* y_local = c_scratch.data() + static_cast<size_t>(idx) * c_stride;
                 accumulate_multivector_block(y_ptr, ldc, y_local, batch.row_dim, num_vecs);
             }
@@ -490,7 +499,7 @@ private:
     }
 
     static void run_mult_adjoint_batch_batched(
-        const Matrix& matrix,
+        DistGraph* graph,
         const PageBatch& batch,
         uint32_t begin,
         uint32_t count,
@@ -513,7 +522,7 @@ private:
 
             for (uint32_t idx = 0; idx < local_count; ++idx) {
                 const int row = batch.row_block_index(begin + offset + idx);
-                const T* x_ptr = x.local_data() + matrix.graph->block_offsets[row];
+                const T* x_ptr = x.local_data() + graph->block_offsets[row];
                 std::memcpy(
                     x_scratch.data() + static_cast<size_t>(idx) * batch.row_dim,
                     x_ptr,
@@ -538,7 +547,7 @@ private:
 
             for (uint32_t idx = 0; idx < local_count; ++idx) {
                 const int col = batch.col_block_index(begin + offset + idx);
-                T* y_ptr = accum + matrix.graph->block_offsets[col];
+                T* y_ptr = accum + graph->block_offsets[col];
                 const T* y_local = y_scratch.data() + static_cast<size_t>(idx) * batch.col_dim;
                 for (int i = 0; i < batch.col_dim; ++i) {
                     y_ptr[i] += y_local[i];
@@ -548,7 +557,7 @@ private:
     }
 
     static void run_mult_dense_adjoint_batch_batched(
-        const Matrix& matrix,
+        DistGraph* graph,
         const PageBatch& batch,
         uint32_t begin,
         uint32_t count,
@@ -576,7 +585,7 @@ private:
 
             for (uint32_t idx = 0; idx < local_count; ++idx) {
                 const int row = batch.row_block_index(begin + offset + idx);
-                const T* x_ptr = &X(matrix.graph->block_offsets[row], 0);
+                const T* x_ptr = &X(graph->block_offsets[row], 0);
                 T* packed_b = b_scratch.data() + static_cast<size_t>(idx) * b_stride;
                 pack_multivector_block(x_ptr, ldb, batch.row_dim, num_vecs, packed_b);
             }
@@ -600,7 +609,7 @@ private:
 
             for (uint32_t idx = 0; idx < local_count; ++idx) {
                 const int col = batch.col_block_index(begin + offset + idx);
-                T* y_ptr = accum + matrix.graph->block_offsets[col];
+                T* y_ptr = accum + graph->block_offsets[col];
                 const T* y_local = c_scratch.data() + static_cast<size_t>(idx) * c_stride;
                 accumulate_multivector_block(y_ptr, ldc, y_local, batch.col_dim, num_vecs);
             }
@@ -617,10 +626,11 @@ private:
             return tasks;
         }
 
-        // Default scheduling unit is one non-empty shape page. We only split a page
-        // when batched apply is available and the total batch count is too small to
-        // feed the OpenMP team, because the scalar path already exposes work at the
-        // page level.
+        // Default scheduling unit is one non-empty shape page. Splitting is only
+        // useful for the batched path: scalar fallback already exposes page-level
+        // work, while a few huge repeated-shape pages can otherwise starve the
+        // OpenMP team. The split size is bounded by the same scratch budget used
+        // for packed operands and outputs in the batched micro-kernel launch.
         const bool should_split = batched_supported && should_split_apply_batches(batches.size());
         if (!should_split) {
             tasks.reserve(batches.size());
@@ -635,8 +645,6 @@ private:
 
         size_t estimated_tasks = 0;
         for (const auto& batch : batches) {
-            // choose chunk size choose the largest task size allowed by the memory budget for each batch
-            // given by kTargetScratchBytes
             const uint32_t task_size = choose_chunk_size(
                 scratch_elems_for_batch(batch),
                 batch.block_count());
@@ -738,6 +746,44 @@ private:
         #endif
     }
 };
+
+} // namespace vbcsr_apply_detail
+
+template <typename T, typename Kernel>
+void vbcsr_mult(
+    DistGraph* graph,
+    const VBCSRMatrixBackend<T, Kernel>& backend,
+    DistVector<T>& x,
+    DistVector<T>& y) {
+    vbcsr_apply_detail::ShapeBatchKernel<T, Kernel>::mult(graph, backend, x, y);
+}
+
+template <typename T, typename Kernel>
+void vbcsr_mult_dense(
+    DistGraph* graph,
+    const VBCSRMatrixBackend<T, Kernel>& backend,
+    DistMultiVector<T>& x,
+    DistMultiVector<T>& y) {
+    vbcsr_apply_detail::ShapeBatchKernel<T, Kernel>::mult_dense(graph, backend, x, y);
+}
+
+template <typename T, typename Kernel>
+void vbcsr_mult_adjoint(
+    DistGraph* graph,
+    const VBCSRMatrixBackend<T, Kernel>& backend,
+    DistVector<T>& x,
+    DistVector<T>& y) {
+    vbcsr_apply_detail::ShapeBatchKernel<T, Kernel>::mult_adjoint(graph, backend, x, y);
+}
+
+template <typename T, typename Kernel>
+void vbcsr_mult_dense_adjoint(
+    DistGraph* graph,
+    const VBCSRMatrixBackend<T, Kernel>& backend,
+    DistMultiVector<T>& x,
+    DistMultiVector<T>& y) {
+    vbcsr_apply_detail::ShapeBatchKernel<T, Kernel>::mult_dense_adjoint(graph, backend, x, y);
+}
 
 } // namespace vbcsr::detail
 
