@@ -4,6 +4,8 @@
 #include "bsr_backend.hpp"
 #include "csr_backend.hpp"
 #include "vbcsr_backend.hpp"
+#include <stdexcept>
+#include <variant>
 
 namespace vbcsr::detail {
 
@@ -13,29 +15,6 @@ using MatrixBackendHandle = std::variant<
     CSRMatrixBackend<T>,
     BSRMatrixBackend<T>,
     VBCSRMatrixBackend<T, Kernel>>;
-
-template <typename T, typename Kernel, typename Backend>
-MatrixBackendHandle<T, Kernel> make_backend_handle(Backend storage) {
-    return MatrixBackendHandle<T, Kernel>(
-        std::in_place_type<Backend>,
-        std::move(storage));
-}
-
-template <typename T, typename Kernel>
-MatrixBackendHandle<T, Kernel> make_csr_backend_handle(CSRMatrixBackend<T> storage) {
-    return make_backend_handle<T, Kernel>(std::move(storage));
-}
-
-template <typename T, typename Kernel>
-MatrixBackendHandle<T, Kernel> make_bsr_backend_handle(BSRMatrixBackend<T> storage) {
-    return make_backend_handle<T, Kernel>(std::move(storage));
-}
-
-template <typename T, typename Kernel>
-MatrixBackendHandle<T, Kernel> make_vbcsr_backend_handle(
-    VBCSRMatrixBackend<T, Kernel> storage) {
-    return make_backend_handle<T, Kernel>(std::move(storage));
-}
 
 template <typename Backend, typename T, typename Kernel>
 Backend& require_backend(

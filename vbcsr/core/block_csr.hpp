@@ -113,7 +113,6 @@ private:
     using CSRBackendStorage = detail::CSRMatrixBackend<T>;
     using BSRBackendStorage = detail::BSRMatrixBackend<T>;
     using BackendHandle = detail::MatrixBackendHandle<T, Kernel>;
-    using CommittedBackendStorage = BackendHandle;
 
     struct ConstructionToken {};
 
@@ -1491,7 +1490,7 @@ private:
     void rebuild_backend_for_page_size(const char* op_name);
 
     static MatrixKind detect_matrix_kind(const DistGraph* g);
-    static CommittedBackendStorage build_backend_for_structure(
+    static BackendHandle build_backend_for_structure(
         MatrixKind matrix_kind,
         DistGraph* graph,
         uint32_t page_size);
@@ -1499,7 +1498,7 @@ private:
     void attach_backend(VBCSRBackendStorage backend);
     void attach_backend(CSRBackendStorage backend);
     void attach_backend(BSRBackendStorage backend);
-    void attach_backend(CommittedBackendStorage backend);
+    void attach_backend(BackendHandle backend);
     static void ensure_same_backend_family(const BlockSpMat& lhs, const BlockSpMat& rhs, const char* op_name);
     static void ensure_csr_binary_compatibility(const BlockSpMat& lhs, const BlockSpMat& rhs);
     static void ensure_bsr_binary_compatibility(const BlockSpMat& lhs, const BlockSpMat& rhs);
@@ -1863,7 +1862,7 @@ MatrixKind BlockSpMat<T, Kernel>::detect_matrix_kind(const DistGraph* g) {
 }
 
 template <typename T, typename Kernel>
-typename BlockSpMat<T, Kernel>::CommittedBackendStorage BlockSpMat<T, Kernel>::build_backend_for_structure(
+typename BlockSpMat<T, Kernel>::BackendHandle BlockSpMat<T, Kernel>::build_backend_for_structure(
     MatrixKind matrix_kind,
     DistGraph* graph,
     uint32_t page_size) {
@@ -1873,7 +1872,9 @@ typename BlockSpMat<T, Kernel>::CommittedBackendStorage BlockSpMat<T, Kernel>::b
     case MatrixKind::CSR: {
         CSRBackendStorage backend;
         backend.initialize_structure(graph->adj_ind.size(), normalized);
-        return detail::make_csr_backend_handle<T, Kernel>(std::move(backend));
+        return BackendHandle(
+            std::in_place_type<CSRBackendStorage>,
+            std::move(backend));
     }
     case MatrixKind::BSR: {
         int block_size = 0;
@@ -1892,7 +1893,9 @@ typename BlockSpMat<T, Kernel>::CommittedBackendStorage BlockSpMat<T, Kernel>::b
 
         BSRBackendStorage backend;
         backend.initialize_structure(graph->adj_ind.size(), block_size, normalized);
-        return detail::make_bsr_backend_handle<T, Kernel>(std::move(backend));
+        return BackendHandle(
+            std::in_place_type<BSRBackendStorage>,
+            std::move(backend));
     }
     case MatrixKind::VBCSR: {
         VBCSRBackendStorage backend(normalized);
@@ -1931,8 +1934,9 @@ typename BlockSpMat<T, Kernel>::CommittedBackendStorage BlockSpMat<T, Kernel>::b
                     backend.append_block_for_shape(shape_id, graph_block_index));
             }
         }
-        // TODO: the logic behind this switch is too complex, need optimization
-        return detail::make_vbcsr_backend_handle<T, Kernel>(std::move(backend));
+        return BackendHandle(
+            std::in_place_type<VBCSRBackendStorage>,
+            std::move(backend));
     }
     }
     throw std::runtime_error("Unsupported matrix kind in build_backend_for_structure");
@@ -1941,7 +1945,7 @@ typename BlockSpMat<T, Kernel>::CommittedBackendStorage BlockSpMat<T, Kernel>::b
 template <typename T, typename Kernel>
 void BlockSpMat<T, Kernel>::attach_backend(VBCSRBackendStorage backend) {
     configured_page_size_ = backend.configured_blocks_per_page();
-    backend_handle_ = detail::make_vbcsr_backend_handle<T, Kernel>(std::move(backend));
+    backend_handle_.template emplace<VBCSRBackendStorage>(std::move(backend));
     block_norms.clear();
     norms_valid = false;
 }
@@ -1949,7 +1953,7 @@ void BlockSpMat<T, Kernel>::attach_backend(VBCSRBackendStorage backend) {
 template <typename T, typename Kernel>
 void BlockSpMat<T, Kernel>::attach_backend(CSRBackendStorage backend) {
     configured_page_size_ = backend.configured_page_size();
-    backend_handle_ = detail::make_csr_backend_handle<T, Kernel>(std::move(backend));
+    backend_handle_.template emplace<CSRBackendStorage>(std::move(backend));
     block_norms.clear();
     norms_valid = false;
 }
@@ -1957,16 +1961,21 @@ void BlockSpMat<T, Kernel>::attach_backend(CSRBackendStorage backend) {
 template <typename T, typename Kernel>
 void BlockSpMat<T, Kernel>::attach_backend(BSRBackendStorage backend) {
     configured_page_size_ = backend.configured_blocks_per_page();
-    backend_handle_ = detail::make_bsr_backend_handle<T, Kernel>(std::move(backend));
+    backend_handle_.template emplace<BSRBackendStorage>(std::move(backend));
     block_norms.clear();
     norms_valid = false;
 }
 
 template <typename T, typename Kernel>
-void BlockSpMat<T, Kernel>::attach_backend(CommittedBackendStorage backend) {
+void BlockSpMat<T, Kernel>::attach_backend(BackendHandle backend) {
     std::visit(
         [this](auto&& committed_backend) {
-            attach_backend(std::move(committed_backend));
+            using Backend = std::decay_t<decltype(committed_backend)>;
+            if constexpr (std::is_same_v<Backend, std::monostate>) {
+                throw std::logic_error("Cannot attach an empty backend handle");
+            } else {
+                attach_backend(std::move(committed_backend));
+            }
         },
         std::move(backend));
 }
