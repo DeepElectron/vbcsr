@@ -65,6 +65,7 @@ inline const char* matrix_kind_name(MatrixKind kind) {
 #include <set>
 #include <map>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <utility>
 
@@ -111,6 +112,13 @@ private:
     friend struct detail::VBCSRAxpbyExecutor;
     template <typename>
     friend struct detail::VBCSRSpMMExecutor;
+    template <typename U, typename K>
+    friend void graph_matrix_function(
+        BlockSpMat<U, K>&,
+        BlockSpMat<U, K>*,
+        std::function<U(double)>,
+        std::string,
+        bool);
 
     MatrixKind kind = MatrixKind::CSR;
     using VBCSRBackendStorage = detail::VBCSRMatrixBackend<T, Kernel>;

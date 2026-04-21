@@ -1,0 +1,12 @@
+The backend layer is the bridge between block_csr.hpp, the packed storage,
+and the apply kernels for SpMV/SpMM and their adjoints.
+
+Boundary rules:
+1. Storage backends own persistent matrix storage, page slicing metadata,
+   apply plans, vendor cache lifetime, and invalidation when storage moves or
+   changes.
+2. Vendor helper headers build and destroy persistent descriptors/handles from
+   backend-owned slices. They may know MKL/AOCL handle types, index-base
+   quirks, and cache variants, but not launch policy.
+3. Kernel headers own per-call execution policy: native versus vendor
+   dispatch, threading configuration, OpenMP division, and fallback behavior.

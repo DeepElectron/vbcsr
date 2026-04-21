@@ -123,6 +123,29 @@ struct CSRVendorAOCLDescr {
 };
 #endif
 
+// Vendor-facing CSR page view with row ownership and page-local row offsets.
+template <typename T>
+struct CSRPageBatch {
+    const int* cols = nullptr;
+    T* values = nullptr;
+    // Page-local CSR row pointer for this batch's NNZ window.
+    // Length is row_count() + 1.
+    // Each entry is rebased to this batch, so row_offsets[0] is always 0 and
+    // row_offsets[row_count()] is nnz_count.
+    // Row r in [row_begin, row_end) owns local NNZ
+    // [row_offsets[r - row_begin], row_offsets[r - row_begin + 1]).
+    const int* row_offsets = nullptr;
+    uint32_t nnz_count = 0;
+    uint32_t page_index = 0;
+    uint64_t first_nnz = 0;
+    int row_begin = 0;
+    int row_end = 0;
+
+    int row_count() const {
+        return row_end - row_begin;
+    }
+};
+
 template <typename T>
 struct CSRVendorPageEntry {
     // Owning storage for batch.row_offsets.

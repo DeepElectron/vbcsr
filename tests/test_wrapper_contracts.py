@@ -73,6 +73,54 @@ class TestWrapperContracts(unittest.TestCase):
         np.testing.assert_array_equal(mat.get_block(0, 0), np.array([[1.0, 2.0], [3.0, 4.0]]))
         np.testing.assert_array_equal(dup.get_block(0, 0), np.array([[2.0, 2.0], [3.0, 5.0]]))
 
+    def test_non_contiguous_blocks_and_backend_surface(self):
+        mat = VBCSR.create_serial(2, [2, 2], [[0, 1], [1]], comm=comm_self())
+
+        sliced = np.arange(16.0).reshape(4, 4)[::2, ::2]
+        fortran = np.asfortranarray([[1.0, 2.0], [3.0, 4.0]])
+        self.assertFalse(sliced.flags.c_contiguous)
+        self.assertFalse(fortran.flags.c_contiguous)
+
+        mat.add_block(0, 0, sliced)
+        mat.add_block(0, 1, fortran)
+        mat.add_block(1, 1, np.eye(2))
+        mat.assemble()
+
+        self.assertEqual(mat.matrix_kind, "bsr")
+        self.assertEqual(mat.local_block_nnz, 3)
+        self.assertEqual(mat.local_nnz, 12)
+        self.assertEqual(mat.shape_class_count, 0)
+        self.assertTrue(mat.has_contiguous_layout)
+
+        page_size = mat.page_size
+        mat.page_size = page_size
+        self.assertEqual(mat.page_size, page_size)
+        self.assertGreaterEqual(mat.configured_page_size, mat.page_size)
+        mat.pack_contiguous()
+
+        np.testing.assert_array_equal(mat.get_block(0, 0), sliced)
+        np.testing.assert_array_equal(mat.get_block(0, 1), fortran)
+
+        dense = mat.to_dense()
+        non_contiguous_dense = np.asfortranarray(dense)
+        self.assertFalse(non_contiguous_dense.flags.c_contiguous)
+        mat.from_dense(non_contiguous_dense)
+        np.testing.assert_array_equal(mat.to_dense(), dense)
+
+        filled = mat.duplicate()
+        filled.fill(2.0)
+        np.testing.assert_allclose(filled.to_dense()[filled.to_dense() != 0.0], 2.0)
+
+        copied = mat.duplicate()
+        copied.fill(0.0)
+        copied.copy_from(mat)
+        np.testing.assert_allclose(copied.to_dense(), mat.to_dense())
+
+        axpby = mat.duplicate()
+        axpby.fill(0.0)
+        axpby.axpby(1.0, mat, 0.0)
+        np.testing.assert_allclose(axpby.to_dense(), mat.to_dense())
+
     def test_extract_submatrix_has_shape_and_dense_export(self):
         comm = comm_self()
         mat = VBCSR.create_serial(2, [2, 3], [[0, 1], [0, 1]], comm=comm)

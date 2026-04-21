@@ -4,7 +4,10 @@
 #include <pybind11/numpy.h>
 #include <mpi.h>
 
+#include <cstdint>
 #include <cstring>
+#include <stdexcept>
+#include <string>
 
 #include "dist_graph.hpp"
 #include "block_csr.hpp"
@@ -44,6 +47,17 @@ py::array_t<T> make_owned_array_2d_row_major(const std::vector<T>& data, py::ssi
         {cols * static_cast<py::ssize_t>(sizeof(T)), static_cast<py::ssize_t>(sizeof(T))},
         heap_data,
         owner);
+}
+
+template <typename T>
+py::array_t<T, py::array::c_style | py::array::forcecast> as_row_major_2d(
+    py::array_t<T> array,
+    const char* context) {
+    py::array_t<T, py::array::c_style | py::array::forcecast> contiguous(array);
+    if (contiguous.ndim() != 2) {
+        throw std::runtime_error(std::string(context) + ": array must be 2D");
+    }
+    return contiguous;
 }
 
 // Forward declaration for atomic module binding
@@ -140,16 +154,18 @@ void bind_block_spmat(py::module& m, const std::string& name) {
             [](BlockSpMat<T>& self) { return self.graph; },
             py::return_value_policy::reference_internal)
         .def("add_block", [](BlockSpMat<T>& mat, int g_row, int g_col, py::array_t<T> data, AssemblyMode mode) {
-            py::buffer_info info = data.request();
-            if (info.ndim != 2) throw std::runtime_error("Data must be 2D");
-            int rows = info.shape[0];
-            int cols = info.shape[1];
-            // Check layout
-            MatrixLayout layout = MatrixLayout::RowMajor;
-            if (info.strides[0] == sizeof(T) && info.strides[1] == sizeof(T) * rows) {
-                layout = MatrixLayout::ColMajor;
-            }
-            mat.add_block(g_row, g_col, static_cast<T*>(info.ptr), rows, cols, mode, layout);
+            auto contiguous = as_row_major_2d<T>(data, "add_block");
+            py::buffer_info info = contiguous.request();
+            const int rows = static_cast<int>(info.shape[0]);
+            const int cols = static_cast<int>(info.shape[1]);
+            mat.add_block(
+                g_row,
+                g_col,
+                static_cast<T*>(info.ptr),
+                rows,
+                cols,
+                mode,
+                MatrixLayout::RowMajor);
         }, py::arg("g_row"), py::arg("g_col"), py::arg("data"), py::arg("mode") = AssemblyMode::ADD)
         .def("assemble", &BlockSpMat<T>::assemble)
         .def("mult", &BlockSpMat<T>::mult)
@@ -163,6 +179,9 @@ void bind_block_spmat(py::module& m, const std::string& name) {
         .def("shift", &BlockSpMat<T>::shift)
         .def("add_diagonal", &BlockSpMat<T>::add_diagonal)
         .def("axpy", &BlockSpMat<T>::axpy)
+        .def("axpby", &BlockSpMat<T>::axpby)
+        .def("copy_from", &BlockSpMat<T>::copy_from)
+        .def("fill", &BlockSpMat<T>::fill)
         .def("duplicate", &BlockSpMat<T>::duplicate, py::arg("independent_graph") = true)
         .def("save_matrix_market", &BlockSpMat<T>::save_matrix_market)
         .def("spmm", &BlockSpMat<T>::spmm, py::arg("B"), py::arg("threshold"), py::arg("transA") = false, py::arg("transB") = false)
@@ -190,6 +209,28 @@ void bind_block_spmat(py::module& m, const std::string& name) {
         .def_property_readonly("local_nnz", [](const BlockSpMat<T>& self) {
             return self.local_scalar_nnz();
         })
+        .def_property_readonly("local_block_nnz", [](const BlockSpMat<T>& self) {
+            return self.local_block_nnz();
+        })
+        .def_property_readonly("configured_page_size", [](const BlockSpMat<T>& self) {
+            return self.configured_page_size();
+        })
+        .def_property(
+            "page_size",
+            [](const BlockSpMat<T>& self) {
+                return self.page_size();
+            },
+            [](BlockSpMat<T>& self, uint32_t page_size) {
+                self.set_page_size(page_size);
+            })
+        .def("set_page_size", &BlockSpMat<T>::set_page_size, py::arg("page_size"))
+        .def_property_readonly("shape_class_count", [](const BlockSpMat<T>& self) {
+            return self.shape_class_count();
+        })
+        .def_property_readonly("has_contiguous_layout", [](const BlockSpMat<T>& self) {
+            return self.has_contiguous_layout();
+        })
+        .def("pack_contiguous", &BlockSpMat<T>::pack_contiguous)
         .def_property_readonly("global_nnz", [](const BlockSpMat<T>& self) {
             long long local_nnz = static_cast<long long>(self.local_scalar_nnz());
             long long global_nnz = local_nnz;
@@ -211,35 +252,23 @@ void bind_block_spmat(py::module& m, const std::string& name) {
             return make_owned_array_2d_row_major(vec, my_rows, my_cols);
         })
         .def("from_dense", [](BlockSpMat<T>& self, py::array_t<T> array) {
-            // Check dimensions
-            if (array.ndim() != 2) throw std::runtime_error("from_dense: array must be 2D");
-            
-            // Convert to flat vector (RowMajor)
-            std::vector<T> vec(array.size());
-            
-            // Copy logic using buffer info
-            py::buffer_info info = array.request();
-            
-            // Check if contiguous and RowMajor for fast copy
-            bool is_contiguous = (info.strides[1] == sizeof(T) && info.strides[0] == sizeof(T) * info.shape[1]);
-            
-            if (is_contiguous) {
-                std::memcpy(vec.data(), info.ptr, sizeof(T) * array.size());
-            } else {
-                // Slow copy for non-contiguous
-                T* ptr = static_cast<T*>(info.ptr);
-                // We need to iterate carefully if strides are weird, but let's assume standard numpy access
-                // Actually, let's just use unchecked access for simplicity if we wanted, but memcpy is preferred.
-                // If not contiguous, we can let numpy copy it to a contiguous buffer first?
-                // Or just loop.
-                auto r = array.template unchecked<2>();
-                for (py::ssize_t i = 0; i < info.shape[0]; i++) {
-                    for (py::ssize_t j = 0; j < info.shape[1]; j++) {
-                        vec[i * info.shape[1] + j] = r(i, j);
-                    }
-                }
+            auto contiguous = as_row_major_2d<T>(array, "from_dense");
+            py::buffer_info info = contiguous.request();
+
+            const size_t owned_blocks = self.graph->owned_global_indices.size();
+            const py::ssize_t expected_rows =
+                self.graph->block_offsets[owned_blocks];
+            const py::ssize_t expected_cols =
+                self.graph->block_offsets.empty() ? 0 : self.graph->block_offsets.back();
+            if (info.shape[0] != expected_rows || info.shape[1] != expected_cols) {
+                throw std::runtime_error(
+                    "from_dense: expected shape (" +
+                    std::to_string(expected_rows) + ", " +
+                    std::to_string(expected_cols) + ")");
             }
-            
+
+            std::vector<T> vec(static_cast<size_t>(contiguous.size()));
+            std::memcpy(vec.data(), info.ptr, sizeof(T) * vec.size());
             self.from_dense(vec);
         }, py::arg("array"))
         .def("spmf", &py_graph_matrix_function<T>, py::arg("func_name"), py::arg("method") = "lanczos", py::arg("verbose") = false)

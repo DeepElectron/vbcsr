@@ -86,6 +86,41 @@ def generate_random_structure(global_blocks: int, block_sizes: list[int], densit
     return block_sizes, adj
 
 
+def sort_sparse_indices(matrix):
+    if hasattr(matrix, "sort_indices"):
+        matrix.sort_indices()
+    return matrix
+
+
+def make_mkl_sparse_baseline(scalar_csr, block_sizes: list[int]):
+    unique_block_sizes = sorted({int(size) for size in block_sizes})
+    info = {
+        "mkl_sparse_format": "csr",
+        "mkl_blocksize": None,
+        "mkl_format_reason": "variable_block_sizes",
+    }
+
+    if len(unique_block_sizes) == 1:
+        block_size = unique_block_sizes[0]
+        if block_size == 1:
+            info["mkl_format_reason"] = "scalar_blocks"
+            return sort_sparse_indices(scalar_csr), info
+
+        if (
+            scalar_csr.shape[0] % block_size == 0 and
+            scalar_csr.shape[1] % block_size == 0
+        ):
+            bsr = scalar_csr.tobsr(blocksize=(block_size, block_size))
+            info["mkl_sparse_format"] = "bsr"
+            info["mkl_blocksize"] = [block_size, block_size]
+            info["mkl_format_reason"] = "uniform_non_scalar_blocks"
+            return sort_sparse_indices(bsr), info
+
+        info["mkl_format_reason"] = "uniform_block_size_does_not_divide_shape"
+
+    return sort_sparse_indices(scalar_csr), info
+
+
 def make_snapshot(args: argparse.Namespace, rank_count: int, dtype: np.dtype, mat, timings: dict[str, float], extra: dict[str, object]) -> dict[str, object]:
     snapshot = {
         "preset": args.label or f"{args.family}:{args.profile}",
@@ -304,9 +339,11 @@ def main():
     timings["vbcsr"] = t_vbcsr
 
     sp_mat = None
+    mkl_sp_mat = None
+    baseline_info: dict[str, object] = {}
     if (args.scipy or args.mkl) and size == 1:
         if rank == 0:
-            print("Building SciPy CSR...", flush=True)
+            print("Building scalar CSR baseline...", flush=True)
         t0 = time.perf_counter()
         if scipy_rows:
             all_rows = np.concatenate(scipy_rows)
@@ -315,9 +352,27 @@ def main():
             sp_mat = scipy.sparse.csr_matrix((all_data, (all_rows, all_cols)), shape=mat.shape)
         else:
             sp_mat = scipy.sparse.csr_matrix(mat.shape, dtype=dtype)
+        sort_sparse_indices(sp_mat)
         timings["scipy_build"] = time.perf_counter() - t0
         if rank == 0:
-            print(f"SciPy Generation Time: {timings['scipy_build']:.4f} s")
+            print(f"Scalar CSR Generation Time: {timings['scipy_build']:.4f} s")
+
+        if args.mkl:
+            if rank == 0:
+                print("Selecting MKL sparse baseline format...", flush=True)
+            t0 = time.perf_counter()
+            mkl_sp_mat, baseline_info = make_mkl_sparse_baseline(sp_mat, block_sizes)
+            timings["mkl_sparse_build"] = time.perf_counter() - t0
+            if rank == 0:
+                blocksize = baseline_info.get("mkl_blocksize")
+                blocksize_text = f", blocksize={blocksize}" if blocksize is not None else ""
+                print(
+                    "MKL sparse baseline: "
+                    f"{baseline_info['mkl_sparse_format']}"
+                    f"{blocksize_text} "
+                    f"({baseline_info['mkl_format_reason']})"
+                )
+                print(f"MKL sparse format build time: {timings['mkl_sparse_build']:.4f} s")
 
     if args.scipy and size == 1 and sp_mat is not None:
         if args.mode == "mult":
@@ -331,14 +386,18 @@ def main():
         if rank == 0:
             print(f"Speedup (SciPy / VBCSR): {comparisons['scipy_speedup']:.2f}x")
 
-    if args.mkl and size == 1 and sp_mat is not None and sparse_dot_mkl is not None:
+    if args.mkl and size == 1 and mkl_sp_mat is not None and sparse_dot_mkl is not None:
         if args.mode == "mult":
-            op_mkl = lambda: sparse_dot_mkl.dot_product_mkl(sp_mat, x_np)
+            op_mkl = lambda: sparse_dot_mkl.dot_product_mkl(mkl_sp_mat, x_np)
         elif args.mode == "mult_dense":
-            x_np_mkl = np.asfortranarray(x_np)
-            op_mkl = lambda: sparse_dot_mkl.dot_product_mkl(sp_mat, x_np_mkl)
+            # sparse_dot_mkl accepts both row-major and column-major dense RHS
+            # arrays, but its sparse x dense path is much faster with a C-order
+            # RHS in this benchmark. DistMultiVector exposes a Fortran-order
+            # view, so make the layout explicit before timing sparse_dot_mkl.
+            x_np_mkl = np.ascontiguousarray(x_np)
+            op_mkl = lambda: sparse_dot_mkl.dot_product_mkl(mkl_sp_mat, x_np_mkl)
         else:
-            op_mkl = lambda: sparse_dot_mkl.dot_product_mkl(sp_mat, sp_mat)
+            op_mkl = lambda: sparse_dot_mkl.dot_product_mkl(mkl_sp_mat, mkl_sp_mat)
 
         try:
             t_mkl = benchmark_op(op_mkl, f"MKL {args.mode}")
@@ -372,7 +431,17 @@ def main():
             print(f"Relative Difference (SciPy): {diff:.2e}")
 
     if rank == 0 and args.snapshot_out:
-        snapshot = make_snapshot(args, size, np.dtype(dtype), mat, timings, {"comparisons": comparisons})
+        snapshot = make_snapshot(
+            args,
+            size,
+            np.dtype(dtype),
+            mat,
+            timings,
+            {
+                "comparisons": comparisons,
+                "baseline": baseline_info,
+            },
+        )
         write_snapshot(args.snapshot_out, snapshot)
         print(f"Wrote snapshot to {args.snapshot_out}")
 

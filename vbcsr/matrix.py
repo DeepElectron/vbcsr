@@ -114,6 +114,40 @@ class VBCSR(LinearOperator):
         return self._core.matrix_kind
 
     @property
+    def local_nnz(self) -> int:
+        return int(self._core.local_nnz)
+
+    @property
+    def local_block_nnz(self) -> int:
+        return int(self._core.local_block_nnz)
+
+    @property
+    def configured_page_size(self) -> int:
+        return int(self._core.configured_page_size)
+
+    @property
+    def page_size(self) -> int:
+        return int(self._core.page_size)
+
+    @page_size.setter
+    def page_size(self, value: int) -> None:
+        self.set_page_size(value)
+
+    def set_page_size(self, value: int) -> None:
+        self._core.set_page_size(int(value))
+
+    @property
+    def shape_class_count(self) -> int:
+        return int(self._core.shape_class_count)
+
+    @property
+    def has_contiguous_layout(self) -> bool:
+        return bool(self._core.has_contiguous_layout)
+
+    def pack_contiguous(self) -> None:
+        self._core.pack_contiguous()
+
+    @property
     def T(self) -> 'VBCSR':
         return self.transpose()
 
@@ -459,6 +493,24 @@ class VBCSR(LinearOperator):
     def scale(self, alpha: Union[float, complex, int]) -> None:
         """Scale the matrix by a scalar."""
         self._core.scale(alpha)
+
+    def fill(self, value: Union[float, complex, int]) -> None:
+        """Fill all currently stored blocks with a scalar value."""
+        self._core.fill(value)
+
+    def copy_from(self, other: 'VBCSR') -> None:
+        """Copy values from another matrix with the same logical structure."""
+        if not isinstance(other, VBCSR):
+            raise TypeError("copy_from expects a VBCSR matrix")
+        self._core.copy_from(other._core)
+        self._global_nnz = other._global_nnz
+
+    def axpby(self, alpha: Union[float, complex, int], x: 'VBCSR', beta: Union[float, complex, int]) -> None:
+        """Compute self = alpha * x + beta * self in place."""
+        if not isinstance(x, VBCSR):
+            raise TypeError("axpby expects a VBCSR matrix")
+        self._core.axpby(alpha, x._core, beta)
+        self._invalidate_nnz()
 
     def shift(self, alpha: Union[float, complex, int]) -> None:
         """Add a scalar to the diagonal elements."""
