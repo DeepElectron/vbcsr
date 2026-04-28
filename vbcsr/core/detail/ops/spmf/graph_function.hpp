@@ -20,8 +20,13 @@
 namespace vbcsr {
 
 
-template <typename T, typename Kernel = DefaultKernel<T>>
-void graph_matrix_function(BlockSpMat<T, Kernel>& A, BlockSpMat<T, Kernel>* Result, std::function<T(double)> func, std::string method = "lanczos", bool verbose = false) {
+template <typename T, typename Kernel>
+void graph_matrix_function(
+    BlockSpMat<T, Kernel>& A,
+    BlockSpMat<T, Kernel>* Result,
+    std::function<T(double)> func,
+    std::string method,
+    bool verbose) {
     
     DistGraph* graph = A.graph;
     int rank = graph->rank;

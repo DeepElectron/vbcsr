@@ -57,6 +57,7 @@ inline const char* matrix_kind_name(MatrixKind kind) {
 #include <fstream>
 #include <iomanip>
 #include <complex>
+#include <cmath>
 #include <limits>
 #include <string>
 #include <stdexcept>
@@ -234,6 +235,51 @@ public:
 
     void pack_contiguous() {
         require_assembled_for_state_copy("pack_contiguous");
+    }
+
+    double maxabs() const {
+        require_live_graph(graph, "maxabs");
+
+        const int nnz = static_cast<int>(local_block_nnz());
+        double local_max = 0.0;
+
+        #pragma omp parallel for reduction(max:local_max)
+        for (int i = 0; i < nnz; ++i) {
+            const T* data = block_data(i);
+            const size_t size = block_size_elements(i);
+            for (size_t k = 0; k < size; ++k) {
+                using std::abs;
+                local_max = std::max(local_max, static_cast<double>(abs(data[k])));
+            }
+        }
+
+        double global_max = local_max;
+        if (graph->size > 1) {
+            MPI_Allreduce(&local_max, &global_max, 1, MPI_DOUBLE, MPI_MAX, graph->comm);
+        }
+        return global_max;
+    }
+
+    double frobenius_norm() const {
+        require_live_graph(graph, "frobenius_norm");
+
+        const int nnz = static_cast<int>(local_block_nnz());
+        double local_sum = 0.0;
+
+        #pragma omp parallel for reduction(+:local_sum)
+        for (int i = 0; i < nnz; ++i) {
+            const T* data = block_data(i);
+            const size_t size = block_size_elements(i);
+            for (size_t k = 0; k < size; ++k) {
+                local_sum += get_sq_norm(data[k]);
+            }
+        }
+
+        double global_sum = local_sum;
+        if (graph->size > 1) {
+            MPI_Allreduce(&local_sum, &global_sum, 1, MPI_DOUBLE, MPI_SUM, graph->comm);
+        }
+        return std::sqrt(global_sum);
     }
 
     size_t local_scalar_nnz() const {
