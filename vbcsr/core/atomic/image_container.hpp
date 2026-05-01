@@ -46,10 +46,10 @@ public:
     }
 
     ~ImageContainer() {
-        for (auto& kv : image_graphs) {
+        for (auto& kv : image_blocks) {
             delete kv.second;
         }
-        for (auto& kv : image_blocks) {
+        for (auto& kv : image_graphs) {
             delete kv.second;
         }
     }

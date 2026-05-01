@@ -116,9 +116,16 @@ public:
     }
 
     ~DistGraph() {
-        if (neighbor_comm != MPI_COMM_NULL) {
+        int initialized = 0;
+        int finalized = 0;
+        MPI_Initialized(&initialized);
+        if (initialized) {
+            MPI_Finalized(&finalized);
+        }
+        if (initialized && !finalized && neighbor_comm != MPI_COMM_NULL) {
             MPI_Comm_free(&neighbor_comm);
         }
+        neighbor_comm = MPI_COMM_NULL;
     }
 
     // Copy constructor (deep copy except for MPI_Comm handles that shouldn't be shared)
