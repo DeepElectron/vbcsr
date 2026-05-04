@@ -173,6 +173,53 @@ class TestWrapperContracts(unittest.TestCase):
         np.testing.assert_allclose(mv_dup.to_numpy(), np.ones((2, 2)))
         np.testing.assert_allclose(mv.to_numpy(), np.full((2, 2), 3.0))
 
+    def test_mult_adjoint_vector_and_preallocated_output(self):
+        mat = build_sample_matrix()
+        scipy_adjoint = mat.to_scipy(format="csr").getH().tocsr()
+        x_np = np.arange(1, mat.shape[0] + 1, dtype=np.float64)
+
+        result = mat.mult_adjoint(x_np)
+        np.testing.assert_allclose(result.to_numpy(), scipy_adjoint.dot(x_np))
+
+        x_vec = mat.create_vector()
+        x_vec.from_numpy(x_np)
+        result_vec = mat.mult_adjoint(x_vec)
+        np.testing.assert_allclose(result_vec.to_numpy(), scipy_adjoint.dot(x_np))
+
+        y = mat.create_vector()
+        returned = mat.mult_adjoint(x_np, y)
+        self.assertIs(returned, y)
+        np.testing.assert_allclose(y.to_numpy(), scipy_adjoint.dot(x_np))
+
+    def test_mult_adjoint_multivector_and_linear_operator_hooks(self):
+        mat = build_sample_matrix()
+        scipy_adjoint = mat.to_scipy(format="csr").getH().tocsr()
+        x_np = np.arange(1, 11, dtype=np.float64).reshape(mat.shape[0], 2)
+
+        result = mat.mult_adjoint(x_np)
+        np.testing.assert_allclose(result.to_numpy(), scipy_adjoint.dot(x_np))
+
+        x_mv = mat.create_multivector(2)
+        x_mv.from_numpy(x_np)
+        result_mv = mat.mult_adjoint(x_mv)
+        np.testing.assert_allclose(result_mv.to_numpy(), scipy_adjoint.dot(x_np))
+
+        np.testing.assert_allclose(mat._rmatvec(x_np[:, 0]), scipy_adjoint.dot(x_np[:, 0]))
+        np.testing.assert_allclose(mat._rmatmat(x_np), scipy_adjoint.dot(x_np))
+
+    def test_complex_mult_adjoint_matches_conjugate_transpose(self):
+        mat = build_sample_matrix(dtype=np.complex128)
+        mat.shift(1.0j)
+        scipy_adjoint = mat.to_scipy(format="csr").getH().tocsr()
+
+        x_vec = np.linspace(1.0, 2.0, mat.shape[0]) + 1j * np.linspace(0.5, 1.5, mat.shape[0])
+        y_vec = mat.mult_adjoint(x_vec).to_numpy()
+        np.testing.assert_allclose(y_vec, scipy_adjoint.dot(x_vec))
+
+        x_mat = np.column_stack([x_vec, 2.0 * x_vec])
+        y_mat = mat.mult_adjoint(x_mat).to_numpy()
+        np.testing.assert_allclose(y_mat, scipy_adjoint.dot(x_mat))
+
     def test_matrix_wrapper_matches_core_utility_surface(self):
         mat = build_sample_matrix()
         core = mat._core.duplicate()

@@ -462,6 +462,45 @@ class VBCSR(LinearOperator):
         else:
             raise TypeError("mult expects DistVector, DistMultiVector, or numpy.ndarray")
 
+    def mult_adjoint(self, x: Union[DistVector, DistMultiVector, np.ndarray], y: Optional[Union[DistVector, DistMultiVector]] = None) -> Union[DistVector, DistMultiVector]:
+        """
+        Perform adjoint matrix multiplication: y = A^H * x.
+
+        Args:
+            x: Input vector (DistVector), multivector (DistMultiVector), or numpy array.
+               If numpy array, it is assumed to be the local part of the vector/multivector.
+            y: Output vector or multivector (optional).
+
+        Returns:
+            The result y.
+        """
+        # Auto-convert numpy array
+        if isinstance(x, np.ndarray):
+            if x.ndim == 1:
+                v = self.create_vector()
+                v.from_numpy(x)
+                x = v
+            elif x.ndim == 2:
+                k = x.shape[1]
+                mv = self.create_multivector(k)
+                mv.from_numpy(x)
+                x = mv
+            else:
+                raise ValueError("Input numpy array must be 1D or 2D")
+
+        if isinstance(x, DistVector):
+            if y is None:
+                y = self.create_vector()
+            self._core.mult_adjoint(x._core, y._core)
+            return y
+        elif isinstance(x, DistMultiVector):
+            if y is None:
+                y = self.create_multivector(x.num_vectors)
+            self._core.mult_dense_adjoint(x._core, y._core)
+            return y
+        else:
+            raise TypeError("mult_adjoint expects DistVector, DistMultiVector, or numpy.ndarray")
+
     def _matvec(self, x: np.ndarray) -> np.ndarray:
         """
         Matrix-vector multiplication for SciPy LinearOperator.
@@ -490,6 +529,16 @@ class VBCSR(LinearOperator):
         res = self.mult(X)
         return res.to_numpy()
 
+    def _rmatvec(self, x: np.ndarray) -> np.ndarray:
+        """Adjoint matrix-vector multiplication for SciPy LinearOperator."""
+        res = self.mult_adjoint(x)
+        return res.to_numpy()
+
+    def _rmatmat(self, X: np.ndarray) -> np.ndarray:
+        """Adjoint matrix-matrix multiplication for SciPy LinearOperator."""
+        res = self.mult_adjoint(X)
+        return res.to_numpy()
+
     def scale(self, alpha: Union[float, complex, int]) -> None:
         """Scale the matrix by a scalar."""
         self._core.scale(alpha)
@@ -497,6 +546,10 @@ class VBCSR(LinearOperator):
     def fill(self, value: Union[float, complex, int]) -> None:
         """Fill all currently stored blocks with a scalar value."""
         self._core.fill(value)
+
+    def fill_random(self) -> None:
+        """Fill all currently stored blocks with random values."""
+        self._core.fill_random()
 
     def copy_from(self, other: 'VBCSR') -> None:
         """Copy values from another matrix with the same logical structure."""

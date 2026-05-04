@@ -1,4 +1,5 @@
 import argparse
+import ctypes
 import json
 import os
 import shlex
@@ -24,7 +25,9 @@ PRESET_PROFILES = {
 }
 
 VBCSR_SHAPES = np.array([9, 13, 15, 20], dtype=np.int32)
-CANONICAL_MODES = ("mult", "mult_dense", "spmm")
+CANONICAL_MODES = ("mult", "mult_dense", "mult_adjoint", "mult_dense_adjoint", "spmm")
+DENSE_MODES = ("mult_dense", "mult_dense_adjoint")
+ADJOINT_MODES = ("mult_adjoint", "mult_dense_adjoint")
 
 
 def try_get_git_commit() -> str:
@@ -53,24 +56,31 @@ def apply_profile_defaults(args: argparse.Namespace) -> None:
         args.min_block = 1
         args.max_block = 1
     elif args.family == "bsr":
-        args.min_block = 8
-        args.max_block = 8
+        if args.min_block is None:
+            args.min_block = 8
+        if args.max_block is None:
+            args.max_block = 8
     elif args.family == "vbcsr":
         args.min_block = int(VBCSR_SHAPES.min())
         args.max_block = int(VBCSR_SHAPES.max())
+    elif args.family == "random":
+        args.min_block = 1 if args.min_block is None else args.min_block
+        args.max_block = 16 if args.max_block is None else args.max_block
     else:
-        args.min_block = 10 if args.min_block is None else args.min_block
-        args.max_block = 50 if args.max_block is None else args.max_block
+        raise ValueError(f"Unknown family: {args.family}")
 
 def generate_block_sizes(global_blocks: int, family: str, block_size_min: int, block_size_max: int, seed: int = 42) -> list[int]:
     rng = np.random.default_rng(seed)
     if family == "csr":
         return [1] * global_blocks
     if family == "bsr":
-        return [8] * global_blocks
+        assert block_size_min == block_size_max, "For BSR family, min_block and max_block must be equal"
+        return [block_size_min] * global_blocks
     if family == "vbcsr":
         return rng.choice(VBCSR_SHAPES, size=global_blocks, replace=True).astype(int).tolist()
-    return rng.integers(block_size_min, block_size_max + 1, size=global_blocks).astype(int).tolist()
+    if family == "random":
+        return rng.integers(block_size_min, block_size_max + 1, size=global_blocks).astype(int).tolist()
+    raise ValueError(f"Unknown family: {family}")
 
 
 def generate_random_structure(global_blocks: int, block_sizes: list[int], density: float, seed: int = 42) -> tuple[list[int], list[list[int]]]:
@@ -119,6 +129,238 @@ def make_mkl_sparse_baseline(scalar_csr, block_sizes: list[int]):
         info["mkl_format_reason"] = "uniform_block_size_does_not_divide_shape"
 
     return sort_sparse_indices(scalar_csr), info
+
+
+def make_scalar_csr_from_vbcsr(mat):
+    """Build an aligned scalar CSR baseline from the already-filled VBCSR matrix."""
+    if mat.matrix_kind in ("csr", "bsr"):
+        return sort_sparse_indices(mat.to_scipy(format="bsr").tocsr())
+    return sort_sparse_indices(mat.to_scipy(format="csr"))
+
+
+class CachedMKLSparseOp:
+    """Reusable MKL sparse handle for fair repeated SpMV/sparse-dense timing."""
+
+    def __init__(self, sparse_matrix, rhs: np.ndarray, mode: str):
+        if mode not in ("mult", "mult_dense", "mult_adjoint", "mult_dense_adjoint"):
+            raise ValueError(f"Cached MKL baseline does not support mode {mode!r}")
+
+        from sparse_dot_mkl._mkl_interface import (
+            LAYOUT_CODE_C,
+            MKL,
+            SPARSE_OPERATION_CONJUGATE_TRANSPOSE,
+            SPARSE_DIAG_NON_UNIT,
+            SPARSE_FILL_MODE_FULL,
+            SPARSE_MATRIX_TYPE_GENERAL,
+            SPARSE_OPERATION_NON_TRANSPOSE,
+            SPARSE_OPERATION_TRANSPOSE,
+            _check_return_value,
+            _create_mkl_sparse,
+            _destroy_mkl_handle,
+            _get_numpy_layout,
+            _mkl_scalar,
+            _output_dtypes,
+            matrix_descr,
+            sparse_matrix_t,
+        )
+
+        self._check_return_value = _check_return_value
+        self._destroy_mkl_handle = _destroy_mkl_handle
+        self._get_numpy_layout = _get_numpy_layout
+        self._sparse_matrix_t = sparse_matrix_t
+        self._MKL = MKL
+        self._handle = None
+        self.mode = mode
+        self.info = {
+            "mkl_runner": "cached_sparse_handle",
+            "mkl_handle_reused": True,
+            "mkl_call_binding": "raw_ctypes_pointers",
+        }
+
+        self._handle, self._double_precision, self._complex_type = _create_mkl_sparse(sparse_matrix)
+        self._descr = matrix_descr(
+            SPARSE_MATRIX_TYPE_GENERAL,
+            SPARSE_FILL_MODE_FULL,
+            SPARSE_DIAG_NON_UNIT,
+        )
+        self._adjoint = mode in ADJOINT_MODES
+        if self._adjoint:
+            self._operation = (
+                SPARSE_OPERATION_CONJUGATE_TRANSPOSE
+                if self._complex_type
+                else SPARSE_OPERATION_TRANSPOSE
+            )
+            output_rows = sparse_matrix.shape[1]
+        else:
+            self._operation = SPARSE_OPERATION_NON_TRANSPOSE
+            output_rows = sparse_matrix.shape[0]
+        self._alpha = _mkl_scalar(1.0, self._complex_type, self._double_precision)
+        self._beta = _mkl_scalar(0.0, self._complex_type, self._double_precision)
+        self._scalar_ctype = (
+            type(self._alpha)
+            if self._complex_type
+            else (ctypes.c_double if self._double_precision else ctypes.c_float)
+        )
+        self.output = None
+
+        if mode in ("mult", "mult_adjoint"):
+            self._rhs = np.asarray(rhs).ravel()
+            self.output = np.empty(
+                output_rows,
+                dtype=_output_dtypes[(self._double_precision, self._complex_type)],
+            )
+            self._func = self._mv_function()
+            self._bind_mv_signature()
+            self._rhs_ptr = ctypes.c_void_p(self._rhs.ctypes.data)
+            self._out_ptr = ctypes.c_void_p(self.output.ctypes.data)
+            self._apply_hints(kind="mv", columns=1)
+        else:
+            rhs_arr = np.asarray(rhs)
+            if not (rhs_arr.flags.c_contiguous or rhs_arr.flags.f_contiguous):
+                rhs_arr = np.asfortranarray(rhs_arr)
+            self._rhs = rhs_arr
+            self._layout, self._rhs_ld = self._get_numpy_layout(self._rhs)
+            order = "C" if self._layout == LAYOUT_CODE_C else "F"
+            self.output = np.empty(
+                (output_rows, self._rhs.shape[1]),
+                dtype=_output_dtypes[(self._double_precision, self._complex_type)],
+                order=order,
+            )
+            _, self._out_ld = self._get_numpy_layout(self.output, second_arr=self._rhs)
+            self._func = self._mm_function()
+            self._bind_mm_signature()
+            self._rhs_ptr = ctypes.c_void_p(self._rhs.ctypes.data)
+            self._out_ptr = ctypes.c_void_p(self.output.ctypes.data)
+            self._apply_hints(kind="mm", columns=self._rhs.shape[1], layout=self._layout)
+
+    def _mv_function(self):
+        if self._double_precision and self._complex_type:
+            return self._MKL._mkl_sparse_z_mv
+        if self._complex_type:
+            return self._MKL._mkl_sparse_c_mv
+        if self._double_precision:
+            return self._MKL._mkl_sparse_d_mv
+        return self._MKL._mkl_sparse_s_mv
+
+    def _mm_function(self):
+        if self._double_precision and self._complex_type:
+            return self._MKL._mkl_sparse_z_mm
+        if self._complex_type:
+            return self._MKL._mkl_sparse_c_mm
+        if self._double_precision:
+            return self._MKL._mkl_sparse_d_mm
+        return self._MKL._mkl_sparse_s_mm
+
+    def _bind_mv_signature(self) -> None:
+        self._func.argtypes = [
+            ctypes.c_int,
+            self._scalar_ctype,
+            self._sparse_matrix_t,
+            type(self._descr),
+            ctypes.c_void_p,
+            self._scalar_ctype,
+            ctypes.c_void_p,
+        ]
+        self._func.restype = ctypes.c_int
+
+    def _bind_mm_signature(self) -> None:
+        self._func.argtypes = [
+            ctypes.c_int,
+            self._scalar_ctype,
+            self._sparse_matrix_t,
+            type(self._descr),
+            ctypes.c_int,
+            ctypes.c_void_p,
+            self._MKL.MKL_INT,
+            self._MKL.MKL_INT,
+            self._scalar_ctype,
+            ctypes.c_void_p,
+            self._MKL.MKL_INT,
+        ]
+        self._func.restype = ctypes.c_int
+
+    def _apply_hints(self, kind: str, columns: int, layout=None) -> None:
+        try:
+            from sparse_dot_mkl._mkl_interface._load_library import mkl_library
+
+            libmkl = mkl_library()
+            optimize = getattr(libmkl, "mkl_sparse_optimize")
+            optimize.argtypes = [self._sparse_matrix_t]
+            optimize.restype = ctypes.c_int
+
+            if kind == "mv":
+                set_hint = getattr(libmkl, "mkl_sparse_set_mv_hint")
+                set_hint.argtypes = [
+                    self._sparse_matrix_t,
+                    ctypes.c_int,
+                    type(self._descr),
+                    self._MKL.MKL_INT,
+                ]
+                set_hint.restype = ctypes.c_int
+                status = set_hint(self._handle, self._operation, self._descr, self._MKL.MKL_INT(1))
+                self._check_return_value(status, "mkl_sparse_set_mv_hint")
+            else:
+                set_hint = getattr(libmkl, "mkl_sparse_set_mm_hint")
+                set_hint.argtypes = [
+                    self._sparse_matrix_t,
+                    ctypes.c_int,
+                    type(self._descr),
+                    ctypes.c_int,
+                    self._MKL.MKL_INT,
+                    self._MKL.MKL_INT,
+                ]
+                set_hint.restype = ctypes.c_int
+                status = set_hint(
+                    self._handle,
+                    self._operation,
+                    self._descr,
+                    ctypes.c_int(layout),
+                    self._MKL.MKL_INT(columns),
+                    self._MKL.MKL_INT(1),
+                )
+                self._check_return_value(status, "mkl_sparse_set_mm_hint")
+
+            status = optimize(self._handle)
+            self._check_return_value(status, "mkl_sparse_optimize")
+            self.info["mkl_handle_hint"] = f"{kind}+optimize"
+        except Exception as exc:
+            self.info["mkl_handle_hint"] = "unavailable"
+            self.info["mkl_handle_hint_error"] = str(exc)
+
+    def __call__(self):
+        if self.mode in ("mult", "mult_adjoint"):
+            status = self._func(
+                self._operation,
+                self._alpha,
+                self._handle,
+                self._descr,
+                self._rhs_ptr,
+                self._beta,
+                self._out_ptr,
+            )
+            self._check_return_value(status, self._func.__name__)
+            return self.output
+
+        status = self._func(
+            self._operation,
+            self._alpha,
+            self._handle,
+            self._descr,
+            self._layout,
+            self._rhs_ptr,
+            self._rhs.shape[1],
+            self._rhs_ld,
+            self._beta,
+            self._out_ptr,
+            self._out_ld,
+        )
+        self._check_return_value(status, self._func.__name__)
+        return self.output
+
+    def close(self) -> None:
+        if self._handle is not None:
+            self._destroy_mkl_handle(self._handle)
+            self._handle = None
 
 
 def make_snapshot(args: argparse.Namespace, rank_count: int, dtype: np.dtype, mat, timings: dict[str, float], extra: dict[str, object]) -> dict[str, object]:
@@ -172,11 +414,11 @@ def main():
         type=str,
         default="mult",
         choices=CANONICAL_MODES,
-        help="Benchmark mode (`mult`, `mult_dense`, `spmm`)",
+        help="Benchmark mode (`mult`, `mult_dense`, `mult_adjoint`, `mult_dense_adjoint`, `spmm`)",
     )
-    parser.add_argument("--num-vecs", type=int, default=None, help="Number of vectors for mult_dense")
+    parser.add_argument("--num-vecs", type=int, default=None, help="Number of vectors for dense RHS modes")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--min-seconds", type=float, default=1.0, help="Minimum benchmark loop duration")
+    parser.add_argument("--min-seconds", type=float, default=2.0, help="Minimum benchmark loop duration")
     parser.add_argument("--min-iterations", type=int, default=5, help="Minimum benchmark iterations")
     args = parser.parse_args()
 
@@ -184,11 +426,13 @@ def main():
     if args.mkl:
         try:
             import sparse_dot_mkl
+            mkl_thread_count = sparse_dot_mkl.mkl_get_max_threads()
         except ImportError:
             print("Error: sparse_dot_mkl not found. Please install it to use --mkl.")
             return
     else:
         sparse_dot_mkl = None
+        mkl_thread_count = None
 
     if MPI is not None:
         comm = MPI.COMM_WORLD
@@ -210,7 +454,7 @@ def main():
         print(f"Block Size Range: [{args.min_block}, {args.max_block}]")
         print(f"Density: {args.density}")
         print(f"Dtype: {dtype}")
-        if args.mode == "mult_dense":
+        if args.mode in DENSE_MODES:
             print(f"Num Vecs: {args.num_vecs}")
         print("Generating structure...", flush=True)
 
@@ -229,6 +473,8 @@ def main():
     if rank == 0:
         print("Building VBCSR...", flush=True)
 
+    if comm is not None:
+        comm.Barrier()
     t0 = time.perf_counter()
     mat = vbcsr.VBCSR.create_distributed(
         owned_indices=owned_indices,
@@ -237,56 +483,30 @@ def main():
         dtype=dtype,
         comm=comm,
     )
-
-    scipy_rows = []
-    scipy_cols = []
-    scipy_data = []
-
-    if (args.scipy or args.mkl) and rank == 0:
-        row_offsets = np.zeros(args.blocks + 1, dtype=int)
-        np.cumsum(block_sizes, out=row_offsets[1:])
-
-    rng = np.random.default_rng(args.seed + rank)
-    for local_i, global_i in enumerate(owned_indices):
-        r_dim = my_block_sizes[local_i]
-        neighbors = my_adj[local_i]
-        r_start = row_offsets[global_i] if (args.scipy or args.mkl) and size == 1 else 0
-
-        for global_j in neighbors:
-            c_dim = block_sizes[global_j]
-            if dtype == np.float64:
-                data = rng.random((r_dim, c_dim))
-            else:
-                data = rng.random((r_dim, c_dim)) + 1j * rng.random((r_dim, c_dim))
-
-            mat.add_block(global_i, global_j, data)
-
-            if (args.scipy or args.mkl) and size == 1:
-                c_start = row_offsets[global_j]
-                r_idx, c_idx = np.indices((r_dim, c_dim))
-                scipy_rows.append((r_idx + r_start).ravel())
-                scipy_cols.append((c_idx + c_start).ravel())
-                scipy_data.append(data.ravel())
-
+    mat.fill_random()
     mat.assemble()
     if comm is not None:
         comm.Barrier()
-    t_gen = time.perf_counter() - t0
+        t_gen = comm.allreduce(time.perf_counter() - t0, op=MPI.MAX)
+    else:
+        t_gen = time.perf_counter() - t0
 
     if rank == 0:
         print(f"VBCSR Generation Time: {t_gen:.4f} s")
         print(f"Matrix Shape: {mat.shape}")
         print(f"Matrix Kind: {mat.matrix_kind}")
 
+    rng = np.random.default_rng(args.seed + rank)
+
     x_vbcsr = None
     y_vbcsr = None
     x_np = None
-    if args.mode == "mult":
+    if args.mode in ("mult", "mult_adjoint"):
         x_vbcsr = mat.create_vector()
         y_vbcsr = mat.create_vector()
         x_vbcsr.set_constant(1.0)
         x_np = x_vbcsr.to_numpy() if size == 1 else None
-    elif args.mode == "mult_dense":
+    elif args.mode in DENSE_MODES:
         x_vbcsr = mat.create_multivector(args.num_vecs)
         y_vbcsr = mat.create_multivector(args.num_vecs)
         x_vbcsr.set_constant(1.0)
@@ -334,28 +554,35 @@ def main():
         t_vbcsr = benchmark_op(lambda: mat.mult(x_vbcsr, y_vbcsr), "VBCSR Mult")
     elif args.mode == "mult_dense":
         t_vbcsr = benchmark_op(lambda: mat.mult(x_vbcsr, y_vbcsr), "VBCSR MultDense")
+    elif args.mode == "mult_adjoint":
+        t_vbcsr = benchmark_op(lambda: mat.mult_adjoint(x_vbcsr, y_vbcsr), "VBCSR MultAdjoint")
+    elif args.mode == "mult_dense_adjoint":
+        t_vbcsr = benchmark_op(lambda: mat.mult_adjoint(x_vbcsr, y_vbcsr), "VBCSR MultDenseAdjoint")
     else:
         t_vbcsr = benchmark_op(lambda: mat.spmm(mat), "VBCSR SpMM")
     timings["vbcsr"] = t_vbcsr
 
     sp_mat = None
+    sp_mat_adjoint = None
     mkl_sp_mat = None
     baseline_info: dict[str, object] = {}
     if (args.scipy or args.mkl) and size == 1:
         if rank == 0:
             print("Building scalar CSR baseline...", flush=True)
         t0 = time.perf_counter()
-        if scipy_rows:
-            all_rows = np.concatenate(scipy_rows)
-            all_cols = np.concatenate(scipy_cols)
-            all_data = np.concatenate(scipy_data)
-            sp_mat = scipy.sparse.csr_matrix((all_data, (all_rows, all_cols)), shape=mat.shape)
-        else:
-            sp_mat = scipy.sparse.csr_matrix(mat.shape, dtype=dtype)
-        sort_sparse_indices(sp_mat)
+        sp_mat = make_scalar_csr_from_vbcsr(mat)
         timings["scipy_build"] = time.perf_counter() - t0
         if rank == 0:
             print(f"Scalar CSR Generation Time: {timings['scipy_build']:.4f} s")
+
+        if args.scipy and args.mode in ADJOINT_MODES:
+            if rank == 0:
+                print("Building scalar CSR adjoint baseline...", flush=True)
+            t0 = time.perf_counter()
+            sp_mat_adjoint = sort_sparse_indices(sp_mat.getH().tocsr())
+            timings["scipy_adjoint_build"] = time.perf_counter() - t0
+            if rank == 0:
+                print(f"Scalar CSR adjoint build time: {timings['scipy_adjoint_build']:.4f} s")
 
         if args.mkl:
             if rank == 0:
@@ -379,6 +606,10 @@ def main():
             t_scipy = benchmark_op(lambda: sp_mat.dot(x_np), "SciPy Mult")
         elif args.mode == "mult_dense":
             t_scipy = benchmark_op(lambda: sp_mat.dot(x_np), "SciPy MultDense")
+        elif args.mode == "mult_adjoint":
+            t_scipy = benchmark_op(lambda: sp_mat_adjoint.dot(x_np), "SciPy MultAdjoint")
+        elif args.mode == "mult_dense_adjoint":
+            t_scipy = benchmark_op(lambda: sp_mat_adjoint.dot(x_np), "SciPy MultDenseAdjoint")
         else:
             t_scipy = benchmark_op(lambda: sp_mat.dot(sp_mat), "SciPy SpMM")
         timings["scipy"] = t_scipy
@@ -387,20 +618,53 @@ def main():
             print(f"Speedup (SciPy / VBCSR): {comparisons['scipy_speedup']:.2f}x")
 
     if args.mkl and size == 1 and mkl_sp_mat is not None and sparse_dot_mkl is not None:
-        if args.mode == "mult":
-            op_mkl = lambda: sparse_dot_mkl.dot_product_mkl(mkl_sp_mat, x_np)
-        elif args.mode == "mult_dense":
-            # sparse_dot_mkl accepts both row-major and column-major dense RHS
-            # arrays, but its sparse x dense path is much faster with a C-order
-            # RHS in this benchmark. DistMultiVector exposes a Fortran-order
-            # view, so make the layout explicit before timing sparse_dot_mkl.
-            x_np_mkl = np.ascontiguousarray(x_np)
-            op_mkl = lambda: sparse_dot_mkl.dot_product_mkl(mkl_sp_mat, x_np_mkl)
-        else:
-            op_mkl = lambda: sparse_dot_mkl.dot_product_mkl(mkl_sp_mat, mkl_sp_mat)
+        sparse_dot_mkl.mkl_set_num_threads(mkl_thread_count)
+        baseline_info["mkl_threads"] = mkl_thread_count
+        cached_mkl_op = None
+        op_mkl = None
+        mkl_name = f"MKL {args.mode}"
+
+        if args.mode != "spmm":
+            try:
+                t0 = time.perf_counter()
+                cached_mkl_op = CachedMKLSparseOp(mkl_sp_mat, x_np, args.mode)
+                timings["mkl_handle_build"] = time.perf_counter() - t0
+                baseline_info.update(cached_mkl_op.info)
+                op_mkl = cached_mkl_op
+                mkl_name = f"MKL cached {args.mode}"
+                if rank == 0:
+                    print(f"MKL sparse handle build time: {timings['mkl_handle_build']:.4f} s")
+                    print(
+                        "MKL sparse runner: cached sparse handle "
+                        f"({baseline_info.get('mkl_handle_hint', 'no hint')})"
+                    )
+            except Exception as exc:
+                comparisons["mkl_cached_error"] = str(exc)
+                baseline_info["mkl_runner"] = "sparse_dot_mkl_wrapper"
+                if rank == 0:
+                    print(f"Cached MKL setup failed, falling back to sparse_dot_mkl wrapper: {exc}")
+
+        if op_mkl is None:
+            baseline_info["mkl_runner"] = "sparse_dot_mkl_wrapper"
+            if args.mode == "mult":
+                op_mkl = lambda: sparse_dot_mkl.dot_product_mkl(mkl_sp_mat, x_np)
+            elif args.mode == "mult_dense":
+                # Fallback wrapper path creates and destroys an MKL sparse
+                # handle per call. Keep its previously fastest RHS layout.
+                x_np_mkl = np.ascontiguousarray(x_np)
+                op_mkl = lambda: sparse_dot_mkl.dot_product_mkl(mkl_sp_mat, x_np_mkl)
+            elif args.mode == "mult_adjoint":
+                mkl_sp_mat_adjoint = sort_sparse_indices(mkl_sp_mat.getH().tocsr())
+                op_mkl = lambda: sparse_dot_mkl.dot_product_mkl(mkl_sp_mat_adjoint, x_np)
+            elif args.mode == "mult_dense_adjoint":
+                mkl_sp_mat_adjoint = sort_sparse_indices(mkl_sp_mat.getH().tocsr())
+                x_np_mkl = np.ascontiguousarray(x_np)
+                op_mkl = lambda: sparse_dot_mkl.dot_product_mkl(mkl_sp_mat_adjoint, x_np_mkl)
+            else:
+                op_mkl = lambda: sparse_dot_mkl.dot_product_mkl(mkl_sp_mat, mkl_sp_mat)
 
         try:
-            t_mkl = benchmark_op(op_mkl, f"MKL {args.mode}")
+            t_mkl = benchmark_op(op_mkl, mkl_name)
             timings["mkl"] = t_mkl
             comparisons["mkl_speedup"] = t_mkl / t_vbcsr
             if rank == 0:
@@ -409,6 +673,9 @@ def main():
             comparisons["mkl_error"] = str(exc)
             if rank == 0:
                 print(f"MKL benchmark failed: {exc}")
+        finally:
+            if cached_mkl_op is not None:
+                cached_mkl_op.close()
 
     if args.scipy and size == 1 and sp_mat is not None:
         if rank == 0:
@@ -421,6 +688,14 @@ def main():
             mat.mult(x_vbcsr, y_vbcsr)
             res_vbcsr = y_vbcsr.to_numpy()
             res_scipy = sp_mat.dot(x_np)
+        elif args.mode == "mult_adjoint":
+            mat.mult_adjoint(x_vbcsr, y_vbcsr)
+            res_vbcsr = y_vbcsr.to_numpy()
+            res_scipy = sp_mat_adjoint.dot(x_np)
+        elif args.mode == "mult_dense_adjoint":
+            mat.mult_adjoint(x_vbcsr, y_vbcsr)
+            res_vbcsr = y_vbcsr.to_numpy()
+            res_scipy = sp_mat_adjoint.dot(x_np)
         else:
             res_vbcsr = mat.spmm(mat).to_scipy().toarray()
             res_scipy = sp_mat.dot(sp_mat).toarray()

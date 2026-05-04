@@ -182,6 +182,7 @@ void bind_block_spmat(py::module& m, const std::string& name) {
         .def("axpby", &BlockSpMat<T>::axpby)
         .def("copy_from", &BlockSpMat<T>::copy_from)
         .def("fill", &BlockSpMat<T>::fill)
+        .def("fill_random", &BlockSpMat<T>::fill_random)
         .def("duplicate", &BlockSpMat<T>::duplicate, py::arg("independent_graph") = true)
         .def("save_matrix_market", &BlockSpMat<T>::save_matrix_market)
         .def("spmm", &BlockSpMat<T>::spmm, py::arg("B"), py::arg("threshold"), py::arg("transA") = false, py::arg("transB") = false)
