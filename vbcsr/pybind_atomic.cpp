@@ -332,7 +332,40 @@ void bind_atomic_module(py::module& m) {
              return shifts;
         })
         .def_readonly("graph", &AtomicData::graph, py::return_value_policy::reference)
-        
+
+        // 3-body sparsity graph: returns a DistGraph whose adjacency includes the
+        // 2-body edges PLUS all (j, k) pairs for which there is some atom i with
+        // |R_ij| <= r_max_left[type_i] + r_max_right[type_j] and the same for
+        // (i, k). Required by 3-center operators like Vnl =
+        // Sum_K |beta_K> D_K <beta_K|.  See
+        // ``vbcsr/core/atomic/atomic_data.hpp:632`` and the rsatb backend
+        // ``operator_construction.hpp::velocity_graph`` for the canonical use.
+        .def("get_graph3b", [](AtomicData& self, py::object r_max_left, py::object r_max_right) {
+                auto to_double_vec = [](py::object obj, const char* label) {
+                    std::vector<double> out;
+                    if (py::isinstance<py::array>(obj)) {
+                        py::array_t<double, py::array::c_style | py::array::forcecast> arr(obj);
+                        out.assign(arr.data(), arr.data() + arr.size());
+                    } else {
+                        py::list lst(obj);
+                        out.reserve(lst.size());
+                        for (auto h : lst) out.push_back(py::cast<double>(h));
+                    }
+                    if (out.empty()) {
+                        throw std::runtime_error(std::string("get_graph3b: ") + label + " must be a non-empty list or array of floats");
+                    }
+                    return out;
+                };
+                auto left = to_double_vec(r_max_left, "r_max_left");
+                auto right = to_double_vec(r_max_right, "r_max_right");
+                return self.get_graph3b(left, right);
+             },
+             py::arg("r_max_left"),
+             py::arg("r_max_right"),
+             py::return_value_policy::take_ownership,
+             "Build the 3-body (i, j) adjacency graph used by Vnl-like 3-center "
+             "operators. Cutoffs are per-atom-type (indexed by AtomicData.atom_types).")
+
         // Keep to_ase for convenience of C++ side data export
         .def("to_ase", [owned_positions](const AtomicData& self) {
             self.ensure_owned_atomic_numbers("AtomicData.to_ase");
