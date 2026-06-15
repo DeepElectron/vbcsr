@@ -76,7 +76,9 @@ inline std::vector<bool> parse_pbc(py::object pbc_obj) {
 template<typename T>
 void bind_image_container(py::module& m, const std::string& name) {
     py::class_<ImageContainer<T>>(m, name.c_str())
-        .def(py::init<AtomicData*>())
+        // keep_alive<1,2>: the container stores a raw AtomicData* (and its graph),
+        // so the AtomicData must outlive the container.
+        .def(py::init<AtomicData*>(), py::keep_alive<1, 2>())
         .def("assemble", &ImageContainer<T>::assemble)
         .def("add_block", [](ImageContainer<T>& self, std::vector<int> R, int g_row, int g_col, py::array_t<T> data, AssemblyMode mode) {
             
@@ -146,7 +148,35 @@ void bind_image_container(py::module& m, const std::string& name) {
                  return self.sample_k(k, convention);
              }
              throw std::runtime_error("Only single k-point (3,) supported");
-        }, py::arg("k_point"), py::arg("convention") = PhaseConvention::R_ONLY);
+        }, py::arg("k_point"), py::arg("convention") = PhaseConvention::R_ONLY,
+           // keep_alive<0,1>: the sampled BlockSpMat references the container's
+           // base graph (atom_data->graph), so the container (and its AtomicData)
+           // must outlive the returned matrix — else its destructor reads a freed
+           // DistGraph (use-after-free surfacing during GC/teardown).
+           py::keep_alive<0, 1>())
+        .def("redistribute_into",
+             [](const ImageContainer<T>& self, ImageContainer<T>& target, RedistOp op,
+                py::object common_comm) {
+                 self.redistribute_into(target, op, get_mpi_comm(common_comm));
+             },
+             py::arg("target"), py::arg("op"), py::arg("common_comm"),
+             "Batched cross-comm redistribute of all images (doc/design/35 incr3): "
+             "fill ``target``'s images from this container's blocks in one Alltoallv on "
+             "``common_comm``. op Copy=send-down/broadcast, Sum=reduce-up.")
+        .def("get_block",
+             [](const ImageContainer<T>& self, std::vector<int> R, int g_row, int g_col)
+                 -> py::object {
+                 std::vector<T> vec = self.get_block(R, g_row, g_col, MatrixLayout::RowMajor);
+                 if (vec.empty()) return py::none();
+                 auto it = self.image_blocks.find(R);
+                 const DistGraph* g = it->second->graph;
+                 const int lr = g->global_to_local.at(g_row);
+                 const int lc = g->global_to_local.at(g_col);
+                 return copy_2d_array<T>(g->block_sizes[lr], g->block_sizes[lc], vec.data());
+             },
+             py::arg("R"), py::arg("g_row"), py::arg("g_col"),
+             "Read one image block (R, global row, global col) on the row owner; None "
+             "if this rank does not hold it.");
 }
 
 void bind_atomic_module(py::module& m) {
@@ -306,6 +336,7 @@ void bind_atomic_module(py::module& m) {
              return copy_2d_array<double>(3, 3, cell_ptr);
         })
         .def("norb", &AtomicData::norb)
+        .def("get_atom_norb", &AtomicData::get_atom_norb)
         .def_property_readonly("pbc", [](const AtomicData& self) {
              return std::vector<bool>(self.pbc.begin(), self.pbc.end());
         })
@@ -331,7 +362,13 @@ void bind_atomic_module(py::module& m) {
              }
              return shifts;
         })
-        .def_readonly("graph", &AtomicData::graph, py::return_value_policy::reference)
+        // reference_internal (not bare reference): the returned DistGraph is owned
+        // by this AtomicData, so any handle to it must keep the AtomicData alive.
+        // A BlockSpMat built from this graph uses keep_alive<1,2> to pin the graph
+        // handle for its lifetime; with bare `reference` that pinned the handle but
+        // not the owning AtomicData, so the AtomicData could be freed first and the
+        // matrix destructor would read the freed DistGraph (use-after-free).
+        .def_readonly("graph", &AtomicData::graph, py::return_value_policy::reference_internal)
 
         // 3-body sparsity graph: returns a DistGraph whose adjacency includes the
         // 2-body edges PLUS all (j, k) pairs for which there is some atom i with

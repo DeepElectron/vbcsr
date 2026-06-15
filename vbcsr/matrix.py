@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.sparse.linalg import LinearOperator
 import vbcsr_core
-from vbcsr_core import AssemblyMode
+from vbcsr_core import AssemblyMode, RedistOp
 from typing import Union, Optional, List, Any, Tuple
 from .vector import DistVector
 from .multivector import DistMultiVector
@@ -391,6 +391,34 @@ class VBCSR(LinearOperator):
         """
         self._invalidate_nnz()
         self._core.add_block(g_row, g_col, data, mode)
+
+    def redistribute(self, target_graph: Any, mode: AssemblyMode = AssemblyMode.INSERT,
+                     comm: Any = None) -> 'VBCSR':
+        """Redistribute to a different partition of the same global block structure
+        (same comm; doc/design/35). ``target_graph`` is a (core) ``DistGraph`` with
+        identical global blocks but different ``owned_global_indices``. ``mode``
+        INSERT = repartition, ADD = reduce. Returns a new VBCSR on ``target_graph``."""
+        core_result = self._core.redistribute(target_graph, mode)
+        return VBCSR._wrap_core(
+            core_result, self.dtype, comm if comm is not None else self.comm
+        )
+
+    def redistribute_cross(self, target_graph: Any, op: RedistOp, common_comm: Any,
+                           target_comm: Any = None) -> 'VBCSR':
+        """Cross-comm redistribute (doc/design/35 incr2). Move blocks from this
+        matrix's partition to ``target_graph``'s partition, transporting on
+        ``common_comm`` (an mpi4py comm spanning both rank sets, e.g. comm_world).
+        The result is built on ``target_graph``, so it lives on the target comm.
+
+        ``op`` = ``RedistOp.Copy`` (each block to every target owner of its row =
+        broadcast / send-down) or ``RedistOp.Sum`` (partials from several source
+        ranks accumulate at the unique target owner = reduce-up). ``target_comm``
+        is the mpi4py comm the result lives on (defaults to ``common_comm``)."""
+        core_result = self._core.redistribute_cross(target_graph, op, common_comm)
+        return VBCSR._wrap_core(
+            core_result, self.dtype,
+            target_comm if target_comm is not None else common_comm
+        )
 
     def get_block(self, g_row: int, g_col: int) -> Optional[np.ndarray]:
         """

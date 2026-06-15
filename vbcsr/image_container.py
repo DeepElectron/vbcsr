@@ -103,6 +103,27 @@ class ImageContainer:
         """Finalize assembly - exchange remote blocks between MPI ranks."""
         self._core.assemble()
 
+    def get_block(self, g_row, g_col, R=None):
+        """Read one image block (R, g_row, g_col) on the row owner; ``None`` if this
+        rank does not hold it. Returns a 2-D ``(n_orb_row, n_orb_col)`` array."""
+        if R is None:
+            R = [0, 0, 0]
+        else:
+            R = [int(x) for x in R]
+        return self._core.get_block(R, int(g_row), int(g_col))
+
+    def redistribute_into(self, target, op, common_comm):
+        """Batched cross-comm redistribute of all images (doc/design/35 incr3).
+
+        Move every image block from this container's partition to ``target``'s
+        partition in one Alltoallv on ``common_comm`` (an mpi4py comm spanning both
+        rank sets, e.g. comm_world), filling ``target`` in place. Source and target
+        cover the same geometry (same R set / global adjacency) but different atom-row
+        partitions. ``op`` = ``RedistOp.Copy`` (each block to every target owner =
+        send-down/broadcast) or ``RedistOp.Sum`` (partials accumulate at the target
+        owner = reduce-up). ``target`` is a (Python) ``ImageContainer``."""
+        self._core.redistribute_into(target._core, op, common_comm)
+
     def sample_k(self, k_point, convention="R", symm=False):
         """
         Fourier-transform real-space blocks to a single k-point.

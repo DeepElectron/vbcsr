@@ -13,6 +13,15 @@ enum class MatrixLayout {
     ColMajor
 };
 
+// Block-redistribution reduction (doc/design/35). Copy = each source block is
+// written to every target owner of its row (one->one, or one->many = broadcast /
+// send-down). Sum = contributions from several source ranks that hold the same
+// (i,j) partial are accumulated at the target owner (reduce-up).
+enum class RedistOp {
+    Copy,
+    Sum
+};
+
 enum class MatrixKind {
     CSR,
     BSR,
@@ -65,6 +74,7 @@ inline const char* matrix_kind_name(MatrixKind kind) {
 #include <variant>
 #include <set>
 #include <map>
+#include <unordered_map>
 #include <cstring>
 #include <functional>
 #include <mutex>
@@ -572,6 +582,151 @@ public:
     }
 
     // Finalize assembly by exchanging remote blocks
+    // Redistribute to a different partition of the SAME global block structure
+    // (doc/design/35). Increment 1: same communicator (graph->comm == target->comm).
+    // Enumerate this rank's owned blocks and re-add them into a matrix built on
+    // ``target``; ``assemble`` routes each block to its target owner. ``mode`` =
+    // INSERT (a one-to-one repartition) or ADD (accumulate when several source ranks
+    // contribute the same (i,j) block — a same-comm reduce). Cross-comm / broadcast /
+    // multi-owner variants follow in later increments.
+    BlockSpMat redistribute(DistGraph* target, AssemblyMode mode = AssemblyMode::INSERT) const {
+        BlockSpMat result(target);
+        const DistGraph* g = graph;
+        const int n_owned = static_cast<int>(g->owned_global_indices.size());
+        const int n_ghost = static_cast<int>(g->ghost_global_indices.size());
+        auto l2g = [&](int lb) -> int {
+            return lb < n_owned ? g->owned_global_indices[lb]
+                                : g->ghost_global_indices[lb - n_owned];
+        };
+        (void)n_ghost;
+        // ``target`` must be a fully-constructed graph (ghost block sizes backfilled,
+        // as any assembled operator graph is) — add_block needs the column dim.
+        for (int i = 0; i < n_owned; ++i) {
+            const int gi = g->owned_global_indices[i];
+            const int r_dim = g->block_sizes[i];
+            for (int k = g->adj_ptr[i]; k < g->adj_ptr[i + 1]; ++k) {
+                const int lcol = g->adj_ind[k];
+                const int gj = l2g(lcol);
+                const int c_dim = g->block_sizes[lcol];
+                result.add_block(gi, gj, block_data(k), r_dim, c_dim, mode, MatrixLayout::ColMajor);
+            }
+        }
+        result.assemble();
+        return result;
+    }
+
+    // Cross-comm redistribute (doc/design/35, increment 2). Move blocks from this
+    // matrix's partition (``graph->comm``, e.g. comm_world / L1) to ``target``'s
+    // partition (``target->comm``, e.g. pool_comm / L3), transporting on
+    // ``common_comm`` (a comm spanning both rank sets, e.g. comm_world). The result
+    // is built on ``target``, so it genuinely lives on ``target->comm``.
+    //
+    // The owner map is *derived*: every common_comm rank announces the global rows it
+    // owns in the TARGET layout (one Allgatherv), giving global-row -> {owner cc-ranks}.
+    // A row owned by several ranks (pool replication) makes Copy fan out (= send-down);
+    // partials held by several source ranks make Sum accumulate at the unique target
+    // owner (= reduce-up). ``target`` must be assembled (ghost block sizes backfilled).
+    BlockSpMat redistribute(DistGraph* target, RedistOp op, MPI_Comm common_comm) const {
+        int cc_rank, cc_size;
+        MPI_Comm_rank(common_comm, &cc_rank);
+        MPI_Comm_size(common_comm, &cc_size);
+        (void)cc_rank;
+
+        // 1. Derive global-row -> owner cc-ranks in the target layout.
+        const int my_n = static_cast<int>(target->owned_global_indices.size());
+        std::vector<int> all_n(cc_size);
+        MPI_Allgather(&my_n, 1, MPI_INT, all_n.data(), 1, MPI_INT, common_comm);
+        std::vector<int> displ(cc_size + 1, 0);
+        for (int i = 0; i < cc_size; ++i) displ[i + 1] = displ[i] + all_n[i];
+        std::vector<int> all_owned(displ[cc_size]);
+        MPI_Allgatherv(target->owned_global_indices.data(), my_n, MPI_INT,
+                       all_owned.data(), all_n.data(), displ.data(), MPI_INT, common_comm);
+        std::unordered_map<int, std::vector<int>> target_owners;
+        for (int r = 0; r < cc_size; ++r) {
+            for (int k = displ[r]; k < displ[r + 1]; ++k) {
+                target_owners[all_owned[k]].push_back(r);
+            }
+        }
+
+        // 2. Pack this rank's owned blocks, one copy per target owner of the row.
+        const DistGraph* g = graph;
+        const int n_owned = static_cast<int>(g->owned_global_indices.size());
+        auto l2g = [&](int lb) -> int {
+            return lb < n_owned ? g->owned_global_indices[lb]
+                                : g->ghost_global_indices[lb - n_owned];
+        };
+        std::vector<size_t> send_counts(cc_size, 0);
+        for (int i = 0; i < n_owned; ++i) {
+            const int gi = g->owned_global_indices[i];
+            auto it = target_owners.find(gi);
+            if (it == target_owners.end()) continue;
+            const int r_dim = g->block_sizes[i];
+            for (int k = g->adj_ptr[i]; k < g->adj_ptr[i + 1]; ++k) {
+                const int c_dim = g->block_sizes[g->adj_ind[k]];
+                const size_t blk_bytes = 4 * sizeof(int)
+                                       + static_cast<size_t>(r_dim) * c_dim * sizeof(T);
+                for (int dest : it->second) send_counts[dest] += blk_bytes;
+            }
+        }
+        std::vector<size_t> sdispls(cc_size + 1, 0);
+        for (int i = 0; i < cc_size; ++i) sdispls[i + 1] = sdispls[i] + send_counts[i];
+        std::vector<char> send_blob(sdispls[cc_size]);
+        std::vector<size_t> off = sdispls;
+        for (int i = 0; i < n_owned; ++i) {
+            const int gi = g->owned_global_indices[i];
+            auto it = target_owners.find(gi);
+            if (it == target_owners.end()) continue;
+            const int r_dim = g->block_sizes[i];
+            for (int k = g->adj_ptr[i]; k < g->adj_ptr[i + 1]; ++k) {
+                const int lcol = g->adj_ind[k];
+                const int gj = l2g(lcol);
+                const int c_dim = g->block_sizes[lcol];
+                const T* bd = block_data(k);
+                const size_t data_bytes = static_cast<size_t>(r_dim) * c_dim * sizeof(T);
+                for (int dest : it->second) {
+                    char* ptr = send_blob.data() + off[dest];
+                    std::memcpy(ptr, &gi, sizeof(int));    ptr += sizeof(int);
+                    std::memcpy(ptr, &gj, sizeof(int));    ptr += sizeof(int);
+                    std::memcpy(ptr, &r_dim, sizeof(int)); ptr += sizeof(int);
+                    std::memcpy(ptr, &c_dim, sizeof(int)); ptr += sizeof(int);
+                    std::memcpy(ptr, bd, data_bytes);      ptr += data_bytes;
+                    off[dest] = ptr - send_blob.data();
+                }
+            }
+        }
+
+        // 3. Exchange counts + blocks on the common comm.
+        std::vector<size_t> recv_counts(cc_size);
+        MPI_Alltoall(send_counts.data(), sizeof(size_t), MPI_BYTE,
+                     recv_counts.data(), sizeof(size_t), MPI_BYTE, common_comm);
+        std::vector<size_t> rdispls(cc_size + 1, 0);
+        for (int i = 0; i < cc_size; ++i) rdispls[i + 1] = rdispls[i] + recv_counts[i];
+        std::vector<char> recv_blob(rdispls[cc_size]);
+        safe_alltoallv(send_blob.data(), send_counts, sdispls, MPI_BYTE,
+                       recv_blob.data(), recv_counts, rdispls, MPI_BYTE, common_comm);
+
+        // 4. Place received blocks on the target. INSERT for Copy; for Sum, zero
+        //    first and ADD so several senders' partials accumulate at the owner.
+        BlockSpMat result(target);
+        const AssemblyMode amode = (op == RedistOp::Sum) ? AssemblyMode::ADD
+                                                         : AssemblyMode::INSERT;
+        if (op == RedistOp::Sum) result.fill(T(0));
+        const char* ptr = recv_blob.data();
+        const char* rend = recv_blob.data() + recv_blob.size();
+        while (ptr < rend) {
+            int gi, gj, r_dim, c_dim;
+            std::memcpy(&gi, ptr, sizeof(int));    ptr += sizeof(int);
+            std::memcpy(&gj, ptr, sizeof(int));    ptr += sizeof(int);
+            std::memcpy(&r_dim, ptr, sizeof(int)); ptr += sizeof(int);
+            std::memcpy(&c_dim, ptr, sizeof(int)); ptr += sizeof(int);
+            result.add_block(gi, gj, reinterpret_cast<const T*>(ptr), r_dim, c_dim,
+                             amode, MatrixLayout::ColMajor);
+            ptr += static_cast<size_t>(r_dim) * c_dim * sizeof(T);
+        }
+        result.assemble();
+        return result;
+    }
+
     void assemble() {
         if (graph->size == 1) { // mpisize, serial fallback
             clear_remote_assembly_state(this);

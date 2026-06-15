@@ -168,6 +168,25 @@ void bind_block_spmat(py::module& m, const std::string& name) {
                 MatrixLayout::RowMajor);
         }, py::arg("g_row"), py::arg("g_col"), py::arg("data"), py::arg("mode") = AssemblyMode::ADD)
         .def("assemble", &BlockSpMat<T>::assemble)
+        .def("redistribute",
+             static_cast<BlockSpMat<T> (BlockSpMat<T>::*)(DistGraph*, AssemblyMode) const>(
+                 &BlockSpMat<T>::redistribute),
+             py::arg("target_graph"), py::arg("mode") = AssemblyMode::INSERT,
+             // the returned matrix holds a DistGraph* into target_graph: pin it.
+             py::keep_alive<0, 2>(),
+             "Redistribute to a different partition of the same global structure "
+             "(same comm; doc/design/35). mode INSERT=repartition, ADD=reduce.")
+        .def("redistribute_cross",
+             [](const BlockSpMat<T>& self, DistGraph* target_graph, RedistOp op,
+                py::object common_comm) {
+                 return self.redistribute(target_graph, op, get_mpi_comm(common_comm));
+             },
+             py::arg("target_graph"), py::arg("op"), py::arg("common_comm"),
+             // the returned matrix holds a DistGraph* into target_graph: pin it.
+             py::keep_alive<0, 2>(),
+             "Cross-comm redistribute (doc/design/35 incr2): move blocks from this "
+             "matrix's partition to target_graph's partition, transporting on "
+             "common_comm. op Copy=broadcast/send-down, Sum=reduce-up.")
         .def("mult", &BlockSpMat<T>::mult)
         .def("mult_dense", &BlockSpMat<T>::mult_dense)
         .def("mult_adjoint", &BlockSpMat<T>::mult_adjoint)
@@ -282,12 +301,22 @@ void bind_block_spmat(py::module& m, const std::string& name) {
         ;
 }
 
+// The dense LCAO eigensolver (ELPA + ScaLAPACK + 2D block-cyclic) was relocated
+// out of VBCSR into rescu++ _core (rescupp._core.lcao_eig); see
+// doc/design/31-dense-linalg-relocation.md. VBCSR is a sparse library and no
+// longer links ELPA/ScaLAPACK or hosts the solver.
+
 PYBIND11_MODULE(vbcsr_core, m) {
     m.doc() = "VBCSR C++ Core Bindings";
 
     py::enum_<AssemblyMode>(m, "AssemblyMode")
         .value("INSERT", AssemblyMode::INSERT)
         .value("ADD", AssemblyMode::ADD)
+        .export_values();
+
+    py::enum_<RedistOp>(m, "RedistOp")
+        .value("Copy", RedistOp::Copy)
+        .value("Sum", RedistOp::Sum)
         .export_values();
 
     m.def("finalize_mpi", &finalize_mpi, "Finalize MPI if initialized");
@@ -301,6 +330,8 @@ PYBIND11_MODULE(vbcsr_core, m) {
         .def_readonly("owned_global_indices", &DistGraph::owned_global_indices)
         .def_readonly("ghost_global_indices", &DistGraph::ghost_global_indices)
         .def_readonly("block_sizes", &DistGraph::block_sizes)
+        .def_readonly("adj_ptr", &DistGraph::adj_ptr)
+        .def_readonly("adj_ind", &DistGraph::adj_ind)
         .def_property_readonly("owned_scalar_rows", [](const DistGraph& self) {
             const size_t owned_blocks = self.owned_global_indices.size();
             if (self.block_offsets.size() <= owned_blocks) {
@@ -331,6 +362,8 @@ PYBIND11_MODULE(vbcsr_core, m) {
             if (it == self.global_to_local.end()) return -1;
             return it->second;
         })
+        .def("get_global_index", &DistGraph::get_global_index)
+        .def_readonly("ghost_global_indices", &DistGraph::ghost_global_indices)
         .def_readonly("rank", &DistGraph::rank)
         .def_readonly("size", &DistGraph::size);
 
