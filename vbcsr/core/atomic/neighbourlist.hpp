@@ -82,8 +82,15 @@ public:
         std::array<double, 3> cxa = cross(c, a);
         std::array<double, 3> axb = cross(a, b);
 
-        double vol = std::abs(dot(a, bxc));
-        
+        // Signed triple product (cell determinant). Fractional coordinates must
+        // divide by the SIGNED determinant: for a left-handed cell-vector
+        // ordering (a.(bxc) < 0) the cross products bxc/cxa/axb are anti-parallel
+        // to the reciprocal directions, so dividing by |det| would negate the
+        // fractional coordinates and wrap atoms to the wrong image. Face
+        // distances (heights) use the absolute volume.
+        double det = dot(a, bxc);
+        double vol = std::abs(det);
+
         if (vol < 1e-8) {
             throw std::invalid_argument("Cell volume is too small or negative.");
         }
@@ -135,9 +142,9 @@ public:
             double rz = positions[3*i+2];
 
             // Scaled coordinates s = inv_cell * r
-            double sx = dot({rx, ry, rz}, bxc) / vol;
-            double sy = dot({rx, ry, rz}, cxa) / vol;
-            double sz = dot({rx, ry, rz}, axb) / vol;
+            double sx = dot({rx, ry, rz}, bxc) / det;
+            double sy = dot({rx, ry, rz}, cxa) / det;
+            double sz = dot({rx, ry, rz}, axb) / det;
 
             // Wrap scaled coordinates if PBC
             auto wrap = [](double val) {

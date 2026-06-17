@@ -42,9 +42,31 @@ public:
     using ResultT = std::complex<double>;
     using ResultKernel = DefaultKernel<ResultT>;
 
+    // True when this container owns ``base_graph`` (the union-graph ctor below);
+    // the normal ctor borrows ``data->graph`` and leaves this false.
+    bool owns_base_graph = false;
+
 public:
     ImageContainer(AtomicData* data) : atom_data(data), base_graph(data->graph) {
         build_image_graphs();
+    }
+
+    // Union-graph ctor: every image (one per shift in ``shifts``, which MUST be the
+    // globally-consistent shift set across the comm) lives on the single provided
+    // ``union_graph`` rather than per-R exact graphs derived from the 2-body
+    // ``iconn``. This is for operators whose (i, j) sparsity is wider than the
+    // AtomicData edges — notably V_nl, whose pairs share a common projector and so
+    // span the 3-body ``get_graph3b`` graph. ``add_block`` routes each (i, j) block
+    // to its row owner exactly like ``VBCSR(graph3b).add_block``; ``sample_k``
+    // accumulates onto ``base_graph = union_graph``. If ``own_union`` the container
+    // deletes ``union_graph`` in its destructor. The per-R ``BlockSpMat`` borrow the
+    // graph (non-owning), so there is no double free.
+    ImageContainer(AtomicData* data, DistGraph* union_graph,
+                   const std::vector<std::vector<int>>& shifts, bool own_union = false)
+        : atom_data(data), base_graph(union_graph), owns_base_graph(own_union) {
+        for (const auto& R : shifts) {
+            image_blocks[R] = new BlockSpMat<T, Kernel>(union_graph);
+        }
     }
 
     ~ImageContainer() {
@@ -53,6 +75,9 @@ public:
         }
         for (auto& kv : image_graphs) {
             delete kv.second;
+        }
+        if (owns_base_graph) {
+            delete base_graph;
         }
     }
 

@@ -47,13 +47,25 @@ class ImageContainer:
     def __init__(self, atomic_data, dtype=np.float64):
         self.atomic_data = atomic_data
         self.dtype = np.dtype(dtype)
-        
+
         if self.dtype == np.float64:
             self._core = vbcsr_core.ImageContainer(atomic_data)
         elif self.dtype == np.complex128:
             self._core = vbcsr_core.ImageContainer_Complex(atomic_data)
         else:
             raise ValueError("Unsupported dtype. Use float64 or complex128.")
+
+    @classmethod
+    def _adopt(cls, core_container, atomic_data, dtype=np.float64):
+        """Wrap an already-built native ``vbcsr_core.ImageContainer`` (e.g. one
+        assembled entirely in C++ by an external module) in this Python wrapper so
+        it gains ``sample_k``/``symm`` ergonomics. The wrapper does not re-create or
+        own the native container beyond the usual Python reference."""
+        self = cls.__new__(cls)
+        self.atomic_data = atomic_data
+        self.dtype = np.dtype(dtype)
+        self._core = core_container
+        return self
 
     def add_block(self, g_row, g_col, data, R=None, mode="add"):
         """

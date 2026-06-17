@@ -459,13 +459,34 @@ pybind11_add_module(vbcsr_core ${SOURCES})
 
 # Link libraries for Python binding
 target_link_libraries(vbcsr_core PRIVATE vbcsr)
-set_target_properties(vbcsr_core PROPERTIES
-    BUILD_WITH_INSTALL_RPATH OFF
-    INSTALL_RPATH ""
-    INSTALL_RPATH_USE_LINK_PATH FALSE
-    INSTALL_REMOVE_ENVIRONMENT_RPATH TRUE
-    SKIP_BUILD_RPATH TRUE
-)
+
+# NOTE: the ELPA + ScaLAPACK dense LCAO eigensolver was relocated out of VBCSR
+# into rescu++ _core (rescupp._core.lcao_eig); see
+# doc/design/31-dense-linalg-relocation.md. VBCSR is a sparse library and links
+# neither ELPA nor ScaLAPACK.
+
+# RPATH policy. For a redistributable wheel (cibuildwheel/auditwheel re-writes
+# rpaths afterwards) we strip the build/environment rpath. For a normal local or
+# editable install — e.g. into the conda env via install.sh — we instead KEEP
+# the link-time rpath so the extension finds its conda-resident dependencies
+# (ELPA, ScaLAPACK, OpenBLAS, MPI) at import without LD_LIBRARY_PATH, exactly as
+# the op2c extension does. Stripping here also broke installs on environments
+# where the conda prefix is reachable through two mount paths (the RPATH_CHANGE
+# fails when the embedded rpath string differs from the expected one).
+option(VBCSR_STRIP_INSTALL_RPATH "Strip the install RPATH (for redistributable wheels)" OFF)
+if(VBCSR_STRIP_INSTALL_RPATH)
+    set_target_properties(vbcsr_core PROPERTIES
+        BUILD_WITH_INSTALL_RPATH OFF
+        INSTALL_RPATH ""
+        INSTALL_RPATH_USE_LINK_PATH FALSE
+        INSTALL_REMOVE_ENVIRONMENT_RPATH TRUE
+        SKIP_BUILD_RPATH TRUE
+    )
+else()
+    set_target_properties(vbcsr_core PROPERTIES
+        INSTALL_RPATH_USE_LINK_PATH TRUE
+    )
+endif()
 
 # Install rules
 include(GNUInstallDirs)
