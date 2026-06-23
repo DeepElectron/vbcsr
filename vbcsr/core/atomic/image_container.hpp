@@ -45,28 +45,18 @@ public:
     // True when this container owns ``base_graph`` (the union-graph ctor below);
     // the normal ctor borrows ``data->graph`` and leaves this false.
     bool owns_base_graph = false;
+    // True when this container was built with the owning ``ImageContainer(AtomicData*, true)``
+    // ctor and must delete ``atom_data`` (and, through it, its graph) in the destructor.
+    bool owns_atom_data = false;
 
 public:
-    ImageContainer(AtomicData* data) : atom_data(data), base_graph(data->graph) {
+    // ``own_atom_data`` lets the container take ownership of a freshly-built AtomicData (e.g.
+    // ``get_atomicdata3b``, doc/design/41) and delete it in the destructor — so a graph3b
+    // operator/weight container can be built with this NORMAL ctor (which reads the per-edge
+    // shifts to build the per-R image graphs) instead of the union-graph ctor below.
+    ImageContainer(AtomicData* data, bool own_atom_data = false)
+        : atom_data(data), base_graph(data->graph), owns_atom_data(own_atom_data) {
         build_image_graphs();
-    }
-
-    // Union-graph ctor: every image (one per shift in ``shifts``, which MUST be the
-    // globally-consistent shift set across the comm) lives on the single provided
-    // ``union_graph`` rather than per-R exact graphs derived from the 2-body
-    // ``iconn``. This is for operators whose (i, j) sparsity is wider than the
-    // AtomicData edges — notably V_nl, whose pairs share a common projector and so
-    // span the 3-body ``get_graph3b`` graph. ``add_block`` routes each (i, j) block
-    // to its row owner exactly like ``VBCSR(graph3b).add_block``; ``sample_k``
-    // accumulates onto ``base_graph = union_graph``. If ``own_union`` the container
-    // deletes ``union_graph`` in its destructor. The per-R ``BlockSpMat`` borrow the
-    // graph (non-owning), so there is no double free.
-    ImageContainer(AtomicData* data, DistGraph* union_graph,
-                   const std::vector<std::vector<int>>& shifts, bool own_union = false)
-        : atom_data(data), base_graph(union_graph), owns_base_graph(own_union) {
-        for (const auto& R : shifts) {
-            image_blocks[R] = new BlockSpMat<T, Kernel>(union_graph);
-        }
     }
 
     ~ImageContainer() {
@@ -78,6 +68,9 @@ public:
         }
         if (owns_base_graph) {
             delete base_graph;
+        }
+        if (owns_atom_data) {
+            delete atom_data;  // deletes its own_graph too (AtomicData dtor)
         }
     }
 
@@ -233,6 +226,25 @@ public:
         }
     }
 
+    // In-place per-image axpy: ``this += alpha * other``, matching images by their R shift. Used
+    // to fuse the 2-body kinetic T into the graph3b V_nl to form the combined static Hamiltonian
+    // H_static = T + V_nl (doc/design/41 §3), so only {S, H_static} is sent down (not 3 images)
+    // and V_nl is never rebuilt on the pool graph. ``this`` MUST be a superset graph — every R in
+    // ``other`` present here, and (per-R) every (row,col) of ``other`` present in this image — the
+    // graph3b ⊇ 2-body case. Both sides must share the owned-row partition + block sizes; the
+    // cross-graph ``BlockSpMat::axpby`` maps blocks by GLOBAL (row,col) index.
+    void axpy_into(const ImageContainer& other, T alpha) {
+        for (const auto& kv : other.image_blocks) {
+            auto it = image_blocks.find(kv.first);
+            if (it == image_blocks.end()) {
+                throw std::runtime_error(
+                    "ImageContainer::axpy_into: a shift R of `other` is absent in this container "
+                    "(this must be a superset graph, e.g. graph3b absorbing the 2-body operator)");
+            }
+            it->second->axpy(alpha, *kv.second);
+        }
+    }
+
     // Read one image block (R, global row, global col) on the owner of the row;
     // returns empty if this rank does not hold it. RowMajor by default.
     std::vector<T> get_block(const std::vector<int>& R, int g_row, int g_col,
@@ -360,6 +372,12 @@ public:
             ptr += static_cast<size_t>(r_dim) * c_dim * sizeof(T);
         }
     }
+
+    // NOTE: the former ``gather_into`` (request-list gather that re-``assemble``d into a target
+    // DistGraph) was removed in doc/design/41 §2.3 — its ``assemble`` re-routes the just-fetched
+    // blocks by the target partition (a no-op only for a serial target, and an un-gather for any
+    // real partition). The operator-walk gather is now the keyed ``LocalBlockView`` produced by
+    // ``rescupp::lcao_grid::GatherPlan::gather_local`` (alias local, cache remote, no re-route).
 
     // Accumulate all image blocks onto a compatible reference graph using
     // a per-image weight and an optional per-block correction factor.

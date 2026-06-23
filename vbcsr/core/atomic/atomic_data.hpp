@@ -2,6 +2,8 @@
 #include "../dist_graph.hpp"
 #include <vector>
 #include <map>
+#include <set>
+#include <array>
 #include <algorithm>
 #include <mpi.h>
 #include <iostream>
@@ -370,7 +372,80 @@ public:
             r_edges,
             type_norb);
     }
-    
+
+    // Distributed construction from a CALLER-GIVEN partition (doc/design/42 §4).
+    // Each rank passes ONLY its owned atoms — there is no rank-0 gather of the
+    // geometry and no ParMETIS: the partition is whatever the caller chose (e.g.
+    // a spatial slab/RCB aligned with the grid). Global ids are assigned
+    // contiguously by rank (Allgather of counts -> Exscan), so rank r owns
+    // [offset_r, offset_r + n_r). This form Allgathers positions/Z (O(N), transient)
+    // so every rank builds the edges of ITS OWNED atoms locally; the persistent
+    // storage is owned + ghost only. ``my_input_index[li]`` is the original
+    // input-order index of owned atom ``li`` (fills AtomicData.atom_index).
+    static AtomicData* from_distributed(
+        const std::vector<double>& my_pos, const std::vector<int>& my_z,
+        const std::vector<int>& my_input_index,
+        const std::vector<double>& cell, const std::vector<bool>& pbc,
+        const std::vector<double>& r_max_per_type, const std::vector<int>& type_norb_in,
+        MPI_Comm comm) {
+        int rank = 0, size = 1, initialized = 0;
+        MPI_Initialized(&initialized);
+        if (initialized) { MPI_Comm_rank(comm, &rank); MPI_Comm_size(comm, &size); }
+        const int my_n = static_cast<int>(my_z.size());
+
+        // 1. Contiguous global-id layout: rank r owns [offset_r, offset_r + n_r).
+        std::vector<int> counts(size, my_n), displs(size + 1, 0);
+        if (initialized) MPI_Allgather(&my_n, 1, MPI_INT, counts.data(), 1, MPI_INT, comm);
+        for (int i = 0; i < size; ++i) displs[i + 1] = displs[i] + counts[i];
+        const int total = displs[size];
+        const int my_offset = displs[rank];
+        if (total == 0) return new AtomicData(comm);
+
+        // 2. Allgather all positions + atomic numbers (global-id == rank order).
+        std::vector<int> pos_counts(size), pos_displs(size + 1, 0);
+        for (int i = 0; i < size; ++i) { pos_counts[i] = counts[i] * 3; pos_displs[i + 1] = pos_displs[i] + pos_counts[i]; }
+        std::vector<double> all_pos(static_cast<size_t>(total) * 3);
+        std::vector<int> all_z(total);
+        if (initialized) {
+            MPI_Allgatherv(my_pos.data(), my_n * 3, MPI_DOUBLE, all_pos.data(), pos_counts.data(), pos_displs.data(), MPI_DOUBLE, comm);
+            MPI_Allgatherv(my_z.data(), my_n, MPI_INT, all_z.data(), counts.data(), displs.data(), MPI_INT, comm);
+        } else { all_pos = my_pos; all_z = my_z; }
+
+        // 3. Global z -> type (sorted-unique z; identical on every rank).
+        std::vector<int> uz = all_z; std::sort(uz.begin(), uz.end());
+        uz.erase(std::unique(uz.begin(), uz.end()), uz.end());
+        std::map<int, int> z2t; for (size_t i = 0; i < uz.size(); ++i) z2t[uz[i]] = static_cast<int>(i);
+        std::vector<int> all_types(total); for (int g = 0; g < total; ++g) all_types[g] = z2t[all_z[g]];
+        std::vector<int> type_norb = type_norb_in;
+        if (type_norb.empty()) type_norb.assign(uz.size(), 1);
+        std::vector<int> my_types(my_n); for (int li = 0; li < my_n; ++li) my_types[li] = all_types[my_offset + li];
+
+        // 4. Edges of MY owned atoms (NeighborList over all positions; same cutoff
+        //    + distance test as process_input_rank0, so the graph is identical to
+        //    from_points for the same geometry). r_edges: 5 ints {gi, gj, rx, ry, rz}.
+        double max_r = 0; for (double r : r_max_per_type) max_r = std::max(max_r, r);
+        NeighborList nl; nl.build(all_pos, cell, pbc, max_r * 2.0);
+        std::vector<int> r_edges;
+        for (int li = 0; li < my_n; ++li) {
+            const int gi = my_offset + li, ti = all_types[gi];
+            for (const auto& nb : nl.get_neighbors(gi)) {
+                const int gj = nb.index, tj = all_types[gj];
+                const double rc = r_max_per_type[ti] + r_max_per_type[tj];
+                const double dx = all_pos[3 * gj]     - all_pos[3 * gi]     + nb.rx * cell[0] + nb.ry * cell[3] + nb.rz * cell[6];
+                const double dy = all_pos[3 * gj + 1] - all_pos[3 * gi + 1] + nb.rx * cell[1] + nb.ry * cell[4] + nb.rz * cell[7];
+                const double dz = all_pos[3 * gj + 2] - all_pos[3 * gi + 2] + nb.rx * cell[2] + nb.ry * cell[5] + nb.rz * cell[8];
+                if (std::sqrt(dx * dx + dy * dy + dz * dz) > rc + 1e-9) continue;
+                r_edges.push_back(gi); r_edges.push_back(gj);
+                r_edges.push_back(nb.rx); r_edges.push_back(nb.ry); r_edges.push_back(nb.rz);
+            }
+        }
+
+        // 5. Build the distributed object (owned atoms + owned-src edges; the ctor
+        //    derives ghosts from the edge dsts). Same final assembly as from_points.
+        return construct_final_object(comm, rank, size, cell, pbc, my_n,
+            my_input_index, my_z, my_types, my_pos, r_edges, type_norb);
+    }
+
     static AtomicData* from_file(const std::string& filename, const std::vector<double>& r_max_per_type, std::vector<int> type_norb, MPI_Comm comm, const std::string& format="") {
         int rank;
         int initialized = 0;
@@ -749,8 +824,142 @@ public:
         }
         
         new_graph->construct_distributed(owned_indices, my_block_sizes, matrix_adj);
-        
+
         return new_graph;
+    }
+
+    // Build a full ``AtomicData`` whose neighbour graph IS the 3-centre (graph3b) structure,
+    // with the SAME atom distribution as ``this`` — the proper-AtomicData sibling of
+    // ``get_graph3b`` (doc/design/41). Unlike ``get_graph3b`` (which returns a shift-less
+    // ``DistGraph`` and so forces the union-graph ``ImageContainer`` ctor + a hand-built
+    // explicit shift set), this tracks each 3-centre block's integer lattice shift, so the
+    // normal ``ImageContainer(AtomicData*)`` ctor builds the per-R image graphs directly.
+    //
+    // For an owned centre i with reduced neighbours (j, R_j) and (k, R_k) (within the
+    // ``r_max_left[itype] + r_max_right[jtype]`` cut, same as get_graph3b), the 3-centre block
+    // (gid_j -> gid_k) lives at shift R_k - R_j and is owned by gid_j's row owner; the routing
+    // is the same one-Alltoallv idiom as get_graph3b, carrying 5 ints (gj, gk, dRx, dRy, dRz)
+    // per block. The self-onsite (j==k, R=0) is dropped — the ImageContainer ctor re-adds the
+    // R=0 diagonal. The resulting (gi, gj, R) edge set equals the graph3b pair set the V_nl /
+    // force / DM consumers enumerate, so an ImageContainer on this AtomicData has exactly their
+    // blocks (and ``build_dmr_images`` can read its pairs straight from the graph).
+    AtomicData* get_atomicdata3b(const std::vector<double>& r_max_left,
+                                 const std::vector<double>& r_max_right) {
+        int initialized = 0;
+        MPI_Initialized(&initialized);
+
+        // 1. Reduced neighbour list WITH integer shift (do NOT collapse periodic images).
+        std::vector<std::vector<std::pair<int, std::array<int, 3>>>> rnbr(n_atom);
+        for (int i = 0; i < n_atom; ++i) {
+            const int itype = atom_type[i];
+            for (int edge_idx : iconn[i]) {
+                const int j = edges[edge_idx].dst;
+                double rx, ry, rz;
+                get_edge_vec(edge_idx, &rx, &ry, &rz);
+                const double r = std::sqrt(rx * rx + ry * ry + rz * rz);
+                const int jtype = atom_type[j];
+                if (r <= r_max_left[itype] + r_max_right[jtype] + 1e-9) {
+                    int sx, sy, sz;
+                    get_edge_shift_vec(edge_idx, &sx, &sy, &sz);
+                    rnbr[i].push_back({get_gid(j), {sx, sy, sz}});
+                }
+            }
+        }
+
+        // 2. Each ordered neighbour pair (j,Rj),(k,Rk) of i -> block (gid_j -> gid_k) at Rk-Rj,
+        //    routed to gid_j's owner (5 ints each).
+        std::map<int, std::vector<std::array<int, 5>>> send_map;
+        for (int i = 0; i < n_atom; ++i) {
+            const auto& nb = rnbr[i];
+            for (const auto& a : nb) {
+                const int owner_j = graph->find_owner(a.first);
+                for (const auto& b : nb) {
+                    send_map[owner_j].push_back({a.first, b.first,
+                        b.second[0] - a.second[0], b.second[1] - a.second[1], b.second[2] - a.second[2]});
+                }
+            }
+        }
+        for (auto& kv : send_map) {
+            std::sort(kv.second.begin(), kv.second.end());
+            kv.second.erase(std::unique(kv.second.begin(), kv.second.end()), kv.second.end());
+        }
+
+        std::vector<int> send_counts(size, 0);
+        for (auto& kv : send_map) send_counts[kv.first] = static_cast<int>(kv.second.size()) * 5;
+        std::vector<int> recv_counts(size);
+        if (initialized) {
+            MPI_Alltoall(send_counts.data(), 1, MPI_INT, recv_counts.data(), 1, MPI_INT, comm);
+        } else {
+            recv_counts = send_counts;
+        }
+        std::vector<int> sdispls(size + 1, 0), rdispls(size + 1, 0);
+        for (int i = 0; i < size; ++i) {
+            sdispls[i + 1] = sdispls[i] + send_counts[i];
+            rdispls[i + 1] = rdispls[i] + recv_counts[i];
+        }
+        std::vector<int> send_buf(sdispls[size]);
+        for (auto& kv : send_map) {
+            int off = sdispls[kv.first];
+            for (const auto& e : kv.second) for (int t = 0; t < 5; ++t) send_buf[off++] = e[t];
+        }
+        std::vector<int> recv_buf(rdispls[size]);
+        if (initialized) {
+            MPI_Alltoallv(send_buf.data(), send_counts.data(), sdispls.data(), MPI_INT,
+                          recv_buf.data(), recv_counts.data(), rdispls.data(), MPI_INT, comm);
+        } else {
+            recv_buf = send_buf;
+        }
+
+        // 3. Dedup received 3-centre edges (gid_j owned here); drop the self-onsite.
+        std::set<std::array<int, 5>> edge_set;
+        for (size_t p = 0; p + 4 < recv_buf.size(); p += 5) {
+            if (recv_buf[p] == recv_buf[p + 1] &&
+                recv_buf[p + 2] == 0 && recv_buf[p + 3] == 0 && recv_buf[p + 4] == 0) continue;
+            edge_set.insert({recv_buf[p], recv_buf[p + 1], recv_buf[p + 2], recv_buf[p + 3], recv_buf[p + 4]});
+        }
+
+        // graph3b ⊇ the 2-body S/T graph: add this rank's owned 2-body edges (i -> j, R_j) WITH
+        // shift (owned locally, no routing). The 3-centre enumeration alone covers only pairs
+        // sharing a common centre, so the pure 2-body pairs must be added explicitly — mirrors
+        // get_graph3b's "add two-body and onsite edges". The R=0 onsite is re-added by the
+        // ImageContainer ctor, so it is skipped here.
+        for (int i = 0; i < n_atom; ++i) {
+            const int gi = get_gid(i);
+            for (int edge_idx : iconn[i]) {
+                const int j = edges[edge_idx].dst;
+                int sx, sy, sz;
+                get_edge_shift_vec(edge_idx, &sx, &sy, &sz);
+                if (gi == get_gid(j) && sx == 0 && sy == 0 && sz == 0) continue;
+                edge_set.insert({gi, get_gid(j), sx, sy, sz});
+            }
+        }
+
+        std::vector<int> edge_index, edge_shift;
+        edge_index.reserve(edge_set.size() * 2);
+        edge_shift.reserve(edge_set.size() * 3);
+        for (const auto& e : edge_set) {
+            edge_index.push_back(e[0]); edge_index.push_back(e[1]);
+            edge_shift.push_back(e[2]); edge_shift.push_back(e[3]); edge_shift.push_back(e[4]);
+        }
+        int n_edge3 = static_cast<int>(edge_set.size());
+        int N_edge3 = n_edge3;
+        if (initialized) MPI_Allreduce(&n_edge3, &N_edge3, 1, MPI_INT, MPI_SUM, comm);
+
+        // 4. Owned per-atom arrays copied from this AtomicData.
+        std::vector<int> at_index(n_atom), at_type(n_atom), at_num(n_atom);
+        std::vector<double> pos(3 * n_atom);
+        for (int i = 0; i < n_atom; ++i) {
+            at_index[i] = atom_index[i];
+            at_type[i] = atom_type[i];
+            at_num[i] = atomic_numbers[i];
+            pos[3 * i] = x[i]; pos[3 * i + 1] = y[i]; pos[3 * i + 2] = z[i];
+        }
+
+        return new AtomicData(
+            static_cast<size_t>(n_atom), static_cast<size_t>(N_atom), static_cast<size_t>(atom_offset),
+            static_cast<size_t>(n_edge3), static_cast<size_t>(N_edge3),
+            at_index.data(), at_type.data(), edge_index.data(), type_norb.data(), edge_shift.data(),
+            cell.data(), pos.data(), at_num.data(), comm, pbc);
     }
 
 private:

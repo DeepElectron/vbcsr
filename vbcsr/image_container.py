@@ -136,6 +136,13 @@ class ImageContainer:
         owner = reduce-up). ``target`` is a (Python) ``ImageContainer``."""
         self._core.redistribute_into(target._core, op, common_comm)
 
+    def axpy_into(self, other, alpha):
+        """In-place per-image ``self += alpha * other`` (matched by lattice shift R). ``self`` must
+        be a superset graph of ``other`` — e.g. the graph3b V_nl absorbing the 2-body kinetic to
+        form the combined static Hamiltonian H_static = T + V_nl (doc/design/41 §3). ``other`` is a
+        (Python) :class:`ImageContainer` on the same owned-row partition."""
+        self._core.axpy_into(other._core, float(alpha))
+
     def sample_k(self, k_point, convention="R", symm=False):
         """
         Fourier-transform real-space blocks to a single k-point.

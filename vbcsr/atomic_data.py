@@ -104,7 +104,7 @@ class AtomicData(vbcsr_core.AtomicData):
         )
 
     @classmethod
-    def from_distributed(
+    def from_graph_arrays(
         cls,
         n_atom,
         N_atom,
@@ -148,7 +148,7 @@ class AtomicData(vbcsr_core.AtomicData):
             if atomic_number_array.size != int(n_atom):
                 raise ValueError("atomic_numbers size must equal n_atom")
 
-        return super().from_distributed(
+        return super().from_graph_arrays(
             int(n_atom),
             int(N_atom),
             int(atom_offset),
@@ -163,6 +163,30 @@ class AtomicData(vbcsr_core.AtomicData):
             pos,
             atomic_number_array,
             comm,
+        )
+
+    @classmethod
+    def from_distributed(cls, pos, z, input_index, cell, pbc, r_max, type_norb, comm=None):
+        """Build the distributed AtomicData from a CALLER-GIVEN partition (doc 42 §4).
+
+        Each rank passes ONLY its owned atoms: ``pos`` (n_owned, 3), ``z`` (n_owned,),
+        and ``input_index`` (n_owned,) — the original input-order index of each owned
+        atom (fills ``atom_index``/``indices``). ``r_max``/``type_norb`` are per-type
+        (global, indexed by sorted-unique-Z). Global ids are assigned contiguously by
+        rank and the edge graph + ghosts are built distributed (no rank-0 gather, no
+        ParMETIS). The partition (which atom each rank owns) is the caller's choice.
+        """
+        comm = _default_comm(comm)
+        pos = np.ascontiguousarray(np.asarray(pos, dtype=np.float64).reshape(-1, 3))
+        z = np.ascontiguousarray(np.asarray(z, dtype=np.int32).reshape(-1))
+        input_index = np.ascontiguousarray(np.asarray(input_index, dtype=np.int32).reshape(-1))
+        cell = np.ascontiguousarray(np.asarray(cell, dtype=np.float64).reshape(3, 3))
+        r_max_vec = np.ascontiguousarray(np.asarray(r_max, dtype=np.float64).reshape(-1))
+        type_norb_vec = np.ascontiguousarray(np.asarray(type_norb, dtype=np.int32).reshape(-1))
+        if z.size != pos.shape[0] or input_index.size != pos.shape[0]:
+            raise ValueError("from_distributed: pos/z/input_index must share n_owned")
+        return super().from_distributed(
+            pos, z, input_index, cell, _normalize_pbc(pbc), r_max_vec, type_norb_vec, comm
         )
 
     @classmethod

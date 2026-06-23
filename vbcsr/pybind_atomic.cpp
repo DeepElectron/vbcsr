@@ -163,6 +163,15 @@ void bind_image_container(py::module& m, const std::string& name) {
              "Batched cross-comm redistribute of all images (doc/design/35 incr3): "
              "fill ``target``'s images from this container's blocks in one Alltoallv on "
              "``common_comm``. op Copy=send-down/broadcast, Sum=reduce-up.")
+        // gather_into removed (doc/design/41 §2.3): the operator-walk gather is now the keyed
+        // LocalBlockView from rescupp.lcao_grid.GatherPlan.gather_local (alias local, cache remote).
+        .def("axpy_into",
+             [](ImageContainer<T>& self, const ImageContainer<T>& other, T alpha) {
+                 self.axpy_into(other, alpha);
+             },
+             py::arg("other"), py::arg("alpha"),
+             "In-place per-image this += alpha*other (matched by R; this must be a superset graph, "
+             "e.g. graph3b V_nl absorbing the 2-body T to form H_static). doc/design/41 §3.")
         .def("get_block",
              [](const ImageContainer<T>& self, std::vector<int> R, int g_row, int g_col)
                  -> py::object {
@@ -195,7 +204,7 @@ void bind_atomic_module(py::module& m) {
         self.ensure_owned_atomic_numbers(context);
         return copy_1d_array(self.atomic_numbers.data(), self.n_atom);
     };
-    
+
     py::class_<AtomicData>(m, "AtomicData")
         .def(py::init([](py::object comm_obj) {
             return new AtomicData(get_mpi_comm(comm_obj));
@@ -247,10 +256,12 @@ void bind_atomic_module(py::module& m) {
         }, py::arg("pos"), py::arg("z"), py::arg("cell"), py::arg("pbc"), 
            py::arg("r_max"), py::arg("type_norb"), py::arg("comm") = py::none())
         
-        // Static Constructor - from pre-computed distributed graph data
+        // Static Constructor - from pre-computed distributed graph ARRAYS (low level).
         // Mirrors the C++ constructor: AtomicData(n_atom, N_atom, atom_offset, n_edge, N_edge,
-        //   atom_index, atom_type, edge_index, type_norb, edge_shift, cell, pos, comm)
-        .def_static("from_distributed", [](
+        //   atom_index, atom_type, edge_index, type_norb, edge_shift, cell, pos, comm).
+        // The caller must have ALREADY built the owned+edge arrays; for building a
+        // distributed graph from each rank's points + a partition, use from_distributed.
+        .def_static("from_graph_arrays", [](
                 int n_atom, int N_atom, int atom_offset, int n_edge, int N_edge,
                 py::array_t<int> atom_index,
                 py::array_t<int> atom_type,
@@ -311,7 +322,43 @@ void bind_atomic_module(py::module& m) {
            py::arg("type_norb"), py::arg("edge_shift"),
            py::arg("cell"), py::arg("pos"), py::arg("atomic_numbers") = py::none(),
            py::arg("comm") = py::none())
-        
+
+        // Distributed construction from a CALLER-GIVEN partition (doc/design/42 §4):
+        // each rank passes ONLY its owned atoms (pos/z + their input-order indices);
+        // global ids are assigned contiguously by rank and the edge graph + ghosts
+        // are built distributed (no rank-0 gather, no ParMETIS). The caller chooses
+        // the partition (e.g. a spatial slab/RCB aligned with the grid).
+        .def_static("from_distributed", [](
+                py::array_t<double> pos, py::array_t<int> z, py::array_t<int> input_index,
+                py::array_t<double> cell, py::object pbc_obj,
+                py::object r_max_obj, py::object type_norb_obj, py::object comm_obj) {
+            MPI_Comm comm = get_mpi_comm(comm_obj);
+            auto r_pos = pos.unchecked<2>();
+            if (r_pos.ndim() != 2 || r_pos.shape(1) != 3) throw std::runtime_error("pos must be (n_owned, 3)");
+            std::vector<double> vec_pos = numpy_to_vector(pos);
+            std::vector<int> vec_z = numpy_to_vector(z);
+            std::vector<int> vec_idx = numpy_to_vector(input_index);
+            std::vector<double> vec_cell = numpy_to_vector(cell);
+            std::vector<bool> vec_pbc = parse_pbc(pbc_obj);
+            auto to_dvec = [](py::object o, const char* w) {
+                if (py::isinstance<py::list>(o)) return numpy_to_vector<double>(py::array(o));
+                if (py::isinstance<py::array>(o)) return numpy_to_vector<double>(o);
+                throw std::runtime_error(std::string(w) + ": must be list or array of floats");
+            };
+            auto to_ivec = [](py::object o, const char* w) {
+                if (py::isinstance<py::list>(o)) return numpy_to_vector<int>(py::array(o));
+                if (py::isinstance<py::array>(o)) return numpy_to_vector<int>(o);
+                throw std::runtime_error(std::string(w) + ": must be list or array of ints");
+            };
+            std::vector<double> r_max_vec = to_dvec(r_max_obj, "from_distributed r_max");
+            std::vector<int> type_norb_vec = to_ivec(type_norb_obj, "from_distributed type_norb");
+            if (vec_idx.size() != vec_z.size())
+                throw std::runtime_error("from_distributed: input_index size must equal n_owned");
+            return AtomicData::from_distributed(vec_pos, vec_z, vec_idx, vec_cell, vec_pbc,
+                                                r_max_vec, type_norb_vec, comm);
+        }, py::arg("pos"), py::arg("z"), py::arg("input_index"), py::arg("cell"),
+           py::arg("pbc"), py::arg("r_max"), py::arg("type_norb"), py::arg("comm") = py::none())
+
         // Properties
         .def_property_readonly("pos", owned_positions)
         .def_property_readonly("positions", owned_positions)
@@ -337,6 +384,7 @@ void bind_atomic_module(py::module& m) {
         })
         .def("norb", &AtomicData::norb)
         .def("get_atom_norb", &AtomicData::get_atom_norb)
+        .def_property_readonly("n_atom", [](const AtomicData& self) { return self.n_atom; })
         .def_property_readonly("pbc", [](const AtomicData& self) {
              return std::vector<bool>(self.pbc.begin(), self.pbc.end());
         })
