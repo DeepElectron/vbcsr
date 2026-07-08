@@ -25,6 +25,7 @@ import math
 import os
 import platform
 import resource
+import shutil
 import shlex
 import socket
 import subprocess
@@ -70,7 +71,7 @@ except Exception:  # pragma: no cover - depends on the benchmark environment.
     MPI = None
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DOMAINS = ("csr", "bsr", "vbcsr")
 OPERATIONS = ("spmv", "spmm", "spgemm")
 VBCSR_BLOCK_SIZES = (9, 13, 15, 20)
@@ -100,9 +101,13 @@ class BenchmarkSpec:
     @property
     def label(self) -> str:
         dtype_label = "complex" if self.dtype == np.dtype(np.complex128) else "real"
+        threshold_label = ""
+        if self.operation == "spgemm":
+            threshold_label = f"_thr{format_float_label(self.spgemm_threshold)}"
         return (
             f"{self.suite}_{self.domain}_{self.operation}_"
             f"geom_n{self.blocks}_deg{self.target_degree}_rhs{self.rhs}_{dtype_label}"
+            f"{threshold_label}"
         )
 
 
@@ -202,6 +207,20 @@ def parse_dtype(value: str) -> np.dtype:
     raise argparse.ArgumentTypeError("dtype must be 'real' or 'complex'")
 
 
+def parse_thresholds(value: str | None, fallback: float) -> list[float]:
+    if value is None or value.strip() == "":
+        return [float(fallback)]
+    thresholds = [float(item) for item in value.replace(",", " ").split()]
+    if not thresholds:
+        raise argparse.ArgumentTypeError("--spgemm-thresholds cannot be empty")
+    return thresholds
+
+
+def format_float_label(value: float) -> str:
+    text = f"{value:.3e}"
+    return text.replace("+", "").replace("-", "m").replace(".", "p")
+
+
 def stable_seed(seed: int, *items: int) -> int:
     value = np.uint64(seed) ^ np.uint64(0x9E3779B97F4A7C15)
     for item in items:
@@ -235,7 +254,8 @@ def geometric_grid_shape(blocks: int, dim: int) -> tuple[int, ...]:
 
 def make_geometric_positions(spec: BenchmarkSpec) -> tuple[np.ndarray, np.ndarray, tuple[int, ...]]:
     shape = geometric_grid_shape(spec.blocks, spec.geometry_dim)
-    flat = np.arange(spec.blocks, dtype=np.int64)
+    grid_size = math.prod(shape)
+    flat = (np.arange(spec.blocks, dtype=np.int64) * grid_size) // spec.blocks
     grid = np.array(np.unravel_index(flat, shape), dtype=np.float64).T
     positions = grid * spec.geometry_spacing
     box_lengths = np.array(shape, dtype=np.float64) * spec.geometry_spacing
@@ -889,6 +909,28 @@ def numpy_blas_metadata() -> dict[str, str]:
     return {"numpy_config": stream.getvalue()}
 
 
+def flexiblas_metadata() -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "executable": shutil.which("flexiblas"),
+        "FLEXIBLAS": os.environ.get("FLEXIBLAS"),
+        "FLEXIBLAS64": os.environ.get("FLEXIBLAS64"),
+        "FLEXIBLAS_CONFIG": os.environ.get("FLEXIBLAS_CONFIG"),
+    }
+    if result["executable"] is None:
+        return result
+    for name, args in (("list", ["list"]), ("current", ["current"])):
+        try:
+            result[name] = subprocess.check_output(
+                [str(result["executable"]), *args],
+                text=True,
+                stderr=subprocess.STDOUT,
+                timeout=10,
+            ).strip()
+        except Exception as exc:
+            result[name] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
 def package_metadata() -> dict[str, Any]:
     result: dict[str, Any] = {
         "python": sys.version,
@@ -935,6 +977,19 @@ def mpi_metadata(comm: Any, rank: int, size: int) -> dict[str, Any]:
 
 def environment_metadata(comm: Any, rank: int, size: int) -> dict[str, Any]:
     thread_vars = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "BLIS_NUM_THREADS")
+    slurm_vars = (
+        "SLURM_JOB_ID",
+        "SLURM_JOB_NAME",
+        "SLURM_CLUSTER_NAME",
+        "SLURM_JOB_ACCOUNT",
+        "SLURM_JOB_PARTITION",
+        "SLURM_NNODES",
+        "SLURM_NTASKS",
+        "SLURM_TASKS_PER_NODE",
+        "SLURM_CPUS_PER_TASK",
+        "SLURM_MEM_PER_NODE",
+        "SLURM_SUBMIT_DIR",
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -944,12 +999,24 @@ def environment_metadata(comm: Any, rank: int, size: int) -> dict[str, Any]:
         "packages": package_metadata(),
         "cmake": cmake_metadata(),
         "blas": numpy_blas_metadata(),
+        "flexiblas": flexiblas_metadata(),
         "cpu": cpu_metadata(),
         "mpi": mpi_metadata(comm, rank, size),
         "environment": {
             "conda_default_env": os.environ.get("CONDA_DEFAULT_ENV"),
             "conda_prefix": os.environ.get("CONDA_PREFIX"),
+            "virtual_env": os.environ.get("VIRTUAL_ENV"),
+            "python_venv": os.environ.get("PYTHON_VENV"),
             "VBCSR_BUILD_DIR": os.environ.get("VBCSR_BUILD_DIR"),
+            "loaded_modules": os.environ.get("LOADEDMODULES"),
+            "lmod_family_mpi": os.environ.get("LMOD_FAMILY_MPI"),
+            "lmod_family_compiler": os.environ.get("LMOD_FAMILY_COMPILER"),
+            "flexiblas": {
+                "FLEXIBLAS": os.environ.get("FLEXIBLAS"),
+                "FLEXIBLAS64": os.environ.get("FLEXIBLAS64"),
+                "FLEXIBLAS_CONFIG": os.environ.get("FLEXIBLAS_CONFIG"),
+            },
+            "slurm": {name: os.environ.get(name) for name in slurm_vars},
             "threads": {name: os.environ.get(name) for name in thread_vars},
         },
     }
@@ -957,6 +1024,7 @@ def environment_metadata(comm: Any, rank: int, size: int) -> dict[str, Any]:
 
 def build_specs(args: argparse.Namespace, rank_count: int) -> list[BenchmarkSpec]:
     dtype = parse_dtype(args.dtype)
+    spgemm_thresholds = parse_thresholds(args.spgemm_thresholds, args.spgemm_threshold)
     if args.suite == "distributed-weak":
         blocks = int(args.weak_blocks_per_rank) * rank_count
         weak_blocks = int(args.weak_blocks_per_rank)
@@ -964,29 +1032,33 @@ def build_specs(args: argparse.Namespace, rank_count: int) -> list[BenchmarkSpec
         blocks = int(args.blocks)
         weak_blocks = None
 
-    return [
-        BenchmarkSpec(
-            suite=args.suite,
-            domain=domain,
-            operation=operation,
-            blocks=blocks,
-            target_degree=int(args.target_degree),
-            rhs=int(args.rhs),
-            dtype=dtype,
-            seed=int(args.seed),
-            bsr_block_size=int(args.bsr_block_size),
-            spgemm_threshold=float(args.spgemm_threshold),
-            spgemm_audit_limit=int(args.spgemm_audit_limit),
-            geometry_dim=int(args.geometry_dim),
-            geometry_spacing=float(args.geometry_spacing),
-            geometry_jitter=float(args.geometry_jitter),
-            geometry_cutoff=args.geometry_cutoff,
-            geometry_cutoff_quantile=float(args.geometry_cutoff_quantile),
-            weak_blocks_per_rank=weak_blocks,
-        )
-        for domain in DOMAINS
-        for operation in OPERATIONS
-    ]
+    specs: list[BenchmarkSpec] = []
+    for domain in DOMAINS:
+        for operation in OPERATIONS:
+            thresholds = spgemm_thresholds if operation == "spgemm" else [float(args.spgemm_threshold)]
+            for threshold in thresholds:
+                specs.append(
+                    BenchmarkSpec(
+                        suite=args.suite,
+                        domain=domain,
+                        operation=operation,
+                        blocks=blocks,
+                        target_degree=int(args.target_degree),
+                        rhs=int(args.rhs),
+                        dtype=dtype,
+                        seed=int(args.seed),
+                        bsr_block_size=int(args.bsr_block_size),
+                        spgemm_threshold=float(threshold),
+                        spgemm_audit_limit=int(args.spgemm_audit_limit),
+                        geometry_dim=int(args.geometry_dim),
+                        geometry_spacing=float(args.geometry_spacing),
+                        geometry_jitter=float(args.geometry_jitter),
+                        geometry_cutoff=args.geometry_cutoff,
+                        geometry_cutoff_quantile=float(args.geometry_cutoff_quantile),
+                        weak_blocks_per_rank=weak_blocks,
+                    )
+                )
+    return specs
 
 
 def write_outputs(payload: dict[str, Any], output_dir: Path, label: str) -> tuple[Path, Path]:
@@ -1010,6 +1082,7 @@ def write_outputs(payload: dict[str, Any], output_dir: Path, label: str) -> tupl
         "degree_min",
         "degree_max",
         "rhs",
+        "spgemm_threshold",
         "vbcsr_median_seconds",
         "vbcsr_min_seconds",
         "vbcsr_std_seconds",
@@ -1054,6 +1127,7 @@ def write_outputs(payload: dict[str, Any], output_dir: Path, label: str) -> tupl
                     "degree_min": case["adjacency"]["degree_min"],
                     "degree_max": case["adjacency"]["degree_max"],
                     "rhs": case["parameters"]["rhs"],
+                    "spgemm_threshold": case["parameters"]["spgemm_threshold"] if case["operation"] == "spgemm" else None,
                     "vbcsr_median_seconds": timings["vbcsr"]["median_seconds"],
                     "vbcsr_min_seconds": timings["vbcsr"]["min_seconds"],
                     "vbcsr_std_seconds": timings["vbcsr"]["std_seconds"],
@@ -1084,14 +1158,19 @@ def write_outputs(payload: dict[str, Any], output_dir: Path, label: str) -> tupl
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run publication VBCSR benchmark data generation.")
     parser.add_argument("--suite", choices=("efficiency", "distributed-strong", "distributed-weak"), default="efficiency")
-    parser.add_argument("--blocks", type=int, default=2048, help="Global block count for efficiency and strong scaling")
-    parser.add_argument("--weak-blocks-per-rank", type=int, default=2048)
+    parser.add_argument("--blocks", type=int, default=4096, help="Global block count for efficiency and strong scaling")
+    parser.add_argument("--weak-blocks-per-rank", type=int, default=4096)
     parser.add_argument("--target-degree", type=int, default=12)
     parser.add_argument("--rhs", type=int, default=16)
     parser.add_argument("--dtype", choices=("real", "complex"), default="real")
     parser.add_argument("--seed", type=int, default=1729)
     parser.add_argument("--bsr-block-size", type=int, default=8)
     parser.add_argument("--spgemm-threshold", type=float, default=0.0)
+    parser.add_argument(
+        "--spgemm-thresholds",
+        default=None,
+        help="Comma or space separated SpGEMM threshold sweep. SpMV/SpMM are still run once.",
+    )
     parser.add_argument("--spgemm-audit-limit", type=int, default=200000)
     parser.add_argument("--geometry-dim", type=int, default=3)
     parser.add_argument("--geometry-spacing", type=float, default=1.0)
