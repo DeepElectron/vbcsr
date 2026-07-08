@@ -71,7 +71,7 @@ except Exception:  # pragma: no cover - depends on the benchmark environment.
     MPI = None
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DOMAINS = ("csr", "bsr", "vbcsr")
 OPERATIONS = ("spmv", "spmm", "spgemm")
 VBCSR_BLOCK_SIZES = (9, 13, 15, 20)
@@ -96,6 +96,9 @@ class BenchmarkSpec:
     geometry_jitter: float
     geometry_cutoff: float | None
     geometry_cutoff_quantile: float
+    magnitude_decay_length: float
+    offdiagonal_scale: float
+    diagonal_shift: float
     weak_blocks_per_rank: int | None = None
 
     @property
@@ -283,7 +286,65 @@ def calibrate_cutoff(positions: np.ndarray, box_lengths: np.ndarray, spec: Bench
     return max(cutoff * 1.000001, np.finfo(float).eps), "calibrated_from_target_degree"
 
 
-def make_geometric_adjacency(spec: BenchmarkSpec) -> tuple[list[list[int]], dict[str, Any]]:
+def periodic_distance(row: int, col: int, positions: np.ndarray, box_lengths: np.ndarray) -> float:
+    delta = positions[row] - positions[col]
+    delta = delta - box_lengths * np.round(delta / box_lengths)
+    return float(np.linalg.norm(delta))
+
+
+def block_magnitude_scale(row: int, col: int, positions: np.ndarray, box_lengths: np.ndarray, spec: BenchmarkSpec) -> float:
+    if row == col:
+        return 1.0
+    if spec.magnitude_decay_length <= 0.0:
+        raise ValueError("--magnitude-decay-length must be positive")
+    distance = periodic_distance(row, col, positions, box_lengths)
+    return float(spec.offdiagonal_scale * math.exp(-distance / spec.magnitude_decay_length))
+
+
+def matrix_value_model_statistics(
+    adjacency: list[list[int]],
+    positions: np.ndarray,
+    box_lengths: np.ndarray,
+    spec: BenchmarkSpec,
+) -> dict[str, Any]:
+    offdiag_distances: list[float] = []
+    offdiag_scales: list[float] = []
+    for row, cols in enumerate(adjacency):
+        for col in cols:
+            if row == col:
+                continue
+            distance = periodic_distance(row, col, positions, box_lengths)
+            offdiag_distances.append(distance)
+            offdiag_scales.append(float(spec.offdiagonal_scale * math.exp(-distance / spec.magnitude_decay_length)))
+
+    distances = np.asarray(offdiag_distances, dtype=np.float64)
+    scales = np.asarray(offdiag_scales, dtype=np.float64)
+    result: dict[str, Any] = {
+        "model": "exponential_distance_decay_with_onsite_shift",
+        "distance_metric": "periodic_minimum_image",
+        "magnitude_decay_length": spec.magnitude_decay_length,
+        "offdiagonal_scale": spec.offdiagonal_scale,
+        "diagonal_shift": spec.diagonal_shift,
+        "diagonal_random_scale": 1.0,
+        "block_random_normalization": "1/sqrt(row_block_size * column_block_size)",
+    }
+    if distances.size:
+        result.update(
+            {
+                "offdiagonal_distance_min": float(distances.min()),
+                "offdiagonal_distance_mean": float(distances.mean()),
+                "offdiagonal_distance_max": float(distances.max()),
+                "offdiagonal_magnitude_scale_min": float(scales.min()),
+                "offdiagonal_magnitude_scale_mean": float(scales.mean()),
+                "offdiagonal_magnitude_scale_max": float(scales.max()),
+            }
+        )
+    return result
+
+
+def make_geometric_adjacency(
+    spec: BenchmarkSpec,
+) -> tuple[list[list[int]], dict[str, Any], np.ndarray, np.ndarray]:
     if spec.geometry_spacing <= 0.0:
         raise ValueError("--geometry-spacing must be positive")
     if spec.geometry_jitter < 0.0:
@@ -315,7 +376,7 @@ def make_geometric_adjacency(spec: BenchmarkSpec) -> tuple[list[list[int]], dict
         "degree_std": float(degrees.std()) if degrees.size else 0.0,
         "directed_block_edges": directed_edges,
         "reciprocal_directed_edge_fraction": float(reciprocal / max(directed_edges, 1)),
-    }
+    }, positions, box_lengths
 
 
 def make_block_sizes(spec: BenchmarkSpec) -> list[int]:
@@ -329,22 +390,33 @@ def make_block_sizes(spec: BenchmarkSpec) -> list[int]:
     raise ValueError(f"unknown domain {spec.domain!r}")
 
 
-def make_block_data(row: int, col: int, row_dim: int, col_dim: int, dtype: np.dtype, seed: int) -> np.ndarray:
-    rng = np.random.default_rng(stable_seed(seed, 307, row, col, row_dim, col_dim))
+def make_block_data(
+    row: int,
+    col: int,
+    row_dim: int,
+    col_dim: int,
+    spec: BenchmarkSpec,
+    positions: np.ndarray,
+    box_lengths: np.ndarray,
+) -> np.ndarray:
+    rng = np.random.default_rng(stable_seed(spec.seed, 307, row, col, row_dim, col_dim))
     scale = 1.0 / math.sqrt(max(row_dim * col_dim, 1))
-    real = rng.standard_normal((row_dim, col_dim)) * scale
+    magnitude = block_magnitude_scale(row, col, positions, box_lengths, spec)
+    real = rng.standard_normal((row_dim, col_dim)) * scale * magnitude
     data = real
-    if dtype == np.dtype(np.complex128):
-        data = real + 1j * rng.standard_normal((row_dim, col_dim)) * scale
+    if spec.dtype == np.dtype(np.complex128):
+        data = real + 1j * rng.standard_normal((row_dim, col_dim)) * scale * magnitude
     if row == col and row_dim == col_dim:
-        data = data + np.eye(row_dim, dtype=dtype) * (2.0 + 0.01 * (row % 17))
-    return np.ascontiguousarray(data, dtype=dtype)
+        data = data + np.eye(row_dim, dtype=spec.dtype) * (spec.diagonal_shift + 0.01 * (row % 17))
+    return np.ascontiguousarray(data, dtype=spec.dtype)
 
 
 def build_matrix(
     spec: BenchmarkSpec,
     block_sizes: list[int],
     adjacency: list[list[int]],
+    positions: np.ndarray,
+    box_lengths: np.ndarray,
     comm: Any,
     rank: int,
     size: int,
@@ -370,7 +442,7 @@ def build_matrix(
     for row in owned:
         row_dim = block_sizes[row]
         for col in adjacency[row]:
-            matrix.add_block(row, col, make_block_data(row, col, row_dim, block_sizes[col], spec.dtype, spec.seed))
+            matrix.add_block(row, col, make_block_data(row, col, row_dim, block_sizes[col], spec, positions, box_lengths))
     matrix.assemble()
     barrier(comm)
     assembly_seconds = time.perf_counter() - t1
@@ -402,12 +474,14 @@ def benchmark_atomistic_conversion(
     spec: BenchmarkSpec,
     block_sizes: list[int],
     adjacency: list[list[int]],
+    positions: np.ndarray,
+    box_lengths: np.ndarray,
+    cutoff: float,
+    cutoff_source: str,
     comm: Any,
     rank: int,
     size: int,
 ) -> dict[str, Any]:
-    positions, box_lengths, _ = make_geometric_positions(spec)
-    cutoff, cutoff_source = calibrate_cutoff(positions, box_lengths, spec)
     atomic_numbers, unique_z, type_norb = atomic_numbers_and_type_norb(block_sizes, spec)
     cell = np.diag(box_lengths).astype(np.float64)
 
@@ -623,7 +697,15 @@ def validate_against_scipy(matrix: vbcsr.VBCSR, scalar: sp.csr_matrix, inputs: d
         reference = scalar.dot(scalar)
     error = relative_error(reference, observed)
     tolerance = 1e-9 if spec.dtype == np.dtype(np.complex128) else 1e-10
-    return {"reference": "scipy_csr", "relative_error": error, "tolerance": tolerance, "passed": bool(error <= tolerance)}
+    exact_required = not (spec.operation == "spgemm" and spec.spgemm_threshold > 0.0)
+    return {
+        "reference": "scipy_csr_exact_product",
+        "relative_error": error,
+        "tolerance": tolerance,
+        "passed": bool(error <= tolerance),
+        "exact_validation_required": exact_required,
+        "role": "correctness_check" if exact_required else "threshold_accuracy_measurement",
+    }
 
 
 def get_current_rss_bytes() -> int:
@@ -708,7 +790,13 @@ def spgemm_candidate_count(adjacency: list[list[int]]) -> int:
     return int(sum(len(adjacency[inner]) for row in adjacency for inner in row))
 
 
-def spgemm_threshold_audit(adjacency: list[list[int]], block_sizes: list[int], spec: BenchmarkSpec) -> dict[str, Any]:
+def spgemm_threshold_audit(
+    adjacency: list[list[int]],
+    block_sizes: list[int],
+    spec: BenchmarkSpec,
+    positions: np.ndarray,
+    box_lengths: np.ndarray,
+) -> dict[str, Any]:
     candidate_count = spgemm_candidate_count(adjacency)
     if candidate_count > spec.spgemm_audit_limit:
         return {"audited": False, "candidate_block_products": candidate_count, "audit_limit": spec.spgemm_audit_limit}
@@ -718,10 +806,10 @@ def spgemm_threshold_audit(adjacency: list[list[int]], block_sizes: list[int], s
         a_row_dim = block_sizes[row]
         row_eps = spec.spgemm_threshold / max(1, len(inners))
         for inner in inners:
-            a = make_block_data(row, inner, a_row_dim, block_sizes[inner], spec.dtype, spec.seed)
+            a = make_block_data(row, inner, a_row_dim, block_sizes[inner], spec, positions, box_lengths)
             norm_a = float(np.linalg.norm(a))
             for col in adjacency[inner]:
-                b = make_block_data(inner, col, block_sizes[inner], block_sizes[col], spec.dtype, spec.seed)
+                b = make_block_data(inner, col, block_sizes[inner], block_sizes[col], spec, positions, box_lengths)
                 norm_b = float(np.linalg.norm(b))
                 if norm_a * norm_b < row_eps:
                     row_scaled_product_skips += 1
@@ -751,9 +839,21 @@ def run_case(
     require_mkl: bool,
 ) -> dict[str, Any]:
     block_sizes = make_block_sizes(spec)
-    adjacency, adjacency_info = make_geometric_adjacency(spec)
-    matrix, build_timings = build_matrix(spec, block_sizes, adjacency, comm, rank, size)
-    atomistic_conversion = benchmark_atomistic_conversion(spec, block_sizes, adjacency, comm, rank, size)
+    adjacency, adjacency_info, positions, box_lengths = make_geometric_adjacency(spec)
+    value_model = matrix_value_model_statistics(adjacency, positions, box_lengths, spec)
+    matrix, build_timings = build_matrix(spec, block_sizes, adjacency, positions, box_lengths, comm, rank, size)
+    atomistic_conversion = benchmark_atomistic_conversion(
+        spec,
+        block_sizes,
+        adjacency,
+        positions,
+        box_lengths,
+        float(adjacency_info["cutoff"]),
+        str(adjacency_info["cutoff_source"]),
+        comm,
+        rank,
+        size,
+    )
     inputs = make_inputs(matrix, spec, rank)
 
     result: dict[str, Any] = {
@@ -777,8 +877,12 @@ def run_case(
             "geometry_jitter": spec.geometry_jitter,
             "geometry_cutoff": spec.geometry_cutoff,
             "geometry_cutoff_quantile": spec.geometry_cutoff_quantile,
+            "magnitude_decay_length": spec.magnitude_decay_length,
+            "offdiagonal_scale": spec.offdiagonal_scale,
+            "diagonal_shift": spec.diagonal_shift,
         },
         "adjacency": adjacency_info,
+        "matrix_value_model": value_model,
         "atomistic_conversion": atomistic_conversion,
         "timings": dict(build_timings),
         "matrix": matrix_statistics(matrix, block_sizes, adjacency, spec, comm, rank, size),
@@ -851,7 +955,7 @@ def run_case(
             "output_block_nnz_sum": int(reduce_value(comm, output.local_block_nnz, "sum")),
             "output_scalar_nnz_sum": int(reduce_value(comm, output.local_nnz, "sum")),
             "fill_ratio_scalar": float(reduce_value(comm, output.local_nnz, "sum") / max(result["matrix"]["global_scalar_nnz"], 1)),
-            "threshold_audit": spgemm_threshold_audit(adjacency, block_sizes, spec),
+            "threshold_audit": spgemm_threshold_audit(adjacency, block_sizes, spec, positions, box_lengths),
         }
 
     vbcsr_median = result["timings"]["vbcsr"]["median_seconds"]
@@ -1025,6 +1129,10 @@ def environment_metadata(comm: Any, rank: int, size: int) -> dict[str, Any]:
 def build_specs(args: argparse.Namespace, rank_count: int) -> list[BenchmarkSpec]:
     dtype = parse_dtype(args.dtype)
     spgemm_thresholds = parse_thresholds(args.spgemm_thresholds, args.spgemm_threshold)
+    if args.magnitude_decay_length <= 0.0:
+        raise ValueError("--magnitude-decay-length must be positive")
+    if args.offdiagonal_scale <= 0.0:
+        raise ValueError("--offdiagonal-scale must be positive")
     if args.suite == "distributed-weak":
         blocks = int(args.weak_blocks_per_rank) * rank_count
         weak_blocks = int(args.weak_blocks_per_rank)
@@ -1055,6 +1163,9 @@ def build_specs(args: argparse.Namespace, rank_count: int) -> list[BenchmarkSpec
                         geometry_jitter=float(args.geometry_jitter),
                         geometry_cutoff=args.geometry_cutoff,
                         geometry_cutoff_quantile=float(args.geometry_cutoff_quantile),
+                        magnitude_decay_length=float(args.magnitude_decay_length),
+                        offdiagonal_scale=float(args.offdiagonal_scale),
+                        diagonal_shift=float(args.diagonal_shift),
                         weak_blocks_per_rank=weak_blocks,
                     )
                 )
@@ -1083,6 +1194,10 @@ def write_outputs(payload: dict[str, Any], output_dir: Path, label: str) -> tupl
         "degree_max",
         "rhs",
         "spgemm_threshold",
+        "magnitude_decay_length",
+        "offdiagonal_magnitude_scale_min",
+        "offdiagonal_magnitude_scale_mean",
+        "offdiagonal_magnitude_scale_max",
         "vbcsr_median_seconds",
         "vbcsr_min_seconds",
         "vbcsr_std_seconds",
@@ -1090,6 +1205,7 @@ def write_outputs(payload: dict[str, Any], output_dir: Path, label: str) -> tupl
         "mkl_median_seconds",
         "vbcsr_vs_best_scalar_baseline",
         "validation_passed",
+        "validation_exact_required",
         "validation_relative_error",
         "graph_construction_seconds",
         "assembly_seconds",
@@ -1128,6 +1244,10 @@ def write_outputs(payload: dict[str, Any], output_dir: Path, label: str) -> tupl
                     "degree_max": case["adjacency"]["degree_max"],
                     "rhs": case["parameters"]["rhs"],
                     "spgemm_threshold": case["parameters"]["spgemm_threshold"] if case["operation"] == "spgemm" else None,
+                    "magnitude_decay_length": case["parameters"]["magnitude_decay_length"],
+                    "offdiagonal_magnitude_scale_min": case["matrix_value_model"].get("offdiagonal_magnitude_scale_min"),
+                    "offdiagonal_magnitude_scale_mean": case["matrix_value_model"].get("offdiagonal_magnitude_scale_mean"),
+                    "offdiagonal_magnitude_scale_max": case["matrix_value_model"].get("offdiagonal_magnitude_scale_max"),
                     "vbcsr_median_seconds": timings["vbcsr"]["median_seconds"],
                     "vbcsr_min_seconds": timings["vbcsr"]["min_seconds"],
                     "vbcsr_std_seconds": timings["vbcsr"]["std_seconds"],
@@ -1135,6 +1255,7 @@ def write_outputs(payload: dict[str, Any], output_dir: Path, label: str) -> tupl
                     "mkl_median_seconds": timings.get("mkl", {}).get("median_seconds"),
                     "vbcsr_vs_best_scalar_baseline": case["speedups"].get("vbcsr_vs_best_scalar_baseline"),
                     "validation_passed": case["validation"].get("passed"),
+                    "validation_exact_required": case["validation"].get("exact_validation_required"),
                     "validation_relative_error": case["validation"].get("relative_error"),
                     "graph_construction_seconds": timings["graph_construction_seconds"],
                     "assembly_seconds": timings["assembly_seconds"],
@@ -1177,6 +1298,9 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--geometry-jitter", type=float, default=0.12)
     parser.add_argument("--geometry-cutoff", type=float, default=None)
     parser.add_argument("--geometry-cutoff-quantile", type=float, default=0.90)
+    parser.add_argument("--magnitude-decay-length", type=float, default=0.5)
+    parser.add_argument("--offdiagonal-scale", type=float, default=1.0)
+    parser.add_argument("--diagonal-shift", type=float, default=2.0)
     parser.add_argument("--repeats", type=int, default=7)
     parser.add_argument("--min-seconds", type=float, default=1.0)
     parser.add_argument("--min-iterations", type=int, default=5)
@@ -1231,7 +1355,7 @@ def main() -> int:
         if rank == 0:
             cases.append(case)
             validation = case.get("validation", {})
-            if validation.get("passed") is False:
+            if validation.get("exact_validation_required", True) and validation.get("passed") is False:
                 print(f"Validation failed for {case['label']}: {validation}", file=sys.stderr)
                 return 1
 
@@ -1247,6 +1371,7 @@ def main() -> int:
                 "domains": list(DOMAINS),
                 "operations": list(OPERATIONS),
                 "adjacency_model": "geometric_finite_cutoff",
+                "matrix_value_model": "exponential_distance_decay_with_onsite_shift",
                 "efficiency_baselines": ["scipy_csr", "mkl_sparse_if_available"],
                 "distributed_metrics": [
                     "operation_time",

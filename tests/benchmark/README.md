@@ -1,15 +1,16 @@
 # VBCSR Publication Benchmarks
 
 `run_benchmark.py` is the data-generation script for the benchmark section of
-`doc/main.tex`. It uses an atom-like periodic geometric finite-cutoff graph and
-runs the CSR, BSR, and VBCSR domains for SpMV, SpMM, and SpGEMM.
+`doc/main.tex`. It uses an atom-like periodic geometric finite-cutoff graph
+with exponentially decaying off-diagonal block magnitudes, and runs the CSR,
+BSR, and VBCSR domains for SpMV, SpMM, and SpGEMM.
 
 The JSON output records the full reproducibility state: git revision, CMake
 cache entries, Python packages, NumPy BLAS configuration, FlexiBLAS state,
 loaded modules, Slurm allocation, CPU model, MPI library, graph parameters,
 matrix storage, communication volume, assembly time, atomistic conversion time,
-validation error, and SpGEMM threshold/fill statistics. The CSV output contains
-one plotting row per benchmark case.
+validation error, value-decay parameters, and SpGEMM threshold/fill statistics.
+The CSV output contains one plotting row per benchmark case.
 
 ## Alliance/Compute Canada Environment
 
@@ -39,16 +40,19 @@ Run on one rank. The production default is `4096` graph blocks, which is a
 
 ```bash
 sbatch \
-  --export=ALL,REPO_ROOT=$PWD,PYTHON_VENV=$PWD/.venv-vbcsr,VBCSR_BUILD_DIR=build,BLOCKS=4096,TARGET_DEGREE=12,RHS=16,REPEATS=7,SPGEMM_THRESHOLDS=0.0 \
+  --export=ALL,REPO_ROOT=$PWD,PYTHON_VENV=$PWD/.venv-vbcsr,VBCSR_BUILD_DIR=build,BLOCKS=4096,TARGET_DEGREE=12,RHS=16,REPEATS=7,MAGNITUDE_DECAY_LENGTH=0.5,SPGEMM_THRESHOLDS=0.0 \
   tests/benchmark/slurm_efficiency.sbatch
 ```
 
 For the SpGEMM threshold/fill/error tradeoff rows, submit an additional
-efficiency job with a threshold sweep:
+efficiency job with a threshold sweep. Nonzero thresholds are approximate
+SpGEMM measurements: the script records the relative error against the exact
+SciPy product and does not treat that expected approximation error as a failed
+correctness check.
 
 ```bash
 sbatch \
-  --export=ALL,REPO_ROOT=$PWD,PYTHON_VENV=$PWD/.venv-vbcsr,VBCSR_BUILD_DIR=build,BLOCKS=4096,TARGET_DEGREE=12,RHS=16,REPEATS=7,SPGEMM_THRESHOLDS='0.0 1e-12 1e-10 1e-8' \
+  --export=ALL,REPO_ROOT=$PWD,PYTHON_VENV=$PWD/.venv-vbcsr,VBCSR_BUILD_DIR=build,BLOCKS=4096,TARGET_DEGREE=12,RHS=16,REPEATS=7,MAGNITUDE_DECAY_LENGTH=0.5,SPGEMM_THRESHOLDS='0.0 1e-6 1e-4 1e-2 1e-1' \
   tests/benchmark/slurm_efficiency.sbatch
 ```
 
@@ -65,7 +69,7 @@ TASKS_PER_NODE=32
 for np in 1 2 4 8 16 32 64; do
   nodes=$(( (np + TASKS_PER_NODE - 1) / TASKS_PER_NODE ))
   sbatch --nodes=${nodes} --ntasks=${np} --ntasks-per-node=${TASKS_PER_NODE} \
-    --export=ALL,REPO_ROOT=$PWD,PYTHON_VENV=$PWD/.venv-vbcsr,VBCSR_BUILD_DIR=build,SUITE=distributed-strong,BLOCKS=32768,TARGET_DEGREE=12,RHS=16,REPEATS=7,LABEL=paper_strong_np${np} \
+    --export=ALL,REPO_ROOT=$PWD,PYTHON_VENV=$PWD/.venv-vbcsr,VBCSR_BUILD_DIR=build,SUITE=distributed-strong,BLOCKS=32768,TARGET_DEGREE=12,RHS=16,REPEATS=7,MAGNITUDE_DECAY_LENGTH=0.5,LABEL=paper_strong_np${np} \
     tests/benchmark/slurm_distributed.sbatch
 done
 ```
@@ -85,7 +89,7 @@ TASKS_PER_NODE=32
 for np in 1 2 4 8 16 32 64; do
   nodes=$(( (np + TASKS_PER_NODE - 1) / TASKS_PER_NODE ))
   sbatch --nodes=${nodes} --ntasks=${np} --ntasks-per-node=${TASKS_PER_NODE} \
-    --export=ALL,REPO_ROOT=$PWD,PYTHON_VENV=$PWD/.venv-vbcsr,VBCSR_BUILD_DIR=build,SUITE=distributed-weak,WEAK_BLOCKS_PER_RANK=4096,TARGET_DEGREE=12,RHS=16,REPEATS=7,LABEL=paper_weak_np${np} \
+    --export=ALL,REPO_ROOT=$PWD,PYTHON_VENV=$PWD/.venv-vbcsr,VBCSR_BUILD_DIR=build,SUITE=distributed-weak,WEAK_BLOCKS_PER_RANK=4096,TARGET_DEGREE=12,RHS=16,REPEATS=7,MAGNITUDE_DECAY_LENGTH=0.5,LABEL=paper_weak_np${np} \
     tests/benchmark/slurm_distributed.sbatch
 done
 ```
