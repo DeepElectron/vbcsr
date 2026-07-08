@@ -332,6 +332,12 @@ PYBIND11_MODULE(vbcsr_core, m) {
         .def_readonly("block_sizes", &DistGraph::block_sizes)
         .def_readonly("adj_ptr", &DistGraph::adj_ptr)
         .def_readonly("adj_ind", &DistGraph::adj_ind)
+        .def_readonly("send_counts", &DistGraph::send_counts)
+        .def_readonly("recv_counts", &DistGraph::recv_counts)
+        .def_readonly("send_counts_scalar", &DistGraph::send_counts_scalar)
+        .def_readonly("recv_counts_scalar", &DistGraph::recv_counts_scalar)
+        .def_readonly("send_ranks", &DistGraph::send_ranks)
+        .def_readonly("recv_ranks", &DistGraph::recv_ranks)
         .def_property_readonly("owned_scalar_rows", [](const DistGraph& self) {
             const size_t owned_blocks = self.owned_global_indices.size();
             if (self.block_offsets.size() <= owned_blocks) {
