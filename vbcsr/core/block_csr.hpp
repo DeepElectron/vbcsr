@@ -240,6 +240,43 @@ public:
         return 0;
     }
 
+    std::string vendor_backend_name() const {
+        switch (kind) {
+        case MatrixKind::CSR:
+            return active_csr_backend().vendor_backend_name();
+        case MatrixKind::BSR:
+            return active_bsr_backend().vendor_backend_name();
+        case MatrixKind::VBCSR:
+            return "none";
+        }
+        return "unknown";
+    }
+
+    uint64_t vendor_launch_count() const {
+        switch (kind) {
+        case MatrixKind::CSR:
+            return active_csr_backend().get_vendor_launch_count();
+        case MatrixKind::BSR:
+            return active_bsr_backend().get_vendor_launch_count();
+        case MatrixKind::VBCSR:
+            return 0;
+        }
+        return 0;
+    }
+
+    void reset_vendor_launch_count() const {
+        switch (kind) {
+        case MatrixKind::CSR:
+            active_csr_backend().reset_vendor_launch_count();
+            return;
+        case MatrixKind::BSR:
+            active_bsr_backend().reset_vendor_launch_count();
+            return;
+        case MatrixKind::VBCSR:
+            return;
+        }
+    }
+
     bool has_contiguous_layout() const {
         return true;
     }

@@ -1,0 +1,519 @@
+\documentclass[
+reprint,
+superscriptaddress,
+frontmatterverbose,
+amsmath,amssymb,
+pra,
+]{revtex4-2}
+
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\usepackage[normalem]{ulem}
+\usepackage{graphicx}
+\usepackage{dcolumn}
+\usepackage{bm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{csquotes}
+\usepackage{hyperref}
+\usepackage{array}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{braket}
+
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+
+\lstdefinestyle{mystyle}{
+    backgroundcolor=\color{backcolour},
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{magenta},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    numbers=left,
+    numbersep=5pt,
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    tabsize=2
+}
+\lstset{style=mystyle}
+
+\hypersetup{
+    pdfborder={0 0 0},
+    pdfnewwindow=true,
+    colorlinks=true,
+    hypertexnames=false,
+    linkcolor=blue,
+    citecolor=blue,
+    filecolor=blue,
+    urlcolor=blue,
+}
+
+\newcommand{\ii}{{\mathrm{i}}}
+\newcommand{\bk}{{\bm{k}}}
+\newcommand{\bR}{{\bm{R}}}
+\newcommand{\tr}{{\text{tr}}}
+\renewcommand\boldsymbol{\bm}
+
+\begin{document}
+
+\title{VBCSR: High-Performance Distributed Infrastructure for Materials Simulation}
+
+\author{Zhanghao Zhouyin}
+\affiliation{Department of Physics, McGill University, Montreal, Quebec, Canada H3A2T8}
+
+\author{Hong Guo}
+\affiliation{Department of Physics, McGill University, Montreal, Quebec, Canada H3A2T8}
+
+\date{\today}
+
+\begin{abstract}
+Modern materials simulation is increasingly built from locality: localized atomic orbitals, elements, descriptors, learned Hamiltonian blocks etc.  These local objects are natural for chemistry, physics, and machine learning, but in many fields, simulation using a global operator build by its local parts is essential. Therefore, a highly-scalable, distributed operator infrastructure that have simple dependencies, high-performance and convinent enough for python dominant usage is desired. VBCSR is a Python-first distributed operator infrastructure designed for this need.  It represents atom-centered and graph-structured operators as sparse matrices with scalar, fixed-block, or variable-block structure. For maximize performance, VBCSR automatically selects highly tuned CSR, BSR, or true variable-block kernels behind a common user interface.  The package combines distributed data structure supported for general development, as well as the domain specific functionals that is right out-of-the-box. This paper mainly introduce the design concept, the architecture and main functionalities. We hope this package can help people benefit from the simple usage so to build their scientific workflow easier, while still benefiting the high-performance design to wrote simple but productive code with minimal effort to assist AI-enabled and first-principles and materials simulation.
+\end{abstract}
+
+\maketitle
+
+\section{Introduction}
+
+Locality principles are widely adopted in modern materials simulation.  In localized-basis electronic structure, a Hamiltonian or density matrix is built from atom-centered orbital blocks.  In tight-binding and machine-learned Hamiltonian models, the natural input and output are interactions on a local neighbor graph.  In finite-element, finite-volume, and coupled multi-physics methods, space is discretized into local cells, elements, or nodes that may carry different numbers of unknowns.  These examples come from different communities, but they lead to the same computational object when scaling up: a distributed infrastructure that represents local couplings between spatially localized degrees of freedom.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.92\linewidth]{fig/logo.png}
+    \caption{The VBCSR package logo.}
+    \label{fig:logo}
+\end{figure}
+
+The locality principle have largely motivated the AI-enabled scientific computing.  Machine Learning interatomic potentials, material descriptors, Hamiltonian blocks and surrogate properties mostly prefer local representations since they often embeded the dominant interactions, designing in this principle often lead to transferbility and better accuracy.  Many of the practical simulation, however, must do more than predict local pieces.  It must assemble those pieces into a global operator, distribute the operator across many processes, apply it to vectors state or batches of states, evaluate matrix functions, and often requires superhigh performance beyond prototype Python workflows.  Available packages often sacrifice the simplicity in exchange of the performance, despite highly mature, would less ideal for daily research usage.
+
+VBCSR is designed around one rule: expose a simple scientific object as Python native, and hide the complicated backend choices needed for performance.  The user works with graphs, atoms, local blocks, vectors, multivectors, and operator algebra just like operating any other Python object, while benefitting from the highly tunned kernels for efficiency and scalability. Therefore, the user can easily implement prototype algorithm with VBCSR, or replace their original code's data structure with VBCSR with performance boost. For developers, VBCSR are designed to be a lightweight, dependency-minimal, and composable package that can be embedded in larger workflows.
+
+The VBCSR stores and applies is centred around the structure of operators. Specifically, the operator is stored in the VBCSR as sparse matrices through CSR, BSR or truly variable-block CSR kernels to match the diverse data layout. The variable-block case is essential for atom-centered simulation. For example, in density functional theory and tight-binding simulations, different species naturally carry different numbers of orbitals; a carbon atom, a hydrogen atom, and a transition-metal atom should be considered as the element in the spatial domain that defines the interconnectivity patterns, while the local degree of freedom should vary. Similar structures is also common in finite element simulations.  More generally, a node $i$ may carry $b_i$ local degrees of freedom, and a coupling to node $j$ is a dense block of shape $b_i \times b_j$.  we design specific storage, computational kernels and  the distribution framework to naturally benefit from this structure. Therefore, VBCSR can becomes useful to a broad scientific audience where the performance is crucial.
+
+Existing high-performance sparse and electronic-structure libraries address important parts of this landscape, including RESCU \cite{michaud2016rescu}, DBCSR \cite{sivkov2019dbcsr}, CP2K \cite{kuhne2020cp2k}, NTPoly \cite{dawson2018massively}, BML \cite{bock2018basic}, CheSS \cite{mohr2017efficient}, and specialized dense micro-kernel approaches such as LIBXSMM \cite{heinecke2016libxsmm}.  VBCSR benefit from the mature design of algorithms of those, while concentrate on the niche: providing a Python-first distributed infrastructure layer that can be embedded in scientific workflows in material simulation  with multiple high-performance backend.  Therefore, a scalar graph Laplacian, a uniform-block elasticity operator, and a species-dependent localized-basis Hamiltonian can therefore share one user-facing abstraction.
+
+The contribution of this paper is consequently both numerical and infrastructural.  We present VBCSR as a lightweight distributed operator package for materials simulation, with:
+\begin{enumerate}
+    \item graph, vector, multivector, and matrix abstractions that preserve
+    spatial-local and graph-centered degrees of freedom;
+    \item automatic CSR, BSR, and VBCSR backend switching under one Python API;
+    \item shape-aware variable-block storage and batched kernels for sparse apply,
+    sparse-dense apply, thresholded sparse multiplication and graph-local matrix functions; and
+    \item atomistic and periodic-image containers that connect localized-basis
+    materials data to distributed operator algebra.
+\end{enumerate}
+
+\section{Lightweight Python Operator Infrastructure}
+
+\subsection{Distributed operators as central object}
+
+The central abstraction in VBCSR is a distributed operator defined on a graph. The local degree of freedom in each node of the graph defines the block size of the operator, and the edges of the graph defines the sparsity pattern. The spatial distribution is therefore a graph level partition using either geometric inspired method, or graph theory based method. Therefore, the structure and operator themselves can be defined distributedly by their local blocks, and automatically assembled to form the global representation. Worthnoticing is, the graph and partition is automatically conducted, and the logic is hidden from the usage, therefore, the user can focus on the scientific problem and constructing the operators by adding local blocks, without worrying anything about the data geometry and distribution.
+
+Once the structure of the partitioned graph are defined, the DOFs of the nodes are used to define the rows and columns of the operator.  Each node $i$ carries a block size $b_i$, and an operator block between nodes $i$ and $j$ is stored as a dense matrix $A_{ij}\in \mathbb{C}^{b_i \times b_j}$ or $A_{ij}\in \mathbb{R}^{b_i \times b_j}$.  Applying the operator has the form
+\begin{equation}
+    y_i = \sum_{j \in \mathcal{N}(i)} A_{ij} x_j,
+    \label{eq:block_apply}
+\end{equation}
+where $x_j$ and $y_i$ are local vector or blocks of vectors, and $\mathcal{N}(i)$ is the
+neighbor set of node $i$. Therefore, we can constructed the oprator class in the scientific object like the Hamiltonian in atomic simulation, the differential operator in PDE solving, and use the operator operation to solve it by iterative methods. 
+
+The repo also have other structures, they are all design as object that act by, auxilliate, or extend the operator class. For example, the disvector and multivector are defined as the distributed state with assist the operator, while the atomic data and image container are defined as the high-level scientific object to assist the atomic system construction, which is backed by the distribution class of the operator, and the real space and reciprocal space operator representation and conversion.  The design is therefore a layered infrastructure, where the user can use the high-level scientific object to construct the operator, and use the operator to solve the problem, while the backend is fully hidden so no complexity is exposed.
+
+\subsection{High Performance}
+
+High performance in VBCSR comes naturally from the data model of VBCSR.  Once the graph and block sizes are known, the package chooses an internal storage format that matches the operator.  Scalar operators use a CSR path, uniformly blocked operators use a BSR path, and genuinely heterogeneous operators use the VBCSR path.  The user still sees one matrix object and the same operations, such as construction, assembly, multiplication, transposition, filtering, and matrix functions.
+
+This automatic choice matters because different scientific operators expose
+different kinds of regularity.  A scalar graph descriptor should be stored and
+applied as a scalar sparse matrix.  A model with the same number of unknowns on
+every node can use fixed-size dense blocks.  A multi-species localized-basis
+Hamiltonian may instead contain many block shapes, because different atoms
+carry different numbers of orbitals.  VBCSR keeps these cases under one
+interface, but lowers them to different kernels behind the scenes.
+
+The storage layout is designed to keep the numerical work close to the memory
+layout.  The CSR and BSR backends use paged sparse storage and can call highly
+optimized sparse kernels from vendor libraries when they are available.  The 
+variable-block backend is accelerated through a shape resolved structure. We notice that despite the shape of blocks might varies, the total kind of shapes are often finite. Therefore, we groups blocks with the same shape and applies batched dense kernels to those groups when they applied.  In practical terms, the package tries to give the computer long, regular pieces of work despite the scientific operator is irregular.
+
+Parallel performance follows the same locality principle.  The distributed
+graph assigns each process a set of owned nodes and records the neighboring
+remote nodes that are needed to apply the local block rows.  During an
+operator application, only these neighboring vector blocks have to be
+exchanged.  The partition can be produced from geometric locality, from a graph
+partition, or from user-provided distributed data, so the computational layout
+can follow the spatial structure of the physical system. Practically, a partition can be optimized to minimize the neighbour required to achieve maximum performance.  For the scientific
+application, this allows the developer fully disentagle with the high-performance computing aspects of the problem. You only need to form the local blocks, and the package will handle the distribution and communication automatically.
+
+\subsection{Python-native workflow}
+
+The Python interface is designed so that a distributed operator behaves like a
+normal scientific Python object.  The matrix class follows the SciPy
+\texttt{LinearOperator} model and supports familiar matrix syntax, including
+the \texttt{@} operator for applying a matrix to a vector, a batch of vectors,
+or another sparse operator.  This makes VBCSR usable inside ordinary Python
+workflows without requiring users to write separate code for the distributed
+case.
+
+Vectors and multivectors are also exposed in a NumPy-like way.  Their locally
+owned entries can be viewed or filled with NumPy arrays, so prototype data,
+test cases, and small validation examples can move naturally between VBCSR and
+the wider scientific Python ecosystem.  On small problems, conversion helpers
+allow comparison with SciPy sparse matrices; on large problems, the same
+logical operations are executed by the distributed C++ backend.
+
+The key design choice is that advanced operator functionality is embedded in
+the object itself.  Scaling, shifting, transposition, conjugation, sparse
+matrix multiplication, block filtering, submatrix extraction, multivector
+application, and matrix-function approximations are called as ordinary matrix
+operations.  The accelerated kernels, communication schedules, and backend
+selection remain hidden behind this interface.  For the user, the workflow is
+therefore close to standard Python linear algebra, while the implementation
+can still use the specialized storage and kernels needed for large materials
+simulations.
+
+\section{Architecture and Algorithms}
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=0.98\linewidth]{Architecture.png}
+    \caption{VBCSR uses one Python-facing matrix interface and dispatches to
+    CSR, BSR, or variable-block backends according to the block-size structure
+    recorded in the distributed graph.  The same graph ownership, vector
+    layouts, communication routines, and numerical libraries support all
+    backends.}
+    \label{fig:architecture}
+\end{figure*}
+
+\subsection{Architecture overview}
+
+Figure~\ref{fig:architecture} summarizes the VBCSR software stack.  The input
+structure is a distributed block graph: graph edges define the sparse pattern,
+and node block sizes define the local degrees of freedom.  A single Python
+matrix class exposes assembly, sparse application, transpose, sparse matrix
+multiplication, filtering, and matrix-function utilities through pybind11-backed
+native kernels.
+
+The central architectural layer is backend abstraction.  After graph
+construction, the matrix facade selects one storage family from the global block
+structure: scalar graphs use CSR, uniform non-scalar graphs use BSR, and
+heterogeneous graphs use VBCSR.  This dispatch separates public matrix semantics
+from physical storage.  The same API is preserved across formats, while each
+backend owns the layout, page metadata, cached apply plans, and optional vendor
+descriptors required by its kernel family.
+
+Kernel dispatch follows the selected backend.  CSR uses scalar sparse kernels,
+BSR uses fixed-size dense-block kernels, and VBCSR uses shape-grouped
+variable-block kernels.  All backends share the distributed graph, vector and
+multivector layouts, ghost exchange routines, MPI communication layer,
+thread-level parallelism, and BLAS/LAPACK dense operations.
+
+\subsection{Distributed graphs, vectors, and ownership}
+
+The distributed graph defines row ownership, local indexing, block dimensions,
+and communication metadata.  Each rank owns a subset of global block rows; all
+remote column blocks required by those rows are stored as ghosts.  Local indices
+are ordered as owned blocks followed by ghost blocks, and adjacency arrays use
+this local numbering.  After ghost synchronization, sparse application reduces
+to local operation of Eq.~\eqref{eq:block_apply}.
+
+All communication and layout management is handled by the graph.  Therefore, the graph also owns the block sizes.  Their prefix sums define scalar offsets for
+matrix blocks, vector storage, and MPI message sizes.
+
+All other object, \texttt{DistVector} and \texttt{DistMultiVector}, uses the graph schedule to exchange owned block data into the ghost region; adjoint operations reverse the schedule and accumulate ghost contributions into owned entries.
+
+\subsection{Variable-block storage}
+
+The VBCSR backend targets graphs with heterogeneous block sizes.  It avoids both
+largest-block padding and scalar expansion by separating graph order from value
+order.  The graph preserves the node-level sparsity pattern, while numerical
+blocks are grouped by shape.
+
+For an edge $(i,j)$, the value block has shape $b_i \times b_j$.  Backend
+construction registers each distinct shape, counts its local blocks, and stores
+all blocks of that shape in a packed value stream.  A graph-block pointer list maps
+each adjacency entry to its location in the shape store, preserving sparsity while giving kernels shape-contiguous workload.
+
+Shape storage is paged, so does the storage for CSR and BSR in the package.  Each shape class owns bounded pages containing
+contiguous same-shape blocks, avoiding large monolithic allocations and keeping
+index ranges bounded for large matrices.
+
+The shaped pages gives direct benefit for batched kernel execution. Continuous buffers can be hand over copyfree and use highly optimized batched GEMM kernels for supported matrix operation. This gives us superior efficiency, and almost naive compatibilities for GPU acceleration.
+
+\subsection{Sparse apply and sparse-dense apply}
+
+Sparse application is evaluated on the distributed block graph.  After
+synchronizing ghost input blocks, each rank applies the owned block rows as
+\begin{equation}
+    Y_i = \sum_{j \in \mathcal{N}(i)} A_{ij} X_j ,
+    \label{eq:block_apply_local}
+\end{equation}
+where $X_j$ and $Y_i$ may be vectors or dense blocks containing multiple
+right-hand sides.  The adjoint apply uses the transposed graph action
+\begin{equation}
+    Y_j \mathrel{+}= A_{ij}^{\dagger} X_i,\qquad j\in\mathcal{N}(i),
+    \label{eq:block_apply_adjoint}
+\end{equation}
+with ghost-column contributions reduced back to their owning ranks.  Vector and
+multivector paths therefore share the communication schedule; the local kernel
+changes from GEMV-like to GEMM-like work.
+
+Kernel selection follows the active backend.  CSR can use native sparse kernels
+or vendor sparse handles when MKL or AOCL-Sparse is available.  BSR uses vendor
+BSR kernels when enabled and otherwise dispatches common small uniform block
+sizes to specialized dense-block kernels.  VBCSR traverses same-shape pages and
+executes them either as individual dense block products or as strided batched
+GEMV/GEMM through the linked BLAS.  Small packed blocks use hand-written
+compile-time kernels, including AVX2/FMA paths for double precision; larger or
+non-packed cases fall back to CBLAS.  The current implementation does not
+include a LIBXSMM-specific path.  OpenMP parallelism is applied over sparse rows
+or VBCSR batches, with per-thread accumulation in the variable-block case.
+
+\subsection{Thresholded sparse-sparse multiplication}
+
+Sparse matrix-matrix multiplication appears in density-matrix purification,
+polynomial expansions, graph closure operations, and approximate inverse
+construction.  VBCSR follows the block-sparse thresholding principle used in
+DBCSR \cite{sivkov2019dbcsr}: products are generated at the block level,
+\begin{equation}
+    C_{ij} = \sum_k A_{ik} B_{kj},
+    \label{eq:spgemm}
+\end{equation}
+and norm estimates are used to avoid forming blocks whose contribution is below
+a prescribed tolerance.  This reflects a common principle in linear-scaling
+electronic structure: locality and decay make many formally nonzero matrix
+entries scientifically negligible
+\cite{prodan2005nearsightedness,benzi2013decay,benzi2007decay}.
+
+The multiplication is separated into symbolic and numeric phases.  In the
+symbolic phase, each output row accumulates candidate columns using estimates
+$\|A_{ik}\|\|B_{kj}\|$; columns whose accumulated estimate exceeds the
+threshold are retained in the result graph.  For distributed input, only
+metadata for remote rows of $B$ is exchanged during this phase, and the
+corresponding remote block values are fetched only after the surviving
+structure is known.  The numeric phase evaluates the retained block products,
+applies a row-scaled product skip, and performs a final block-norm filter on
+the assembled result.
+
+The main difference from a fixed-block multiplication is the backend-adaptive
+representation.  CSR, BSR, and VBCSR share the same symbolic filtering design,
+while their numeric phases use kernels matched to the active storage format.
+The VBCSR path additionally groups products by the row, inner, and column block
+dimensions, so heterogeneous blocks are executed as same-shape dense-product
+batches rather than padded to a single global block size.  The output is a new
+distributed graph and matrix in the same backend family as the inputs.
+
+\subsection{Graph-local matrix functions}
+
+Matrix functions can be approximated by graph-local methods when the relevant
+operator is local or rapidly decaying on a sparse graph.  Following this
+principle, as in graph-based purification methods \cite{niklasson2016graph},
+VBCSR evaluates $f(A)$ from restricted neighborhoods rather than from a global
+dense matrix.  For a node $i$, the package extracts an $\ell$-hop neighborhood
+$\mathcal{N}_{\ell}(i)$, evaluates a dense matrix function on the induced local
+submatrix, and writes back the central block row:
+\begin{equation}
+    f(A)_{i,:} \approx
+    \left[
+    f\left(A_{\mathcal{N}_{\ell}(i),\mathcal{N}_{\ell}(i)}\right)
+    \right]_{i,:}.
+    \label{eq:local_function}
+\end{equation}
+The approximation is controlled by the graph cutoff radius $\ell$: increasing
+$\ell$ enlarges the local subproblem and reduces the truncation error, while a
+fixed cutoff keeps the amount of work per graph node bounded.  The algorithm is
+therefore linear-scaling for bounded-degree graphs and fixed $\ell$.  In the
+distributed setting, each rank imports the halo blocks needed to form its local
+neighborhoods, performs the dense evaluations independently, and inserts the
+resulting central rows into the distributed output matrix.
+
+\subsection{Atomistic data and periodic quantum operators}
+
+VBCSR includes a native atomistic data layer so that sparse block structure can
+be derived directly from the physical system.  \texttt{AtomicData} stores
+atomic numbers, positions, cell vectors, periodic boundary flags, atom types,
+and species-dependent orbital counts.  Structures may be constructed from
+Python/ASE objects, embedded file readers, explicit graph arrays, or already
+distributed atom partitions.  From these inputs the package builds the
+distributed neighbor graph, records the lattice shift associated with each
+periodic edge, assigns atom-centered block sizes, and exchanges ghost atom
+attributes needed by local operator assembly.  The automatic construction can
+partition the structure internally, while the distributed constructor preserves
+a partition supplied by an external workflow.
+
+Periodic quantum operators are represented by \texttt{ImageContainer}, which
+stores a family of block-sparse matrices indexed by lattice translation
+$\mathbf{R}$.  Each image has its own distributed graph, but all images share
+the same atom ownership and orbital block-size model inherited from
+\texttt{AtomicData}.  Operator blocks can be inserted individually or in
+batches, assembled across MPI ranks, combined image-wise, and redistributed
+between compatible atom partitions.  This design keeps real-space operator
+construction local while preserving the information required for reciprocal
+space.
+
+Sampling at a wave vector $\mathbf{k}$ forms a complex block-sparse operator on
+the base atom graph,
+\begin{equation}
+    O(\mathbf{k}) =
+    \sum_{\mathbf{R}} e^{-2\pi\ii\,\mathbf{k}\cdot\mathbf{R}}
+    O(\mathbf{R}),
+    \label{eq:k_sampling}
+\end{equation}
+with an optional basis-position phase convention that replaces
+$\mathbf{R}$ by $\mathbf{R}+\boldsymbol{\tau}_j-\boldsymbol{\tau}_i$ for block
+$(i,j)$.  Thus the same real-space quantum-operator container supports
+efficient construction, redistribution, and $R$-space to $k$-space
+transformation without discarding the variable-block atom-centered structure.
+
+\section{Benchmark Experiments}
+
+The benchmark section is organized around two questions.  The first is kernel
+efficiency: for a fixed sparse operator, how much performance is gained or lost
+by using the CSR, BSR, or VBCSR backend rather than a scalar sparse baseline?
+The second is distributed cost: how the same design behaves when graph
+construction, communication, memory use, and MPI scaling are included.  This
+separation keeps single-node kernel comparisons distinct from the broader
+infrastructure claims of the package.
+
+\subsection{Kernel efficiency}
+
+The efficiency benchmark compares three operation classes supported by VBCSR:
+sparse matrix-vector multiplication (SpMV), sparse matrix-dense matrix
+multiplication (SpMM), and sparse general matrix-matrix multiplication
+(SpGEMM).  Each operation is measured in three structural domains.  The CSR
+domain uses scalar block size and tests whether VBCSR's abstraction introduces
+overhead when no block structure is present.  The BSR domain uses a uniform
+non-scalar block size and tests the fixed-block path against scalar expansion.
+The VBCSR domain uses heterogeneous block sizes and tests the package's main
+target case, where padding to a single block size is undesirable.
+
+For each domain, the same mathematical operator will be benchmarked with three
+implementations: SciPy sparse matrices, an MKL sparse backend, and the selected
+VBCSR backend.  In the CSR domain, all methods operate on scalar CSR
+representations.  In the BSR domain, VBCSR and MKL can use fixed-block storage
+when available, while SciPy CSR provides the scalar-expanded reference.  In the
+VBCSR domain, VBCSR preserves the original heterogeneous block layout; SciPy
+and MKL are evaluated on equivalent scalar CSR matrices because their standard
+sparse interfaces do not represent variable block sizes directly.  The primary
+reported quantity is time per operation, with speedup normalized against the
+best available scalar CSR baseline.  Secondary quantities include matrix
+storage, number of scalar nonzeros after expansion, number of block nonzeros,
+and, for SpGEMM, the output fill ratio.
+
+SpMV measures the overhead and benefit of block traversal for a single
+right-hand side.  SpMM measures reuse of the same sparse graph across multiple
+dense right-hand sides, where block kernels and batched execution should become
+more important.  SpGEMM measures both symbolic graph construction and numeric
+block-product accumulation; it is the most sensitive test of whether the block
+structure is preserved through a complete sparse algebra operation.  The final
+paper should report these results in one combined figure, using rows for the
+three operations and columns for the CSR, BSR, and VBCSR domains.
+
+\begin{figure*}[t]
+    \centering
+    \fbox{\begin{minipage}[c][0.32\textheight][c]{0.92\textwidth}
+    \centering
+    Planned combined efficiency benchmark.  Rows: SpMV, SpMM, and SpGEMM.
+    Columns: CSR, BSR, and VBCSR structural domains.  Each panel reports
+    operation time for SciPy sparse, MKL sparse, and VBCSR, with speedup
+    annotations relative to the best scalar CSR baseline.
+    \end{minipage}}
+    \caption{Planned summary figure for kernel-efficiency benchmarks.  The
+    figure will replace the current separate preliminary panels after the
+    benchmark suite is rerun under a fixed software and hardware environment.}
+    \label{fig:benchmark_efficiency}
+\end{figure*}
+
+\subsection{Distributed scaling and reproducibility}
+
+The second benchmark group evaluates the costs that are not visible in a
+single-kernel timing.  These experiments should measure strong and weak scaling
+for distributed SpMV, SpMM, and SpGEMM; graph construction and matrix assembly
+time; ghost exchange volume; memory footprint; and the cost of converting
+between atomistic operators and sparse matrix backends.  For thresholded
+SpGEMM, the benchmark should additionally report the tolerance, skipped block
+products, output block count, and final fill ratio, so that performance can be
+read together with the approximation and sparsity behavior.
+
+All benchmark results should be generated from scripts that record the package
+revision, compiler, MPI implementation, BLAS and sparse backend, CPU model,
+thread count, process count, matrix-generation parameters, and random seed.
+The repository tests for public Python symbols, distributed graph and vector
+behavior, sparse operations, atomistic utilities, and benchmark drivers provide
+the correctness layer for this section.  The final manuscript should therefore
+report both timing results and the reproducibility metadata needed to rerun each
+figure.
+
+\section{Discussion}
+
+VBCSR should be understood as infrastructure for AI-enabled scientific
+computing, not as an AI model by itself.  Its role is to make the output of
+local models usable in scalable simulation.  A learned Hamiltonian, a
+data-driven preconditioner, or a graph-based surrogate operator still needs a
+distributed representation, communication schedule, matrix functions, and
+validation path.  VBCSR provides that layer while keeping the user close to the
+scientific objects: atoms, neighborhoods, orbital blocks, periodic quantum
+operators, and matrix functions.
+
+This positioning also prevents the work from reading as an isolated kernel
+study.  The numerical kernels are essential, but they serve a larger scientific
+story.  The value comes from making several audiences meet in one software
+object.  A materials scientist sees localized orbitals and periodic operators.
+An AI-for-science researcher sees a route from local predictions to global
+simulation.  A numerical linear algebra researcher sees sparse matrix
+functions, thresholded multiplication, and block-aware formats.  A high
+performance computing researcher sees MPI ownership, communication reuse, and
+backend specialization.  The central narrative remains simple: local scientific
+representations need distributed operator infrastructure.
+
+Several limitations guide the benchmark design.  First, the efficiency study
+must separate CSR, BSR, and VBCSR structural domains rather than reporting one
+mixed comparison.  Second, distributed measurements should include larger
+systems, strong scaling, weak scaling, memory use, communication volume, and
+threshold-accuracy tradeoffs.  Third, future benchmark sets should include
+operators produced by external electronic-structure or learned-model pipelines,
+so that synthetic matrix results can be connected to application-scale input
+distributions.  These additions will strengthen the infrastructure argument
+without changing the core manuscript structure.
+
+\section{Conclusion}
+
+VBCSR provides a Python-first distributed operator layer for materials
+simulation and related scientific computing workflows.  Its main idea is
+simple: scientific users should be able to work with local blocks, atoms,
+graphs, periodic quantum operators, and matrix functions, while the package handles
+whether the underlying sparse kernel is CSR, BSR, or true variable-block
+storage.  This automatic format selection is not only a performance
+convenience; it is what allows one workflow to contain scalar, fixed-block, and
+variable-block operators without fragmenting the code.
+
+The current implementation combines distributed graphs, vectors, multivectors,
+adaptive sparse matrices, thresholded sparse-sparse multiplication, graph-local
+matrix functions, atomistic containers, and periodic quantum-operator sampling.
+The benchmark plan isolates the corresponding performance questions through
+SpMV, SpMM, and SpGEMM comparisons across CSR, BSR, and VBCSR domains, followed
+by distributed scaling and reproducibility measurements.  With these benchmark
+results and application-scale inputs, VBCSR can serve as a visible piece of
+infrastructure for the next generation of AI-enabled materials simulation.
+
+\section*{Code and data availability}
+
+The scripts for generating the current benchmark data and the VBCSR library are
+openly available at \url{https://github.com/DeepElectron/vbcsr}.  At
+publication, the exact code revision, benchmark inputs, and plotting scripts
+used for the figures should be archived with the manuscript.
+
+\appendix
+
+\bibliography{main.bib}
+\end{document}

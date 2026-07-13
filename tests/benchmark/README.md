@@ -33,13 +33,29 @@ FlexiBLAS backend switching is controlled through `FLEXIBLAS_BACKEND`. Use the
 backend name printed by `flexiblas list`; the scripts export it as `FLEXIBLAS`
 before Python starts.
 
+Threading policy for the publication jobs: `OMP_NUM_THREADS` controls VBCSR's
+outer OpenMP parallelism. BLAS runtime thread pools used under VBCSR are pinned
+to one thread by default through `MKL_NUM_THREADS=1`,
+`OPENBLAS_NUM_THREADS=1`, `BLIS_NUM_THREADS=1`, `NUMEXPR_NUM_THREADS=1`, and
+`VECLIB_MAXIMUM_THREADS=1`, avoiding nested BLAS threading inside VBCSR apply
+kernels. `OMP_DYNAMIC=FALSE` and `MKL_DYNAMIC=FALSE` are set in the Slurm
+wrappers.
+
+The sparse-dot-mkl reference is a top-level MKL sparse baseline, so it has its
+own explicit control: `SPARSE_DOT_MKL_NUM_THREADS`. For the one-rank efficiency
+job the Slurm default is `SPARSE_DOT_MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK}`,
+matching the VBCSR CPU budget. The Python driver applies this with
+`sparse_dot_mkl.mkl_set_num_threads(...)`, records the reported MKL thread
+state for every MKL baseline row, and restores `MKL_NUM_THREADS` afterward so
+the next VBCSR case is not contaminated by the reference baseline.
+
 ## Kernel Efficiency
 
 Run on one rank. The production default is `4096` graph blocks, which is a
 `16 x 16 x 16` periodic lattice before jitter.
 
 ```bash
-sbatch \
+sbatch --cpus-per-task=32 \
   --export=ALL,REPO_ROOT=$PWD,PYTHON_VENV=$PWD/.venv-vbcsr,VBCSR_BUILD_DIR=build,BLOCKS=4096,TARGET_DEGREE=12,RHS=16,REPEATS=7,MAGNITUDE_DECAY_LENGTH=0.5,SPGEMM_THRESHOLDS=0.0 \
   tests/benchmark/slurm_efficiency.sbatch
 ```
@@ -51,13 +67,31 @@ SciPy product and does not treat that expected approximation error as a failed
 correctness check.
 
 ```bash
-sbatch \
+sbatch --cpus-per-task=32 \
   --export=ALL,REPO_ROOT=$PWD,PYTHON_VENV=$PWD/.venv-vbcsr,VBCSR_BUILD_DIR=build,BLOCKS=4096,TARGET_DEGREE=12,RHS=16,REPEATS=7,MAGNITUDE_DECAY_LENGTH=0.5,SPGEMM_THRESHOLDS='0.0 1e-6 1e-4 1e-2 1e-1' \
   tests/benchmark/slurm_efficiency.sbatch
 ```
 
 The efficiency job requires `sparse_dot_mkl` because the paper compares VBCSR
 against SciPy CSR and an MKL sparse baseline.
+
+For exact SpGEMM, the candidate block-product count scales approximately as
+`blocks * target_degree^2`. A run with `BLOCKS=4096` and `TARGET_DEGREE=100`
+therefore has about 41 million candidate block products per exact SpGEMM call,
+before repeats and reference implementations are counted. Use that setting only
+for a deliberately high-connectivity stress case.
+
+Create the paper figure from the newest efficiency CSV:
+
+```bash
+python tests/benchmark/plot_efficiency.py \
+  --output-prefix tests/benchmark/results/kernel_efficiency
+```
+
+The script writes both PDF and PNG, with SciPy, sparse-dot-mkl, and VBCSR shown
+as separate bars. The x-axis labels identify the tested block-size model. The
+PDF is the preferred format for the manuscript because it preserves vector text
+and bars.
 
 ## Strong Scaling
 

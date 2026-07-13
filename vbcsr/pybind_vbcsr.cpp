@@ -235,6 +235,13 @@ void bind_block_spmat(py::module& m, const std::string& name) {
         .def_property_readonly("configured_page_size", [](const BlockSpMat<T>& self) {
             return self.configured_page_size();
         })
+        .def_property_readonly("vendor_backend_name", [](const BlockSpMat<T>& self) {
+            return self.vendor_backend_name();
+        })
+        .def_property_readonly("vendor_launch_count", [](const BlockSpMat<T>& self) {
+            return self.vendor_launch_count();
+        })
+        .def("reset_vendor_launch_count", &BlockSpMat<T>::reset_vendor_launch_count)
         .def_property(
             "page_size",
             [](const BlockSpMat<T>& self) {

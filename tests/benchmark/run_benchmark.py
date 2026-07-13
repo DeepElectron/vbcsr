@@ -71,7 +71,7 @@ except Exception:  # pragma: no cover - depends on the benchmark environment.
     MPI = None
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 DOMAINS = ("csr", "bsr", "vbcsr")
 OPERATIONS = ("spmv", "spmm", "spgemm")
 VBCSR_BLOCK_SIZES = (9, 13, 15, 20)
@@ -637,6 +637,88 @@ def mkl_baseline_matrix(scalar_csr: sp.csr_matrix, spec: BenchmarkSpec) -> tuple
     return scalar_csr, info
 
 
+def positive_thread_count_from_env(names: tuple[str, ...], default: int, default_source: str) -> tuple[int, str]:
+    for name in names:
+        value = os.environ.get(name)
+        if value is None or value.strip() == "":
+            continue
+        try:
+            threads = int(value)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be a positive integer, got {value!r}") from exc
+        if threads <= 0:
+            raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        return threads, name
+    return default, default_source
+
+
+def sparse_dot_mkl_thread_request() -> tuple[int, str]:
+    return positive_thread_count_from_env(("SPARSE_DOT_MKL_NUM_THREADS", "MKL_REFERENCE_NUM_THREADS", "MKL_NUM_THREADS"), 1, "benchmark_default")
+
+
+def nested_blas_mkl_thread_request() -> tuple[int, str]:
+    return positive_thread_count_from_env(("VBCSR_NESTED_MKL_NUM_THREADS", "MKL_NUM_THREADS"), 1, "benchmark_default")
+
+
+def apply_sparse_dot_mkl_threading(sparse_dot_mkl: Any, threads: int, source: str, policy: str) -> dict[str, Any]:
+    info: dict[str, Any] = {
+        "policy": policy,
+        "requested_threads": threads,
+        "request_source": source,
+        "omp_num_threads_ignored_for_mkl_baseline": True,
+    }
+
+    get_max_threads = getattr(sparse_dot_mkl, "mkl_get_max_threads", None)
+    if get_max_threads is not None:
+        try:
+            info["max_threads_before"] = int(get_max_threads())
+        except Exception as exc:
+            info["max_threads_before_error"] = f"{type(exc).__name__}: {exc}"
+
+    for setter_name in ("mkl_set_num_threads", "mkl_set_num_threads_local"):
+        setter = getattr(sparse_dot_mkl, setter_name, None)
+        key = setter_name.replace("mkl_", "")
+        if setter is None:
+            info[key] = {"available": False}
+            continue
+        try:
+            previous = setter(threads)
+            info[key] = {"available": True, "ok": True, "return_value": previous}
+        except Exception as exc:
+            info[key] = {"available": True, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    if get_max_threads is not None:
+        try:
+            info["max_threads_after"] = int(get_max_threads())
+        except Exception as exc:
+            info["max_threads_after_error"] = f"{type(exc).__name__}: {exc}"
+    global_setter = info.get("set_num_threads", {})
+    reported_after = info.get("max_threads_after")
+    info["effective_thread_count_verified"] = reported_after is not None
+    info["thread_control_ok"] = bool(global_setter.get("ok") and (reported_after is None or reported_after == threads))
+    return info
+
+
+def configure_sparse_dot_mkl_threading(sparse_dot_mkl: Any) -> dict[str, Any]:
+    threads, source = sparse_dot_mkl_thread_request()
+    return apply_sparse_dot_mkl_threading(sparse_dot_mkl, threads, source, "explicit_mkl_sparse_reference_thread_control")
+
+
+def restore_sparse_dot_mkl_threading(sparse_dot_mkl: Any, configured: dict[str, Any]) -> dict[str, Any]:
+    threads, source = nested_blas_mkl_thread_request()
+    restored = apply_sparse_dot_mkl_threading(sparse_dot_mkl, threads, source, "restore_nested_blas_mkl_thread_control")
+    previous_local = configured.get("set_num_threads_local", {}).get("return_value")
+    if isinstance(previous_local, int):
+        setter = getattr(sparse_dot_mkl, "mkl_set_num_threads_local", None)
+        if setter is not None:
+            try:
+                setter(previous_local)
+                restored["restored_previous_local_thread_setting"] = previous_local
+            except Exception as exc:
+                restored["restore_previous_local_thread_setting_error"] = f"{type(exc).__name__}: {exc}"
+    return restored
+
+
 def vbcsr_op(matrix: vbcsr.VBCSR, inputs: dict[str, Any], spec: BenchmarkSpec) -> Callable[[], Any]:
     if spec.operation == "spmv":
         return lambda: matrix.mult(inputs["x_vector"], inputs["y_vector"])
@@ -645,6 +727,68 @@ def vbcsr_op(matrix: vbcsr.VBCSR, inputs: dict[str, Any], spec: BenchmarkSpec) -
     if spec.operation == "spgemm":
         return lambda: matrix.spmm(matrix, spec.spgemm_threshold)
     raise ValueError(spec.operation)
+
+
+def benchmark_vbcsr_with_internal_diagnostics(
+    matrix: vbcsr.VBCSR,
+    inputs: dict[str, Any],
+    spec: BenchmarkSpec,
+    *,
+    comm: Any,
+    repeats: int,
+    min_seconds: float,
+    min_iterations: int,
+    warmups: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    diagnostic: dict[str, Any] = {
+        "matrix_kind": matrix.matrix_kind,
+        "page_size": int(matrix.page_size),
+        "configured_page_size": int(matrix.configured_page_size),
+        "vendor_debug_available": False,
+    }
+
+    try:
+        diagnostic["vendor_backend_name"] = matrix.vendor_backend_name
+        matrix.reset_vendor_launch_count()
+        before = int(matrix.vendor_launch_count)
+        diagnostic["vendor_debug_available"] = True
+    except Exception as exc:
+        diagnostic["vendor_debug_error"] = f"{type(exc).__name__}: {exc}"
+        timing = benchmark_repeated(
+            vbcsr_op(matrix, inputs, spec),
+            comm=comm,
+            repeats=repeats,
+            min_seconds=min_seconds,
+            min_iterations=min_iterations,
+            warmups=warmups,
+        )
+        return timing, diagnostic
+
+    timing = benchmark_repeated(
+        vbcsr_op(matrix, inputs, spec),
+        comm=comm,
+        repeats=repeats,
+        min_seconds=min_seconds,
+        min_iterations=min_iterations,
+        warmups=warmups,
+    )
+    after = int(matrix.vendor_launch_count)
+    local_calls = int(sum(int(item) for item in timing.get("iterations", []))) + int(repeats) * int(warmups)
+    local_delta = after - before
+    global_calls = int(reduce_value(comm, local_calls, "sum"))
+    global_delta = int(reduce_value(comm, local_delta, "sum"))
+    diagnostic.update(
+        {
+            "vendor_launch_count_before": before,
+            "vendor_launch_count_after": after,
+            "vendor_launch_delta_local": local_delta,
+            "operation_calls_including_warmups_local": local_calls,
+            "vendor_launch_delta_sum": global_delta,
+            "operation_calls_including_warmups_sum": global_calls,
+            "vendor_launches_per_call": float(global_delta / global_calls) if global_calls > 0 else None,
+        }
+    )
+    return timing, diagnostic
 
 
 def scipy_op(scalar: sp.csr_matrix, inputs: dict[str, Any], spec: BenchmarkSpec) -> Callable[[], Any]:
@@ -659,8 +803,7 @@ def scipy_op(scalar: sp.csr_matrix, inputs: dict[str, Any], spec: BenchmarkSpec)
     raise ValueError(spec.operation)
 
 
-def mkl_op(matrix: sp.spmatrix, inputs: dict[str, Any], spec: BenchmarkSpec) -> Callable[[], Any]:
-    sparse_dot_mkl = importlib.import_module("sparse_dot_mkl")
+def mkl_op(matrix: sp.spmatrix, inputs: dict[str, Any], spec: BenchmarkSpec, sparse_dot_mkl: Any) -> Callable[[], Any]:
     if spec.operation == "spmv":
         rhs = inputs["x_vector"].to_numpy().copy()
         return lambda: sparse_dot_mkl.dot_product_mkl(matrix, rhs)
@@ -891,8 +1034,10 @@ def run_case(
         "speedups": {},
     }
 
-    result["timings"]["vbcsr"] = benchmark_repeated(
-        vbcsr_op(matrix, inputs, spec),
+    result["timings"]["vbcsr"], result["vbcsr_internal"] = benchmark_vbcsr_with_internal_diagnostics(
+        matrix,
+        inputs,
+        spec,
         comm=comm,
         repeats=repeats,
         min_seconds=min_seconds,
@@ -921,19 +1066,32 @@ def run_case(
             warmups=warmups,
         )
         try:
-            import sparse_dot_mkl  # noqa: F401
+            sparse_dot_mkl = importlib.import_module("sparse_dot_mkl")
+            mkl_threading = configure_sparse_dot_mkl_threading(sparse_dot_mkl)
+            if not mkl_threading.get("thread_control_ok", False):
+                raise RuntimeError(f"sparse_dot_mkl thread control failed: {mkl_threading}")
 
             mkl_matrix, mkl_info = mkl_baseline_matrix(scalar, spec)
-            mkl_info.update({"available": True, "nnz": int(mkl_matrix.nnz), "storage_bytes": sparse_storage_bytes(mkl_matrix)})
-            result["baselines"]["mkl_sparse"] = mkl_info
-            result["timings"]["mkl"] = benchmark_repeated(
-                mkl_op(mkl_matrix, inputs, spec),
-                comm=None,
-                repeats=repeats,
-                min_seconds=min_seconds,
-                min_iterations=min_iterations,
-                warmups=warmups,
+            mkl_info.update(
+                {
+                    "available": True,
+                    "nnz": int(mkl_matrix.nnz),
+                    "storage_bytes": sparse_storage_bytes(mkl_matrix),
+                    "threading": mkl_threading,
+                }
             )
+            result["baselines"]["mkl_sparse"] = mkl_info
+            try:
+                result["timings"]["mkl"] = benchmark_repeated(
+                    mkl_op(mkl_matrix, inputs, spec, sparse_dot_mkl),
+                    comm=None,
+                    repeats=repeats,
+                    min_seconds=min_seconds,
+                    min_iterations=min_iterations,
+                    warmups=warmups,
+                )
+            finally:
+                mkl_info["threading_restore"] = restore_sparse_dot_mkl_threading(sparse_dot_mkl, mkl_threading)
         except Exception as exc:
             result["baselines"]["mkl_sparse"] = {
                 "available": False,
@@ -1080,7 +1238,17 @@ def mpi_metadata(comm: Any, rank: int, size: int) -> dict[str, Any]:
 
 
 def environment_metadata(comm: Any, rank: int, size: int) -> dict[str, Any]:
-    thread_vars = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "BLIS_NUM_THREADS")
+    thread_vars = (
+        "OMP_NUM_THREADS",
+        "OMP_DYNAMIC",
+        "SPARSE_DOT_MKL_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "MKL_DYNAMIC",
+        "OPENBLAS_NUM_THREADS",
+        "BLIS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    )
     slurm_vars = (
         "SLURM_JOB_ID",
         "SLURM_JOB_NAME",
@@ -1200,10 +1368,21 @@ def write_outputs(payload: dict[str, Any], output_dir: Path, label: str) -> tupl
         "offdiagonal_magnitude_scale_max",
         "vbcsr_median_seconds",
         "vbcsr_min_seconds",
+        "vbcsr_max_seconds",
         "vbcsr_std_seconds",
         "scipy_median_seconds",
+        "scipy_min_seconds",
+        "scipy_max_seconds",
+        "scipy_std_seconds",
         "mkl_median_seconds",
+        "mkl_min_seconds",
+        "mkl_max_seconds",
+        "mkl_std_seconds",
         "vbcsr_vs_best_scalar_baseline",
+        "vbcsr_vendor_backend",
+        "vbcsr_vendor_launches_per_call",
+        "vbcsr_vendor_launch_delta_sum",
+        "vbcsr_operation_calls_including_warmups_sum",
         "validation_passed",
         "validation_exact_required",
         "validation_relative_error",
@@ -1250,10 +1429,23 @@ def write_outputs(payload: dict[str, Any], output_dir: Path, label: str) -> tupl
                     "offdiagonal_magnitude_scale_max": case["matrix_value_model"].get("offdiagonal_magnitude_scale_max"),
                     "vbcsr_median_seconds": timings["vbcsr"]["median_seconds"],
                     "vbcsr_min_seconds": timings["vbcsr"]["min_seconds"],
+                    "vbcsr_max_seconds": timings["vbcsr"]["max_seconds"],
                     "vbcsr_std_seconds": timings["vbcsr"]["std_seconds"],
                     "scipy_median_seconds": timings.get("scipy", {}).get("median_seconds"),
+                    "scipy_min_seconds": timings.get("scipy", {}).get("min_seconds"),
+                    "scipy_max_seconds": timings.get("scipy", {}).get("max_seconds"),
+                    "scipy_std_seconds": timings.get("scipy", {}).get("std_seconds"),
                     "mkl_median_seconds": timings.get("mkl", {}).get("median_seconds"),
+                    "mkl_min_seconds": timings.get("mkl", {}).get("min_seconds"),
+                    "mkl_max_seconds": timings.get("mkl", {}).get("max_seconds"),
+                    "mkl_std_seconds": timings.get("mkl", {}).get("std_seconds"),
                     "vbcsr_vs_best_scalar_baseline": case["speedups"].get("vbcsr_vs_best_scalar_baseline"),
+                    "vbcsr_vendor_backend": case.get("vbcsr_internal", {}).get("vendor_backend_name"),
+                    "vbcsr_vendor_launches_per_call": case.get("vbcsr_internal", {}).get("vendor_launches_per_call"),
+                    "vbcsr_vendor_launch_delta_sum": case.get("vbcsr_internal", {}).get("vendor_launch_delta_sum"),
+                    "vbcsr_operation_calls_including_warmups_sum": case.get("vbcsr_internal", {}).get(
+                        "operation_calls_including_warmups_sum"
+                    ),
                     "validation_passed": case["validation"].get("passed"),
                     "validation_exact_required": case["validation"].get("exact_validation_required"),
                     "validation_relative_error": case["validation"].get("relative_error"),
@@ -1341,6 +1533,7 @@ def main() -> int:
     for spec in specs:
         if rank == 0:
             print(f"[{spec.label}] running", flush=True)
+        case_start = time.perf_counter()
         case = run_case(
             spec,
             comm=comm,
@@ -1354,14 +1547,21 @@ def main() -> int:
         )
         if rank == 0:
             cases.append(case)
+            elapsed = time.perf_counter() - case_start
+            vbcsr_median = case.get("timings", {}).get("vbcsr", {}).get("median_seconds")
+            print(
+                f"[{spec.label}] done in {elapsed:.2f} s; "
+                f"VBCSR median={vbcsr_median:.6g} s",
+                flush=True,
+            )
             validation = case.get("validation", {})
             if validation.get("exact_validation_required", True) and validation.get("passed") is False:
                 print(f"Validation failed for {case['label']}: {validation}", file=sys.stderr)
                 return 1
 
     if rank == 0:
-        label = args.label
-        if label is None:
+        label = args.label.strip() if isinstance(args.label, str) else args.label
+        if label is None or label == "":
             stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
             label = f"vbcsr_publication_{args.suite}_np{size}_{stamp}"
         payload = {

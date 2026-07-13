@@ -126,6 +126,17 @@ class VBCSR(LinearOperator):
         return int(self._core.configured_page_size)
 
     @property
+    def vendor_backend_name(self) -> str:
+        return str(self._core.vendor_backend_name)
+
+    @property
+    def vendor_launch_count(self) -> int:
+        return int(self._core.vendor_launch_count)
+
+    def reset_vendor_launch_count(self) -> None:
+        self._core.reset_vendor_launch_count()
+
+    @property
     def page_size(self) -> int:
         return int(self._core.page_size)
 

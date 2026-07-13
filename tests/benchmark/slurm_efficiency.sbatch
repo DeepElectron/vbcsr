@@ -2,7 +2,7 @@
 #SBATCH --job-name=vbcsr-efficiency
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
+#SBATCH --cpus-per-task=32
 #SBATCH --time=02:00:00
 #SBATCH --output=tests/benchmark/results/slurm-efficiency-%j.out
 #SBATCH --error=tests/benchmark/results/slurm-efficiency-%j.err
@@ -17,6 +17,9 @@ ALLIANCE_MODULES="${ALLIANCE_MODULES:-StdEnv/2023 python scipy-stack flexiblas}"
 FLEXIBLAS_BACKEND="${FLEXIBLAS_BACKEND:-${FLEXIBLAS:-}}"
 SPGEMM_THRESHOLD="${SPGEMM_THRESHOLD:-0.0}"
 SPGEMM_THRESHOLDS="${SPGEMM_THRESHOLDS:-${SPGEMM_THRESHOLD}}"
+MAGNITUDE_DECAY_LENGTH="${MAGNITUDE_DECAY_LENGTH:-0.5}"
+OFFDIAGONAL_SCALE="${OFFDIAGONAL_SCALE:-1.0}"
+DIAGONAL_SHIFT="${DIAGONAL_SHIFT:-2.0}"
 
 cd "${REPO_ROOT}"
 mkdir -p tests/benchmark/results
@@ -43,8 +46,15 @@ source "${PYTHON_VENV}/bin/activate"
 export PYTHON_VENV
 export VBCSR_BUILD_DIR
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-${SLURM_CPUS_PER_TASK}}"
-export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-${SLURM_CPUS_PER_TASK}}"
-export MKL_NUM_THREADS="${MKL_NUM_THREADS:-${SLURM_CPUS_PER_TASK}}"
+export OMP_DYNAMIC="${OMP_DYNAMIC:-FALSE}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export MKL_DYNAMIC="${MKL_DYNAMIC:-FALSE}"
+SPARSE_DOT_MKL_DEFAULT_THREADS="${SLURM_CPUS_PER_TASK:-${OMP_NUM_THREADS}}"
+export SPARSE_DOT_MKL_NUM_THREADS="${SPARSE_DOT_MKL_NUM_THREADS:-${SPARSE_DOT_MKL_DEFAULT_THREADS}}"
+export BLIS_NUM_THREADS="${BLIS_NUM_THREADS:-1}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
+export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-1}"
 if [[ -n "${FLEXIBLAS_BACKEND}" ]]; then
   export FLEXIBLAS="${FLEXIBLAS_BACKEND}"
 fi
@@ -74,6 +84,9 @@ ARGS=(
   --geometry-spacing "${GEOMETRY_SPACING:-1.0}" \
   --geometry-jitter "${GEOMETRY_JITTER:-0.12}" \
   --geometry-cutoff-quantile "${GEOMETRY_CUTOFF_QUANTILE:-0.90}" \
+  --magnitude-decay-length "${MAGNITUDE_DECAY_LENGTH}" \
+  --offdiagonal-scale "${OFFDIAGONAL_SCALE}" \
+  --diagonal-shift "${DIAGONAL_SHIFT}" \
   --repeats "${REPEATS:-7}" \
   --min-seconds "${MIN_SECONDS:-1.0}" \
   --min-iterations "${MIN_ITERATIONS:-5}" \
