@@ -1050,6 +1050,12 @@ public:
 
     // Get a specific block (copy)
     std::vector<T> get_block(int local_row, int local_col, MatrixLayout layout = MatrixLayout::RowMajor) const {
+        // Only owned rows have CSR storage: adj_ptr has n_owned+1 entries, so a ghost local
+        // index (>= n_owned, see DistGraph's ghost convention) would read out of range here.
+        // Absent -> empty, consistent with the not-found return below.
+        if (local_row < 0 || local_row + 1 >= static_cast<int>(graph->adj_ptr.size())) {
+            return std::vector<T>();
+        }
         int start = graph->adj_ptr[local_row];
         int end = graph->adj_ptr[local_row+1];
         

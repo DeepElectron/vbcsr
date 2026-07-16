@@ -455,10 +455,93 @@ void test_multielement_multiorbital() {
     if (rank == 0) std::cout << "Multi-Element/Multi-Orbital Test passed!" << std::endl;
 }
 
+// A ghost row is resolvable through DistGraph::global_to_local but owns no CSR row, so asking
+// the container for it must hit the documented "absent -> empty" contract rather than reading
+// adj_ptr out of range (which used to surface far away as a bogus block handle lookup).
+void test_ghost_row_returns_empty() {
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    if (rank == 0) std::cout << "\nStarting Ghost-Row Guard Test..." << std::endl;
+
+    // Same 2-atom / 2-rank geometry as test_image_container: rank 0 owns atom 0, rank 1 owns
+    // atom 1, and the edge 0->1 makes atom 1 a ghost on rank 0 (and vice versa is not needed).
+    int my_n_atom = (rank < 2) ? 1 : 0;
+    if (size == 1) my_n_atom = 2;
+    int atom_offset = (rank == 1) ? 1 : 0;
+
+    std::vector<int> atom_index, atom_type;
+    std::vector<double> pos;
+    if (size == 1) {
+        atom_index = {0, 1};
+        atom_type = {0, 0};
+        pos = {0.0, 0.0, 0.0, 5.0, 5.0, 5.0};
+    } else if (rank == 0) {
+        atom_index = {0};
+        atom_type = {0};
+        pos = {0.0, 0.0, 0.0};
+    } else if (rank == 1) {
+        atom_index = {1};
+        atom_type = {0};
+        pos = {5.0, 5.0, 5.0};
+    }
+
+    std::vector<int> type_norb = {1};
+    std::vector<double> cell = {10.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 10.0};
+
+    std::vector<int> edge_index, edge_shift;
+    if (rank == 0) {
+        edge_index = {0, 1};
+        edge_shift = {0, 0, 0};
+    }
+    int n_edge = edge_index.size() / 2;
+
+    AtomicData* data = new AtomicData(
+        my_n_atom, 2, atom_offset, n_edge, 1,
+        atom_index.data(), atom_type.data(), edge_index.data(), type_norb.data(), edge_shift.data(),
+        cell.data(), pos.data(), MPI_COMM_WORLD
+    );
+
+    ImageContainer<double>* img = new ImageContainer<double>(data);
+
+    std::vector<int> R0 = {0, 0, 0};
+    double val = 1.0;
+    if (rank == 0) img->add_block(R0, 0, 1, &val, 1, 1);
+    img->assemble();
+
+    if (size > 1 && rank == 0) {
+        const DistGraph* g = img->image_graphs.at(R0);
+
+        // Atom 1 is a ghost here: resolvable to a local id, but not an owned row.
+        assert(g->global_to_local.count(1));
+        const int ghost_lid = g->global_to_local.at(1);
+        assert(ghost_lid >= static_cast<int>(g->owned_global_indices.size()));
+
+        // Asking for the ghost as the ROW must come back empty, not read past adj_ptr.
+        assert(img->get_block(R0, 1, 0).empty());
+        assert(img->get_block(R0, 1, 1).empty());
+
+        // The owned row still resolves normally -- the guard must not over-reject.
+        std::vector<double> owned = img->get_block(R0, 0, 1);
+        assert(owned.size() == 1);
+        assert(std::abs(owned[0] - 1.0) < 1e-9);
+
+        // A row absent from the graph entirely stays empty (pre-existing contract).
+        assert(img->get_block(R0, 42, 0).empty());
+    }
+
+    delete img;
+    delete data;
+
+    if (rank == 0) std::cout << "Ghost-Row Guard Test passed!" << std::endl;
+}
+
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
     test_image_container();
     test_multielement_multiorbital();
+    test_ghost_row_returns_empty();
     MPI_Finalize();
     return 0;
 }

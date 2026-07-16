@@ -255,6 +255,11 @@ public:
         auto lr = g->global_to_local.find(g_row);
         auto lc = g->global_to_local.find(g_col);
         if (lr == g->global_to_local.end() || lc == g->global_to_local.end()) return {};
+        // global_to_local also resolves GHOST atoms, whose local ids sit past the owned rows
+        // and therefore index no CSR row. Only the owner of a row can serve its blocks.
+        if (lr->second < 0 || lr->second >= static_cast<int>(g->owned_global_indices.size())) {
+            return {};
+        }
         return it->second->get_block(lr->second, lc->second, layout);
     }
 

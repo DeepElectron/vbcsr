@@ -91,6 +91,25 @@ struct VBCSRApplyPlan {
     std::vector<VBCSRPageBatch<T>> batches;
 };
 
+struct VBCSRForwardRowTask {
+    int row = 0;
+    int row_dim = 0;
+    int block_begin = 0;
+    int block_end = 0;
+    int block_degree = 0;
+    bool packed_output = false;
+    bool rhs_pair_candidate = false;
+    size_t work = 0;
+};
+
+struct VBCSRForwardApplyPlan {
+    int direct_dense_row_degree_limit = 0;
+    int rhs_pair_dense_row_degree_limit = 0;
+    int max_row_dim = 0;
+    size_t total_work = 0;
+    std::vector<VBCSRForwardRowTask> rows;
+};
+
 template <typename T, typename Kernel>
 struct VBCSRMatrixBackend {
     using Storage = ShapeBlockStore<T>;
@@ -98,6 +117,8 @@ struct VBCSRMatrixBackend {
     using ApplyStats = VBCSRApplyStats;
     using PageBatch = VBCSRPageBatch<T>;
     using ApplyPlan = VBCSRApplyPlan<T>;
+    using ForwardApplyPlan = VBCSRForwardApplyPlan;
+    using ForwardRowTask = VBCSRForwardRowTask;
 
     // "graph block index" means the flat local block position from row_ptr/col_ind.
     // Storage capacity and page traversal are block-oriented.
@@ -247,6 +268,50 @@ struct VBCSRMatrixBackend {
         return *apply_plan;
     }
 
+    const ForwardApplyPlan& ensure_forward_apply_plan(
+        const std::vector<int>& row_ptr,
+        const std::vector<int>& col_ind,
+        const std::vector<int>& block_sizes,
+        int n_rows,
+        int direct_dense_row_degree_limit,
+        int rhs_pair_dense_row_degree_limit) const {
+        std::lock_guard<std::mutex> lock(apply_plan_mutex);
+        if (!forward_apply_plan ||
+            forward_apply_plan->direct_dense_row_degree_limit != direct_dense_row_degree_limit ||
+            forward_apply_plan->rhs_pair_dense_row_degree_limit != rhs_pair_dense_row_degree_limit ||
+            static_cast<int>(forward_apply_plan->rows.size()) != n_rows) {
+            auto plan = std::make_unique<ForwardApplyPlan>();
+            plan->direct_dense_row_degree_limit = direct_dense_row_degree_limit;
+            plan->rhs_pair_dense_row_degree_limit = rhs_pair_dense_row_degree_limit;
+            plan->rows.reserve(static_cast<size_t>(std::max(0, n_rows)));
+            for (int row = 0; row < n_rows; ++row) {
+                const int row_dim = block_sizes[row];
+                const int block_begin = row_ptr[row];
+                const int block_end = row_ptr[row + 1];
+                const int block_degree = block_end - block_begin;
+                size_t row_work = 0;
+                for (int slot = block_begin; slot < block_end; ++slot) {
+                    const int col = col_ind[slot];
+                    row_work += static_cast<size_t>(row_dim) *
+                                static_cast<size_t>(block_sizes[col]);
+                }
+                plan->max_row_dim = std::max(plan->max_row_dim, row_dim);
+                plan->total_work += row_work;
+                plan->rows.push_back(ForwardRowTask{
+                    row,
+                    row_dim,
+                    block_begin,
+                    block_end,
+                    block_degree,
+                    block_degree > direct_dense_row_degree_limit,
+                    block_degree > rhs_pair_dense_row_degree_limit,
+                    row_work});
+            }
+            forward_apply_plan = std::move(plan);
+        }
+        return *forward_apply_plan;
+    }
+
     template <typename Fn>
     void for_each_shape_batch(
         const std::vector<int>& row_ptr,
@@ -274,6 +339,7 @@ private:
     void invalidate_apply_plan() const {
         std::lock_guard<std::mutex> lock(apply_plan_mutex);
         apply_plan.reset();
+        forward_apply_plan.reset();
     }
 
     T* block_ptr_from_handle(uint64_t handle) {
@@ -310,6 +376,7 @@ private:
     std::vector<std::unique_ptr<ApplyStats>> apply_stats_by_shape;
     mutable std::mutex apply_plan_mutex;
     mutable std::unique_ptr<ApplyPlan> apply_plan;
+    mutable std::unique_ptr<ForwardApplyPlan> forward_apply_plan;
 };
 
 } // namespace vbcsr::detail

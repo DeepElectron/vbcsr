@@ -135,6 +135,10 @@ struct TinyBlockKernel {
         }
     }
 
+    static void gemm_rhs_pair(int n, const T* A, int lda, const T* B, int ldb, T* C, int ldc, T alpha, T beta, int K) {
+        gemm(n, A, lda, B, ldb, C, ldc, alpha, beta, K);
+    }
+
     static void gemv_trans(const T* A, const T* x, T* y, T alpha, T beta, int N) {
         // Fallback generic transpose
         for (int j = 0; j < N; ++j) {
@@ -225,7 +229,154 @@ struct TinyBlockKernel<double, M> {
 
     static void gemm(int n, const double* __restrict__ A, int lda, const double* __restrict__ B, int ldb, double* __restrict__ C, int ldc, double alpha, double beta, int K) {
         for (int j = 0; j < n; ++j) {
-            gemv(A, &B[j*ldb], &C[j*ldc], alpha, beta, K);
+            if (lda == M) {
+                gemv(A, &B[j*ldb], &C[j*ldc], alpha, beta, K);
+                continue;
+            }
+            double* __restrict__ C_col = &C[j * ldc];
+            const double* __restrict__ B_col = &B[j * ldb];
+            #pragma omp simd
+            for (int i = 0; i < M; ++i) {
+                C_col[i] *= beta;
+            }
+            for (int l = 0; l < K; ++l) {
+                const double b_val = alpha * B_col[l];
+                const double* __restrict__ A_col = A + l * lda;
+                #pragma omp simd
+                for (int i = 0; i < M; ++i) {
+                    C_col[i] += A_col[i] * b_val;
+                }
+            }
+        }
+    }
+
+    static void gemm_rhs_pair(int n, const double* __restrict__ A, int lda, const double* __restrict__ B, int ldb, double* __restrict__ C, int ldc, double alpha, double beta, int K) {
+        if (ldc != M || n < 16) {
+            if (lda == M) {
+                for (int col = 0; col < n; ++col) {
+                    gemv(A, &B[col * ldb], &C[col * ldc], alpha, beta, K);
+                }
+                return;
+            }
+            for (int col = 0; col < n; ++col) {
+                double* __restrict__ C_col = &C[col * ldc];
+                const double* __restrict__ B_col = &B[col * ldb];
+                #pragma omp simd
+                for (int i = 0; i < M; ++i) {
+                    C_col[i] *= beta;
+                }
+                for (int l = 0; l < K; ++l) {
+                    const double b_val = alpha * B_col[l];
+                    const double* __restrict__ A_col = A + l * lda;
+                    #pragma omp simd
+                    for (int i = 0; i < M; ++i) {
+                        C_col[i] += A_col[i] * b_val;
+                    }
+                }
+            }
+            return;
+        }
+        int j = 0;
+        for (; j + 1 < n; j += 2) {
+            const double* __restrict__ B0 = &B[j * ldb];
+            const double* __restrict__ B1 = &B[(j + 1) * ldb];
+            double* __restrict__ C0 = &C[j * ldc];
+            double* __restrict__ C1 = &C[(j + 1) * ldc];
+
+            auto read_vec = [](const double* ptr, int offset) {
+                if (M >= offset + 4) {
+                    return _mm256_loadu_pd(ptr + offset);
+                }
+                double tmp[4] = {0.0, 0.0, 0.0, 0.0};
+                for (int lane = 0; lane < M - offset; ++lane) {
+                    tmp[lane] = ptr[offset + lane];
+                }
+                return _mm256_loadu_pd(tmp);
+            };
+            auto store_vec = [](double* ptr, int offset, __m256d value) {
+                if (M >= offset + 4) {
+                    _mm256_storeu_pd(ptr + offset, value);
+                    return;
+                }
+                double tmp[4];
+                _mm256_storeu_pd(tmp, value);
+                for (int lane = 0; lane < M - offset; ++lane) {
+                    ptr[offset + lane] = tmp[lane];
+                }
+            };
+
+            const __m256d vbeta = _mm256_set1_pd(beta);
+            __m256d c00 = _mm256_mul_pd(read_vec(C0, 0), vbeta);
+            __m256d c10 = _mm256_mul_pd(read_vec(C1, 0), vbeta);
+            __m256d c01, c11, c02, c12, c03, c13;
+            if (M > 4) {
+                c01 = _mm256_mul_pd(read_vec(C0, 4), vbeta);
+                c11 = _mm256_mul_pd(read_vec(C1, 4), vbeta);
+            }
+            if (M > 8) {
+                c02 = _mm256_mul_pd(read_vec(C0, 8), vbeta);
+                c12 = _mm256_mul_pd(read_vec(C1, 8), vbeta);
+            }
+            if (M > 12) {
+                c03 = _mm256_mul_pd(read_vec(C0, 12), vbeta);
+                c13 = _mm256_mul_pd(read_vec(C1, 12), vbeta);
+            }
+
+            for (int l = 0; l < K; ++l) {
+                const double* __restrict__ A_col = A + l * lda;
+                const __m256d b0 = _mm256_set1_pd(alpha * B0[l]);
+                const __m256d b1 = _mm256_set1_pd(alpha * B1[l]);
+
+                __m256d a0 = read_vec(A_col, 0);
+                c00 = _mm256_fmadd_pd(a0, b0, c00);
+                c10 = _mm256_fmadd_pd(a0, b1, c10);
+                if (M > 4) {
+                    __m256d a1 = read_vec(A_col, 4);
+                    c01 = _mm256_fmadd_pd(a1, b0, c01);
+                    c11 = _mm256_fmadd_pd(a1, b1, c11);
+                }
+                if (M > 8) {
+                    __m256d a2 = read_vec(A_col, 8);
+                    c02 = _mm256_fmadd_pd(a2, b0, c02);
+                    c12 = _mm256_fmadd_pd(a2, b1, c12);
+                }
+                if (M > 12) {
+                    __m256d a3 = read_vec(A_col, 12);
+                    c03 = _mm256_fmadd_pd(a3, b0, c03);
+                    c13 = _mm256_fmadd_pd(a3, b1, c13);
+                }
+            }
+
+            store_vec(C0, 0, c00);
+            store_vec(C1, 0, c10);
+            if (M > 4) {
+                store_vec(C0, 4, c01);
+                store_vec(C1, 4, c11);
+            }
+            if (M > 8) {
+                store_vec(C0, 8, c02);
+                store_vec(C1, 8, c12);
+            }
+            if (M > 12) {
+                store_vec(C0, 12, c03);
+                store_vec(C1, 12, c13);
+            }
+        }
+        if (j < n) {
+            double* __restrict__ C_col = &C[j * ldc];
+            const double* __restrict__ B_col = &B[j * ldb];
+            #pragma omp simd
+            for (int i = 0; i < M; ++i) {
+                C_col[i] *= beta;
+            }
+            for (int l = 0; l < K; ++l) {
+                const double b_val = alpha * B_col[l];
+                const double* __restrict__ A_col = A + l * lda;
+                #pragma omp simd
+                for (int i = 0; i < M; ++i) {
+                    C_col[i] += A_col[i] * b_val;
+                }
+            }
         }
     }
 
@@ -359,6 +510,16 @@ struct FixedBlockKernel {
                 }
             }
         }
+    }
+
+    static void gemm_rhs_pair(int n, const T* __restrict__ A, int lda, const T* __restrict__ B, int ldb, T* __restrict__ C, int ldc, T alpha, T beta) {
+#if defined(__AVX2__) && defined(__FMA__)
+        if constexpr (M <= 16) {
+            TinyBlockKernel<T, M>::gemm_rhs_pair(n, A, lda, B, ldb, C, ldc, alpha, beta, N);
+            return;
+        }
+#endif
+        gemm(n, A, lda, B, ldb, C, ldc, alpha, beta);
     }
 
     static void gemv_trans(const T* __restrict__ A, const T* __restrict__ x, T* __restrict__ y, T alpha, T beta) {
@@ -725,7 +886,7 @@ struct SmartKernel {
             CASE_GEMV(R, 1) CASE_GEMV(R, 2) CASE_GEMV(R, 3) CASE_GEMV(R, 4) CASE_GEMV(R, 5) \
             CASE_GEMV(R, 6) CASE_GEMV(R, 7) CASE_GEMV(R, 8) CASE_GEMV(R, 9) CASE_GEMV(R, 10) \
             CASE_GEMV(R, 11) CASE_GEMV(R, 12) CASE_GEMV(R, 13) CASE_GEMV(R, 14) CASE_GEMV(R, 15) \
-            CASE_GEMV(R, 16) \
+            CASE_GEMV(R, 16) CASE_GEMV(R, 17) CASE_GEMV(R, 18) CASE_GEMV(R, 19) CASE_GEMV(R, 20) \
             default: BLASKernel::gemv(m, n, alpha, A, m, x, 1, beta, y, 1); break; \
         }
 
@@ -738,7 +899,7 @@ struct SmartKernel {
                 CASE_ROW_GEMV(1) CASE_ROW_GEMV(2) CASE_ROW_GEMV(3) CASE_ROW_GEMV(4) CASE_ROW_GEMV(5)
                 CASE_ROW_GEMV(6) CASE_ROW_GEMV(7) CASE_ROW_GEMV(8) CASE_ROW_GEMV(9) CASE_ROW_GEMV(10)
                 CASE_ROW_GEMV(11) CASE_ROW_GEMV(12) CASE_ROW_GEMV(13) CASE_ROW_GEMV(14) CASE_ROW_GEMV(15)
-                CASE_ROW_GEMV(16)
+                CASE_ROW_GEMV(16) CASE_ROW_GEMV(17) CASE_ROW_GEMV(18) CASE_ROW_GEMV(19) CASE_ROW_GEMV(20)
                 default: BLASKernel::gemv(m, n, alpha, A, lda, x, incx, beta, y, incy); break;
             }
         } else {
@@ -769,6 +930,8 @@ struct SmartKernel {
             switch(m) {
                 CASE_ROW_GEMM(1) CASE_ROW_GEMM(2) CASE_ROW_GEMM(3) CASE_ROW_GEMM(4) CASE_ROW_GEMM(5)
                 CASE_ROW_GEMM(6) CASE_ROW_GEMM(7) CASE_ROW_GEMM(8) CASE_ROW_GEMM(9) CASE_ROW_GEMM(10)
+                CASE_ROW_GEMM(11) CASE_ROW_GEMM(12) CASE_ROW_GEMM(13) CASE_ROW_GEMM(14) CASE_ROW_GEMM(15)
+                CASE_ROW_GEMM(16) CASE_ROW_GEMM(17) CASE_ROW_GEMM(18) CASE_ROW_GEMM(19) CASE_ROW_GEMM(20)
                 default: BLASKernel::gemm(m, n, k, alpha, A, lda, B, ldb, beta, C_ptr, ldc); break;
             }
         } else {
@@ -782,7 +945,7 @@ struct SmartKernel {
             CASE_GEMV_TRANS(R, 1) CASE_GEMV_TRANS(R, 2) CASE_GEMV_TRANS(R, 3) CASE_GEMV_TRANS(R, 4) CASE_GEMV_TRANS(R, 5) \
             CASE_GEMV_TRANS(R, 6) CASE_GEMV_TRANS(R, 7) CASE_GEMV_TRANS(R, 8) CASE_GEMV_TRANS(R, 9) CASE_GEMV_TRANS(R, 10) \
             CASE_GEMV_TRANS(R, 11) CASE_GEMV_TRANS(R, 12) CASE_GEMV_TRANS(R, 13) CASE_GEMV_TRANS(R, 14) CASE_GEMV_TRANS(R, 15) \
-            CASE_GEMV_TRANS(R, 16) \
+            CASE_GEMV_TRANS(R, 16) CASE_GEMV_TRANS(R, 17) CASE_GEMV_TRANS(R, 18) CASE_GEMV_TRANS(R, 19) CASE_GEMV_TRANS(R, 20) \
             default: BLASKernel::gemv(m, n, alpha, A, m, x, 1, beta, y, 1, CblasConjTrans); break; \
         }
     #define CASE_ROW_GEMV_TRANS(R) case R: SWITCH_GEMV_TRANS(R); break;
@@ -794,7 +957,7 @@ struct SmartKernel {
                 CASE_ROW_GEMV_TRANS(1) CASE_ROW_GEMV_TRANS(2) CASE_ROW_GEMV_TRANS(3) CASE_ROW_GEMV_TRANS(4) CASE_ROW_GEMV_TRANS(5)
                 CASE_ROW_GEMV_TRANS(6) CASE_ROW_GEMV_TRANS(7) CASE_ROW_GEMV_TRANS(8) CASE_ROW_GEMV_TRANS(9) CASE_ROW_GEMV_TRANS(10)
                 CASE_ROW_GEMV_TRANS(11) CASE_ROW_GEMV_TRANS(12) CASE_ROW_GEMV_TRANS(13) CASE_ROW_GEMV_TRANS(14) CASE_ROW_GEMV_TRANS(15)
-                CASE_ROW_GEMV_TRANS(16)
+                CASE_ROW_GEMV_TRANS(16) CASE_ROW_GEMV_TRANS(17) CASE_ROW_GEMV_TRANS(18) CASE_ROW_GEMV_TRANS(19) CASE_ROW_GEMV_TRANS(20)
                 default: BLASKernel::gemv(m, n, alpha, A, lda, x, incx, beta, y, incy, CblasConjTrans); break;
             }
         } else {
@@ -807,6 +970,8 @@ struct SmartKernel {
         switch(k) { \
             CASE_GEMM_TRANS(R, 1) CASE_GEMM_TRANS(R, 2) CASE_GEMM_TRANS(R, 3) CASE_GEMM_TRANS(R, 4) CASE_GEMM_TRANS(R, 5) \
             CASE_GEMM_TRANS(R, 6) CASE_GEMM_TRANS(R, 7) CASE_GEMM_TRANS(R, 8) CASE_GEMM_TRANS(R, 9) CASE_GEMM_TRANS(R, 10) \
+            CASE_GEMM_TRANS(R, 11) CASE_GEMM_TRANS(R, 12) CASE_GEMM_TRANS(R, 13) CASE_GEMM_TRANS(R, 14) CASE_GEMM_TRANS(R, 15) \
+            CASE_GEMM_TRANS(R, 16) CASE_GEMM_TRANS(R, 17) CASE_GEMM_TRANS(R, 18) CASE_GEMM_TRANS(R, 19) CASE_GEMM_TRANS(R, 20) \
             default: BLASKernel::gemm(k, n, m, alpha, A, lda, B, ldb, beta, C_ptr, ldc, CblasConjTrans, CblasNoTrans); break; \
         }
     #define CASE_ROW_GEMM_TRANS(R) case R: SWITCH_GEMM_TRANS(R); break;
@@ -822,6 +987,8 @@ struct SmartKernel {
             switch(m) {
                 CASE_ROW_GEMM_TRANS(1) CASE_ROW_GEMM_TRANS(2) CASE_ROW_GEMM_TRANS(3) CASE_ROW_GEMM_TRANS(4) CASE_ROW_GEMM_TRANS(5)
                 CASE_ROW_GEMM_TRANS(6) CASE_ROW_GEMM_TRANS(7) CASE_ROW_GEMM_TRANS(8) CASE_ROW_GEMM_TRANS(9) CASE_ROW_GEMM_TRANS(10)
+                CASE_ROW_GEMM_TRANS(11) CASE_ROW_GEMM_TRANS(12) CASE_ROW_GEMM_TRANS(13) CASE_ROW_GEMM_TRANS(14) CASE_ROW_GEMM_TRANS(15)
+                CASE_ROW_GEMM_TRANS(16) CASE_ROW_GEMM_TRANS(17) CASE_ROW_GEMM_TRANS(18) CASE_ROW_GEMM_TRANS(19) CASE_ROW_GEMM_TRANS(20)
                 default: BLASKernel::gemm(k, n, m, alpha, A, lda, B, ldb, beta, C_ptr, ldc, CblasConjTrans, CblasNoTrans); break;
             }
         } else {
