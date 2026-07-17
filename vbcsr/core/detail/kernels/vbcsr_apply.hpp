@@ -24,9 +24,8 @@ struct ShapeBatchKernel {
     using ApplyMode = typename Backend::ApplyMode;
     using PageBatch = typename Backend::PageBatch;
 
-    // Adjoint apply writes through columns, so it still uses shape/page tasks
-    // with per-thread accumulation. Forward apply is row-owned and writes each
-    // destination block row directly.
+    // Page tasks remain available for fallback helpers, while the public forward
+    // and adjoint apply paths are destination-owned to avoid shared output writes.
     struct ApplyTask {
         int batch_index = -1;
         uint32_t begin = 0;
@@ -55,30 +54,7 @@ struct ShapeBatchKernel {
         x.bind_to_graph(graph);
         y.bind_to_graph(graph);
         std::fill(y.data.begin(), y.data.end(), T(0));
-
-        const auto& batches = backend
-                                  .ensure_apply_plan(graph->adj_ptr, graph->adj_ind)
-                                  .batches;
-        const auto tasks = build_apply_tasks(
-            batches,
-            SmartKernel<T>::supports_batched_gemv(),
-            [](const PageBatch& batch) {
-                return static_cast<size_t>(batch.row_dim + batch.col_dim);
-            });
-        auto thread_acc = make_thread_accumulators(static_cast<int>(y.data.size()));
-
-        #pragma omp parallel for schedule(dynamic)
-        for (int task_idx = 0; task_idx < static_cast<int>(tasks.size()); ++task_idx) {
-            const int tid = current_thread_id();
-            auto& accum = thread_acc[tid];
-            const auto& task = tasks[task_idx];
-            const auto& batch = batches[task.batch_index];
-            const ApplyMode mode = select_vector_apply_mode(task.count);
-            backend.record_apply_batch(batch.shape_id, mode);
-            run_mult_adjoint_batch(graph, batch, task.begin, task.count, mode, x, accum.data());
-        }
-
-        reduce_thread_accumulators(thread_acc, y.data);
+        run_mult_adjoint_col_direct(graph, backend, x, y);
         y.reduce_ghosts();
     }
 
@@ -87,34 +63,7 @@ struct ShapeBatchKernel {
         X.bind_to_graph(graph);
         Y.bind_to_graph(graph);
         std::fill(Y.data.begin(), Y.data.end(), T(0));
-
-        const auto& batches = backend
-                                  .ensure_apply_plan(graph->adj_ptr, graph->adj_ind)
-                                  .batches;
-        auto thread_acc = make_thread_accumulators(static_cast<int>(Y.data.size()));
-        const int ldb = X.local_rows + X.ghost_rows;
-        const int ldc = Y.local_rows + Y.ghost_rows;
-        const int num_vecs = X.num_vectors;
-        const auto tasks = build_apply_tasks(
-            batches,
-            SmartKernel<T>::supports_batched_gemm(),
-            [num_vecs](const PageBatch& batch) {
-                return static_cast<size_t>(num_vecs) *
-                       static_cast<size_t>(batch.row_dim + batch.col_dim);
-            });
-
-        #pragma omp parallel for schedule(dynamic)
-        for (int task_idx = 0; task_idx < static_cast<int>(tasks.size()); ++task_idx) {
-            const int tid = current_thread_id();
-            auto& accum = thread_acc[tid];
-            const auto& task = tasks[task_idx];
-            const auto& batch = batches[task.batch_index];
-            const ApplyMode mode = select_dense_apply_mode(task.count);
-            backend.record_apply_batch(batch.shape_id, mode);
-            run_mult_dense_adjoint_batch(graph, batch, task.begin, task.count, mode, X, ldb, num_vecs, ldc, accum.data());
-        }
-
-        reduce_thread_accumulators(thread_acc, Y.data);
+        run_mult_dense_adjoint_col_direct(graph, backend, X, Y);
         Y.reduce_ghosts();
     }
 
@@ -126,7 +75,7 @@ private:
     // Sparse rows avoid scratch/copy overhead; denser rows keep repeated RHS
     // updates in compact scratch before one final store to Y.
     static constexpr int kDirectDenseRowDegreeLimit = 16;
-    static constexpr int kRhsPairDenseRowDegreeLimit = 64;
+    static constexpr int kRhsPairDenseRowDegreeLimit = 16;
 
     template <int RowDim>
     static void fixed_gemv_for_col(
@@ -400,6 +349,38 @@ private:
         return chunks;
     }
 
+    static size_t adjoint_task_work_units(const typename Backend::AdjointColumnTask& task) {
+        return std::max<size_t>(size_t(1), task.work);
+    }
+
+    static std::vector<int> build_adjoint_work_chunks(const typename Backend::AdjointApplyPlan& plan) {
+        const int column_count = static_cast<int>(plan.columns.size());
+        if (column_count == 0) {
+            return std::vector<int>{0};
+        }
+
+        const int chunk_count = std::max(1, std::min(column_count, max_parallel_threads()));
+        std::vector<int> chunks(static_cast<size_t>(chunk_count) + 1, 0);
+        const size_t total_units = std::max<size_t>(size_t(1), plan.total_work);
+        const size_t target_units =
+            (total_units + static_cast<size_t>(chunk_count) - 1) /
+            static_cast<size_t>(chunk_count);
+
+        int column = 0;
+        for (int chunk = 0; chunk < chunk_count - 1; ++chunk) {
+            const int remaining_chunks = chunk_count - chunk - 1;
+            size_t chunk_units = 0;
+            while (column < column_count - remaining_chunks &&
+                   (chunk_units < target_units || column == chunks[static_cast<size_t>(chunk)])) {
+                chunk_units += adjoint_task_work_units(plan.columns[static_cast<size_t>(column)]);
+                ++column;
+            }
+            chunks[static_cast<size_t>(chunk) + 1] = column;
+        }
+        chunks[static_cast<size_t>(chunk_count)] = column_count;
+        return chunks;
+    }
+
     static void run_mult_row_direct(
         DistGraph* graph,
         const Backend& backend,
@@ -533,7 +514,8 @@ private:
                         y_ptr = &Y(graph->block_offsets[row], 0);
                         y_ld = out_ld;
                     }
-                    const bool use_rhs_pair = task.rhs_pair_candidate && num_vecs >= 16 && packed_output;
+                    const bool use_rhs_pair =
+                        task.rhs_pair_candidate && num_vecs >= 16 && packed_output && row_dim <= 16;
 
                     switch (row_dim) {
                         #define VBCSR_APPLY_DENSE_ROW_CASE(R) \
@@ -584,6 +566,122 @@ private:
                     }
                     if (packed_output) {
                         store_dense_row_block(graph, Y, row, row_accum.data(), y_ld, row_dim, num_vecs);
+                    }
+                }
+            }
+        }
+    }
+
+    static void run_mult_adjoint_col_direct(
+        DistGraph* graph,
+        const Backend& backend,
+        DistVector<T>& x,
+        DistVector<T>& y) {
+        const int n_rows = static_cast<int>(graph->owned_global_indices.size());
+        const auto& plan = backend.ensure_adjoint_apply_plan(
+            graph->adj_ptr,
+            graph->adj_ind,
+            graph->block_sizes,
+            n_rows,
+            kDirectDenseRowDegreeLimit);
+        const auto chunks = build_adjoint_work_chunks(plan);
+        const int chunk_count = static_cast<int>(chunks.size()) - 1;
+        const auto& block_offsets = graph->block_offsets;
+        const auto& block_sizes = graph->block_sizes;
+
+        #pragma omp parallel for schedule(static)
+        for (int chunk = 0; chunk < chunk_count; ++chunk) {
+            for (int task_index = chunks[static_cast<size_t>(chunk)];
+                 task_index < chunks[static_cast<size_t>(chunk) + 1];
+                 ++task_index) {
+                const auto& task = plan.columns[static_cast<size_t>(task_index)];
+                T* y_ptr = y.data.data() + block_offsets[task.col];
+                for (int incoming = task.incoming_begin; incoming < task.incoming_end; ++incoming) {
+                    const int slot = plan.incoming_slots[static_cast<size_t>(incoming)];
+                    const int row = plan.incoming_rows[static_cast<size_t>(incoming)];
+                    const int row_dim = block_sizes[row];
+                    const T* block = backend.block_ptr_for_graph_block(slot);
+                    const T* x_ptr = x.data.data() + block_offsets[row];
+                    SmartKernel<T>::gemv_trans(
+                        row_dim,
+                        task.col_dim,
+                        T(1),
+                        block,
+                        row_dim,
+                        x_ptr,
+                        1,
+                        T(1),
+                        y_ptr,
+                        1);
+                }
+            }
+        }
+    }
+
+    static void run_mult_dense_adjoint_col_direct(
+        DistGraph* graph,
+        const Backend& backend,
+        DistMultiVector<T>& X,
+        DistMultiVector<T>& Y) {
+        const int n_rows = static_cast<int>(graph->owned_global_indices.size());
+        const int num_vecs = X.num_vectors;
+        const int x_ld = X.local_rows + X.ghost_rows;
+        const int y_out_ld = Y.local_rows + Y.ghost_rows;
+        const auto& plan = backend.ensure_adjoint_apply_plan(
+            graph->adj_ptr,
+            graph->adj_ind,
+            graph->block_sizes,
+            n_rows,
+            kDirectDenseRowDegreeLimit);
+        const auto chunks = build_adjoint_work_chunks(plan);
+        const int chunk_count = static_cast<int>(chunks.size()) - 1;
+        const auto& block_offsets = graph->block_offsets;
+        const auto& block_sizes = graph->block_sizes;
+
+        #pragma omp parallel
+        {
+            std::vector<T> col_accum;
+            col_accum.reserve(static_cast<size_t>(std::max(1, plan.max_col_dim)) * std::max(1, num_vecs));
+
+            #pragma omp for schedule(static)
+            for (int chunk = 0; chunk < chunk_count; ++chunk) {
+                for (int task_index = chunks[static_cast<size_t>(chunk)];
+                     task_index < chunks[static_cast<size_t>(chunk) + 1];
+                     ++task_index) {
+                    const auto& task = plan.columns[static_cast<size_t>(task_index)];
+                    T* y_ptr = nullptr;
+                    int y_ld = 0;
+                    if (task.packed_output) {
+                        col_accum.assign(static_cast<size_t>(task.col_dim) * num_vecs, T(0));
+                        y_ptr = col_accum.data();
+                        y_ld = task.col_dim;
+                    } else {
+                        y_ptr = &Y(block_offsets[task.col], 0);
+                        y_ld = y_out_ld;
+                    }
+
+                    for (int incoming = task.incoming_begin; incoming < task.incoming_end; ++incoming) {
+                        const int slot = plan.incoming_slots[static_cast<size_t>(incoming)];
+                        const int row = plan.incoming_rows[static_cast<size_t>(incoming)];
+                        const int row_dim = block_sizes[row];
+                        const T* block = backend.block_ptr_for_graph_block(slot);
+                        const T* x_ptr = &X(block_offsets[row], 0);
+                        SmartKernel<T>::gemm_trans(
+                            row_dim,
+                            num_vecs,
+                            task.col_dim,
+                            T(1),
+                            block,
+                            row_dim,
+                            x_ptr,
+                            x_ld,
+                            T(1),
+                            y_ptr,
+                            y_ld);
+                    }
+
+                    if (task.packed_output) {
+                        store_dense_row_block(graph, Y, task.col, col_accum.data(), y_ld, task.col_dim, num_vecs);
                     }
                 }
             }

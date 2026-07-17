@@ -110,6 +110,26 @@ struct VBCSRForwardApplyPlan {
     std::vector<VBCSRForwardRowTask> rows;
 };
 
+struct VBCSRAdjointColumnTask {
+    int col = 0;
+    int col_dim = 0;
+    int incoming_begin = 0;
+    int incoming_end = 0;
+    int incoming_degree = 0;
+    bool packed_output = false;
+    size_t work = 0;
+};
+
+struct VBCSRAdjointApplyPlan {
+    int direct_dense_col_degree_limit = 0;
+    int block_count = 0;
+    int max_col_dim = 0;
+    size_t total_work = 0;
+    std::vector<int> incoming_slots;
+    std::vector<int> incoming_rows;
+    std::vector<VBCSRAdjointColumnTask> columns;
+};
+
 template <typename T, typename Kernel>
 struct VBCSRMatrixBackend {
     using Storage = ShapeBlockStore<T>;
@@ -119,6 +139,8 @@ struct VBCSRMatrixBackend {
     using ApplyPlan = VBCSRApplyPlan<T>;
     using ForwardApplyPlan = VBCSRForwardApplyPlan;
     using ForwardRowTask = VBCSRForwardRowTask;
+    using AdjointApplyPlan = VBCSRAdjointApplyPlan;
+    using AdjointColumnTask = VBCSRAdjointColumnTask;
 
     // "graph block index" means the flat local block position from row_ptr/col_ind.
     // Storage capacity and page traversal are block-oriented.
@@ -203,6 +225,24 @@ struct VBCSRMatrixBackend {
         const uint64_t handle = storage.append(shape_id, graph_block_index);
         invalidate_apply_plan();
         return handle;
+    }
+
+    uint64_t append_block_for_shape_uninitialized(int shape_id, int graph_block_index) {
+        const uint64_t handle = storage.append_uninitialized(shape_id, graph_block_index);
+        invalidate_apply_plan();
+        return handle;
+    }
+
+    void append_blocks_for_shape_uninitialized(
+        int shape_id,
+        const std::vector<int>& graph_block_indices) {
+        storage.append_many_uninitialized(
+            shape_id,
+            graph_block_indices,
+            [&](int graph_block_index, uint64_t handle) {
+                set_graph_block_handle(graph_block_index, handle);
+            });
+        invalidate_apply_plan();
     }
 
     template <typename Fn>
@@ -312,6 +352,79 @@ struct VBCSRMatrixBackend {
         return *forward_apply_plan;
     }
 
+    const AdjointApplyPlan& ensure_adjoint_apply_plan(
+        const std::vector<int>& row_ptr,
+        const std::vector<int>& col_ind,
+        const std::vector<int>& block_sizes,
+        int n_rows,
+        int direct_dense_col_degree_limit) const {
+        const int block_count = static_cast<int>(block_sizes.size());
+        std::lock_guard<std::mutex> lock(apply_plan_mutex);
+        if (!adjoint_apply_plan ||
+            adjoint_apply_plan->direct_dense_col_degree_limit != direct_dense_col_degree_limit ||
+            adjoint_apply_plan->block_count != block_count) {
+            auto plan = std::make_unique<AdjointApplyPlan>();
+            plan->direct_dense_col_degree_limit = direct_dense_col_degree_limit;
+            plan->block_count = block_count;
+
+            const int slot_count = n_rows > 0 ? row_ptr[static_cast<size_t>(n_rows)] : 0;
+            std::vector<int> incoming_counts(static_cast<size_t>(std::max(0, block_count)), 0);
+            for (int row = 0; row < n_rows; ++row) {
+                for (int slot = row_ptr[row]; slot < row_ptr[row + 1]; ++slot) {
+                    ++incoming_counts[static_cast<size_t>(col_ind[slot])];
+                }
+            }
+
+            std::vector<int> incoming_offsets(static_cast<size_t>(block_count) + 1, 0);
+            for (int col = 0; col < block_count; ++col) {
+                incoming_offsets[static_cast<size_t>(col) + 1] =
+                    incoming_offsets[static_cast<size_t>(col)] +
+                    incoming_counts[static_cast<size_t>(col)];
+            }
+
+            plan->incoming_slots.assign(static_cast<size_t>(std::max(0, slot_count)), 0);
+            plan->incoming_rows.assign(static_cast<size_t>(std::max(0, slot_count)), 0);
+            auto cursor = incoming_offsets;
+            for (int row = 0; row < n_rows; ++row) {
+                for (int slot = row_ptr[row]; slot < row_ptr[row + 1]; ++slot) {
+                    const int col = col_ind[slot];
+                    const int dest = cursor[static_cast<size_t>(col)]++;
+                    plan->incoming_slots[static_cast<size_t>(dest)] = slot;
+                    plan->incoming_rows[static_cast<size_t>(dest)] = row;
+                }
+            }
+
+            plan->columns.reserve(static_cast<size_t>(block_count));
+            for (int col = 0; col < block_count; ++col) {
+                const int incoming_begin = incoming_offsets[static_cast<size_t>(col)];
+                const int incoming_end = incoming_offsets[static_cast<size_t>(col) + 1];
+                if (incoming_begin == incoming_end) {
+                    continue;
+                }
+                const int col_dim = block_sizes[col];
+                size_t col_work = 0;
+                for (int incoming = incoming_begin; incoming < incoming_end; ++incoming) {
+                    const int row = plan->incoming_rows[static_cast<size_t>(incoming)];
+                    col_work += static_cast<size_t>(block_sizes[row]) *
+                                static_cast<size_t>(col_dim);
+                }
+                const int incoming_degree = incoming_end - incoming_begin;
+                plan->max_col_dim = std::max(plan->max_col_dim, col_dim);
+                plan->total_work += col_work;
+                plan->columns.push_back(AdjointColumnTask{
+                    col,
+                    col_dim,
+                    incoming_begin,
+                    incoming_end,
+                    incoming_degree,
+                    incoming_degree > direct_dense_col_degree_limit,
+                    col_work});
+            }
+            adjoint_apply_plan = std::move(plan);
+        }
+        return *adjoint_apply_plan;
+    }
+
     template <typename Fn>
     void for_each_shape_batch(
         const std::vector<int>& row_ptr,
@@ -340,6 +453,7 @@ private:
         std::lock_guard<std::mutex> lock(apply_plan_mutex);
         apply_plan.reset();
         forward_apply_plan.reset();
+        adjoint_apply_plan.reset();
     }
 
     T* block_ptr_from_handle(uint64_t handle) {
@@ -377,6 +491,7 @@ private:
     mutable std::mutex apply_plan_mutex;
     mutable std::unique_ptr<ApplyPlan> apply_plan;
     mutable std::unique_ptr<ForwardApplyPlan> forward_apply_plan;
+    mutable std::unique_ptr<AdjointApplyPlan> adjoint_apply_plan;
 };
 
 } // namespace vbcsr::detail

@@ -128,6 +128,11 @@ void fixed_gemm_one(int rhs, const double* A, const double* B, int ldb, double* 
     vbcsr::FixedBlockKernel<double, M, K>::gemm(rhs, A, M, B, ldb, C, ldc, 1.0, beta);
 }
 
+template <int M, int K>
+void fixed_gemm_rhs_pair_one(int rhs, const double* A, const double* B, int ldb, double* C, int ldc, double beta) {
+    vbcsr::FixedBlockKernel<double, M, K>::gemm_rhs_pair(rhs, A, M, B, ldb, C, ldc, 1.0, beta);
+}
+
 void mkl_gemv_one(int m, int k, const double* A, const double* x, double* y, double beta) {
     vbcsr::BLASKernel::gemv(m, k, 1.0, A, m, x, 1, beta, y, 1);
 }
@@ -209,6 +214,34 @@ Timing run_fixed_gemm(
         [&]() {
             for (int b = 0; b < args.batch; ++b) {
                 fixed_gemm_one<M, K>(
+                    rhs,
+                    A.data() + static_cast<size_t>(b) * M * K,
+                    B.data() + static_cast<size_t>(b) * strideb,
+                    ldb,
+                    C.data() + static_cast<size_t>(b) * M * rhs,
+                    ldc,
+                    args.beta);
+            }
+            return checksum_stride(C, M + 11);
+        },
+        args.min_iterations,
+        args.min_seconds);
+}
+
+template <int M, int K>
+Timing run_fixed_gemm_rhs_pair(
+    int rhs,
+    int ldb,
+    int strideb,
+    const Args& args,
+    const std::vector<double>& A,
+    const std::vector<double>& B,
+    std::vector<double>& C) {
+    const int ldc = M;
+    return benchmark(
+        [&]() {
+            for (int b = 0; b < args.batch; ++b) {
+                fixed_gemm_rhs_pair_one<M, K>(
                     rhs,
                     A.data() + static_cast<size_t>(b) * M * K,
                     B.data() + static_cast<size_t>(b) * strideb,
@@ -370,13 +403,20 @@ void run_shape(const Args& args, std::mt19937_64& rng) {
         auto B = random_values(b_size, rng);
         std::vector<double> C(static_cast<size_t>(args.batch) * M * rhs, 0.0);
         fixed_samples.clear();
+        std::vector<double> fixed_pair_samples;
         mkl_direct_samples.clear();
         mkl_batched_samples.clear();
+        double fixed_pair_checksum = 0.0;
         for (int repeat = 0; repeat < args.repeats; ++repeat) {
             std::fill(C.begin(), C.end(), 0.0);
             auto t_fixed = run_fixed_gemm<M, K>(rhs, ldb, strideb, args, A, B, C);
             fixed_samples.push_back(t_fixed.seconds);
             fixed_checksum = t_fixed.checksum;
+
+            std::fill(C.begin(), C.end(), 0.0);
+            auto t_fixed_pair = run_fixed_gemm_rhs_pair<M, K>(rhs, ldb, strideb, args, A, B, C);
+            fixed_pair_samples.push_back(t_fixed_pair.seconds);
+            fixed_pair_checksum = t_fixed_pair.checksum;
 
             std::fill(C.begin(), C.end(), 0.0);
             auto t_mkl = run_mkl_direct_gemm(M, K, rhs, ldb, strideb, args, A, B, C);
@@ -389,6 +429,7 @@ void run_shape(const Args& args, std::mt19937_64& rng) {
             mkl_batched_checksum = t_batched.checksum;
         }
         print_result("gemm", "vbcsr_fixed", M, K, rhs, args.batch, median(fixed_samples), fixed_checksum);
+        print_result("gemm", "vbcsr_fixed_rhs_pair", M, K, rhs, args.batch, median(fixed_pair_samples), fixed_pair_checksum);
         print_result("gemm", "mkl_direct", M, K, rhs, args.batch, median(mkl_direct_samples), mkl_direct_checksum);
         print_result("gemm", "mkl_strided_batch_ideal", M, K, rhs, args.batch, median(mkl_batched_samples), mkl_batched_checksum);
     }

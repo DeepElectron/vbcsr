@@ -101,7 +101,7 @@ struct NaiveKernel {
 
 // Template Kernel for Fixed Block Sizes
 // M, N are compile-time constants
-// Tiny Block Kernel (M=1..16) using AVX2 Intrinsics
+// Tiny Block Kernel (M=1..20) using AVX2 Intrinsics
 // Requires __AVX2__ and __FMA__
 #if defined(__AVX2__) && defined(__FMA__)
 #include <immintrin.h>
@@ -165,7 +165,7 @@ template <int M>
 struct TinyBlockKernel<double, M> {
     static void gemv(const double* __restrict__ A, const double* __restrict__ x, double* __restrict__ y, double alpha, double beta, int N) {
         // AVX2 registers: ymm0-ymm15 (256-bit, 4 doubles)
-        __m256d y0, y1, y2, y3;
+        __m256d y0, y1, y2, y3, y4;
         __m256d vbeta = _mm256_set1_pd(beta);
         
         // Safe Read Y
@@ -182,12 +182,14 @@ struct TinyBlockKernel<double, M> {
         if (M > 4) read_y(4, y1);
         if (M > 8) read_y(8, y2);
         if (M > 12) read_y(12, y3);
+        if (M > 16) read_y(16, y4);
         
         // Scale
         y0 = _mm256_mul_pd(y0, vbeta);
         if (M > 4) y1 = _mm256_mul_pd(y1, vbeta);
         if (M > 8) y2 = _mm256_mul_pd(y2, vbeta);
         if (M > 12) y3 = _mm256_mul_pd(y3, vbeta);
+        if (M > 16) y4 = _mm256_mul_pd(y4, vbeta);
         
         // Accumulate
         for (int j = 0; j < N; ++j) {
@@ -209,6 +211,7 @@ struct TinyBlockKernel<double, M> {
             if (M > 4) fma(4, y1);
             if (M > 8) fma(8, y2);
             if (M > 12) fma(12, y3);
+            if (M > 16) fma(16, y4);
         }
         
         // Store Y back
@@ -225,6 +228,7 @@ struct TinyBlockKernel<double, M> {
         if (M > 4) store_y(4, y1);
         if (M > 8) store_y(8, y2);
         if (M > 12) store_y(12, y3);
+        if (M > 16) store_y(16, y4);
     }
 
     static void gemm(int n, const double* __restrict__ A, int lda, const double* __restrict__ B, int ldb, double* __restrict__ C, int ldc, double alpha, double beta, int K) {
@@ -308,7 +312,7 @@ struct TinyBlockKernel<double, M> {
             const __m256d vbeta = _mm256_set1_pd(beta);
             __m256d c00 = _mm256_mul_pd(read_vec(C0, 0), vbeta);
             __m256d c10 = _mm256_mul_pd(read_vec(C1, 0), vbeta);
-            __m256d c01, c11, c02, c12, c03, c13;
+            __m256d c01, c11, c02, c12, c03, c13, c04, c14;
             if (M > 4) {
                 c01 = _mm256_mul_pd(read_vec(C0, 4), vbeta);
                 c11 = _mm256_mul_pd(read_vec(C1, 4), vbeta);
@@ -320,6 +324,10 @@ struct TinyBlockKernel<double, M> {
             if (M > 12) {
                 c03 = _mm256_mul_pd(read_vec(C0, 12), vbeta);
                 c13 = _mm256_mul_pd(read_vec(C1, 12), vbeta);
+            }
+            if (M > 16) {
+                c04 = _mm256_mul_pd(read_vec(C0, 16), vbeta);
+                c14 = _mm256_mul_pd(read_vec(C1, 16), vbeta);
             }
 
             for (int l = 0; l < K; ++l) {
@@ -345,6 +353,11 @@ struct TinyBlockKernel<double, M> {
                     c03 = _mm256_fmadd_pd(a3, b0, c03);
                     c13 = _mm256_fmadd_pd(a3, b1, c13);
                 }
+                if (M > 16) {
+                    __m256d a4 = read_vec(A_col, 16);
+                    c04 = _mm256_fmadd_pd(a4, b0, c04);
+                    c14 = _mm256_fmadd_pd(a4, b1, c14);
+                }
             }
 
             store_vec(C0, 0, c00);
@@ -360,6 +373,10 @@ struct TinyBlockKernel<double, M> {
             if (M > 12) {
                 store_vec(C0, 12, c03);
                 store_vec(C1, 12, c13);
+            }
+            if (M > 16) {
+                store_vec(C0, 16, c04);
+                store_vec(C1, 16, c14);
             }
         }
         if (j < n) {
@@ -389,7 +406,7 @@ struct TinyBlockKernel<double, M> {
         // Load x into registers if M is small enough?
         // M=1..16. We can load x into ymm registers.
         
-        __m256d x0, x1, x2, x3;
+        __m256d x0, x1, x2, x3, x4;
         
         // Safe Read X
         auto read_x = [&](int offset, __m256d& reg) {
@@ -405,6 +422,7 @@ struct TinyBlockKernel<double, M> {
         if (M > 4) read_x(4, x1);
         if (M > 8) read_x(8, x2);
         if (M > 12) read_x(12, x3);
+        if (M > 16) read_x(16, x4);
         
         for (int j = 0; j < N; ++j) {
             const double* A_col = A + j*M;
@@ -425,6 +443,7 @@ struct TinyBlockKernel<double, M> {
             if (M > 4) dot(4, x1);
             if (M > 8) dot(8, x2);
             if (M > 12) dot(12, x3);
+            if (M > 16) dot(16, x4);
             
             // Horizontal sum
             double s = 0.0;
@@ -457,7 +476,7 @@ template <typename T, int M, int N>
 struct FixedBlockKernel {
     static void gemv(const T* __restrict__ A, const T* __restrict__ x, T* __restrict__ y, T alpha, T beta) {
 #if defined(__AVX2__) && defined(__FMA__)
-        if constexpr (M <= 16) {
+        if constexpr (M <= 20) {
             TinyBlockKernel<T, M>::gemv(A, x, y, alpha, beta, N);
             return;
         }
@@ -483,7 +502,7 @@ struct FixedBlockKernel {
 
     static void gemm(int n, const T* __restrict__ A, int lda, const T* __restrict__ B, int ldb, T* __restrict__ C, int ldc, T alpha, T beta) {
 #if defined(__AVX2__) && defined(__FMA__)
-        if constexpr (M <= 16) {
+        if constexpr (M <= 20) {
             TinyBlockKernel<T, M>::gemm(n, A, lda, B, ldb, C, ldc, alpha, beta, N);
             return;
         }
@@ -514,7 +533,7 @@ struct FixedBlockKernel {
 
     static void gemm_rhs_pair(int n, const T* __restrict__ A, int lda, const T* __restrict__ B, int ldb, T* __restrict__ C, int ldc, T alpha, T beta) {
 #if defined(__AVX2__) && defined(__FMA__)
-        if constexpr (M <= 16) {
+        if constexpr (M <= 20) {
             TinyBlockKernel<T, M>::gemm_rhs_pair(n, A, lda, B, ldb, C, ldc, alpha, beta, N);
             return;
         }
@@ -524,7 +543,7 @@ struct FixedBlockKernel {
 
     static void gemv_trans(const T* __restrict__ A, const T* __restrict__ x, T* __restrict__ y, T alpha, T beta) {
 #if defined(__AVX2__) && defined(__FMA__)
-        if constexpr (M <= 16) {
+        if constexpr (M <= 20) {
             TinyBlockKernel<T, M>::gemv_trans(A, x, y, alpha, beta, N);
             return;
         }
@@ -546,7 +565,7 @@ struct FixedBlockKernel {
 
     static void gemm_trans(int n, const T* __restrict__ A, int lda, const T* __restrict__ B, int ldb, T* __restrict__ C, int ldc, T alpha, T beta) {
 #if defined(__AVX2__) && defined(__FMA__)
-        if constexpr (M <= 16) {
+        if constexpr (M <= 20) {
             TinyBlockKernel<T, M>::gemm_trans(n, A, lda, B, ldb, C, ldc, alpha, beta, N);
             return;
         }
@@ -834,7 +853,9 @@ struct BLASKernel {
     static void configure_native_threading() {
 #ifdef VBCSR_USE_MKL
         int one = 1;
-        mkl_set_num_threads_(&one);
+        if (mkl_get_max_threads() != one) {
+            mkl_set_num_threads_(&one);
+        }
 #elif defined(VBCSR_USE_OPENBLAS)
         openblas_set_num_threads(1);
 #else
@@ -850,7 +871,9 @@ struct BLASKernel {
     static void configure_vendor_sparse_threading() {
 #ifdef VBCSR_USE_MKL
         int threads = preferred_parallel_thread_count();
-        mkl_set_num_threads_(&threads);
+        if (mkl_get_max_threads() != threads) {
+            mkl_set_num_threads_(&threads);
+        }
 #endif
     }
 

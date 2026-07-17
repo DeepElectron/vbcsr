@@ -85,7 +85,8 @@ bool bsr_try_vendor_mkl_dense(
     const BSRVendorCache<T>& cache,
     DistMultiVector<T>& x,
     DistMultiVector<T>& y,
-    bool adjoint) {
+    bool adjoint,
+    bool replace_output) {
     const matrix_descr descr = bsr_mkl_descr();
     const sparse_layout_t layout = SPARSE_LAYOUT_COLUMN_MAJOR;
     const int num_vecs = x.num_vectors;
@@ -205,7 +206,7 @@ bool bsr_try_vendor_mkl_dense(
         sparse_status_t status = SPARSE_STATUS_NOT_SUPPORTED;
         if constexpr (std::is_same_v<T, double>) {
             const double alpha = 1.0;
-            const double beta = 1.0;
+            const double beta = replace_output ? 0.0 : 1.0;
             const double* b_ptr = x.data.data();
             double* c_ptr = y.data.data() + row_offset;
             status = mkl_sparse_d_mm(
@@ -222,7 +223,7 @@ bool bsr_try_vendor_mkl_dense(
                 static_cast<MKL_INT>(y_ld));
         } else if constexpr (std::is_same_v<T, std::complex<double>>) {
             const MKL_Complex16 alpha{1.0, 0.0};
-            const MKL_Complex16 beta{1.0, 0.0};
+            const MKL_Complex16 beta{replace_output ? 0.0 : 1.0, 0.0};
             const auto* b_ptr =
                 reinterpret_cast<const MKL_Complex16*>(x.data.data());
             auto* c_ptr = reinterpret_cast<MKL_Complex16*>(y.data.data() + row_offset);
@@ -247,6 +248,31 @@ bool bsr_try_vendor_mkl_dense(
 
     backend.note_vendor_launch(static_cast<uint64_t>(cache.batches.size()));
     return true;
+}
+
+template <typename T>
+bool bsr_vendor_batches_have_disjoint_output_rows(const BSRVendorCache<T>& cache) {
+    int previous_row_end = 0;
+    for (const auto& entry : cache.batches) {
+        if (entry.batch.row_begin < previous_row_end) {
+            return false;
+        }
+        previous_row_end = entry.batch.row_end;
+    }
+    return true;
+}
+
+template <typename T>
+void bsr_zero_output_ghost_rows(DistMultiVector<T>& y) {
+    if (y.ghost_rows <= 0) {
+        return;
+    }
+    const int y_ld = y.local_rows + y.ghost_rows;
+    #pragma omp parallel for
+    for (int vec = 0; vec < y.num_vectors; ++vec) {
+        T* column = y.data.data() + static_cast<size_t>(vec) * y_ld;
+        std::fill(column + y.local_rows, column + y_ld, T(0));
+    }
 }
 
 } // namespace
@@ -490,9 +516,14 @@ void bsr_mult_dense(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistMu
         graph->adj_ind,
         static_cast<int>(graph->block_sizes.size()));
     if (cache.kind != BSRVendorBackendKind::None) {
-        std::fill(y.data.begin(), y.data.end(), T(0));
+        const bool replace_output = bsr_vendor_batches_have_disjoint_output_rows(cache);
+        if (!replace_output) {
+            std::fill(y.data.begin(), y.data.end(), T(0));
+        } else {
+            bsr_zero_output_ghost_rows(y);
+        }
         if (cache.kind == BSRVendorBackendKind::MKL &&
-            bsr_try_vendor_mkl_dense(graph, backend, cache, x, y, false)) {
+            bsr_try_vendor_mkl_dense(graph, backend, cache, x, y, false, replace_output)) {
             return;
         }
     }
@@ -694,7 +725,7 @@ void bsr_mult_dense_adjoint(
     if (cache.kind != BSRVendorBackendKind::None) {
         std::fill(y.data.begin(), y.data.end(), T(0));
         if (cache.kind == BSRVendorBackendKind::MKL &&
-            bsr_try_vendor_mkl_dense(graph, backend, cache, x, y, true)) {
+            bsr_try_vendor_mkl_dense(graph, backend, cache, x, y, true, false)) {
             y.reduce_ghosts();
             return;
         }

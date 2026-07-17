@@ -224,6 +224,37 @@ struct BSRMatrixBackend {
         initialize_structure(logical_blocks, uniform_block_size);
     }
 
+    void initialize_structure_for_complete_overwrite(
+        uint64_t logical_blocks,
+        int uniform_block_size,
+        uint32_t configured_blocks_per_page,
+        uint32_t active_blocks_per_page) {
+        block_size = uniform_block_size;
+        configured_blocks_per_page_ =
+            normalize_blocks_per_page(configured_blocks_per_page, block_size);
+        const uint32_t normalized_active_blocks = logical_blocks == 0
+            ? configured_blocks_per_page_
+            : static_cast<uint32_t>(
+                  std::clamp<uint64_t>(
+                      static_cast<uint64_t>(std::max<uint32_t>(active_blocks_per_page, 1u)),
+                      1u,
+                      std::min<uint64_t>(
+                          logical_blocks,
+                          static_cast<uint64_t>(configured_blocks_per_page_))));
+        const uint64_t page_values =
+            static_cast<uint64_t>(normalized_active_blocks) *
+            static_cast<uint64_t>(values_per_block());
+        if (page_values > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+            throw std::overflow_error("BSR complete-overwrite page is too large");
+        }
+        values = PagedBuffer<T>(std::max<uint32_t>(
+            static_cast<uint32_t>(page_values),
+            1u));
+        invalidate_apply_plan();
+        values.resize_uninitialized(
+            logical_blocks * static_cast<uint64_t>(values_per_block()));
+    }
+
     T* block_ptr(int slot) {
         return values.element_ptr(
             static_cast<uint64_t>(slot) *
@@ -330,6 +361,13 @@ struct BSRMatrixBackend {
         const std::vector<int>& row_ptr,
         const std::vector<int>& col_ind,
         int num_block_cols) const {
+        {
+            std::lock_guard<std::mutex> lock(vendor_cache_mutex);
+            if (vendor_cache != nullptr) {
+                return *vendor_cache;
+            }
+        }
+
         const auto& plan = ensure_apply_plan(row_ptr, col_ind);
         std::lock_guard<std::mutex> lock(vendor_cache_mutex);
         if (vendor_cache == nullptr) {

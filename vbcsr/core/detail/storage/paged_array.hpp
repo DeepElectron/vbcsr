@@ -13,6 +13,12 @@
 namespace vbcsr::detail {
 
 template <typename T>
+struct BSRMatrixBackend;
+
+template <typename T>
+class ShapeBlockStore;
+
+template <typename T>
 struct PageSlice {
     T* data = nullptr;
     uint32_t count = 0;
@@ -22,6 +28,9 @@ struct PageSlice {
 
 template <typename T>
 class PagedBuffer {
+    friend struct BSRMatrixBackend<T>;
+    friend class ShapeBlockStore<T>;
+
 public:
     struct Page {
         std::unique_ptr<T[]> data;
@@ -160,6 +169,16 @@ public:
     }
 
 private:
+    // Deliberately private: this is only for backend code paths that prove every
+    // element is overwritten before the buffer can be observed by matrix code.
+    void resize_uninitialized(uint64_t element_count) {
+        if (element_count > capacity()) {
+            ensure_capacity_uninitialized(element_count);
+        }
+        size_ = element_count;
+        refresh_page_usage();
+    }
+
     template <typename BufferLike, typename Fn>
     static void walk_range(BufferLike& buffer, uint64_t begin, uint64_t end, Fn&& fn) {
         if (begin > end || end > buffer.size()) {
@@ -213,10 +232,22 @@ private:
         }
     }
 
+    void ensure_capacity_uninitialized(uint64_t element_capacity) {
+        while (capacity() < element_capacity) {
+            append_page_uninitialized();
+        }
+    }
+
     void append_page() {
         Page storage_page;
         storage_page.data = std::make_unique<T[]>(elements_per_page_);
         std::fill(storage_page.data.get(), storage_page.data.get() + elements_per_page_, T(0));
+        pages_.push_back(std::move(storage_page));
+    }
+
+    void append_page_uninitialized() {
+        Page storage_page;
+        storage_page.data.reset(new T[elements_per_page_]);
         pages_.push_back(std::move(storage_page));
     }
 

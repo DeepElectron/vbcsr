@@ -764,14 +764,37 @@ def benchmark_vbcsr_with_internal_diagnostics(
         )
         return timing, diagnostic
 
-    timing = benchmark_repeated(
-        vbcsr_op(matrix, inputs, spec),
-        comm=comm,
-        repeats=repeats,
-        min_seconds=min_seconds,
-        min_iterations=min_iterations,
-        warmups=warmups,
-    )
+    vbcsr_threading: dict[str, Any] | None = None
+    sparse_dot_mkl_for_threading: Any | None = None
+    if (
+        spec.domain == "csr"
+        and spec.operation == "spgemm"
+        and diagnostic.get("vendor_backend_name") == "mkl"
+        and comm is None
+    ):
+        try:
+            sparse_dot_mkl_for_threading = importlib.import_module("sparse_dot_mkl")
+            vbcsr_threading = configure_sparse_dot_mkl_threading(sparse_dot_mkl_for_threading)
+            diagnostic["vendor_threading"] = vbcsr_threading
+        except Exception as exc:
+            diagnostic["vendor_threading_error"] = f"{type(exc).__name__}: {exc}"
+
+    try:
+        timing = benchmark_repeated(
+            vbcsr_op(matrix, inputs, spec),
+            comm=comm,
+            repeats=repeats,
+            min_seconds=min_seconds,
+            min_iterations=min_iterations,
+            warmups=warmups,
+        )
+    finally:
+        if sparse_dot_mkl_for_threading is not None and vbcsr_threading is not None:
+            diagnostic["vendor_threading_restore"] = restore_sparse_dot_mkl_threading(
+                sparse_dot_mkl_for_threading,
+                vbcsr_threading,
+            )
+
     after = int(matrix.vendor_launch_count)
     local_calls = int(sum(int(item) for item in timing.get("iterations", []))) + int(repeats) * int(warmups)
     local_delta = after - before

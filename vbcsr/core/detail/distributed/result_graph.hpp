@@ -53,6 +53,56 @@ DistGraph* construct_result_graph(
     const GhostSizeMap& ghost_sizes,
     const char* context) {
     auto* graph = new DistGraph(comm);
+    if (graph->size == 1) {
+        const int n_owned = static_cast<int>(owned_global_indices.size());
+        graph->owned_global_indices = owned_global_indices;
+        graph->ghost_global_indices.clear();
+        graph->global_to_local.clear();
+        for (int idx = 0; idx < n_owned; ++idx) {
+            graph->global_to_local[owned_global_indices[static_cast<size_t>(idx)]] = idx;
+        }
+
+        graph->block_sizes = owned_block_sizes;
+        graph->block_displs.assign({0, n_owned});
+        graph->adj_ptr.assign(static_cast<size_t>(n_owned) + 1, 0);
+        graph->adj_ind.clear();
+        for (int row = 0; row < n_owned; ++row) {
+            std::vector<int> row_cols;
+            row_cols.reserve(adjacency[static_cast<size_t>(row)].size());
+            for (int global_col : adjacency[static_cast<size_t>(row)]) {
+                auto it = graph->global_to_local.find(global_col);
+                if (it == graph->global_to_local.end()) {
+                    throw std::runtime_error(std::string("Invalid serial ") + context + " result graph column");
+                }
+                row_cols.push_back(it->second);
+            }
+            std::sort(row_cols.begin(), row_cols.end());
+            graph->adj_ind.insert(graph->adj_ind.end(), row_cols.begin(), row_cols.end());
+            graph->adj_ptr[static_cast<size_t>(row) + 1] =
+                static_cast<int>(graph->adj_ind.size());
+        }
+
+        graph->block_offsets.resize(graph->block_sizes.size() + 1);
+        graph->block_offsets[0] = 0;
+        for (size_t idx = 0; idx < graph->block_sizes.size(); ++idx) {
+            graph->block_offsets[idx + 1] =
+                graph->block_offsets[idx] + graph->block_sizes[idx];
+        }
+
+        graph->send_counts.assign(1, 0);
+        graph->recv_counts.assign(1, 0);
+        graph->send_indices.clear();
+        graph->recv_indices.clear();
+        graph->send_displs.assign(2, 0);
+        graph->recv_displs.assign(2, 0);
+        graph->send_ranks.clear();
+        graph->recv_ranks.clear();
+        graph->send_counts_scalar.assign(1, 0);
+        graph->recv_counts_scalar.assign(1, 0);
+        graph->send_displs_scalar.assign(2, 0);
+        graph->recv_displs_scalar.assign(2, 0);
+        return graph;
+    }
     graph->construct_distributed(owned_global_indices, owned_block_sizes, adjacency);
     backfill_ghost_block_sizes(*graph, ghost_sizes, context);
     return graph;
