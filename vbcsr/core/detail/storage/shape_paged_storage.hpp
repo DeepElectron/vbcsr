@@ -104,6 +104,47 @@ public:
     }
 
     uint64_t append(int shape_id, int graph_block_index) {
+        return append_impl(shape_id, graph_block_index, true);
+    }
+
+    uint64_t append_uninitialized(int shape_id, int graph_block_index) {
+        return append_impl(shape_id, graph_block_index, false);
+    }
+
+    template <typename HandleFn>
+    void append_many_uninitialized(
+        int shape_id,
+        const std::vector<int>& graph_block_indices,
+        HandleFn&& handle_fn) {
+        auto& record = require_shape(shape_id);
+        const size_t count = graph_block_indices.size();
+        if (count == 0) {
+            return;
+        }
+
+        const size_t first_shape_block = record.used_blocks;
+        const size_t new_used_blocks = first_shape_block + count;
+        ensure_reserved_blocks(record, new_used_blocks);
+        record.graph_block_indices.insert(
+            record.graph_block_indices.end(),
+            graph_block_indices.begin(),
+            graph_block_indices.end());
+        record.used_blocks = new_used_blocks;
+        record.values.resize_uninitialized(live_value_count(record));
+
+        for (size_t idx = 0; idx < count; ++idx) {
+            const size_t shape_block_index = first_shape_block + idx;
+            handle_fn(
+                graph_block_indices[idx],
+                encode_handle(
+                    shape_id,
+                    page_id_from_shape_block(record, shape_block_index),
+                    page_block_index_from_shape_block(record, shape_block_index)));
+        }
+    }
+
+private:
+    uint64_t append_impl(int shape_id, int graph_block_index, bool zero_initialize_new_values) {
         if (graph_block_index < 0) {
             throw std::logic_error("ShapeBlockStore graph block index cannot be negative");
         }
@@ -120,13 +161,18 @@ public:
         const size_t shape_block_index = record.used_blocks;
         ++record.used_blocks;
         record.graph_block_indices.push_back(graph_block_index);
-        record.values.resize(live_value_count(record));
+        if (zero_initialize_new_values) {
+            record.values.resize(live_value_count(record));
+        } else {
+            record.values.resize_uninitialized(live_value_count(record));
+        }
         return encode_handle(
             shape_id,
             page_id_from_shape_block(record, shape_block_index),
             page_block_index_from_shape_block(record, shape_block_index));
     }
 
+public:
     T* block_ptr(uint64_t handle) {
         return const_cast<T*>(static_cast<const ShapeBlockStore&>(*this).block_ptr(handle));
     }
