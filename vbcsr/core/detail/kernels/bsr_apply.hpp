@@ -1,20 +1,37 @@
 #ifndef VBCSR_DETAIL_KERNELS_BSR_APPLY_HPP
 #define VBCSR_DETAIL_KERNELS_BSR_APPLY_HPP
 
-// TODO: the native kernels can be optimized to use batched GEMM for acceleration
-// But since we have vendor MKL path, the priority is less than other features.
-
 #include "../../dist_multivector.hpp"
 #include "../../dist_vector.hpp"
 #include "dense_kernels.hpp"
+#include "rowmajor_kernels.hpp"
 #include "../backend/bsr_backend.hpp"
 
 #include <algorithm>
-#include <cstring>
+#include <cstdlib>
 #include <vector>
-#include <xmmintrin.h>
 
 namespace vbcsr::detail {
+
+// BSR applies (SpMV and dense) route to the native row-major kernels by
+// default: with the Phase-4 canonical row-major blocks, the native paths
+// measured faster than MKL's BSR kernels on the reference EPYC 7352 setup —
+// dense mm 1.65x at 1 thread (~1.03x at 16); mv 1.9x at 1 thread (MKL's mv
+// slows ~17% on row-major blocks, while the native contiguous-row dot kernel
+// beats even MKL's column-major-block figure). See the migration plan Phase 4
+// record. Set VBCSR_BSR_VENDOR=1 (legacy alias: VBCSR_BSR_DENSE_VENDOR) to
+// route through the vendor paths instead (re-measure hook; also exercised by
+// test_pb_csr's vendor-cache tests).
+inline bool bsr_vendor_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("VBCSR_BSR_VENDOR");
+        if (value == nullptr) {
+            value = std::getenv("VBCSR_BSR_DENSE_VENDOR");
+        }
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
 
 #ifdef VBCSR_HAVE_MKL_BSR_SPARSE
 namespace {
@@ -88,40 +105,53 @@ bool bsr_try_vendor_mkl_dense(
     bool adjoint,
     bool replace_output) {
     const matrix_descr descr = bsr_mkl_descr();
-    const sparse_layout_t layout = SPARSE_LAYOUT_COLUMN_MAJOR;
+    // Dense operands are ROW major (the multivector layout, padded ld). The
+    // BSR block layout inside the vendor handles is also row major (canonical
+    // since Phase 4), so block and operand layouts match — the pairing MKL's
+    // BSR mm supports with zero-based indexing (see build_bsr_mkl_mm_variant).
+    const sparse_layout_t layout = SPARSE_LAYOUT_ROW_MAJOR;
     const int num_vecs = x.num_vectors;
-    const int x_ld = x.local_rows + x.ghost_rows;
-    const int y_ld = y.local_rows + y.ghost_rows;
+    const int x_ld = x.ld;
+    const int y_ld = y.ld;
 
     const auto run_dense_adjoint_via_mv = [&]() -> bool {
+        // The row-major multivector has no contiguous columns, so each vector
+        // is staged through temporary contiguous buffers for the mv kernel.
         const sparse_operation_t op = bsr_mkl_operation<T>(true);
-        for (const auto& entry : cache.batches) {
-            const size_t row_offset =
-                static_cast<size_t>(graph->block_offsets[entry.batch.row_begin]);
-            for (int vec = 0; vec < num_vecs; ++vec) {
+        const int x_rows = x.local_rows + x.ghost_rows;
+        const int y_rows = y.local_rows + y.ghost_rows;
+        std::vector<T> x_col(static_cast<size_t>(x_rows));
+        std::vector<T> y_col(static_cast<size_t>(y_rows));
+        for (int vec = 0; vec < num_vecs; ++vec) {
+            for (int row = 0; row < x_rows; ++row) {
+                x_col[row] = x(row, vec);
+            }
+            for (int row = 0; row < y_rows; ++row) {
+                y_col[row] = y(row, vec);
+            }
+            for (const auto& entry : cache.batches) {
+                const size_t row_offset =
+                    static_cast<size_t>(graph->block_offsets[entry.batch.row_begin]);
                 sparse_status_t status = SPARSE_STATUS_NOT_SUPPORTED;
                 if constexpr (std::is_same_v<T, double>) {
-                    const double alpha = 1.0;
-                    const double beta = 1.0;
-                    const double* x_ptr =
-                        x.data.data() + static_cast<size_t>(vec) * x_ld + row_offset;
-                    double* y_ptr = y.data.data() + static_cast<size_t>(vec) * y_ld;
-                    status =
-                        mkl_sparse_d_mv(op, alpha, entry.mkl.mv_handle, descr, x_ptr, beta, y_ptr);
+                    status = mkl_sparse_d_mv(
+                        op, 1.0, entry.mkl.mv_handle, descr,
+                        x_col.data() + row_offset, 1.0, y_col.data());
                 } else if constexpr (std::is_same_v<T, std::complex<double>>) {
                     const MKL_Complex16 alpha{1.0, 0.0};
                     const MKL_Complex16 beta{1.0, 0.0};
-                    const auto* x_ptr = reinterpret_cast<const MKL_Complex16*>(
-                        x.data.data() + static_cast<size_t>(vec) * x_ld + row_offset);
-                    auto* y_ptr = reinterpret_cast<MKL_Complex16*>(
-                        y.data.data() + static_cast<size_t>(vec) * y_ld);
-                    status =
-                        mkl_sparse_z_mv(op, alpha, entry.mkl.mv_handle, descr, x_ptr, beta, y_ptr);
+                    status = mkl_sparse_z_mv(
+                        op, alpha, entry.mkl.mv_handle, descr,
+                        reinterpret_cast<const MKL_Complex16*>(x_col.data() + row_offset),
+                        beta,
+                        reinterpret_cast<MKL_Complex16*>(y_col.data()));
                 }
-
                 if (status != SPARSE_STATUS_SUCCESS) {
                     return false;
                 }
+            }
+            for (int row = 0; row < y_rows; ++row) {
+                y(row, vec) = y_col[row];
             }
         }
 
@@ -148,7 +178,7 @@ bool bsr_try_vendor_mkl_dense(
             if constexpr (std::is_same_v<T, double>) {
                 const double alpha = 1.0;
                 const double beta = 1.0;
-                const double* b_ptr = x.data.data() + row_offset;
+                const double* b_ptr = x.data.data() + row_offset * x_ld;
                 double* c_ptr = y.data.data();
                 status = mkl_sparse_d_mm(
                     op,
@@ -166,7 +196,7 @@ bool bsr_try_vendor_mkl_dense(
                 const MKL_Complex16 alpha{1.0, 0.0};
                 const MKL_Complex16 beta{1.0, 0.0};
                 const auto* b_ptr = reinterpret_cast<const MKL_Complex16*>(
-                    x.data.data() + row_offset);
+                    x.data.data() + row_offset * x_ld);
                 auto* c_ptr = reinterpret_cast<MKL_Complex16*>(y.data.data());
                 status = mkl_sparse_z_mm(
                     op,
@@ -208,7 +238,7 @@ bool bsr_try_vendor_mkl_dense(
             const double alpha = 1.0;
             const double beta = replace_output ? 0.0 : 1.0;
             const double* b_ptr = x.data.data();
-            double* c_ptr = y.data.data() + row_offset;
+            double* c_ptr = y.data.data() + row_offset * y_ld;
             status = mkl_sparse_d_mm(
                 SPARSE_OPERATION_NON_TRANSPOSE,
                 alpha,
@@ -226,7 +256,7 @@ bool bsr_try_vendor_mkl_dense(
             const MKL_Complex16 beta{replace_output ? 0.0 : 1.0, 0.0};
             const auto* b_ptr =
                 reinterpret_cast<const MKL_Complex16*>(x.data.data());
-            auto* c_ptr = reinterpret_cast<MKL_Complex16*>(y.data.data() + row_offset);
+            auto* c_ptr = reinterpret_cast<MKL_Complex16*>(y.data.data() + row_offset * y_ld);
             status = mkl_sparse_z_mm(
                 SPARSE_OPERATION_NON_TRANSPOSE,
                 alpha,
@@ -267,21 +297,18 @@ void bsr_zero_output_ghost_rows(DistMultiVector<T>& y) {
     if (y.ghost_rows <= 0) {
         return;
     }
-    const int y_ld = y.local_rows + y.ghost_rows;
-    #pragma omp parallel for
-    for (int vec = 0; vec < y.num_vectors; ++vec) {
-        T* column = y.data.data() + static_cast<size_t>(vec) * y_ld;
-        std::fill(column + y.local_rows, column + y_ld, T(0));
-    }
+    // Row-major: ghost rows are the buffer tail — one contiguous fill
+    // (padding lanes are zero before and after).
+    std::fill(
+        y.data.begin() + static_cast<size_t>(y.local_rows) * y.ld, y.data.end(), T(0));
 }
 
 } // namespace
 #endif
 
-inline int bsr_default_rhs_tile(int block_size) {
-    return block_size <= 8 ? 8 : 4;
-}
-
+// Fixed-block-size lambda dispatch. The apply impls below take runtime dims,
+// so they no longer use this; it remains for consumers that instantiate
+// genuinely block-size-templated kernels (detail/ops/spmm/bsr.hpp).
 template <typename Fn>
 decltype(auto) bsr_dispatch_block_size(int block_size, Fn&& fn) {
     switch (block_size) {
@@ -311,93 +338,18 @@ inline std::pair<int, int> bsr_thread_row_range(int n_rows) {
     return {begin, end};
 }
 
-template <typename T>
-inline void bsr_pack_rhs_tile(
-    T* packed_tile,
-    const T* source,
-    int block_size,
-    int rhs_count,
-    int source_ld) {
-    for (int rhs = 0; rhs < rhs_count; ++rhs) {
-        const T* src_col = source + static_cast<size_t>(rhs) * source_ld;
-        T* dst_col = packed_tile + static_cast<size_t>(rhs) * block_size;
-        std::memcpy(dst_col, src_col, sizeof(T) * static_cast<size_t>(block_size));
-    }
-}
-
-template <typename T>
-inline void bsr_unpack_rhs_tile(
-    T* destination,
-    const T* packed_tile,
-    int block_size,
-    int rhs_count,
-    int destination_ld) {
-    for (int rhs = 0; rhs < rhs_count; ++rhs) {
-        T* dst_col = destination + static_cast<size_t>(rhs) * destination_ld;
-        const T* src_col = packed_tile + static_cast<size_t>(rhs) * block_size;
-        std::memcpy(dst_col, src_col, sizeof(T) * static_cast<size_t>(block_size));
-    }
-}
-
-template <int BlockSize, typename T>
-inline void bsr_apply_block_gemv(int runtime_block_size, const T* block, const T* x, T* y) {
-    if constexpr (BlockSize == 0) {
-        SmartKernel<T>::gemv(runtime_block_size, runtime_block_size, T(1), block, runtime_block_size, x, 1, T(1), y, 1);
-    } else {
-        FixedBlockKernel<T, BlockSize, BlockSize>::gemv(block, x, y, T(1), T(1));
-    }
-}
-
-template <int BlockSize, typename T>
-inline void bsr_apply_block_gemm(
-    int runtime_block_size,
-    int rhs_count,
-    const T* block,
-    const T* x,
-    int x_ld,
-    T* y,
-    int y_ld) {
-    if constexpr (BlockSize == 0) {
-        SmartKernel<T>::gemm(runtime_block_size, rhs_count, runtime_block_size, T(1), block, runtime_block_size, x, x_ld, T(1), y, y_ld);
-    } else {
-        FixedBlockKernel<T, BlockSize, BlockSize>::gemm(rhs_count, block, BlockSize, x, x_ld, y, y_ld, T(1), T(1));
-    }
-}
-
-template <int BlockSize, typename T>
-inline void bsr_apply_block_gemv_trans(int runtime_block_size, const T* block, const T* x, T* y) {
-    if constexpr (BlockSize == 0) {
-        SmartKernel<T>::gemv_trans(runtime_block_size, runtime_block_size, T(1), block, runtime_block_size, x, 1, T(1), y, 1);
-    } else {
-        FixedBlockKernel<T, BlockSize, BlockSize>::gemv_trans(block, x, y, T(1), T(1));
-    }
-}
-
-template <int BlockSize, typename T>
-inline void bsr_apply_block_gemm_trans(
-    int runtime_block_size,
-    int rhs_count,
-    const T* block,
-    const T* x,
-    int x_ld,
-    T* y,
-    int y_ld) {
-    if constexpr (BlockSize == 0) {
-        SmartKernel<T>::gemm_trans(runtime_block_size, rhs_count, runtime_block_size, T(1), block, runtime_block_size, x, x_ld, T(1), y, y_ld);
-    } else {
-        FixedBlockKernel<T, BlockSize, BlockSize>::gemm_trans(rhs_count, block, BlockSize, x, x_ld, y, y_ld, T(1), T(1));
-    }
-}
-
+// SpMV impls keep the compile-time BlockSize dispatch: rm_gemv's k-loops
+// fully unroll when bs is a constant (measured ~8% on bs=8 SpMV), unlike the
+// dense impls where the nv-axis loops dominate and runtime dims are neutral.
 template <int BlockSize, typename T>
 void bsr_mult_impl(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistVector<T>& x, DistVector<T>& y) {
+    const int bs = BlockSize == 0 ? backend.block_size : BlockSize;
     x.bind_to_graph(graph);
     y.bind_to_graph(graph);
     x.sync_ghosts();
 
     const auto& plan = backend.ensure_apply_plan(graph->adj_ptr, graph->adj_ind);
     const int n_rows = graph->adj_ptr.empty() ? 0 : static_cast<int>(graph->adj_ptr.size()) - 1;
-    const int runtime_block_size = backend.block_size;
 
     std::fill(y.data.begin(), y.data.end(), T(0));
 
@@ -416,7 +368,7 @@ void bsr_mult_impl(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistVec
                     const int col = batch.cols[local_block];
                     const T* block = batch.block_ptr(local_block);
                     const T* x_block = x.data.data() + graph->block_offsets[col];
-                    bsr_apply_block_gemv<BlockSize>(runtime_block_size, block, x_block, y_block);
+                    rowmajor_kernels::rm_gemv<T>(bs, bs, block, x_block, y_block);
                 }
             }
         }
@@ -435,7 +387,7 @@ void bsr_mult(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistVector<T
         graph->adj_ptr,
         graph->adj_ind,
         static_cast<int>(graph->block_sizes.size()));
-    if (cache.kind != BSRVendorBackendKind::None) {
+    if (bsr_vendor_enabled() && cache.kind != BSRVendorBackendKind::None) {
         std::fill(y.data.begin(), y.data.end(), T(0));
         if (cache.kind == BSRVendorBackendKind::MKL &&
             bsr_try_vendor_mkl_vector(graph, backend, cache, x, y, false)) {
@@ -446,12 +398,12 @@ void bsr_mult(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistVector<T
 
     BLASKernel::configure_native_threading();
     bsr_dispatch_block_size(backend.block_size, [&](auto block_tag) {
-        constexpr int BlockSize = decltype(block_tag)::value;
-        bsr_mult_impl<BlockSize>(graph, backend, x, y);
+        constexpr int kBlockSize = decltype(block_tag)::value;
+        bsr_mult_impl<kBlockSize>(graph, backend, x, y);
     });
 }
 
-template <int BlockSize, typename T>
+template <typename T>
 void bsr_mult_dense_impl(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistMultiVector<T>& x, DistMultiVector<T>& y) {
     x.bind_to_graph(graph);
     y.bind_to_graph(graph);
@@ -460,43 +412,35 @@ void bsr_mult_dense_impl(DistGraph* graph, const BSRMatrixBackend<T>& backend, D
     const auto& plan = backend.ensure_apply_plan(graph->adj_ptr, graph->adj_ind);
     const int n_rows = graph->adj_ptr.empty() ? 0 : static_cast<int>(graph->adj_ptr.size()) - 1;
     const int runtime_block_size = backend.block_size;
-    const int num_vecs = x.num_vectors;
-    const int x_ld = x.local_rows + x.ghost_rows;
-    const int y_ld = y.local_rows + y.ghost_rows;
-    const int rhs_tile = bsr_default_rhs_tile(runtime_block_size);
+    const int nv = x.ld;  // padded; pad lanes are zero (invariant)
+    const int x_ld = x.ld;
+    const int y_ld = y.ld;
 
     std::fill(y.data.begin(), y.data.end(), T(0));
 
     #pragma omp parallel
     {
-        std::vector<T> x_tile(static_cast<size_t>(runtime_block_size) * rhs_tile, T(0));
         const auto [thread_row_begin, thread_row_end] = bsr_thread_row_range(n_rows);
-
         for (const auto& batch_entry : plan.batches) {
             const auto& batch = batch_entry.batch;
             const int row_begin = std::max(batch.row_begin, thread_row_begin);
             const int row_end = std::min(batch.row_end, thread_row_end);
             for (int row = row_begin; row < row_end; ++row) {
+                T* y_rows = y.data.data() +
+                    static_cast<size_t>(graph->block_offsets[row]) * y_ld;
                 const uint32_t block_begin = batch.row_block_start(row);
                 const uint32_t block_end = batch.row_block_end(row);
-                const uint64_t row_offset = graph->block_offsets[row];
-                for (int vec_begin = 0; vec_begin < num_vecs; vec_begin += rhs_tile) {
-                    const int tile_width = std::min(rhs_tile, num_vecs - vec_begin);
-                    T* y_block = y.data.data() + row_offset + static_cast<size_t>(vec_begin) * y_ld;
-                    for (uint32_t local_block = block_begin; local_block < block_end; ++local_block) {
-                        const int col = batch.cols[local_block];
-                        const T* block = batch.block_ptr(local_block);
-                        const T* x_block = x.data.data() + graph->block_offsets[col] + static_cast<size_t>(vec_begin) * x_ld;
-                        bsr_pack_rhs_tile(x_tile.data(), x_block, runtime_block_size, tile_width, x_ld);
-                        bsr_apply_block_gemm<BlockSize>(
-                            runtime_block_size,
-                            tile_width,
-                            block,
-                            x_tile.data(),
-                            runtime_block_size,
-                            y_block,
-                            y_ld);
-                    }
+                for (uint32_t local_block = block_begin; local_block < block_end; ++local_block) {
+                    const int col = batch.cols[local_block];
+                    rowmajor_kernels::rm_gemm<T>(
+                        runtime_block_size,
+                        runtime_block_size,
+                        nv,
+                        batch.block_ptr(local_block),
+                        x.data.data() + static_cast<size_t>(graph->block_offsets[col]) * x_ld,
+                        x_ld,
+                        y_rows,
+                        y_ld);
                 }
             }
         }
@@ -515,7 +459,7 @@ void bsr_mult_dense(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistMu
         graph->adj_ptr,
         graph->adj_ind,
         static_cast<int>(graph->block_sizes.size()));
-    if (cache.kind != BSRVendorBackendKind::None) {
+    if (bsr_vendor_enabled() && cache.kind != BSRVendorBackendKind::None) {
         const bool replace_output = bsr_vendor_batches_have_disjoint_output_rows(cache);
         if (!replace_output) {
             std::fill(y.data.begin(), y.data.end(), T(0));
@@ -530,20 +474,17 @@ void bsr_mult_dense(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistMu
 #endif
 
     BLASKernel::configure_native_threading();
-    bsr_dispatch_block_size(backend.block_size, [&](auto block_tag) {
-        constexpr int BlockSize = decltype(block_tag)::value;
-        bsr_mult_dense_impl<BlockSize>(graph, backend, x, y);
-    });
+    bsr_mult_dense_impl(graph, backend, x, y);
 }
 
 template <int BlockSize, typename T>
 void bsr_mult_adjoint_impl(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistVector<T>& x, DistVector<T>& y) {
+    const int bs = BlockSize == 0 ? backend.block_size : BlockSize;
     x.bind_to_graph(graph);
     y.bind_to_graph(graph);
 
     const auto& plan = backend.ensure_apply_plan(graph->adj_ptr, graph->adj_ind);
     const int n_rows = graph->adj_ptr.empty() ? 0 : static_cast<int>(graph->adj_ptr.size()) - 1;
-    const int runtime_block_size = backend.block_size;
     const int thread_count =
 #ifdef _OPENMP
         std::max(1, omp_get_max_threads());
@@ -552,6 +493,30 @@ void bsr_mult_adjoint_impl(DistGraph* graph, const BSRMatrixBackend<T>& backend,
 #endif
 
     std::fill(y.data.begin(), y.data.end(), T(0));
+
+    if (thread_count == 1) {
+        // Single thread: accumulate straight into y, no scatter buffers.
+        for (const auto& batch_entry : plan.batches) {
+            const auto& batch = batch_entry.batch;
+            for (int row = batch.row_begin; row < batch.row_end; ++row) {
+                const T* x_block = x.local_data() + graph->block_offsets[row];
+                const uint32_t block_begin = batch.row_block_start(row);
+                const uint32_t block_end = batch.row_block_end(row);
+                for (uint32_t local_block = block_begin; local_block < block_end; ++local_block) {
+                    const int col = batch.cols[local_block];
+                    rowmajor_kernels::rm_gemv_adjoint<T>(
+                        bs,
+                        bs,
+                        batch.block_ptr(local_block),
+                        x_block,
+                        y.data.data() + graph->block_offsets[col]);
+                }
+            }
+        }
+        y.reduce_ghosts();
+        return;
+    }
+
     std::vector<std::vector<T>> thread_buffers(
         static_cast<size_t>(thread_count),
         std::vector<T>(y.data.size(), T(0)));
@@ -578,7 +543,7 @@ void bsr_mult_adjoint_impl(DistGraph* graph, const BSRMatrixBackend<T>& backend,
                     const int col = batch.cols[local_block];
                     const T* block = batch.block_ptr(local_block);
                     T* y_block = y_local.data() + graph->block_offsets[col];
-                    bsr_apply_block_gemv_trans<BlockSize>(runtime_block_size, block, x_block, y_block);
+                    rowmajor_kernels::rm_gemv_adjoint<T>(bs, bs, block, x_block, y_block);
                 }
             }
         }
@@ -607,7 +572,7 @@ void bsr_mult_adjoint(DistGraph* graph, const BSRMatrixBackend<T>& backend, Dist
         graph->adj_ptr,
         graph->adj_ind,
         static_cast<int>(graph->block_sizes.size()));
-    if (cache.kind != BSRVendorBackendKind::None) {
+    if (bsr_vendor_enabled() && cache.kind != BSRVendorBackendKind::None) {
         std::fill(y.data.begin(), y.data.end(), T(0));
         if (cache.kind == BSRVendorBackendKind::MKL &&
             bsr_try_vendor_mkl_vector(graph, backend, cache, x, y, true)) {
@@ -619,12 +584,12 @@ void bsr_mult_adjoint(DistGraph* graph, const BSRMatrixBackend<T>& backend, Dist
 
     BLASKernel::configure_native_threading();
     bsr_dispatch_block_size(backend.block_size, [&](auto block_tag) {
-        constexpr int BlockSize = decltype(block_tag)::value;
-        bsr_mult_adjoint_impl<BlockSize>(graph, backend, x, y);
+        constexpr int kBlockSize = decltype(block_tag)::value;
+        bsr_mult_adjoint_impl<kBlockSize>(graph, backend, x, y);
     });
 }
 
-template <int BlockSize, typename T>
+template <typename T>
 void bsr_mult_dense_adjoint_impl(
     DistGraph* graph,
     const BSRMatrixBackend<T>& backend,
@@ -635,11 +600,10 @@ void bsr_mult_dense_adjoint_impl(
 
     const auto& plan = backend.ensure_apply_plan(graph->adj_ptr, graph->adj_ind);
     const int n_rows = graph->adj_ptr.empty() ? 0 : static_cast<int>(graph->adj_ptr.size()) - 1;
-    const int num_vecs = x.num_vectors;
     const int runtime_block_size = backend.block_size;
-    const int x_ld = x.local_rows + x.ghost_rows;
-    const int y_ld = y.local_rows + y.ghost_rows;
-    const int rhs_tile = bsr_default_rhs_tile(runtime_block_size);
+    const int nv = x.ld;
+    const int x_ld = x.ld;
+    const int y_ld = y.ld;
     const int thread_count =
 #ifdef _OPENMP
         std::max(1, omp_get_max_threads());
@@ -649,59 +613,82 @@ void bsr_mult_dense_adjoint_impl(
 
     std::fill(y.data.begin(), y.data.end(), T(0));
 
-    for (int vec_begin = 0; vec_begin < num_vecs; vec_begin += rhs_tile) {
-        const int tile_width = std::min(rhs_tile, num_vecs - vec_begin);
-        std::vector<std::vector<T>> thread_buffers(
-            static_cast<size_t>(thread_count),
-            std::vector<T>(static_cast<size_t>(y_ld) * tile_width, T(0)));
-
-        #pragma omp parallel
-        {
-#ifdef _OPENMP
-            const int thread_id = omp_get_thread_num();
-#else
-            const int thread_id = 0;
-#endif
-            auto& y_local = thread_buffers[static_cast<size_t>(thread_id)];
-            std::vector<T> x_tile(static_cast<size_t>(runtime_block_size) * rhs_tile, T(0));
-            const auto [thread_row_begin, thread_row_end] = bsr_thread_row_range(n_rows);
-
-            for (const auto& batch_entry : plan.batches) {
-                const auto& batch = batch_entry.batch;
-                const int row_begin = std::max(batch.row_begin, thread_row_begin);
-                const int row_end = std::min(batch.row_end, thread_row_end);
-                for (int row = row_begin; row < row_end; ++row) {
-                    const T* x_block = x.data.data() + graph->block_offsets[row] + static_cast<size_t>(vec_begin) * x_ld;
-                    bsr_pack_rhs_tile(x_tile.data(), x_block, runtime_block_size, tile_width, x_ld);
-                    const uint32_t block_begin = batch.row_block_start(row);
-                    const uint32_t block_end = batch.row_block_end(row);
-                    for (uint32_t local_block = block_begin; local_block < block_end; ++local_block) {
-                        const int col = batch.cols[local_block];
-                        const T* block = batch.block_ptr(local_block);
-                        T* y_block = y_local.data() + graph->block_offsets[col];
-                        bsr_apply_block_gemm_trans<BlockSize>(
-                            runtime_block_size,
-                            tile_width,
-                            block,
-                            x_tile.data(),
-                            runtime_block_size,
-                            y_block,
-                            y_ld);
-                    }
+    if (thread_count == 1) {
+        // Single thread owns every output row: accumulate straight into y and
+        // skip the scatter buffers + merge (two full passes over y otherwise).
+        for (const auto& batch_entry : plan.batches) {
+            const auto& batch = batch_entry.batch;
+            for (int row = batch.row_begin; row < batch.row_end; ++row) {
+                const T* x_rows = x.data.data() +
+                    static_cast<size_t>(graph->block_offsets[row]) * x_ld;
+                const uint32_t block_begin = batch.row_block_start(row);
+                const uint32_t block_end = batch.row_block_end(row);
+                for (uint32_t local_block = block_begin; local_block < block_end; ++local_block) {
+                    const int col = batch.cols[local_block];
+                    rowmajor_kernels::rm_gemm_adjoint<T>(
+                        runtime_block_size,
+                        runtime_block_size,
+                        nv,
+                        batch.block_ptr(local_block),
+                        x_rows,
+                        x_ld,
+                        y.data.data() + static_cast<size_t>(graph->block_offsets[col]) * y_ld,
+                        y_ld);
                 }
             }
         }
+        y.reduce_ghosts();
+        return;
+    }
 
-        const size_t tile_base = static_cast<size_t>(vec_begin) * y_ld;
-        const size_t tile_size = static_cast<size_t>(y_ld) * tile_width;
-        #pragma omp parallel for
-        for (size_t index = 0; index < tile_size; ++index) {
-            T sum = T(0);
-            for (const auto& thread_buffer : thread_buffers) {
-                sum += thread_buffer[index];
+    // Row-driven scatter: per-thread ROW-major accumulation buffers (same
+    // layout as y), merged with one flat contiguous reduction.
+    std::vector<std::vector<T>> thread_buffers(
+        static_cast<size_t>(thread_count),
+        std::vector<T>(y.data.size(), T(0)));
+
+    #pragma omp parallel
+    {
+#ifdef _OPENMP
+        const int thread_id = omp_get_thread_num();
+#else
+        const int thread_id = 0;
+#endif
+        auto& y_local = thread_buffers[static_cast<size_t>(thread_id)];
+        const auto [thread_row_begin, thread_row_end] = bsr_thread_row_range(n_rows);
+
+        for (const auto& batch_entry : plan.batches) {
+            const auto& batch = batch_entry.batch;
+            const int row_begin = std::max(batch.row_begin, thread_row_begin);
+            const int row_end = std::min(batch.row_end, thread_row_end);
+            for (int row = row_begin; row < row_end; ++row) {
+                const T* x_rows = x.data.data() +
+                    static_cast<size_t>(graph->block_offsets[row]) * x_ld;
+                const uint32_t block_begin = batch.row_block_start(row);
+                const uint32_t block_end = batch.row_block_end(row);
+                for (uint32_t local_block = block_begin; local_block < block_end; ++local_block) {
+                    const int col = batch.cols[local_block];
+                    rowmajor_kernels::rm_gemm_adjoint<T>(
+                        runtime_block_size,
+                        runtime_block_size,
+                        nv,
+                        batch.block_ptr(local_block),
+                        x_rows,
+                        x_ld,
+                        y_local.data() + static_cast<size_t>(graph->block_offsets[col]) * y_ld,
+                        y_ld);
+                }
             }
-            y.data[tile_base + index] = sum;
         }
+    }
+
+    #pragma omp parallel for
+    for (size_t index = 0; index < y.data.size(); ++index) {
+        T sum = T(0);
+        for (const auto& thread_buffer : thread_buffers) {
+            sum += thread_buffer[index];
+        }
+        y.data[index] = sum;
     }
 
     y.reduce_ghosts();
@@ -722,7 +709,7 @@ void bsr_mult_dense_adjoint(
         graph->adj_ptr,
         graph->adj_ind,
         static_cast<int>(graph->block_sizes.size()));
-    if (cache.kind != BSRVendorBackendKind::None) {
+    if (bsr_vendor_enabled() && cache.kind != BSRVendorBackendKind::None) {
         std::fill(y.data.begin(), y.data.end(), T(0));
         if (cache.kind == BSRVendorBackendKind::MKL &&
             bsr_try_vendor_mkl_dense(graph, backend, cache, x, y, true, false)) {
@@ -733,10 +720,7 @@ void bsr_mult_dense_adjoint(
 #endif
 
     BLASKernel::configure_native_threading();
-    bsr_dispatch_block_size(backend.block_size, [&](auto block_tag) {
-        constexpr int BlockSize = decltype(block_tag)::value;
-        bsr_mult_dense_adjoint_impl<BlockSize>(graph, backend, x, y);
-    });
+    bsr_mult_dense_adjoint_impl(graph, backend, x, y);
 }
 
 } // namespace vbcsr::detail

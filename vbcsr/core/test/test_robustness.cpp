@@ -9,11 +9,10 @@
 
 using namespace vbcsr;
 
-// Use SmartKernel to test the optimized path
-using Kernel = SmartKernel<double>;
-
-// Reference naive implementation for validation
-
+// Reference naive implementations for validation. Matrix blocks (`A`) come
+// from raw block_data() storage, which is canonical ROW-major: A(i,j) sits at
+// A[i*n + j]. The packed multivector buffers (`B`, `C`, `x`, `y`) keep their
+// column-per-vector packing.
 
 template <typename T>
 void naive_gemv(int m, int n, T alpha, const T* A, const T* x, T beta, T* y) {
@@ -23,7 +22,7 @@ void naive_gemv(int m, int n, T alpha, const T* A, const T* x, T beta, T* y) {
     for (int j = 0; j < n; ++j) {
         T x_val = alpha * x[j];
         for (int i = 0; i < m; ++i) {
-            y[i] += A[i + j*m] * x_val;
+            y[i] += A[i*n + j] * x_val;
         }
     }
 }
@@ -31,11 +30,11 @@ void naive_gemv(int m, int n, T alpha, const T* A, const T* x, T beta, T* y) {
 template <typename T>
 void naive_gemv_trans(int m, int n, T alpha, const T* A, const T* x, T beta, T* y) {
     // y = alpha * A^H * x + beta * y
-    // A: M x N. x: M. y: N.
+    // A: M x N (row-major). x: M. y: N.
     for (int j = 0; j < n; ++j) {
         T dot = T(0);
         for (int i = 0; i < m; ++i) {
-            dot += ConjHelper<T>::apply(A[i + j*m]) * x[i];
+            dot += ConjHelper<T>::apply(A[i*n + j]) * x[i];
         }
         y[j] = alpha * dot + beta * y[j];
     }
@@ -43,6 +42,7 @@ void naive_gemv_trans(int m, int n, T alpha, const T* A, const T* x, T beta, T* 
 
 template <typename T>
 void naive_gemm(int m, int n, int k, T alpha, const T* A, const T* B, T beta, T* C, int ldc) {
+    // A: M x K (row-major). B packed K x N (col-major). C packed with ldc.
     for (int j = 0; j < n; ++j) {
         for (int i = 0; i < m; ++i) {
             C[i + j*ldc] *= beta;
@@ -50,7 +50,7 @@ void naive_gemm(int m, int n, int k, T alpha, const T* A, const T* B, T beta, T*
         for (int l = 0; l < k; ++l) {
             T b_val = alpha * B[l + j*k]; // B is packed K x N
             for (int i = 0; i < m; ++i) {
-                C[i + j*ldc] += A[i + l*m] * b_val;
+                C[i + j*ldc] += A[i*k + l] * b_val;
             }
         }
     }
@@ -59,13 +59,13 @@ void naive_gemm(int m, int n, int k, T alpha, const T* A, const T* B, T beta, T*
 template <typename T>
 void naive_gemm_trans(int m, int n, int k, T alpha, const T* A, const T* B, T beta, T* C, int ldc) {
     // C = alpha * A^H * B + beta * C
-    // A: M x K. A^H: K x M.
-    // B: M x n. C: K x n.
+    // A: M x K (row-major). A^H: K x M.
+    // B: M x n (packed col-major). C: K x n.
     for (int j = 0; j < n; ++j) {
         for (int l = 0; l < k; ++l) { // Row of C (col of A)
             T dot = T(0);
             for (int i = 0; i < m; ++i) {
-                dot += ConjHelper<T>::apply(A[i + l*m]) * B[i + j*m];
+                dot += ConjHelper<T>::apply(A[i*k + l]) * B[i + j*m];
             }
             C[l + j*ldc] = alpha * dot + beta * C[l + j*ldc];
         }
@@ -114,7 +114,7 @@ bool run_test(int rank, int block_size, double range_min, double range_max) {
     graph.construct_distributed(my_owned_indices, my_block_sizes, my_adj);
     
     // 2. Matrix Assembly with Random Values
-    BlockSpMat<double, Kernel> mat(&graph);
+    BlockSpMat<double> mat(&graph);
     int n_owned = graph.owned_global_indices.size();
     
     for (int i = 0; i < n_owned; ++i) {
@@ -172,8 +172,7 @@ bool run_test(int rank, int block_size, double range_min, double range_max) {
     // 4. MatMat Verification
     DistMultiVector<double> X(&graph, n_vecs), Y(&graph, n_vecs);
     for (int v = 0; v < n_vecs; ++v) {
-        double* col = X.col_data(v);
-        for (int i = 0; i < n_owned * block_size; ++i) col[i] = dist(gen);
+        for (int i = 0; i < n_owned * block_size; ++i) X(i, v) = dist(gen);
     }
     
     mat.mult_dense(X, Y);
@@ -193,17 +192,15 @@ bool run_test(int rank, int block_size, double range_min, double range_max) {
             // Construct packed B for this block (K x N)
             std::vector<double> B_packed(block_size * n_vecs);
             for (int v = 0; v < n_vecs; ++v) {
-                const double* x_col_ptr = &X(mat.graph->block_offsets[col], v); // Access via operator()
-                for(int r=0; r<block_size; ++r) B_packed[r + v*block_size] = x_col_ptr[r];
+                for(int r=0; r<block_size; ++r) B_packed[r + v*block_size] = X(mat.graph->block_offsets[col] + r, v); // Access via operator()
             }
             
             naive_gemm(block_size, n_vecs, block_size, 1.0, block_val, B_packed.data(), 1.0, y_ref.data(), block_size);
         }
         
         for (int v = 0; v < n_vecs; ++v) {
-            double* y_col_ptr = &Y(mat.graph->block_offsets[i], v);
             for (int r = 0; r < block_size; ++r) {
-                double err = std::abs(y_col_ptr[r] - y_ref[r + v*block_size]);
+                double err = std::abs(Y(mat.graph->block_offsets[i] + r, v) - y_ref[r + v*block_size]);
                 if (std::abs(y_ref[r + v*block_size]) > 1e-9) err /= std::abs(y_ref[r + v*block_size]);
                 max_err_mm = std::max(max_err_mm, err);
             }
@@ -375,8 +372,7 @@ int main(int argc, char** argv) {
 // Complex Test
 bool run_test_complex(int rank, int block_size, double range_min, double range_max) {
     using T = std::complex<double>;
-    using Kernel = SmartKernel<T>;
-    
+
     int n_global_blocks = 10;
     int n_vecs = 2;
     
@@ -404,7 +400,7 @@ bool run_test_complex(int rank, int block_size, double range_min, double range_m
     DistGraph graph(MPI_COMM_WORLD);
     graph.construct_distributed(my_owned_indices, my_block_sizes, my_adj);
     
-    BlockSpMat<T, Kernel> mat(&graph);
+    BlockSpMat<T> mat(&graph);
     int n_owned = graph.owned_global_indices.size();
     
     for(int i=0; i<n_owned; ++i) {
@@ -452,8 +448,7 @@ bool run_test_complex(int rank, int block_size, double range_min, double range_m
     // 2. MatMat Verification
     DistMultiVector<T> X(&graph, n_vecs), Y(&graph, n_vecs);
     for(int v=0; v<n_vecs; ++v) {
-        T* col = X.col_data(v);
-        for(int i=0; i<n_owned*block_size; ++i) col[i] = T(dist(gen), dist(gen));
+        for(int i=0; i<n_owned*block_size; ++i) X(i, v) = T(dist(gen), dist(gen));
     }
     
     mat.mult_dense(X, Y);
@@ -470,16 +465,14 @@ bool run_test_complex(int rank, int block_size, double range_min, double range_m
             
             std::vector<T> B_packed(block_size * n_vecs);
             for(int v=0; v<n_vecs; ++v) {
-                const T* x_col_ptr = &X(mat.graph->block_offsets[col], v);
-                for(int r=0; r<block_size; ++r) B_packed[r + v*block_size] = x_col_ptr[r];
+                for(int r=0; r<block_size; ++r) B_packed[r + v*block_size] = X(mat.graph->block_offsets[col] + r, v);
             }
             naive_gemm(block_size, n_vecs, block_size, T(1), block_val, B_packed.data(), T(1), y_ref.data(), block_size);
         }
         
         for(int v=0; v<n_vecs; ++v) {
-            T* y_col_ptr = &Y(mat.graph->block_offsets[i], v);
             for(int r=0; r<block_size; ++r) {
-                double err = std::abs(y_col_ptr[r] - y_ref[r + v*block_size]);
+                double err = std::abs(Y(mat.graph->block_offsets[i] + r, v) - y_ref[r + v*block_size]);
                 if (std::abs(y_ref[r + v*block_size]) > 1e-9) err /= std::abs(y_ref[r + v*block_size]);
                 max_err_mm = std::max(max_err_mm, err);
             }

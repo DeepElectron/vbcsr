@@ -3,6 +3,7 @@
 
 #include "../../distributed/block_payload_exchange.hpp"
 #include "../../distributed/result_graph.hpp"
+#include "../../kernels/rowmajor_kernels.hpp"
 #include "common.hpp"
 
 #include <algorithm>
@@ -25,7 +26,6 @@ namespace vbcsr::detail {
 template <typename Matrix>
 struct VBCSRSpMMExecutor {
     using T = typename Matrix::value_type;
-    using Kernel = typename Matrix::KernelType;
     using GhostBlockRef = typename Matrix::GhostBlockRef;
 
 private:
@@ -308,11 +308,11 @@ private:
                         run_product_batch_fallback(key, tasks);
                         continue;
                     }
-                    if (SmartKernel<T>::supports_batched_gemm()) {
+                    if constexpr (supports_batched_products()) {
                         run_product_batch_batched(key, tasks);
-                        continue;
+                    } else {
+                        run_product_batch_fallback(key, tasks);
                     }
-                    run_product_batch_fallback(key, tasks);
                 }
             }
         };
@@ -397,20 +397,27 @@ private:
         }
     }
 
+    // Vendor strided-batch gemm exists for double and complex<double> only;
+    // every other scalar type takes the row-major fallback loop.
+    static constexpr bool supports_batched_products() {
+        return (std::is_same_v<T, double> || std::is_same_v<T, std::complex<double>>) &&
+               BLASKernel::supports_strided_gemm();
+    }
+
     static void run_product_batch_fallback(const ProductBatchKey& key, const std::vector<ProductTask>& tasks) {
+        // Block product C(row_dim x col_dim) += A(row_dim x inner_dim) *
+        // B(inner_dim x col_dim), all blocks in canonical row-major storage:
+        // rm_gemm with X = B (ldx = col_dim) and C compact (ldc = col_dim).
         for (const auto& task : tasks) {
-            SmartKernel<T>::gemm(
+            rowmajor_kernels::rm_gemm<T>(
                 key.row_dim,
+                key.inner_dim,
                 key.col_dim,
-                key.inner_dim,
-                T(1),
                 task.a_ptr,
-                key.row_dim,
                 task.b_ptr,
-                key.inner_dim,
-                T(1),
+                key.col_dim,
                 task.c_ptr,
-                key.row_dim);
+                key.col_dim);
         }
     }
 
@@ -451,20 +458,23 @@ private:
                     static_cast<size_t>(b_stride) * sizeof(T));
             }
 
-            SmartKernel<T>::gemm_batched(
-                key.row_dim,
+            // Row-major blocks through the column-major vendor batch:
+            // C_rm = A_rm * B_rm  <=>  C_cm' = B_cm' * A_cm' on the transposed
+            // (= raw row-major) buffers, so swap the operands and dims.
+            BLASKernel::gemm_batched(
                 key.col_dim,
+                key.row_dim,
                 key.inner_dim,
                 T(1),
-                a_scratch.data(),
-                key.row_dim,
-                a_stride,
                 b_scratch.data(),
-                key.inner_dim,
+                key.col_dim,
                 b_stride,
+                a_scratch.data(),
+                key.inner_dim,
+                a_stride,
                 T(0),
                 c_scratch.data(),
-                key.row_dim,
+                key.col_dim,
                 c_stride,
                 static_cast<int>(count));
 

@@ -5,6 +5,7 @@
 #include <random>
 #include <algorithm>
 #include <map>
+#include <set>
 
 using namespace vbcsr;
 
@@ -16,7 +17,7 @@ void fill_random(std::vector<double>& v, int seed) {
 }
 
 // Helper to check equality
-bool check_equal(const BlockSpMat<double, NaiveKernel<double>>& mat, 
+bool check_equal(const BlockSpMat<double>& mat, 
                  const std::map<std::pair<int,int>, std::vector<double>>& ref_data,
                  int n_blocks, const std::vector<int>& block_sizes,
                  double tol = 1e-12) {
@@ -141,7 +142,7 @@ void run_test(int rank, int size) {
     DistGraph g_lower(MPI_COMM_WORLD); g_lower.construct_serial(n_blocks, block_sizes, adj_lower);
     
     auto create_mat = [&](DistGraph* g, double val_start) {
-        BlockSpMat<double, NaiveKernel<double>> mat(g);
+        BlockSpMat<double> mat(g);
         int n_owned = g->owned_global_indices.size();
         for(int i=0; i<n_owned; ++i) {
             int r = g->owned_global_indices[i];
@@ -155,7 +156,7 @@ void run_test(int rank, int size) {
         return mat;
     };
     
-    auto get_data = [&](const BlockSpMat<double, NaiveKernel<double>>& mat) {
+    auto get_data = [&](const BlockSpMat<double>& mat) {
         std::map<std::pair<int,int>, std::vector<double>> data;
         int n_owned = mat.row_ptr().size() - 1;
         for(int i=0; i<n_owned; ++i) {

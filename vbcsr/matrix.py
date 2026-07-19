@@ -774,19 +774,19 @@ class VBCSR(LinearOperator):
         self._core.insert_submatrix(submat._core, global_indices)
         self._invalidate_nnz()
 
-    def spmf(self, func_name: str, method: str = "lanczos", verbose: bool = False) -> 'VBCSR':
+    def spmf(self, func_name: str, verbose: bool = False) -> 'VBCSR':
         """
-        Compute a matrix function using the graph-based method.
-        
+        Compute a matrix function using the graph-based method
+        (per-subgraph dense diagonalization).
+
         Args:
             func_name (str): Name of the function to compute ("inv", "sqrt", "isqrt", "exp").
-            method (str): Method to use ("lanczos", "dense").
             verbose (bool): Whether to print verbose output.
-            
+
         Returns:
             VBCSR: The computed matrix function.
         """
-        core_res = self._core.spmf(func_name, method, verbose)
+        core_res = self._core.spmf(func_name, verbose)
         return self._wrap_core(core_res, self.dtype, self.comm, shape=self.shape)
 
     def to_dense(self) -> np.ndarray:
@@ -983,8 +983,12 @@ class VBCSR(LinearOperator):
             total_local_cols = sum(block_sizes)
             local_shape = (local_rows, total_local_cols)
             
-            return sp.bsr_matrix((data, col_ind, row_ptr), shape=local_shape)
-            
+            result = sp.bsr_matrix((data, col_ind, row_ptr), shape=local_shape)
+            # SpGEMM results may carry the vendor's per-row export order;
+            # sort on the scipy side so the exported matrix is canonical.
+            result.sort_indices()
+            return result
+
         elif target_format == 'csr':
             # Expand to Scalar CSR
             
@@ -1057,7 +1061,11 @@ class VBCSR(LinearOperator):
             total_local_cols = sum(block_sizes)
             local_shape = (local_rows, total_local_cols)
             
-            return sp.csr_matrix((scalar_data_out, scalar_indices, scalar_indptr), shape=local_shape)
+            result = sp.csr_matrix((scalar_data_out, scalar_indices, scalar_indptr), shape=local_shape)
+            # SpGEMM results may carry the vendor's per-row export order;
+            # sort on the scipy side so the exported matrix is canonical.
+            result.sort_indices()
+            return result
             
         else:
             raise ValueError(f"Unknown format: {target_format}")

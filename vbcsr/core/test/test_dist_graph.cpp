@@ -1,3 +1,6 @@
+// Test assertions must stay active in Release builds.
+#undef NDEBUG
+
 #include "../dist_graph.hpp"
 #include <cassert>
 #include <iostream>

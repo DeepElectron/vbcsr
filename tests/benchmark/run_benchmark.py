@@ -1550,6 +1550,13 @@ def main() -> int:
         if rank == 0:
             print("Efficiency data must be generated with one rank.", file=sys.stderr)
         return 2
+    if args.suite == "efficiency" and comm is not None:
+        # Single-rank efficiency timing must not depend on whether mpi4py is
+        # installed: with a live communicator the timing loop does a real
+        # Allreduce per iteration (inflates microsecond-scale ops) and the
+        # csr/spgemm vendor-threading special case (gated on comm is None)
+        # is skipped. Match the historical comm=None behavior exactly.
+        comm = None
 
     specs = build_specs(args, size)
     cases: list[dict[str, Any]] = []

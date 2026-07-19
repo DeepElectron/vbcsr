@@ -38,6 +38,30 @@ Because ghosts are sorted by owner, **local indices do not necessarily correspon
 -   **Handles**: the backend stores one graph-block handle per local nonzero block so graph traversal and shape-page storage remain decoupled.
 -   **Thread Safety**: `BlockSpMat` is designed for OpenMP threading. Temporary buffers in operations like `axpby` or `spmm` should be thread-local to avoid contention and allocation overhead.
 
+## Data Layout Contract
+
+Since the row-major migration (history and rationale in `doc/row_major_migration_plan.md`, §2.1 plus the per-phase execution records), the core observes one layout contract:
+
+-   **Block storage and MPI payloads**: canonical row-major — element $(i, j)$ of an $r \times c$ block sits at `data[i * c + j]`. The single source of truth is `vbcsr::kCanonicalBlockLayout` in `vbcsr/core/block_csr.hpp`; use the constant at staging and transport call sites, never a literal enum. `MatrixLayout::ColMajor` remains only as a conversion option at the `add_block` / `get_block` / `get_values` boundary (transpose per block) and in genuinely column-major code: the CBLAS wrappers in `detail/kernels/` and the LAPACK work buffers in `detail/ops/spmf/`.
+-   **`DistMultiVector`**: row-major — element $(row, vec)$ at `data[row * ld + vec]` with `ld = round_up(num_vectors * sizeof(T), 64) / sizeof(T)`, so each row starts on a cache line.
+-   **Padding invariant**: lanes `[num_vectors, ld)` of every multivector row are always zero. Flat-loop ops (`scale`, `axpy`, `bdot`, norms) run over the whole padded buffer and depend on this; any code that bulk-writes the buffer must re-establish it via `zero_padding()`.
+
+### Kernel Family
+
+The dense block kernels live in `detail/kernels/rowmajor_kernels.hpp` and vectorize along the `num_vectors` axis, treating the matrix element as a broadcast operand:
+
+-   `rm_gemm` / `rm_gemm_adjoint`: block times dense tile, for the `mult_dense` paths
+-   `rm_gemv` / `rm_gemv_adjoint`: block times vector, for the SpMV paths
+-   AVX2 fast paths cover `double` and `std::complex<double>`; a generic scalar fallback covers other types and ISAs
+
+The old column-major kernel family (`NaiveKernel`, `TinyBlockKernel`, `FixedBlockKernel`, the `SmartKernel` switch tables) was removed, and `BlockSpMat` no longer takes a kernel template parameter. `BLASKernel` in `detail/kernels/dense_kernels.hpp` remains as the vendor BLAS wrapper plus threading configuration (`configure_native_threading` and friends).
+
+### Runtime and Build Knobs
+
+-   `VBCSR_BSR_VENDOR=1` (legacy alias: `VBCSR_BSR_DENSE_VENDOR`): route BSR SpMV and dense applies through the MKL vendor paths. The default is the native path, which measured faster. MKL BSR quirk: `mm` with a row-major dense operand supports exactly the (row-major blocks, zero-based indexing) and (column-major blocks, one-based indexing) pairings — the other two combinations fail at apply time.
+-   `VBCSR_SPGEMM_SORTED=1`: make MKL-path SpGEMM emit sorted column indices per row. The default keeps the vendor export order: no library consumer needs a matrix's own adjacency sorted (audited during the migration), and `to_scipy` sorts on the scipy side.
+-   Build options: `VBCSR_ARCH=native|avx2|none` selects the ISA flags; `VBCSR_SANITIZE=address|undefined` enables sanitizer builds.
+
 ## VBCSR Apply Execution
 
 The mixed-size VBCSR backend stores blocks in shape-bucketed pages. Each page is already physically contiguous in memory, so apply execution no longer has a separate packed-vs-unpacked layout mode.

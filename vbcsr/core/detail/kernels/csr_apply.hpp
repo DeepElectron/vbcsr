@@ -13,8 +13,8 @@ namespace vbcsr::detail {
 
 namespace {
 
-constexpr int kCSRDenseTileWidth = 8;
-
+// Row-major multivector (element (row, vec) at data[row * ld + vec]): the
+// X row for a column and the Y row for the output are both contiguous.
 template <typename T>
 inline void csr_accumulate_dense_entry(
     T value,
@@ -23,26 +23,18 @@ inline void csr_accumulate_dense_entry(
     int col_offset,
     int num_vecs,
     T* sums) {
-    int vec = 0;
-    for (; vec + kCSRDenseTileWidth <= num_vecs; vec += kCSRDenseTileWidth) {
-        sums[vec + 0] += value * x_data[(vec + 0) * x_ld + col_offset];
-        sums[vec + 1] += value * x_data[(vec + 1) * x_ld + col_offset];
-        sums[vec + 2] += value * x_data[(vec + 2) * x_ld + col_offset];
-        sums[vec + 3] += value * x_data[(vec + 3) * x_ld + col_offset];
-        sums[vec + 4] += value * x_data[(vec + 4) * x_ld + col_offset];
-        sums[vec + 5] += value * x_data[(vec + 5) * x_ld + col_offset];
-        sums[vec + 6] += value * x_data[(vec + 6) * x_ld + col_offset];
-        sums[vec + 7] += value * x_data[(vec + 7) * x_ld + col_offset];
-    }
-    for (; vec < num_vecs; ++vec) {
-        sums[vec] += value * x_data[vec * x_ld + col_offset];
+    const T* x_row = x_data + static_cast<size_t>(col_offset) * x_ld;
+    #pragma omp simd
+    for (int vec = 0; vec < num_vecs; ++vec) {
+        sums[vec] += value * x_row[vec];
     }
 }
 
 template <typename T>
 inline void csr_write_dense_row(T* y_data, int y_ld, int row_offset, int num_vecs, const T* sums) {
+    T* y_row = y_data + static_cast<size_t>(row_offset) * y_ld;
     for (int vec = 0; vec < num_vecs; ++vec) {
-        y_data[vec * y_ld + row_offset] = sums[vec];
+        y_row[vec] = sums[vec];
     }
 }
 
@@ -116,10 +108,13 @@ bool csr_try_vendor_mkl_dense(
     bool adjoint) {
     const matrix_descr descr = csr_mkl_descr();
     const sparse_operation_t op = csr_mkl_operation<T>(adjoint);
-    const sparse_layout_t layout = SPARSE_LAYOUT_COLUMN_MAJOR;
+    // Row-major dense operands: this is MKL's fast layout for CSR * dense
+    // (measured 3.07x vs column-major on this workload, see the migration
+    // plan evidence E1). Leading dims are the multivector's padded ld.
+    const sparse_layout_t layout = SPARSE_LAYOUT_ROW_MAJOR;
     const int num_vecs = x.num_vectors;
-    const int x_ld = x.local_rows + x.ghost_rows;
-    const int y_ld = y.local_rows + y.ghost_rows;
+    const int x_ld = x.ld;
+    const int y_ld = y.ld;
 
     if (!backend.ensure_mkl_mm_handles(cache, num_vecs)) {
         return false;
@@ -138,9 +133,14 @@ bool csr_try_vendor_mkl_dense(
             const double beta = 1.0;
             // The dense case follows the same rule as SpMV: forward apply writes only
             // the rows owned by this page-local handle, while adjoint consumes only that
-            // row window from X and accumulates into the full Y storage.
-            const double* b_ptr = adjoint ? x.data.data() + batch.row_begin : x.data.data();
-            double* c_ptr = adjoint ? y.data.data() : y.data.data() + batch.row_begin;
+            // row window from X and accumulates into the full Y storage. Row
+            // windows start at row_begin * ld in row-major storage.
+            const double* b_ptr = adjoint
+                ? x.data.data() + static_cast<size_t>(batch.row_begin) * x_ld
+                : x.data.data();
+            double* c_ptr = adjoint
+                ? y.data.data()
+                : y.data.data() + static_cast<size_t>(batch.row_begin) * y_ld;
             status = mkl_sparse_d_mm(
                 op,
                 alpha,
@@ -157,9 +157,11 @@ bool csr_try_vendor_mkl_dense(
             const MKL_Complex16 alpha{1.0, 0.0};
             const MKL_Complex16 beta{1.0, 0.0};
             const auto* b_ptr = reinterpret_cast<const MKL_Complex16*>(
-                adjoint ? x.data.data() + batch.row_begin : x.data.data());
+                adjoint ? x.data.data() + static_cast<size_t>(batch.row_begin) * x_ld
+                        : x.data.data());
             auto* c_ptr = reinterpret_cast<MKL_Complex16*>(
-                adjoint ? y.data.data() : y.data.data() + batch.row_begin);
+                adjoint ? y.data.data()
+                        : y.data.data() + static_cast<size_t>(batch.row_begin) * y_ld);
             status = mkl_sparse_z_mm(
                 op,
                 alpha,
@@ -207,10 +209,14 @@ bool csr_try_vendor_aocl_mm(
     int num_vecs,
     bool adjoint) {
     const aoclsparse_operation op = csr_aocl_operation<T>(adjoint);
-    const aoclsparse_order order = aoclsparse_order_column;
+    // Row-major dense operands; ld is the multivector's padded ld and row
+    // windows start at row_begin * ld.
+    const aoclsparse_order order = aoclsparse_order_row;
 
     for (const auto& page : cache.pages) {
         const auto& batch = page.batch;
+        const size_t x_off = adjoint ? static_cast<size_t>(batch.row_begin) * x_ld : 0;
+        const size_t y_off = adjoint ? 0 : static_cast<size_t>(batch.row_begin) * y_ld;
         aoclsparse_status status = aoclsparse_status_not_implemented;
         if constexpr (std::is_same_v<T, double>) {
             status = aoclsparse_dcsrmm(
@@ -219,11 +225,11 @@ bool csr_try_vendor_aocl_mm(
                 page.aocl.handle,
                 cache.aocl_descr.handle,
                 order,
-                x_ptr + (adjoint ? batch.row_begin : 0),
+                x_ptr + x_off,
                 static_cast<aoclsparse_int>(num_vecs),
                 static_cast<aoclsparse_int>(x_ld),
                 1.0,
-                y_ptr + (adjoint ? 0 : batch.row_begin),
+                y_ptr + y_off,
                 static_cast<aoclsparse_int>(y_ld));
         } else if constexpr (std::is_same_v<T, std::complex<double>>) {
             const aoclsparse_double_complex alpha{1.0, 0.0};
@@ -234,13 +240,11 @@ bool csr_try_vendor_aocl_mm(
                 page.aocl.handle,
                 cache.aocl_descr.handle,
                 order,
-                reinterpret_cast<const aoclsparse_double_complex*>(
-                    x_ptr + (adjoint ? batch.row_begin : 0)),
+                reinterpret_cast<const aoclsparse_double_complex*>(x_ptr + x_off),
                 static_cast<aoclsparse_int>(num_vecs),
                 static_cast<aoclsparse_int>(x_ld),
                 beta,
-                reinterpret_cast<aoclsparse_double_complex*>(
-                    y_ptr + (adjoint ? 0 : batch.row_begin)),
+                reinterpret_cast<aoclsparse_double_complex*>(y_ptr + y_off),
                 static_cast<aoclsparse_int>(y_ld));
         }
 
@@ -289,14 +293,16 @@ bool csr_try_vendor_aocl_vector(
         return true;
     } else if constexpr (std::is_same_v<T, std::complex<double>>) {
         // AOCL's public CSRMM path covers complex apply today, so reuse it for a single RHS.
+        // A DistVector viewed as a 1-column ROW-major dense operand has ld = 1
+        // (row r at data[r]).
         // TODO: Why reuse, wouldn't AOCL's csrmv be more efficient for single vector? We need to think and optimize this here.
         return csr_try_vendor_aocl_mm(
             backend,
             cache,
             x.local_data(),
-            x.full_size(),
+            1,
             y.local_data(),
-            y.full_size(),
+            1,
             1,
             adjoint);
     } else {
@@ -370,9 +376,9 @@ bool csr_mult_dense_try_vendor_bound(
             backend,
             cache,
             x.data.data(),
-            x.local_rows + x.ghost_rows,
+            x.ld,
             y.data.data(),
-            y.local_rows + y.ghost_rows,
+            y.ld,
             x.num_vectors,
             false);
 #endif
@@ -455,9 +461,9 @@ bool csr_mult_dense_adjoint_try_vendor_bound(
             backend,
             cache,
             x.data.data(),
-            x.local_rows + x.ghost_rows,
+            x.ld,
             y.data.data(),
-            y.local_rows + y.ghost_rows,
+            y.ld,
             x.num_vectors,
             true);
 #endif
@@ -504,8 +510,8 @@ void csr_mult_dense_native(
     const auto& row_ptr = graph->adj_ptr;
     const int n_rows = row_ptr.empty() ? 0 : static_cast<int>(row_ptr.size()) - 1;
     const int num_vecs = x.num_vectors;
-    const int x_ld = x.local_rows + x.ghost_rows;
-    const int y_ld = y.local_rows + y.ghost_rows;
+    const int x_ld = x.ld;
+    const int y_ld = y.ld;
     const int* block_offsets = graph->block_offsets.data();
     const T* x_data = x.data.data();
     T* y_data = y.data.data();
@@ -580,8 +586,8 @@ void csr_mult_dense_adjoint_native(
     const auto& row_ptr = graph->adj_ptr;
     const int n_rows = row_ptr.empty() ? 0 : static_cast<int>(row_ptr.size()) - 1;
     const int num_vecs = x.num_vectors;
-    const int x_ld = x.local_rows + x.ghost_rows;
-    const int y_ld = y.local_rows + y.ghost_rows;
+    const int x_ld = x.ld;
+    const int y_ld = y.ld;
 
     #pragma omp parallel
     {
@@ -595,9 +601,13 @@ void csr_mult_dense_adjoint_native(
                     const int col = slice.cols[idx];
                     const int col_offset = graph->block_offsets[col];
                     const T value = ScalarTraits<T>::conjugate(slice.values[idx]);
+                    // Row-major: both the X source row and the Y target row
+                    // are contiguous lanes.
+                    T* y_row = y_local.data() + static_cast<size_t>(col_offset) * y_ld;
+                    const T* x_row = x.data.data() + static_cast<size_t>(row_offset) * x_ld;
+                    #pragma omp simd
                     for (int vec = 0; vec < num_vecs; ++vec) {
-                        y_local[static_cast<size_t>(vec * y_ld + col_offset)] +=
-                            value * x.data[static_cast<size_t>(vec * x_ld + row_offset)];
+                        y_row[vec] += value * x_row[vec];
                     }
                 }
             });

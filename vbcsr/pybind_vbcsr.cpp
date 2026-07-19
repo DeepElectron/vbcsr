@@ -114,19 +114,22 @@ void bind_dist_multivector(py::module& m, const std::string& name) {
         .def_property_readonly("ghost_rows", [](const DistMultiVector<T>& v) { return v.ghost_rows; })
         .def_property_readonly("num_vectors", [](const DistMultiVector<T>& v) { return v.num_vectors; })
         .def_buffer([](DistMultiVector<T>& v) -> py::buffer_info {
+            // Row-major storage with a padded leading dimension: the exposed
+            // numpy shape is unchanged, the array is now C-ordered (strided
+            // over the padding lanes).
             return py::buffer_info(
                 v.data.data(),
                 sizeof(T),
                 py::format_descriptor<T>::format(),
                 2,
                 { (size_t)(v.local_rows + v.ghost_rows), (size_t)v.num_vectors }, // Shape: (rows, cols)
-                { sizeof(T), sizeof(T) * (v.local_rows + v.ghost_rows) }          // Strides: (row_stride, col_stride)
+                { sizeof(T) * (size_t)v.ld, sizeof(T) }                           // Strides: (row_stride, col_stride)
             );
         });
 }
 
 template<typename T>
-BlockSpMat<T> py_graph_matrix_function(BlockSpMat<T>& self, const std::string& func_name, const std::string& method, bool verbose) {
+BlockSpMat<T> py_graph_matrix_function(BlockSpMat<T>& self, const std::string& func_name, bool verbose) {
     std::function<T(T)> func;
     if (func_name == "inv") {
         func = [](T x) { return T(1.0 / (x + 1e-10)); };
@@ -141,7 +144,7 @@ BlockSpMat<T> py_graph_matrix_function(BlockSpMat<T>& self, const std::string& f
     }
 
     BlockSpMat<T> res = self.duplicate();
-    graph_matrix_function<T>(self, &res, func, method, verbose);
+    graph_matrix_function<T>(self, &res, func, verbose);
     return res;
 }
 
@@ -298,7 +301,7 @@ void bind_block_spmat(py::module& m, const std::string& name) {
             std::memcpy(vec.data(), info.ptr, sizeof(T) * vec.size());
             self.from_dense(vec);
         }, py::arg("array"))
-        .def("spmf", &py_graph_matrix_function<T>, py::arg("func_name"), py::arg("method") = "lanczos", py::arg("verbose") = false)
+        .def("spmf", &py_graph_matrix_function<T>, py::arg("func_name"), py::arg("verbose") = false)
         .def_property_readonly("row_ptr", [](const BlockSpMat<T>& self) {
             return make_owned_array_1d(self.row_ptr());
         })

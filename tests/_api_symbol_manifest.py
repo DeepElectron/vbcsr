@@ -182,7 +182,7 @@ SURFACE_MANIFEST: dict[str, SurfaceClass] = {
         native_owner="vbcsr/core/atomic/image_container.hpp::ImageContainer",
         docs_checks=("## ImageContainer",),
         symbols=(
-            SurfaceSymbol("__init__", (), "ImageContainer ctors", ('.def(py::init<AtomicData*>())',), ("__init__",), ("#### `__init__`",), ("tests/test_atomic_surface.py",)),
+            SurfaceSymbol("__init__", (), "ImageContainer ctors", ('.def(py::init<AtomicData*>(), py::keep_alive<1, 2>())',), ("__init__",), ("#### `__init__`",), ("tests/test_atomic_surface.py",)),
             SurfaceSymbol("add_block", (), "ImageContainer::add_block", ('.def("add_block"',), ("add_block",), ("#### `add_block`",), ("tests/test_atomic_surface.py",)),
             SurfaceSymbol("add_blocks", (), "ImageContainer::add_blocks", ('.def("add_blocks"',), ("add_blocks",), ("#### `add_blocks`",), ("tests/test_atomic_surface.py",)),
             SurfaceSymbol("assemble", (), "ImageContainer::assemble", ('.def("assemble"',), ("assemble",), ("#### `assemble`",), ("tests/test_atomic_surface.py",)),

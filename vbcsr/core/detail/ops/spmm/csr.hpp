@@ -219,9 +219,12 @@ private:
         A.active_csr_backend().note_vendor_launch(1);
         const auto t_spmm = std::chrono::steady_clock::now();
 
-        if (mkl_sparse_order(c_handle.handle) != SPARSE_STATUS_SUCCESS) {
-            return nullptr;
-        }
+        // No mkl_sparse_order here: it was measured at ~6x the multiply
+        // itself (migration plan E4). By default the result keeps the
+        // vendor's per-row export order — no library consumer requires a
+        // matrix's own adjacency sorted (see spgemm_sorted_output_enabled in
+        // spmm/common.hpp); VBCSR_SPGEMM_SORTED=1 restores sorted columns via
+        // a per-row packed-key sort in the copy-out below.
         const auto t_order = std::chrono::steady_clock::now();
 
         sparse_index_base_t index_base = SPARSE_INDEX_BASE_ZERO;
@@ -253,6 +256,9 @@ private:
         std::vector<int> c_row_ptr(static_cast<size_t>(n_rows) + 1, 0);
         std::vector<int> c_cols_local;
         std::vector<T> c_values;
+        // dst slot -> src entry offset (relative to `first`); empty when every
+        // exported row is already sorted (then values copy straight through).
+        std::vector<MKL_INT> value_perm;
 
         if (threshold <= 0.0) {
             const MKL_INT first = row_start[0] - base;
@@ -261,19 +267,6 @@ private:
                 throw std::runtime_error("MKL CSR SpGEMM exported invalid row offsets");
             }
             const size_t exported_nnz = static_cast<size_t>(last - first);
-            if (base == 0 && std::is_same_v<MKL_INT, int>) {
-                c_cols_local.assign(col_ind + first, col_ind + last);
-            } else {
-                c_cols_local.resize(exported_nnz);
-                for (size_t entry = 0; entry < exported_nnz; ++entry) {
-                    const int local_col =
-                        static_cast<int>(col_ind[first + static_cast<MKL_INT>(entry)] - base);
-                    if (local_col < 0 || local_col >= static_cast<int>(B.graph->block_sizes.size())) {
-                        throw std::runtime_error("MKL CSR SpGEMM exported an invalid column index");
-                    }
-                    c_cols_local[entry] = local_col;
-                }
-            }
             for (int row = 0; row < n_rows; ++row) {
                 const int row_begin =
                     static_cast<int>((row_start[row] - base) - first);
@@ -281,6 +274,63 @@ private:
                     static_cast<int>((row_end[row] - base) - first);
                 c_row_ptr[static_cast<size_t>(row)] = row_begin;
                 c_row_ptr[static_cast<size_t>(row) + 1] = row_end_offset;
+            }
+
+            int any_unsorted = 0;
+            if (spgemm_sorted_output_enabled()) {
+                #pragma omp parallel for reduction(|:any_unsorted)
+                for (int row = 0; row < n_rows; ++row) {
+                    const MKL_INT* src = col_ind + first + c_row_ptr[row];
+                    const int deg = c_row_ptr[row + 1] - c_row_ptr[row];
+                    if (!std::is_sorted(src, src + deg)) {
+                        any_unsorted = 1;
+                    }
+                }
+            }
+
+            if (!any_unsorted) {
+                if (base == 0 && std::is_same_v<MKL_INT, int>) {
+                    c_cols_local.assign(col_ind + first, col_ind + last);
+                } else {
+                    c_cols_local.resize(exported_nnz);
+                    for (size_t entry = 0; entry < exported_nnz; ++entry) {
+                        const int local_col =
+                            static_cast<int>(col_ind[first + static_cast<MKL_INT>(entry)] - base);
+                        if (local_col < 0 || local_col >= static_cast<int>(B.graph->block_sizes.size())) {
+                            throw std::runtime_error("MKL CSR SpGEMM exported an invalid column index");
+                        }
+                        c_cols_local[entry] = local_col;
+                    }
+                }
+            } else {
+                c_cols_local.resize(exported_nnz);
+                value_perm.resize(exported_nnz);
+                // Packed (col << 32 | entry) keys sort as plain integers —
+                // no gathering comparator — and unpack into sorted columns
+                // plus the value permutation in one pass. Measured >2x
+                // cheaper than mkl_sparse_order at ~800K nnz.
+                std::vector<uint64_t> keys(exported_nnz);
+                #pragma omp parallel for
+                for (int row = 0; row < n_rows; ++row) {
+                    const int row_begin = c_row_ptr[row];
+                    const int row_end_off = c_row_ptr[row + 1];
+                    const MKL_INT* src = col_ind + first;
+                    for (int i = row_begin; i < row_end_off; ++i) {
+                        keys[static_cast<size_t>(i)] =
+                            (static_cast<uint64_t>(static_cast<uint32_t>(src[i] - base)) << 32) |
+                            static_cast<uint32_t>(i);
+                    }
+                    std::sort(keys.begin() + row_begin, keys.begin() + row_end_off);
+                }
+                const int num_cols = static_cast<int>(B.graph->block_sizes.size());
+                for (size_t entry = 0; entry < exported_nnz; ++entry) {
+                    const int local_col = static_cast<int>(keys[entry] >> 32);
+                    if (local_col < 0 || local_col >= num_cols) {
+                        throw std::runtime_error("MKL CSR SpGEMM exported an invalid column index");
+                    }
+                    c_cols_local[entry] = local_col;
+                    value_perm[entry] = static_cast<MKL_INT>(keys[entry] & 0xffffffffu);
+                }
             }
         } else {
             size_t exported_nnz = 0;
@@ -294,10 +344,12 @@ private:
             }
             c_cols_local.reserve(exported_nnz);
             c_values.reserve(exported_nnz);
+            std::vector<std::pair<int, T>> row_entries;
             for (int row = 0; row < n_rows; ++row) {
                 c_row_ptr[static_cast<size_t>(row)] = static_cast<int>(c_cols_local.size());
                 const MKL_INT begin = row_start[row] - base;
                 const MKL_INT end = row_end[row] - base;
+                row_entries.clear();
                 for (MKL_INT idx = begin; idx < end; ++idx) {
                     const T value = values[idx];
                     if (scalar_abs(value) < threshold) {
@@ -307,7 +359,14 @@ private:
                     if (local_col < 0 || local_col >= static_cast<int>(B.graph->block_sizes.size())) {
                         throw std::runtime_error("MKL CSR SpGEMM exported an invalid column index");
                     }
-                    c_cols_local.push_back(local_col);
+                    row_entries.emplace_back(local_col, value);
+                }
+                if (spgemm_sorted_output_enabled()) {
+                    std::sort(row_entries.begin(), row_entries.end(),
+                              [](const auto& a, const auto& b) { return a.first < b.first; });
+                }
+                for (const auto& [col, value] : row_entries) {
+                    c_cols_local.push_back(col);
                     c_values.push_back(value);
                 }
                 c_row_ptr[static_cast<size_t>(row) + 1] = static_cast<int>(c_cols_local.size());
@@ -322,7 +381,23 @@ private:
         C->set_page_size(A.configured_page_size());
         const auto t_graph = std::chrono::steady_clock::now();
 
-        if (threshold <= 0.0 && !c_cols_local.empty() && C->active_csr_backend().page_count() == 1) {
+        if (threshold <= 0.0 && !value_perm.empty()) {
+            // Unsorted export: place values through the per-row sort permutation.
+            const MKL_INT first = row_start[0] - base;
+            if (C->active_csr_backend().page_count() == 1) {
+                auto page = C->active_csr_backend().page(C->col_ind(), 0);
+                #pragma omp parallel for
+                for (int slot = 0; slot < static_cast<int>(c_cols_local.size()); ++slot) {
+                    page.values[slot] = values[first + value_perm[static_cast<size_t>(slot)]];
+                }
+                C->norms_valid = false;
+            } else {
+                #pragma omp parallel for
+                for (int slot = 0; slot < static_cast<int>(c_cols_local.size()); ++slot) {
+                    *C->mutable_block_data(slot) = values[first + value_perm[static_cast<size_t>(slot)]];
+                }
+            }
+        } else if (threshold <= 0.0 && !c_cols_local.empty() && C->active_csr_backend().page_count() == 1) {
             auto page = C->active_csr_backend().page(C->col_ind(), 0);
             std::memcpy(
                 page.values,

@@ -29,10 +29,19 @@ class TestCleanupGuards(unittest.TestCase):
             for node in tree.body:
                 if not isinstance(node, ast.ClassDef):
                     continue
+                def is_property_accessor(fn: ast.AST) -> bool:
+                    # @x.setter / @x.getter / @x.deleter legitimately reuse the
+                    # property's name; they are not duplicate methods.
+                    return any(
+                        isinstance(dec, ast.Attribute) and dec.attr in ("setter", "getter", "deleter")
+                        for dec in fn.decorator_list
+                    )
+
                 method_names = [
                     child.name
                     for child in node.body
                     if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and not is_property_accessor(child)
                 ]
                 duplicates = [
                     name for name, count in collections.Counter(method_names).items() if count > 1

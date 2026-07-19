@@ -1,3 +1,6 @@
+// Test assertions must stay active in Release builds.
+#undef NDEBUG
+
 #include "../image_container.hpp"
 #include <mpi.h>
 #include <cassert>

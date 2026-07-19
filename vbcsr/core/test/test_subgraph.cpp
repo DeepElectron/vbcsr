@@ -31,6 +31,8 @@ int main(int argc, char** argv) {
     MPI_Comm_size(MPI_COMM_WORLD, &size);
     
     if(rank == 0) std::cout << "Running Subgraph Extraction/Insertion Tests..." << std::endl;
+
+    int failures = 0;
     
     // Setup: 2 Ranks (or 1)
     // Global Matrix: 4 blocks.
@@ -62,7 +64,7 @@ int main(int argc, char** argv) {
     DistGraph* graph = new DistGraph(MPI_COMM_WORLD);
     graph->construct_distributed(my_indices, my_local_block_sizes, adj);
     
-    BlockSpMat<double, SmartKernel<double>> A(graph);
+    BlockSpMat<double> A(graph);
     
     // Fill with unique values: val = row * 10 + col
     for(int i=0; i<my_count; ++i) {
@@ -91,6 +93,7 @@ int main(int argc, char** argv) {
         auto dense = sub.to_dense();
         if (dense.size() != 16) {
             std::cout << "FAILED: Dense size mismatch. Got " << dense.size() << ", expected 16." << std::endl;
+            failures++;
         } else {
             std::cout << "Dense size correct." << std::endl;
         }
@@ -102,18 +105,18 @@ int main(int argc, char** argv) {
         // (2,2) -> 22.0, 22.1...
         
         // Check (0,0) block (top-left in dense)
-        if (std::abs(dense[0] - 0.0) > 1e-9) std::cout << "FAILED: (0,0) value mismatch. Got " << dense[0] << std::endl;
+        if (std::abs(dense[0] - 0.0) > 1e-9) { std::cout << "FAILED: (0,0) value mismatch. Got " << dense[0] << std::endl; failures++; }
         
         // Check (0,2) block (top-right in dense, row 0, col 2*2=4.. wait. Dense is 4x4)
         // Submatrix indices: 0->0, 2->1.
         // Block (0,1) in submatrix corresponds to Global (0,2).
         // Dense offset: Row 0..1, Col 2..3.
         // dense[0*4 + 2] should be A(0,2)[0,0] = 0*10 + 2 + 0 = 2.0
-        if (std::abs(dense[2] - 2.0) > 1e-9) std::cout << "FAILED: (0,2) value mismatch. Got " << dense[2] << std::endl;
+        if (std::abs(dense[2] - 2.0) > 1e-9) { std::cout << "FAILED: (0,2) value mismatch. Got " << dense[2] << std::endl; failures++; }
         
         // Check (2,0) block (bottom-left, Row 2..3, Col 0..1)
         // dense[2*4 + 0] should be A(2,0)[0,0] = 2*10 + 0 + 0 = 20.0
-        if (std::abs(dense[8] - 20.0) > 1e-9) std::cout << "FAILED: (2,0) value mismatch. Got " << dense[8] << std::endl;
+        if (std::abs(dense[8] - 20.0) > 1e-9) { std::cout << "FAILED: (2,0) value mismatch. Got " << dense[8] << std::endl; failures++; }
         
         std::cout << "Extraction Verified." << std::endl;
         
@@ -171,7 +174,7 @@ int main(int argc, char** argv) {
         // Actually, let's verify.
         // We need to find offset of block (0,0).
         // It's likely the first block.
-        if (std::abs(A.block_data(0)[0] - 1000.0) > 1e-9) std::cout << "FAILED: Rank 0 update mismatch. Got " << A.block_data(0)[0] << std::endl;
+        if (std::abs(A.block_data(0)[0] - 1000.0) > 1e-9) { std::cout << "FAILED: Rank 0 update mismatch. Got " << A.block_data(0)[0] << std::endl; failures++; }
         else std::cout << "Rank 0 Update Verified." << std::endl;
     }
     
@@ -195,6 +198,7 @@ int main(int argc, char** argv) {
                     const double* data = A.block_data(k);
                     if (std::abs(data[0] - 1020.0) > 1e-9) { // Original 20.0 + 1000
                             std::cout << "FAILED: Rank 1 update mismatch. Got " << data[0] << " Expected 1020.0" << std::endl;
+                            failures++;
                     } else {
                             std::cout << "Rank 1 Update Verified." << std::endl;
                     }
@@ -202,7 +206,7 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        if (!found) std::cout << "FAILED: Rank 1 did not find block (2,0)" << std::endl;
+        if (!found) { std::cout << "FAILED: Rank 1 did not find block (2,0)" << std::endl; failures++; }
     }
     
     if(rank == 0) std::cout << "Test Finished." << std::endl;
@@ -221,7 +225,7 @@ int main(int argc, char** argv) {
         DistGraph* dummy_graph = new DistGraph(MPI_COMM_SELF);
         dummy_graph->construct_serial(1, dummy_sizes, dummy_adj);
         
-        BlockSpMat<double, SmartKernel<double>> dummy_sub(dummy_graph);
+        BlockSpMat<double> dummy_sub(dummy_graph);
         std::vector<double> data(4, 1.0);
         dummy_sub.add_block(100, 100, data.data(), 2, 2);
         dummy_sub.assemble();
@@ -267,6 +271,7 @@ int main(int argc, char** argv) {
         // Let's check the first element of Block (0,0)
         if (std::abs(val_00 - 1022.0) > 1e-9) {
             std::cout << "FAILED: Unsorted extraction mismatch. Sub(0,0) [Global 2,2] got " << val_00 << " expected 1022.0." << std::endl;
+            failures++;
         } else {
             std::cout << "Unsorted Extraction Verified (Row 0 = Global 2)." << std::endl;
         }
@@ -310,6 +315,7 @@ int main(int argc, char** argv) {
                      const double* data = A.block_data(k);
                      if (std::abs(data[0] - 6022.0) > 1e-9) {
                          std::cout << "FAILED: Global (2,2) update mismatch. Got " << data[0] << " Expected 6022.0" << std::endl;
+                         failures++;
                      } else {
                          std::cout << "Global (2,2) Update Verified." << std::endl;
                      }
@@ -317,7 +323,7 @@ int main(int argc, char** argv) {
                  }
             }
         }
-        if (!found) std::cout << "FAILED: Rank 1 did not find block (2,2)" << std::endl;
+        if (!found) { std::cout << "FAILED: Rank 1 did not find block (2,2)" << std::endl; failures++; }
     }
     
     MPI_Barrier(MPI_COMM_WORLD);
@@ -341,7 +347,7 @@ int main(int argc, char** argv) {
         DistGraph* serial_graph = new DistGraph(MPI_COMM_SELF);
         serial_graph->construct_serial(n_serial_blocks, serial_sizes, serial_adj);
         
-        BlockSpMat<double, SmartKernel<double>> S(serial_graph);
+        BlockSpMat<double> S(serial_graph);
         
         // Fill
         for(int i=0; i<n_serial_blocks; ++i) {
@@ -360,6 +366,7 @@ int main(int argc, char** argv) {
         // Verify (0,0) of submatrix -> Global (1,1) of S -> Value 1.0
         if (std::abs(dense_serial[0] - 1.0) > 1e-9) {
              std::cout << "Rank " << rank << " FAILED: Serial extraction value mismatch." << std::endl;
+             failures++;
         }
         
         // Modify and Insert
@@ -379,18 +386,22 @@ int main(int argc, char** argv) {
                 const double* data = S.block_data(k);
                 if (std::abs(data[0] - 11.0) > 1e-9) {
                     std::cout << "Rank " << rank << " FAILED: Serial update mismatch. Got " << data[0] << std::endl;
+                    failures++;
                 }
                 found = true;
             }
         }
-        if (!found) std::cout << "Rank " << rank << " FAILED: Serial block (1,1) not found." << std::endl;
+        if (!found) { std::cout << "Rank " << rank << " FAILED: Serial block (1,1) not found." << std::endl; failures++; }
         
         if (rank == 0) std::cout << "Explicit Serial Test Finished." << std::endl;
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
     if(rank == 0) std::cerr << "Finalizing..." << std::endl;
-    
+
+    int global_failures = 0;
+    MPI_Allreduce(&failures, &global_failures, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+
     MPI_Finalize();
-    return 0;
+    return global_failures > 0 ? 1 : 0;
 }

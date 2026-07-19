@@ -19,9 +19,10 @@ void fill_random(std::vector<double>& v, int seed) {
     for (auto& val : v) val = dis(gen);
 }
 
-template <typename Kernel>
-void run_test(const std::string& kernel_name, int rank, int size) {
+int run_test(const std::string& kernel_name, int rank, int size) {
     if (rank == 0) std::cout << "Testing " << kernel_name << "..." << std::endl;
+
+    int failures = 0;
 
     // 1. Setup Graph with Diagonals
     // 0: 0, 1
@@ -43,7 +44,7 @@ void run_test(const std::string& kernel_name, int rank, int size) {
     graph.construct_serial(n_blocks, block_sizes, global_adj);
 
     // 2. Setup Matrix and Reference Data
-    BlockSpMat<double, Kernel> mat(&graph);
+    BlockSpMat<double> mat(&graph);
     
     // Generate global matrix data (map<pair<r,c>, vector<double>>)
     std::map<std::pair<int,int>, std::vector<double>> global_mat_data;
@@ -149,7 +150,7 @@ void run_test(const std::string& kernel_name, int rank, int size) {
     
     if (rank == 0) {
         std::cout << "  MatVec Max Error: " << global_max_err << std::endl;
-        if (global_max_err > 1e-12) std::cout << "  FAILED" << std::endl;
+        if (global_max_err > 1e-12) { std::cout << "  FAILED" << std::endl; failures++; }
         else std::cout << "  PASSED" << std::endl;
     }
 
@@ -190,25 +191,25 @@ void run_test(const std::string& kernel_name, int rank, int size) {
     }
     
     // Fill Distributed X
-    // X is ColMajor: X(row, col)
-    // Local storage: [col 0][col 1]... where each col is contiguous local+ghost
-    // DistMultiVector stores data as: col 0 (all rows), col 1 (all rows)...
-    // We need to fill owned parts of each column.
-    
+    // X is row-major padded: element (row, vec) at data[row * ld + vec],
+    // accessed via X(row, vec). We need to fill owned rows of each vector.
+
     for (int v = 0; v < num_vecs; ++v) {
-        double* col_ptr = X.col_data(v);
         offset = 0;
         for (int i = 0; i < n_owned; ++i) {
             int gid = graph.owned_global_indices[i];
-            std::memcpy(col_ptr + offset, global_X[gid][v].data(), block_sizes[gid] * sizeof(double));
+            for (int k = 0; k < block_sizes[gid]; ++k) {
+                X(offset + k, v) = global_X[gid][v][k];
+            }
             offset += block_sizes[gid];
         }
     }
-    
+
     // Initialize Y
     for (int v = 0; v < num_vecs; ++v) {
-        double* col_ptr = Y.col_data(v);
-        std::fill(col_ptr, col_ptr + Y.local_rows + Y.ghost_rows, 0.0);
+        for (int r = 0; r < Y.local_rows + Y.ghost_rows; ++r) {
+            Y(r, v) = 0.0;
+        }
     }
     
     mat.mult_dense(X, Y);
@@ -216,12 +217,11 @@ void run_test(const std::string& kernel_name, int rank, int size) {
     // Verify MatMat
     max_err = 0.0;
     for (int v = 0; v < num_vecs; ++v) {
-        double* col_ptr = Y.col_data(v);
         offset = 0;
         for (int i = 0; i < n_owned; ++i) {
             int gid = graph.owned_global_indices[i];
             for (int k = 0; k < block_sizes[gid]; ++k) {
-                double err = std::abs(col_ptr[offset + k] - global_Y_ref[gid][v][k]);
+                double err = std::abs(Y(offset + k, v) - global_Y_ref[gid][v][k]);
                 max_err = std::max(max_err, err);
             }
             offset += block_sizes[gid];
@@ -232,9 +232,11 @@ void run_test(const std::string& kernel_name, int rank, int size) {
     
     if (rank == 0) {
         std::cout << "  MatMat Max Error: " << global_max_err << std::endl;
-        if (global_max_err > 1e-12) std::cout << "  FAILED" << std::endl;
+        if (global_max_err > 1e-12) { std::cout << "  FAILED" << std::endl; failures++; }
         else std::cout << "  PASSED" << std::endl;
     }
+
+    return failures;
 }
 
 int main(int argc, char** argv) {
@@ -244,11 +246,16 @@ int main(int argc, char** argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    run_test<NaiveKernel<double>>("NaiveKernel", rank, size);
-    
-    // Uncomment to test BLAS if available
-    run_test<BLASKernel>("BLASKernel", rank, size);
+    // The col-major block kernel family (NaiveKernel, TinyBlockKernel, ...)
+    // was removed in Phase 4 of the row-major migration; BlockSpMat's default
+    // (BLASKernel) is the only kernel tag.
+    int failures = 0;
+    failures += run_test("BLASKernel (default)", rank, size);
+
+    // Propagate failures across ranks so any rank failing fails all ranks
+    int global_failures = 0;
+    MPI_Allreduce(&failures, &global_failures, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
 
     MPI_Finalize();
-    return 0;
+    return global_failures > 0 ? 1 : 0;
 }

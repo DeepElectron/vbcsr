@@ -19,7 +19,7 @@ enum class PhaseConvention {
     R_AND_POSITION   // exp(i * K * (R + r_j - r_i))
 };
 
-template <typename T, typename Kernel = DefaultKernel<T>>
+template <typename T>
 class ImageContainer {
 public:
     AtomicData* atom_data;
@@ -27,20 +27,11 @@ public:
     
     // Map R vector (rx, ry, rz) to its specific graph and matrix
     std::map<std::vector<int>, DistGraph*> image_graphs;
-    std::map<std::vector<int>, BlockSpMat<T, Kernel>*> image_blocks;
+    std::map<std::vector<int>, BlockSpMat<T>*> image_blocks;
 
-    using ComplexT = std::complex<double>;
-    // We might need a complex kernel for the result of sample_k if T is real
-    // But usually T is already complex for Hamiltonians? 
-    // If T is double, sample_k returns complex.
-    // Let's assume for now we return BlockSpMat<std::complex<double>>.
-    
-    // Actually, if T is double, we can't store complex result in BlockSpMat<T>.
-    // We need a separate type for the result.
-    // Let's define ResultT as complex<double> always for now, or complex<real_part<T>>.
-    
+    // sample_k always yields complex blocks (phase factors), even for real T,
+    // so the k-sampled result type is fixed to complex<double>.
     using ResultT = std::complex<double>;
-    using ResultKernel = DefaultKernel<ResultT>;
 
     // True when this container owns ``base_graph`` (the union-graph ctor below);
     // the normal ctor borrows ``data->graph`` and leaves this false.
@@ -84,11 +75,9 @@ public:
         // Adjacency list: src_lid -> list of dst_gid
         
         std::map<std::vector<int>, std::vector<std::vector<int>>> adj_by_r;
-        
+
         int n_owned = atom_data->n_atom;
-        
-        // Initialize adj for known Rs? No, discover them.
-        
+
         for (int i = 0; i < n_owned; ++i) {
             const auto& edges = atom_data->get_atom_edges(i);
             for (int edge_idx : edges) {
@@ -193,27 +182,20 @@ public:
             
             image_graphs[R] = g;
             
-            // Also allocate the matrix
-            BlockSpMat<T, Kernel>* mat = new BlockSpMat<T, Kernel>(g);
-            // mat->owns_graph = false; // We manage graph lifetime
+            // Also allocate the matrix. The graph stays owned by image_graphs
+            // (both maps are deleted together in the destructor).
+            BlockSpMat<T>* mat = new BlockSpMat<T>(g);
             image_blocks[R] = mat;
         }
     }
 
-    void add_block(const std::vector<int>& R, int global_row, int global_col, const T* data, int rows, int cols, AssemblyMode mode = AssemblyMode::ADD, MatrixLayout layout = MatrixLayout::ColMajor) {
+    void add_block(const std::vector<int>& R, int global_row, int global_col, const T* data, int rows, int cols, AssemblyMode mode = AssemblyMode::ADD, MatrixLayout layout = kCanonicalBlockLayout) {
         auto it = image_blocks.find(R);
         if (it == image_blocks.end()) {
-             // This should not happen if we built graphs for all Rs in AtomicData.
-             // Unless the user is adding a block for an R that didn't exist in the original edges?
-             // The requirement says: "if not, it should allocate the block_csr using the graph corresponding to that R."
-             // But constructing a distributed graph is collective. We can't just do it on one rank.
-             // If this R is new, we must assume all ranks call add_block or we have a mechanism to add new Rs collectively.
-             // For now, let's assume R must exist or throw. 
-             // Or, if the user meant "allocate the block in the matrix", that's handled by BlockSpMat.
-             // If the user meant "create a new graph for a new R", that's complex.
-             // Given "The base graph actually corresponding to a summation of graph for all shifted vector R",
-             // it implies all possible edges are in base_graph (AtomicData).
-             // So R must be in AtomicData.
+             // A new R cannot be materialized here: DistGraph construction is
+             // collective, so a single rank's add_block cannot create the image
+             // graph. Every R must already appear in the AtomicData edge set
+             // (the base graph is the union of all image graphs).
              throw std::runtime_error("R vector not found in ImageContainer (must be present in AtomicData)");
         }
         
@@ -276,10 +258,8 @@ public:
     // same geometry. No per-R assemble: routed blocks land local, so add_block writes
     // them directly (sample_k reads block_data, which is then current).
     void redistribute_into(ImageContainer& target, RedistOp op, MPI_Comm common_comm) const {
-        int cc_rank, cc_size;
-        MPI_Comm_rank(common_comm, &cc_rank);
+        int cc_size;
         MPI_Comm_size(common_comm, &cc_size);
-        (void)cc_rank;
 
         // 1. atom-row -> owner cc-ranks in the target partition (shared by all R).
         const std::vector<int>& tgt_owned = target.base_graph->owned_global_indices;
@@ -299,13 +279,15 @@ public:
         }
 
         // 2. Pack every owned block of every image, keyed by (R, I, J), once per owner.
-        //    Header per block: rx, ry, rz, gi, gj, r_dim, c_dim (7 ints) + ColMajor data.
+        //    Header per block: rx, ry, rz, gi, gj, r_dim, c_dim (7 ints) + block
+        //    data in canonical row-major layout (kCanonicalBlockLayout), copied
+        //    straight from backend storage and unpacked with the same constant.
         const int header_ints = 7;
         std::vector<size_t> send_counts(cc_size, 0);
         auto for_each_owned_block = [&](auto&& fn) {
             for (const auto& kv : image_blocks) {
                 const std::vector<int>& R = kv.first;
-                const BlockSpMat<T, Kernel>* mat = kv.second;
+                const BlockSpMat<T>* mat = kv.second;
                 const DistGraph* g = mat->graph;
                 const int n_owned = static_cast<int>(g->owned_global_indices.size());
                 for (int i = 0; i < n_owned; ++i) {
@@ -373,7 +355,7 @@ public:
                                          "absent from the target (geometry mismatch).");
             }
             it->second->add_block(gi, gj, reinterpret_cast<const T*>(ptr), r_dim, c_dim,
-                                  amode, MatrixLayout::ColMajor);
+                                  amode, kCanonicalBlockLayout);
             ptr += static_cast<size_t>(r_dim) * c_dim * sizeof(T);
         }
     }
@@ -386,8 +368,8 @@ public:
 
     // Accumulate all image blocks onto a compatible reference graph using
     // a per-image weight and an optional per-block correction factor.
-    template <typename ResultT, typename ResultKernel = DefaultKernel<ResultT>, typename ImageWeightFn, typename BlockWeightFn>
-    BlockSpMat<ResultT, ResultKernel>* accumulate_weighted_images(
+    template <typename ResultT, typename ImageWeightFn, typename BlockWeightFn>
+    BlockSpMat<ResultT>* accumulate_weighted_images(
         DistGraph* reference_graph,
         ImageWeightFn&& image_weight_fn,
         BlockWeightFn&& block_weight_fn
@@ -399,7 +381,7 @@ public:
             throw std::runtime_error("Reference graph must not be null.");
         }
 
-        BlockSpMat<ResultT, ResultKernel>* result = new BlockSpMat<ResultT, ResultKernel>(reference_graph);
+        BlockSpMat<ResultT>* result = new BlockSpMat<ResultT>(reference_graph);
         const int n_owned = static_cast<int>(reference_graph->owned_global_indices.size());
 
         for (const auto& entry : image_blocks) {
@@ -460,7 +442,7 @@ public:
                         row_dim,
                         col_dim,
                         AssemblyMode::ADD,
-                        MatrixLayout::ColMajor);
+                        kCanonicalBlockLayout);
                 }
             }
         }
@@ -468,12 +450,12 @@ public:
         return result;
     }
 
-    template <typename ResultT, typename ResultKernel = DefaultKernel<ResultT>, typename ImageWeightFn>
-    BlockSpMat<ResultT, ResultKernel>* accumulate_weighted_images(
+    template <typename ResultT, typename ImageWeightFn>
+    BlockSpMat<ResultT>* accumulate_weighted_images(
         DistGraph* reference_graph,
         ImageWeightFn&& image_weight_fn
     ) {
-        return accumulate_weighted_images<ResultT, ResultKernel>(
+        return accumulate_weighted_images<ResultT>(
             reference_graph,
             std::forward<ImageWeightFn>(image_weight_fn),
             [](int, int) { return ResultT(1.0); });
@@ -481,17 +463,17 @@ public:
 
     // Sample K
     // Returns a new BlockSpMat allocated on the base_graph
-    BlockSpMat<ResultT, ResultKernel>* sample_k(const std::vector<double>& K, PhaseConvention convention) {
+    BlockSpMat<ResultT>* sample_k(const std::vector<double>& K, PhaseConvention convention) {
         auto image_weight = [&](const std::vector<int>& R_vec) -> ResultT {
             const double phase_r = -2.0 * M_PI * (K[0] * R_vec[0] + K[1] * R_vec[1] + K[2] * R_vec[2]);
             return std::exp(std::complex<double>(0.0, phase_r));
         };
 
         if (convention == PhaseConvention::R_ONLY) {
-            return accumulate_weighted_images<ResultT, ResultKernel>(base_graph, image_weight);
+            return accumulate_weighted_images<ResultT>(base_graph, image_weight);
         }
 
-        return accumulate_weighted_images<ResultT, ResultKernel>(
+        return accumulate_weighted_images<ResultT>(
             base_graph,
             image_weight,
             [&](int local_row, int local_col_base) -> ResultT {

@@ -68,8 +68,9 @@ void csr_mult_dense_native_benchmark(
     const auto& row_ptr = graph->adj_ptr;
     const int n_rows = row_ptr.empty() ? 0 : static_cast<int>(row_ptr.size()) - 1;
     const int num_vecs = x.num_vectors;
-    const int x_ld = x.local_rows + x.ghost_rows;
-    const int y_ld = y.local_rows + y.ghost_rows;
+    // Row-major storage: element (row, vec) lives at data[row * ld + vec].
+    const int x_ld = x.ld;
+    const int y_ld = y.ld;
     const int* block_offsets = graph->block_offsets.data();
     const T* x_data = x.data.data();
     T* y_data = y.data.data();
@@ -84,15 +85,17 @@ void csr_mult_dense_native_benchmark(
             backend.for_each_row_slice(row_ptr, graph->adj_ind, row, [&](auto slice) {
                 for (uint32_t idx = 0; idx < slice.nnz_count; ++idx) {
                     const int col_offset = block_offsets[slice.cols[idx]];
+                    const T* x_row = x_data + static_cast<size_t>(col_offset) * x_ld;
                     for (int vec = 0; vec < num_vecs; ++vec) {
                         sums[static_cast<size_t>(vec)] +=
-                            slice.values[idx] * x_data[static_cast<size_t>(vec * x_ld + col_offset)];
+                            slice.values[idx] * x_row[vec];
                     }
                 }
             });
 
+            T* y_row = y_data + static_cast<size_t>(block_offsets[row]) * y_ld;
             for (int vec = 0; vec < num_vecs; ++vec) {
-                y_data[static_cast<size_t>(vec * y_ld + block_offsets[row])] = sums[static_cast<size_t>(vec)];
+                y_row[vec] = sums[static_cast<size_t>(vec)];
             }
         }
     }

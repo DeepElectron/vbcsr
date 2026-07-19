@@ -1,3 +1,6 @@
+// Test assertions must stay active in Release builds.
+#undef NDEBUG
+
 #include "../block_csr.hpp"
 #include <iostream>
 #include <cassert>
@@ -31,7 +34,7 @@ static_assert(std::is_const_v<std::remove_reference_t<decltype(std::declval<Test
 static_assert(!std::is_assignable_v<decltype(std::declval<TestMatrix&>().row_ptr()[0]), int>);
 static_assert(!has_clear_member<TestRowPtrView>::value);
 static_assert(!has_blk_sizes_member<detail::BSRMatrixBackend<double>>::value);
-static_assert(!has_blk_sizes_member<detail::VBCSRMatrixBackend<double, DefaultKernel<double>>>::value);
+static_assert(!has_blk_sizes_member<detail::VBCSRMatrixBackend<double>>::value);
 
 // Helper to fill vector with random numbers
 void fill_random(std::vector<double>& v, int seed) {
@@ -371,20 +374,6 @@ std::vector<T> generated_block_row_major(
 }
 
 template <typename T>
-void write_block_col_major_from_row_major(
-    T* dest,
-    const std::vector<T>& src,
-    int row_dim,
-    int col_dim) {
-    for (int r = 0; r < row_dim; ++r) {
-        for (int c = 0; c < col_dim; ++c) {
-            dest[static_cast<size_t>(c) * row_dim + r] =
-                src[static_cast<size_t>(r) * col_dim + c];
-        }
-    }
-}
-
-template <typename T>
 std::vector<T> generated_dense_matrix(
     const DistGraph& graph,
     int matrix_id) {
@@ -437,11 +426,12 @@ void populate_matrix_with_generated_blocks(
                 col,
                 row_dim,
                 col_dim);
-            write_block_col_major_from_row_major(
-                matrix.mutable_block_data(graph_block_index),
-                block,
-                row_dim,
-                col_dim);
+            // Raw block storage is canonical row-major, so the generated
+            // row-major block copies through unchanged.
+            std::copy(
+                block.begin(),
+                block.end(),
+                matrix.mutable_block_data(graph_block_index));
         }
     }
 }
@@ -514,6 +504,34 @@ void fill_generated_multivector(
             const double real = base_shift + 0.09 * (vec + 1) + 0.13 * (row + 1);
             const double imag = -0.04 * (vec + 1) + 0.07 * (row + 1);
             data[static_cast<size_t>(vec) * ld + row] = make_test_value<T>(real, imag);
+        }
+    }
+}
+
+// Snapshot of a DistMultiVector in the legacy column-major flat layout
+// (leading dimension = local_rows + ghost_rows), for the col-major
+// reference-math helpers in this file.
+template <typename T>
+std::vector<T> multivector_col_major(const DistMultiVector<T>& mv) {
+    const int n_rows = mv.local_rows + mv.ghost_rows;
+    std::vector<T> out(static_cast<size_t>(n_rows) * mv.num_vectors, T(0));
+    for (int vec = 0; vec < mv.num_vectors; ++vec) {
+        for (int row = 0; row < n_rows; ++row) {
+            out[static_cast<size_t>(vec) * n_rows + row] = mv(row, vec);
+        }
+    }
+    return out;
+}
+
+// Load a legacy column-major flat buffer (ld = local_rows + ghost_rows)
+// into a DistMultiVector via the (row, vec) accessor.
+template <typename T>
+void load_multivector_col_major(DistMultiVector<T>& mv, const std::vector<T>& values) {
+    const int n_rows = mv.local_rows + mv.ghost_rows;
+    assert(values.size() == static_cast<size_t>(n_rows) * mv.num_vectors);
+    for (int vec = 0; vec < mv.num_vectors; ++vec) {
+        for (int row = 0; row < n_rows; ++row) {
+            mv(row, vec) = values[static_cast<size_t>(vec) * n_rows + row];
         }
     }
 }
@@ -1151,16 +1169,16 @@ void test_transpose() {
     // (1,0): [9 10; 11 12]
     // (1,1): [13 14; 15 16]
     
-    std::vector<double> b00 = {1, 3, 2, 4}; // ColMajor: 1,2 row 0; 3,4 row 1? No.
-    // ColMajor: col 0: 1, 3. col 1: 2, 4. -> [1 2; 3 4]
-    std::vector<double> b01 = {5, 7, 6, 8}; // [5 6; 7 8]
-    std::vector<double> b10 = {9, 11, 10, 12}; // [9 10; 11 12]
-    std::vector<double> b11 = {13, 15, 14, 16}; // [13 14; 15 16]
-    
-    mat.add_block(0, 0, b00.data(), 2, 2);
-    mat.add_block(0, 1, b01.data(), 2, 2);
-    mat.add_block(1, 0, b10.data(), 2, 2);
-    mat.add_block(1, 1, b11.data(), 2, 2);
+    // RowMajor packing (canonical block layout).
+    std::vector<double> b00 = {1, 2, 3, 4}; // [1 2; 3 4]
+    std::vector<double> b01 = {5, 6, 7, 8}; // [5 6; 7 8]
+    std::vector<double> b10 = {9, 10, 11, 12}; // [9 10; 11 12]
+    std::vector<double> b11 = {13, 14, 15, 16}; // [13 14; 15 16]
+
+    mat.add_block(0, 0, b00.data(), 2, 2, AssemblyMode::ADD, MatrixLayout::RowMajor);
+    mat.add_block(0, 1, b01.data(), 2, 2, AssemblyMode::ADD, MatrixLayout::RowMajor);
+    mat.add_block(1, 0, b10.data(), 2, 2, AssemblyMode::ADD, MatrixLayout::RowMajor);
+    mat.add_block(1, 1, b11.data(), 2, 2, AssemblyMode::ADD, MatrixLayout::RowMajor);
     mat.assemble();
     
     BlockSpMat<double> mat_T = mat.transpose();
@@ -1303,7 +1321,7 @@ void test_bsr_backend_dispatch_kernels() {
     X(2, 1) = 7.0;
     X(3, 1) = 8.0;
     mat.mult_dense(X, Y);
-    const std::vector<double> expected_dense = dense_matmat(dense, rows, cols, X.data, cols, 2);
+    const std::vector<double> expected_dense = dense_matmat(dense, rows, cols, multivector_col_major(X), cols, 2);
     for (int vec = 0; vec < 2; ++vec) {
         for (int row = 0; row < rows; ++row) {
             assert(std::abs(Y(row, vec) - expected_dense[vec * rows + row]) < 1e-12);
@@ -1332,7 +1350,7 @@ void test_bsr_backend_dispatch_kernels() {
     X_adj(2, 1) = -2.0;
     X_adj(3, 1) = 5.0;
     mat.mult_dense_adjoint(X_adj, Y_adj);
-    const std::vector<double> expected_dense_adj = dense_matmat_transpose(dense, rows, cols, X_adj.data, rows, 2);
+    const std::vector<double> expected_dense_adj = dense_matmat_transpose(dense, rows, cols, multivector_col_major(X_adj), rows, 2);
     for (int vec = 0; vec < 2; ++vec) {
         for (int col = 0; col < cols; ++col) {
             assert(std::abs(Y_adj(col, vec) - expected_dense_adj[vec * cols + col]) < 1e-12);
@@ -1477,7 +1495,7 @@ void test_bsr_backend_dispatch_distributed() {
         X(offset + 1, 1) = owned[i] * 10.0 + 4.0;
     }
     mat.mult_dense(X, Y);
-    const std::vector<double> expected_dense = dense_matmat(dense, rows, cols, X.data, cols, 2);
+    const std::vector<double> expected_dense = dense_matmat(dense, rows, cols, multivector_col_major(X), cols, 2);
     for (int vec = 0; vec < 2; ++vec) {
         for (int row = 0; row < rows; ++row) {
             assert(std::abs(Y(row, vec) - expected_dense[vec * rows + row]) < 1e-12);
@@ -1926,16 +1944,6 @@ void test_vbcsr_shape_batched_apply_kernels() {
     const std::vector<double> dense = mat.to_dense();
     const int rows = graph.block_offsets[graph.owned_global_indices.size()];
     const int cols = graph.block_offsets.back();
-    auto total_batched_apply_count = [&](const auto& matrix) {
-        std::set<int> seen_shapes;
-        size_t total = 0;
-        matrix.for_each_shape_batch([&](const auto& batch) {
-            if (seen_shapes.insert(batch.shape_id).second) {
-                total += static_cast<size_t>(batch.batched_apply_batch_count());
-            }
-        });
-        return total;
-    };
 
     DistVector<double> x(&graph);
     for (int i = 0; i < cols; ++i) {
@@ -1944,9 +1952,6 @@ void test_vbcsr_shape_batched_apply_kernels() {
     DistVector<double> y(&graph);
     mat.mult(x, y);
     assert_close(std::vector<double>(y.data.begin(), y.data.begin() + rows), dense_matvec(dense, rows, cols, x.data));
-    if (SmartKernel<double>::supports_batched_gemv()) {
-        assert(total_batched_apply_count(mat) > 0);
-    }
 
     DistMultiVector<double> X(&graph, 2);
     for (int vec = 0; vec < 2; ++vec) {
@@ -1956,10 +1961,7 @@ void test_vbcsr_shape_batched_apply_kernels() {
     }
     DistMultiVector<double> Y(&graph, 2);
     mat.mult_dense(X, Y);
-    assert_close(Y.data, dense_matmat(dense, rows, cols, X.data, cols, 2));
-    if (SmartKernel<double>::supports_batched_gemm()) {
-        assert(total_batched_apply_count(mat) > 0);
-    }
+    assert_close(multivector_col_major(Y), dense_matmat(dense, rows, cols, multivector_col_major(X), cols, 2));
 
     DistVector<double> x_adj(&graph);
     for (int i = 0; i < rows; ++i) {
@@ -1968,9 +1970,6 @@ void test_vbcsr_shape_batched_apply_kernels() {
     DistVector<double> y_adj(&graph);
     mat.mult_adjoint(x_adj, y_adj);
     assert_close(std::vector<double>(y_adj.data.begin(), y_adj.data.begin() + cols), dense_matvec_transpose(dense, rows, cols, x_adj.data));
-    if (SmartKernel<double>::supports_batched_gemv()) {
-        assert(total_batched_apply_count(mat) > 0);
-    }
 
     DistMultiVector<double> X_adj(&graph, 2);
     for (int vec = 0; vec < 2; ++vec) {
@@ -1980,10 +1979,7 @@ void test_vbcsr_shape_batched_apply_kernels() {
     }
     DistMultiVector<double> Y_adj(&graph, 2);
     mat.mult_dense_adjoint(X_adj, Y_adj);
-    assert_close(Y_adj.data, dense_matmat_transpose(dense, rows, cols, X_adj.data, rows, 2));
-    if (SmartKernel<double>::supports_batched_gemm()) {
-        assert(total_batched_apply_count(mat) > 0);
-    }
+    assert_close(multivector_col_major(Y_adj), dense_matmat_transpose(dense, rows, cols, multivector_col_major(X_adj), rows, 2));
 
     double overwrite01[] = {
         1.0, 3.0,
@@ -1998,9 +1994,6 @@ void test_vbcsr_shape_batched_apply_kernels() {
     assert_close(
         std::vector<double>(y_after_update.data.begin(), y_after_update.data.begin() + rows),
         dense_matvec(dense_after_update, rows, cols, x.data));
-    if (SmartKernel<double>::supports_batched_gemv()) {
-        assert(total_batched_apply_count(mat) > 0);
-    }
 
     std::cout << "PASSED" << std::endl;
 }
@@ -2037,16 +2030,6 @@ void test_vbcsr_shape_batched_apply_kernels_complex() {
     const std::vector<T> dense = mat.to_dense();
     const int rows = graph.block_offsets[graph.owned_global_indices.size()];
     const int cols = graph.block_offsets.back();
-    auto total_batched_apply_count = [&](const auto& matrix) {
-        std::set<int> seen_shapes;
-        size_t total = 0;
-        matrix.for_each_shape_batch([&](const auto& batch) {
-            if (seen_shapes.insert(batch.shape_id).second) {
-                total += static_cast<size_t>(batch.batched_apply_batch_count());
-            }
-        });
-        return total;
-    };
 
     DistVector<T> x(&graph);
     for (int i = 0; i < cols; ++i) {
@@ -2057,9 +2040,6 @@ void test_vbcsr_shape_batched_apply_kernels_complex() {
     assert_close_generic(
         std::vector<T>(y.data.begin(), y.data.begin() + rows),
         dense_matvec_generic(dense, rows, cols, x.data));
-    if (SmartKernel<T>::supports_batched_gemv()) {
-        assert(total_batched_apply_count(mat) > 0);
-    }
 
     DistMultiVector<T> X(&graph, 2);
     for (int vec = 0; vec < 2; ++vec) {
@@ -2069,10 +2049,7 @@ void test_vbcsr_shape_batched_apply_kernels_complex() {
     }
     DistMultiVector<T> Y(&graph, 2);
     mat.mult_dense(X, Y);
-    assert_close_generic(Y.data, dense_matmat_generic(dense, rows, cols, X.data, cols, 2));
-    if (SmartKernel<T>::supports_batched_gemm()) {
-        assert(total_batched_apply_count(mat) > 0);
-    }
+    assert_close_generic(multivector_col_major(Y), dense_matmat_generic(dense, rows, cols, multivector_col_major(X), cols, 2));
 
     DistVector<T> x_adj(&graph);
     for (int i = 0; i < rows; ++i) {
@@ -2083,9 +2060,6 @@ void test_vbcsr_shape_batched_apply_kernels_complex() {
     assert_close_generic(
         std::vector<T>(y_adj.data.begin(), y_adj.data.begin() + cols),
         dense_matvec_adjoint_generic(dense, rows, cols, x_adj.data));
-    if (SmartKernel<T>::supports_batched_gemv()) {
-        assert(total_batched_apply_count(mat) > 0);
-    }
 
     DistMultiVector<T> X_adj(&graph, 2);
     for (int vec = 0; vec < 2; ++vec) {
@@ -2095,10 +2069,7 @@ void test_vbcsr_shape_batched_apply_kernels_complex() {
     }
     DistMultiVector<T> Y_adj(&graph, 2);
     mat.mult_dense_adjoint(X_adj, Y_adj);
-    assert_close_generic(Y_adj.data, dense_matmat_adjoint_generic(dense, rows, cols, X_adj.data, rows, 2));
-    if (SmartKernel<T>::supports_batched_gemm()) {
-        assert(total_batched_apply_count(mat) > 0);
-    }
+    assert_close_generic(multivector_col_major(Y_adj), dense_matmat_adjoint_generic(dense, rows, cols, multivector_col_major(X_adj), rows, 2));
 
     std::cout << "PASSED" << std::endl;
 }
@@ -2532,11 +2503,12 @@ void test_bsr_vendor_batch_cache_metadata() {
 
     detail::BSRMatrixBackend<double> backend;
     backend.initialize_structure(graph.adj_ind.size(), 2, 1);
+    // Raw block storage is canonical row-major.
     const double blocks[][4] = {
-        {1.0, 3.0, 2.0, 4.0},
-        {5.0, 7.0, 6.0, 8.0},
-        {2.0, 1.0, 0.0, 2.0},
-        {0.0, 4.0, 1.0, 3.0},
+        {1.0, 2.0, 3.0, 4.0},
+        {5.0, 6.0, 7.0, 8.0},
+        {2.0, 0.0, 1.0, 2.0},
+        {0.0, 1.0, 4.0, 3.0},
     };
     for (int slot = 0; slot < 4; ++slot) {
         std::memcpy(backend.block_ptr(slot), blocks[slot], sizeof(blocks[slot]));
@@ -2583,12 +2555,11 @@ void test_bsr_vendor_batch_cache_metadata() {
 #ifdef VBCSR_HAVE_MKL_BSR_SPARSE
     assert(cache.kind == detail::BSRVendorBackendKind::MKL);
     assert(backend.vendor_backend_name() == "mkl");
-    assert((batch0.mm_rows_start_one == std::vector<MKL_INT>{1}));
-    assert((batch0.mm_rows_end_one == std::vector<MKL_INT>{2}));
-    assert((batch0.mm_cols_one == std::vector<MKL_INT>{1}));
-    assert((batch3.mm_rows_start_one == std::vector<MKL_INT>{1}));
-    assert((batch3.mm_rows_end_one == std::vector<MKL_INT>{2}));
-    assert((batch3.mm_cols_one == std::vector<MKL_INT>{2}));
+    // The MKL mm variants consume the batches' zero-based arrays directly
+    // (row-major canonical blocks require zero-based indexing for BSR mm;
+    // the pre-flip one-based copies were removed in Phase 4).
+    assert(batch0.batch.cols[0] == 0);
+    assert(batch3.batch.cols[0] == 1);
 #else
     assert(cache.kind == detail::BSRVendorBackendKind::None);
     assert(backend.vendor_backend_name() == "none");
@@ -2605,11 +2576,13 @@ void test_bsr_vendor_dispatch_selection() {
 
     detail::BSRMatrixBackend<double> backend;
     backend.initialize_structure(graph.adj_ind.size(), 2, 1);
+    // Raw block storage is canonical row-major; these pack the same logical
+    // blocks as the row-major dense reference below.
     const double blocks[][4] = {
-        {1.0, 3.0, 2.0, 4.0},
-        {5.0, 7.0, 6.0, 8.0},
-        {2.0, 1.0, 0.0, 2.0},
-        {0.0, 4.0, 1.0, 3.0},
+        {1.0, 2.0, 3.0, 4.0},
+        {5.0, 6.0, 7.0, 8.0},
+        {2.0, 0.0, 1.0, 2.0},
+        {0.0, 1.0, 4.0, 3.0},
     };
     for (int slot = 0; slot < 4; ++slot) {
         std::memcpy(backend.block_ptr(slot), blocks[slot], sizeof(blocks[slot]));
@@ -2646,9 +2619,9 @@ void test_bsr_vendor_dispatch_selection() {
     X(2, 1) = 7.0;
     X(3, 1) = 8.0;
     detail::bsr_mult_dense(&graph, backend, X, Y);
-    const auto expected_dense = dense_matmat_generic(dense, 4, 4, X.data, 4, 2);
+    const auto expected_dense = dense_matmat_generic(dense, 4, 4, multivector_col_major(X), 4, 2);
     assert_close(
-        std::vector<double>(Y.data.begin(), Y.data.begin() + 8),
+        multivector_col_major(Y),
         expected_dense);
 
     DistVector<double> x_adj(&graph);
@@ -2673,9 +2646,9 @@ void test_bsr_vendor_dispatch_selection() {
     X_adj(2, 1) = -2.0;
     X_adj(3, 1) = 5.0;
     detail::bsr_mult_dense_adjoint(&graph, backend, X_adj, Y_adj);
-    const auto expected_dense_adj = dense_matmat_adjoint_generic(dense, 4, 4, X_adj.data, 4, 2);
+    const auto expected_dense_adj = dense_matmat_adjoint_generic(dense, 4, 4, multivector_col_major(X_adj), 4, 2);
     assert_close_generic(
-        std::vector<double>(Y_adj.data.begin(), Y_adj.data.begin() + 8),
+        multivector_col_major(Y_adj),
         expected_dense_adj);
 
 #ifdef VBCSR_HAVE_MKL_BSR_SPARSE
@@ -2883,8 +2856,8 @@ void test_bsr_vendor_complex_dispatch_selection() {
     X(3, 1) = C(0.5, -0.5);
     detail::bsr_mult_dense(&graph, backend, X, Y);
     assert_close_generic(
-        std::vector<C>(Y.data.begin(), Y.data.end()),
-        dense_matmat_generic(dense, 4, 4, X.data, 4, 2));
+        multivector_col_major(Y),
+        dense_matmat_generic(dense, 4, 4, multivector_col_major(X), 4, 2));
 
     DistVector<C> x_adj(&graph);
     DistVector<C> y_adj(&graph);
@@ -2909,8 +2882,8 @@ void test_bsr_vendor_complex_dispatch_selection() {
     X_adj(3, 1) = C(2.5, -1.5);
     detail::bsr_mult_dense_adjoint(&graph, backend, X_adj, Y_adj);
     assert_close_generic(
-        std::vector<C>(Y_adj.data.begin(), Y_adj.data.end()),
-        dense_matmat_adjoint_generic(dense, 4, 4, X_adj.data, 4, 2));
+        multivector_col_major(Y_adj),
+        dense_matmat_adjoint_generic(dense, 4, 4, multivector_col_major(X_adj), 4, 2));
 
     assert(backend.get_vendor_launch_count() > 0);
     std::cout << "PASSED" << std::endl;
@@ -3621,15 +3594,18 @@ void run_matrix_numerical_soundness_suite(
 
     DistMultiVector<T> X(A_base.graph, 3);
     DistMultiVector<T> Y(A_base.graph, 3);
-    fill_generated_multivector(X.data, X.local_rows + X.ghost_rows, X.num_vectors, 0.3);
+    std::vector<T> x_multi_values(
+        static_cast<size_t>(X.local_rows + X.ghost_rows) * X.num_vectors, T(0));
+    fill_generated_multivector(x_multi_values, X.local_rows + X.ghost_rows, X.num_vectors, 0.3);
+    load_multivector_col_major(X, x_multi_values);
     A_ops.mult_dense(X, Y);
     assert_close_generic(
-        Y.data,
+        multivector_col_major(Y),
         dense_matmat_generic(
             expected_A,
             rows,
             cols,
-            X.data,
+            x_multi_values,
             X.local_rows + X.ghost_rows,
             X.num_vectors));
 
@@ -3643,15 +3619,18 @@ void run_matrix_numerical_soundness_suite(
 
     DistMultiVector<T> X_adj(A_base.graph, 2);
     DistMultiVector<T> Y_adj(A_base.graph, 2);
-    fill_generated_multivector(X_adj.data, X_adj.local_rows + X_adj.ghost_rows, X_adj.num_vectors, -0.5);
+    std::vector<T> x_adj_multi_values(
+        static_cast<size_t>(X_adj.local_rows + X_adj.ghost_rows) * X_adj.num_vectors, T(0));
+    fill_generated_multivector(x_adj_multi_values, X_adj.local_rows + X_adj.ghost_rows, X_adj.num_vectors, -0.5);
+    load_multivector_col_major(X_adj, x_adj_multi_values);
     A_ops.mult_dense_adjoint(X_adj, Y_adj);
     assert_close_generic(
-        Y_adj.data,
+        multivector_col_major(Y_adj),
         dense_matmat_adjoint_generic(
             expected_A,
             rows,
             cols,
-            X_adj.data,
+            x_adj_multi_values,
             X_adj.local_rows + X_adj.ghost_rows,
             X_adj.num_vectors));
 
@@ -3844,6 +3823,14 @@ void test_matrix_family_numerical_soundness_complex() {
 }
 
 int main(int argc, char** argv) {
+    // BSR applies (SpMV and dense) default to the native row-major kernels
+    // (measured faster, see bsr_vendor_enabled in bsr_apply.hpp). This
+    // binary's vendor-cache tests assert vendor launches, so opt this process
+    // into the vendor route (the gate latches on first apply; overwrite=0
+    // keeps an explicit environment setting authoritative). The native paths
+    // keep coverage in test_numeric_reference / test_robustness.
+    setenv("VBCSR_BSR_VENDOR", "1", 0);
+
     MPI_Init(&argc, &argv);
     int rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);

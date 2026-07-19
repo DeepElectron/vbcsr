@@ -2,9 +2,8 @@
 #define VBCSR_DETAIL_OPS_TRANSPOSE_HPP
 
 #include "../../scalar_traits.hpp"
-#include "../distributed/result_graph.hpp"
-
 #include "../distributed/mpi_utils.hpp"
+#include "../distributed/result_graph.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -14,16 +13,19 @@
 
 namespace vbcsr::detail {
 
+// dest = conj(src^T) for canonical row-major blocks: src is src_rows x
+// src_cols with src(i, j) at src[i * src_cols + j]; dest is src_cols x
+// src_rows with dest(j, i) at dest[j * src_rows + i].
 template <typename T>
 void write_transposed_conjugate_block(
     T* dest,
     const T* src,
     int src_rows,
     int src_cols) {
-    for (int dest_col = 0; dest_col < src_rows; ++dest_col) {
-        for (int dest_row = 0; dest_row < src_cols; ++dest_row) {
-            dest[dest_col * src_cols + dest_row] =
-                ScalarTraits<T>::conjugate(src[dest_row * src_rows + dest_col]);
+    for (int i = 0; i < src_rows; ++i) {
+        for (int j = 0; j < src_cols; ++j) {
+            dest[j * src_rows + i] =
+                ScalarTraits<T>::conjugate(src[i * src_cols + j]);
         }
     }
 }
@@ -373,7 +375,6 @@ struct BSRTransposeExecutor {
 template <typename Matrix>
 struct VBCSRTransposeExecutor {
     using T = typename Matrix::value_type;
-    using Kernel = typename Matrix::KernelType;
 
     static Matrix run(const Matrix& matrix) {
         if (matrix.graph->size == 1) {

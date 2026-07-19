@@ -13,6 +13,8 @@ jobs:
     steps:
     - uses: actions/checkout@v3
 
+    # OpenBLAS (non-MKL) build: this job is the gate that catches MKL-assumption
+    # leaks — do not add MKL here.
     - name: Install system dependencies
       run: |
         sudo apt-get update
@@ -30,7 +32,18 @@ jobs:
       run: cmake --build build
 
     - name: Run C++ Tests
+      # Full ctest suite, unfiltered — includes the formerly orphaned
+      # test_numeric_reference and test_migration_contract gates.
       run: ctest --test-dir build --output-on-failure
+
+    - name: Run key MPI C++ tests at 3 ranks
+      # ctest registers MPI tests at -np 2; rerun the key distributed binaries at
+      # an odd rank count to catch partition-boundary bugs (migration plan Phase 6).
+      run: |
+        for t in test_robustness test_pb_csr test_migration_contract test_spmm test_block_csr; do
+          echo "=== $t (np=3) ==="
+          mpirun --oversubscribe -np 3 ./build/$t
+        done
 
     - name: Install Python dependencies
       run: |
@@ -45,3 +58,17 @@ jobs:
         
         # Run MPI tests
         mpirun -np 2 pytest tests/test_api_mpi.py tests/test_spmm.py tests/test_vbcsr.py
+
+    - name: Run Python redistribute suite (np=1,2,3)
+      # Plain mpirun scripts (not pytest); vbcsr comes from the source tree and
+      # vbcsr_core from the CMake build dir, so this exercises the CI-built extension.
+      env:
+        OMP_NUM_THREADS: 1
+        PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/build
+      run: |
+        for np in 1 2 3; do
+          for t in tests/test_redistribute_mpi.py tests/test_redistribute_cross_mpi.py tests/test_image_redistribute_mpi.py; do
+            echo "=== $t (np=$np) ==="
+            mpirun --oversubscribe --bind-to none -np $np python $t
+          done
+        done

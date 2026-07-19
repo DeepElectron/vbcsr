@@ -1,3 +1,6 @@
+// Test assertions must stay active in Release builds.
+#undef NDEBUG
+
 #include "../dist_csr.hpp"
 #include "../block_csr.hpp"
 #include <iostream>

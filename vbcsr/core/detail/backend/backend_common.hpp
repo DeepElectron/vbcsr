@@ -21,10 +21,8 @@
 #include <variant>
 #include <vector>
 
-// What backend in charge
-// 1. storage
-// 2. page/batch/slice
-// 3. vendor
+// Backend responsibilities: value storage, page/batch/slice views over that
+// storage, and vendor (MKL/AOCL) handle caching.
 
 namespace vbcsr::detail {
 
@@ -37,6 +35,8 @@ struct PageRowSpan {
     }
 };
 
+// Locate the half-open row range [row_begin, row_end) whose entries overlap
+// the page's block/NNZ window [page_begin, page_end) in the global row_ptr.
 inline PageRowSpan find_page_row_span(
     const std::vector<int>& row_ptr,
     int page_begin,
@@ -48,8 +48,7 @@ inline PageRowSpan find_page_row_span(
     return PageRowSpan{
         static_cast<int>(std::distance(row_ptr.begin(), row_begin_it)) - 1,
         static_cast<int>(std::distance(row_ptr.begin(), row_end_it))};
-} // so this function is implemented to find the index of the start and end of the page.
-// the implementation is really bad, very hard to understand.
+}
 
 template <typename EmitFn>
 void emit_page_local_row_ptr(

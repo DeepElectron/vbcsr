@@ -74,11 +74,11 @@ int main(int argc, char** argv) {
 
     // 2. Create Matrices
     using T = double;
-    BlockSpMat<T, NaiveKernel<T>> mat_A(&graph_A);
-    BlockSpMat<T, NaiveKernel<T>> mat_B(&graph_B); // Subset
-    BlockSpMat<T, NaiveKernel<T>> mat_C(&graph_C); // Different
+    BlockSpMat<T> mat_A(&graph_A);
+    BlockSpMat<T> mat_B(&graph_B); // Subset
+    BlockSpMat<T> mat_C(&graph_C); // Different
     
-    auto fill_mat = [&](BlockSpMat<T, NaiveKernel<T>>& mat, const std::vector<std::vector<int>>& adj) {
+    auto fill_mat = [&](BlockSpMat<T>& mat, const std::vector<std::vector<int>>& adj) {
         int n_owned = mat.graph->owned_global_indices.size();
         std::vector<T> block(16*16, 1.0);
         for(int i=0; i<n_owned; ++i) {
@@ -99,7 +99,7 @@ int main(int argc, char** argv) {
 
     // Case 1: Same Structure (A += alpha * A)
     {
-        BlockSpMat<T, NaiveKernel<T>> Y = mat_A.duplicate();
+        BlockSpMat<T> Y = mat_A.duplicate();
         MPI_Barrier(MPI_COMM_WORLD);
         if (rank == 0) std::cout << "\n--- Case 1: Same Structure ---" << std::endl;
         {
@@ -110,7 +110,7 @@ int main(int argc, char** argv) {
     
     // Case 2: X Subgraph of Y (A += alpha * B) -> B is subset of A
     {
-        BlockSpMat<T, NaiveKernel<T>> Y = mat_A.duplicate();
+        BlockSpMat<T> Y = mat_A.duplicate();
         MPI_Barrier(MPI_COMM_WORLD);
         if (rank == 0) std::cout << "\n--- Case 2: X Subgraph of Y ---" << std::endl;
         {
@@ -121,7 +121,7 @@ int main(int argc, char** argv) {
     
     // Case 3: Y Subgraph of X (B += alpha * A) -> B grows to A
     {
-        BlockSpMat<T, NaiveKernel<T>> Y = mat_B.duplicate();
+        BlockSpMat<T> Y = mat_B.duplicate();
         MPI_Barrier(MPI_COMM_WORLD);
         if (rank == 0) std::cout << "\n--- Case 3: Y Subgraph of X ---" << std::endl;
         {
@@ -132,7 +132,7 @@ int main(int argc, char** argv) {
     
     // Case 4: Different Graphs (A += alpha * C) -> Union
     {
-        BlockSpMat<T, NaiveKernel<T>> Y = mat_A.duplicate();
+        BlockSpMat<T> Y = mat_A.duplicate();
         MPI_Barrier(MPI_COMM_WORLD);
         if (rank == 0) std::cout << "\n--- Case 4: Different Graphs (Union) ---" << std::endl;
         {

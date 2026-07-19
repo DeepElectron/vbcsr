@@ -49,6 +49,7 @@ int main(int argc, char** argv) {
     // Ghost data starts at v.local_size
     // Map: ghost_global_indices[k] -> local index local_size + k
     
+    int failures = 0;
     bool passed = true;
     for (int i = 0; i < graph.ghost_global_indices.size(); ++i) {
         int gid = graph.ghost_global_indices[i];
@@ -103,6 +104,7 @@ int main(int argc, char** argv) {
             std::cout << "Rank " << rank << " Failed DistVector check." << std::endl;
             std::cout << "Got " << v[2] << ", " << v[3] << std::endl;
             passed = false;
+            failures++;
         }
     }
     
@@ -112,10 +114,9 @@ int main(int argc, char** argv) {
     DistMultiVector<std::complex<double>> mv(&graph, 2);
     // Fill
     for (int c = 0; c < 2; ++c) {
-        std::complex<double>* col = mv.col_data(c);
         for (int i = 0; i < mv.local_rows; ++i) {
             double val = (rank * 2 + i + 1) + c * 10;
-            col[i] = std::complex<double>(val, val);
+            mv(i, c) = std::complex<double>(val, val);
         }
     }
     
@@ -126,16 +127,15 @@ int main(int argc, char** argv) {
     // Rank 0, Col 1: Ghost (13+13i, 14+14i)
     
     if (rank == 0) {
-        std::complex<double>* col0 = mv.col_data(0);
-        std::complex<double>* col1 = mv.col_data(1);
-        
-        if (col0[2] != std::complex<double>(3,3) || col0[3] != std::complex<double>(4,4)) {
+        if (mv(2, 0) != std::complex<double>(3,3) || mv(3, 0) != std::complex<double>(4,4)) {
              std::cout << "Rank 0 Failed DistMultiVector Col 0 check." << std::endl;
              passed = false;
+             failures++;
         }
-        if (col1[2] != std::complex<double>(13,13) || col1[3] != std::complex<double>(14,14)) {
+        if (mv(2, 1) != std::complex<double>(13,13) || mv(3, 1) != std::complex<double>(14,14)) {
              std::cout << "Rank 0 Failed DistMultiVector Col 1 check." << std::endl;
              passed = false;
+             failures++;
         }
     }
     
@@ -155,6 +155,7 @@ int main(int argc, char** argv) {
         if (std::abs(dot_val - 8.0) > 1e-12) {
              std::cout << "Dot Product Failed. Expected 8.0, got " << dot_val << std::endl;
              passed = false;
+             failures++;
         } else {
              std::cout << "Dot Product PASSED" << std::endl;
         }
@@ -167,6 +168,7 @@ int main(int argc, char** argv) {
         if (d2[i] != std::complex<double>(1, -1)) {
             std::cout << "Rank " << rank << " Conjugate Failed." << std::endl;
             passed = false;
+            failures++;
         }
     }
     if (passed && rank == 0) std::cout << "Conjugate PASSED" << std::endl;
@@ -177,9 +179,8 @@ int main(int argc, char** argv) {
     DistMultiVector<std::complex<double>> mv2(&graph, 2);
     // Fill with (1,1)
     for (int c = 0; c < 2; ++c) {
-        std::complex<double>* col = mv2.col_data(c);
         for (int i = 0; i < mv2.local_rows; ++i) {
-            col[i] = std::complex<double>(1, 1);
+            mv2(i, c) = std::complex<double>(1, 1);
         }
     }
     
@@ -192,9 +193,13 @@ int main(int argc, char** argv) {
         if (std::abs(dots[1] - 8.0) > 1e-12) bdot_passed = false;
         
         if (bdot_passed) std::cout << "bdot PASSED" << std::endl;
-        else std::cout << "bdot FAILED: " << dots[0] << ", " << dots[1] << std::endl;
+        else { std::cout << "bdot FAILED: " << dots[0] << ", " << dots[1] << std::endl; failures++; }
     }
 
+    // Propagate failures across ranks so any rank failing fails all ranks
+    int global_failures = 0;
+    MPI_Allreduce(&failures, &global_failures, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+
     MPI_Finalize();
-    return 0;
+    return global_failures > 0 ? 1 : 0;
 }

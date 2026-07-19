@@ -8,7 +8,7 @@
 using namespace vbcsr;
 
 // Helper to check equality
-bool check_value(const BlockSpMat<double, NaiveKernel<double>>& mat, 
+bool check_value(const BlockSpMat<double>& mat, 
                  int global_row, int global_col, double expected_val,
                  double tol = 1e-12) {
     
@@ -46,7 +46,8 @@ int main(int argc, char** argv) {
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
-    
+    int failures = 0;
+
     // if (size < 2) {
     //     if (rank == 0) std::cout << "This test requires at least 2 ranks." << std::endl;
     //     MPI_Finalize();
@@ -129,8 +130,8 @@ int main(int argc, char** argv) {
     }
     
     // Create Matrices
-    BlockSpMat<double, NaiveKernel<double>> A(&graph_A);
-    BlockSpMat<double, NaiveKernel<double>> B(&graph_B);
+    BlockSpMat<double> A(&graph_A);
+    BlockSpMat<double> B(&graph_B);
     
     if (rank == 0) {
         // A: (0,0)=1.0, (0,1)=2.0
@@ -161,24 +162,31 @@ int main(int argc, char** argv) {
         A.axpy(1.0, B);
     } catch (const std::exception& e) {
         std::cout << "Exception during axpy: " << e.what() << std::endl;
+        failures++;
     }
-    
+
     if (rank == 0) {
         bool pass = true;
-        if (!check_value(A, 0, 0, 11.0)) pass = false;
+        if (!check_value(A, 0, 0, 11.0)) {
+            pass = false;
+            failures++;
+        }
         if (!check_value(A, 0, 1, 2.0)) {
             std::cout << "FAILURE: A(0,1) corrupted!" << std::endl;
             pass = false;
+            failures++;
         }
         if (!check_value(A, 0, 2, 20.0)) {
             std::cout << "FAILURE: A(0,2) missing or wrong!" << std::endl;
             pass = false;
+            failures++;
         }
-        
+
         if (pass) std::cout << "Test PASSED" << std::endl;
         else std::cout << "Test FAILED" << std::endl;
     }
-    
+
+    MPI_Allreduce(MPI_IN_PLACE, &failures, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
     MPI_Finalize();
-    return 0;
+    return failures > 0 ? 1 : 0;
 }

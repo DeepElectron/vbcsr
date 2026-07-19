@@ -35,7 +35,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < n_owned; ++i) {
         int gid = graph_S.owned_global_indices[i];
         double val = (double)(gid + 1);
-        S.add_block(gid, gid, &val, 1, 1, AssemblyMode::INSERT, MatrixLayout::ColMajor);
+        S.add_block(gid, gid, &val, 1, 1, AssemblyMode::INSERT, MatrixLayout::RowMajor);
     }
     S.assemble();
 
@@ -43,14 +43,14 @@ int main(int argc, char** argv) {
     BlockSpMat<double> S_exp(&graph_S);
     auto func = [](double x) { return std::exp(-x); };
     
-    graph_matrix_function(S, &S_exp, std::function<double(double)>(func), "dense", true);
+    graph_matrix_function(S, &S_exp, std::function<double(double)>(func), true);
     
     // 4. Verify: S_exp should be diag(exp(-1), exp(-2), ...)
     // Since S is diagonal, the result should be diagonal (approximately, due to numerical noise/method)
     // Actually, graph_matrix_function uses subgraph method which might introduce some off-diagonal elements 
     // if the subgraph includes neighbors. But here the graph is 1D chain, so neighbors are included.
     // However, for a diagonal matrix, the eigenvectors are standard basis vectors, so any function of it is diagonal.
-    // The Lanczos method should respect this.
+    // The subgraph dense diagonalization respects this.
     
     double max_err = 0.0;
     
@@ -101,12 +101,19 @@ int main(int argc, char** argv) {
     double global_max_err;
     MPI_Reduce(&max_err, &global_max_err, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     
+    int failures = 0;
     if (rank == 0) {
         std::cout << "  Verification (Diagonal exp(-x)) Max Error: " << global_max_err << std::endl;
-        if (global_max_err > 1e-4) std::cout << "  FAILED" << std::endl;
+        if (global_max_err > 1e-4) {
+            std::cout << "  FAILED" << std::endl;
+            failures++;
+        }
         else std::cout << "  PASSED" << std::endl;
     }
 
+    int global_failures = 0;
+    MPI_Allreduce(&failures, &global_failures, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+
     MPI_Finalize();
-    return 0;
+    return global_failures > 0 ? 1 : 0;
 }

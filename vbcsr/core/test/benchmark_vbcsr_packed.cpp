@@ -3,7 +3,6 @@
 #include <chrono>
 #include <cmath>
 #include <iostream>
-#include <set>
 #include <vector>
 
 using namespace vbcsr;
@@ -79,12 +78,12 @@ int main(int argc, char** argv) {
             const int rows = block_sizes[row];
             const int cols = block_sizes[col];
             std::vector<double> block(static_cast<size_t>(rows) * cols);
-            for (int c = 0; c < cols; ++c) {
-                for (int r = 0; r < rows; ++r) {
-                    block[static_cast<size_t>(c) * rows + r] = block_value(row, col, r, c);
+            for (int r = 0; r < rows; ++r) {
+                for (int c = 0; c < cols; ++c) {
+                    block[static_cast<size_t>(r) * cols + c] = block_value(row, col, r, c);
                 }
             }
-            matrix.add_block(row, col, block.data(), rows, cols, AssemblyMode::INSERT, MatrixLayout::ColMajor);
+            matrix.add_block(row, col, block.data(), rows, cols, AssemblyMode::INSERT, MatrixLayout::RowMajor);
         }
     }
     matrix.assemble();
@@ -95,38 +94,19 @@ int main(int argc, char** argv) {
     }
 
     DistMultiVector<double> X(&graph, n_vecs);
+    // Row-major storage: element (row, vec) at data[row * ld + vec].
+    const int x_total_rows = X.local_rows + X.ghost_rows;
     for (int vec = 0; vec < n_vecs; ++vec) {
-        for (size_t i = 0; i < X.data.size() / static_cast<size_t>(n_vecs); ++i) {
-            X.data[static_cast<size_t>(vec) * (X.data.size() / static_cast<size_t>(n_vecs)) + i] =
-                std::sin(0.02 * static_cast<double>(i) + 0.1 * vec);
+        for (int i = 0; i < x_total_rows; ++i) {
+            X(i, vec) = std::sin(0.02 * static_cast<double>(i) + 0.1 * vec);
         }
     }
 
     DistVector<double> y(&graph);
     DistMultiVector<double> Y(&graph, n_vecs);
-    auto apply_counts = [](const auto& matrix) {
-        std::set<int> seen_shapes;
-        std::pair<size_t, size_t> counts{0, 0};
-        matrix.for_each_shape_batch([&](const auto& batch) {
-            if (seen_shapes.insert(batch.shape_id).second) {
-                counts.first += static_cast<size_t>(batch.scalar_apply_batch_count());
-                counts.second += static_cast<size_t>(batch.batched_apply_batch_count());
-            }
-        });
-        return counts;
-    };
 
-    const auto matvec_before = apply_counts(matrix);
     const double matvec_s = benchmark_seconds([&] { matrix.mult(x, y); }, n_apply_iters);
-    const auto matvec_after = apply_counts(matrix);
-    const size_t matvec_scalar = matvec_after.first - matvec_before.first;
-    const size_t matvec_batched = matvec_after.second - matvec_before.second;
-
-    const auto matmat_before = apply_counts(matrix);
     const double matmat_s = benchmark_seconds([&] { matrix.mult_dense(X, Y); }, n_apply_iters);
-    const auto matmat_after = apply_counts(matrix);
-    const size_t matmat_scalar = matmat_after.first - matmat_before.first;
-    const size_t matmat_batched = matmat_after.second - matmat_before.second;
 
     const double spmm_s = benchmark_seconds([&] {
         BlockSpMat<double> tmp = matrix.spmm_self(0.0);
@@ -138,16 +118,10 @@ int main(int argc, char** argv) {
         std::cout << "  Blocks: " << n_blocks << std::endl;
         std::cout << "  RHS vectors: " << n_vecs << std::endl;
         std::cout << "  Matrix kind: " << static_cast<int>(matrix.matrix_kind()) << std::endl;
-        std::cout << "  Batched GEMM available: " << SmartKernel<double>::supports_batched_gemm() << std::endl;
-        std::cout << "  Batched GEMV available: " << SmartKernel<double>::supports_batched_gemv() << std::endl;
-        std::cout << "  Auto-batched mult: " << (matvec_batched > 0) << std::endl;
-        std::cout << "  Auto-batched mult_dense: " << (matmat_batched > 0) << std::endl;
+        std::cout << "  Batched GEMM available: " << BLASKernel::supports_strided_gemm() << std::endl;
+        std::cout << "  Batched GEMV available: " << BLASKernel::supports_strided_gemv() << std::endl;
         std::cout << "  mult avg s: " << matvec_s << std::endl;
-        std::cout << "  mult scalar launches: " << matvec_scalar << std::endl;
-        std::cout << "  mult batched launches: " << matvec_batched << std::endl;
         std::cout << "  mult_dense avg s: " << matmat_s << std::endl;
-        std::cout << "  mult_dense scalar launches: " << matmat_scalar << std::endl;
-        std::cout << "  mult_dense batched launches: " << matmat_batched << std::endl;
         std::cout << "  spmm_self avg s: " << spmm_s << std::endl;
     }
 

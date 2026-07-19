@@ -412,6 +412,19 @@ public:
         ghost_size = total_size - local_size;
     }
 
+    // True when both graphs describe the same owned block structure: identical
+    // global block partition and identical owned block sizes. Ghost/adjacency
+    // structure may differ. block_displs is replicated on all ranks (built by
+    // Allgather), so ranks always agree on a partition mismatch — callers that
+    // throw on the partition check stay collective-safe without communication.
+    bool same_owned_structure(const DistGraph& other) const {
+        if (block_displs != other.block_displs) return false;
+        if (owned_global_indices != other.owned_global_indices) return false;
+        int n_owned = owned_global_indices.size();
+        return std::equal(block_sizes.begin(), block_sizes.begin() + n_owned,
+                          other.block_sizes.begin());
+    }
+
     // Find owner of a global block index using stored displacements
     int find_owner(int gid) const {
         if (block_displs.empty()) throw std::runtime_error("Graph not constructed");
@@ -471,8 +484,7 @@ private:
         } else {
             incoming_req_counts = req_counts;
         }
-            // tasking the rank-th element and send to rank-th process
-        
+
         // 3. Exchange the actual requests (which GIDs they want)
         std::vector<int> req_sdispls(size + 1, 0);
         std::vector<int> req_rdispls(size + 1, 0);
@@ -575,7 +587,6 @@ private:
     }
     
     void fetch_ghost_block_sizes(const std::vector<int>& displ) {
-        // std::cerr << "fetch_ghost_block_sizes called. n_ghosts: " << ghost_global_indices.size() << std::endl;
         // Similar to build_comm_pattern, but we exchange block sizes
         // 1. Identify owners of ghosts
         int n_ghosts = ghost_global_indices.size();
@@ -648,7 +659,6 @@ private:
                     int gid = ghosts_by_rank[i][k];
                     int recv_size = resp_recv_buf[offset + k];
                     int lid = global_to_local[gid];
-                    // std::cerr << "[DEBUG] Rank " << rank << " filling ghost GID " << gid << " (lid=" << lid << ") with size " << recv_size << " from resp_recv_buf[" << (offset + k) << "]" << std::endl;
                     block_sizes[lid] = recv_size;
                 }
             }

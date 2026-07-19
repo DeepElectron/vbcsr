@@ -349,7 +349,7 @@ bool build_csr_mkl_mm_variant(
             raw_handle,
             SPARSE_OPERATION_NON_TRANSPOSE,
             descr,
-            SPARSE_LAYOUT_COLUMN_MAJOR,
+            SPARSE_LAYOUT_ROW_MAJOR,
             static_cast<MKL_INT>(num_rhs),
             1) != SPARSE_STATUS_SUCCESS) {
         destroy_mkl_sparse_handle(raw_handle);
@@ -359,7 +359,7 @@ bool build_csr_mkl_mm_variant(
             raw_handle,
             mkl_adjoint_operation<T>(),
             descr,
-            SPARSE_LAYOUT_COLUMN_MAJOR,
+            SPARSE_LAYOUT_ROW_MAJOR,
             static_cast<MKL_INT>(num_rhs),
             1) != SPARSE_STATUS_SUCCESS) {
         destroy_mkl_sparse_handle(raw_handle);

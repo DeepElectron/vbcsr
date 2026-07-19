@@ -193,9 +193,10 @@ Inserts a submatrix back into the matrix. For distributed matrices this operatio
 
 #### `spmf`
 ```python
-spmf(self, func_name: str, method: str = "lanczos", verbose: bool = False) -> 'VBCSR'
+spmf(self, func_name: str, verbose: bool = False) -> 'VBCSR'
 ```
-Applies a supported sparse matrix function approximation and returns a matrix in the same backend family.
+Applies a supported sparse matrix function approximation (per-subgraph dense
+diagonalization) and returns a matrix in the same backend family.
 
 #### `to_dense`
 ```python
@@ -363,7 +364,7 @@ Reduces (sums) ghost elements back to their owners.
 
 ## DistMultiVector
 
-Represents a distributed collection of vectors (2D, column-major).
+Represents a distributed collection of vectors (2D, row-major; `to_numpy()` returns a C-contiguous array).
 
 ### Properties
 - **`shape`**: `Tuple[int, int]` - Global shape `(rows, cols)`.

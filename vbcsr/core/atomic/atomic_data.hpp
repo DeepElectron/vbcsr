@@ -64,12 +64,6 @@ public:
     MPI_Comm comm=MPI_COMM_WORLD;
     int rank=0, size=1;
 
-private:
-    // Internal struct for passing edge data during construction
-    // struct EdgeInfo { int src, dst, rx, ry, rz; }; // Removed, use Edge instead
-
-
-public:
     AtomicData(DistGraph* g) : graph(g), own_graph(false) {
         comm = graph->comm;
         int initialized = 0;
@@ -418,19 +412,24 @@ public:
         std::vector<int> all_types(total); for (int g = 0; g < total; ++g) all_types[g] = z2t[all_z[g]];
         std::vector<int> type_norb = type_norb_in;
         if (type_norb.empty()) type_norb.assign(uz.size(), 1);
+        else if (type_norb.size() < uz.size()) type_norb.resize(uz.size(), type_norb.back());
+        // Same undersized-cutoff padding as process_input_rank0.
+        std::vector<double> r_max_type = r_max_per_type;
+        if (r_max_type.empty()) r_max_type.assign(uz.size(), 0.0);
+        else if (r_max_type.size() < uz.size()) r_max_type.resize(uz.size(), r_max_type.back());
         std::vector<int> my_types(my_n); for (int li = 0; li < my_n; ++li) my_types[li] = all_types[my_offset + li];
 
         // 4. Edges of MY owned atoms (NeighborList over all positions; same cutoff
         //    + distance test as process_input_rank0, so the graph is identical to
         //    from_points for the same geometry). r_edges: 5 ints {gi, gj, rx, ry, rz}.
-        double max_r = 0; for (double r : r_max_per_type) max_r = std::max(max_r, r);
+        double max_r = 0; for (double r : r_max_type) max_r = std::max(max_r, r);
         NeighborList nl; nl.build(all_pos, cell, pbc, max_r * 2.0);
         std::vector<int> r_edges;
         for (int li = 0; li < my_n; ++li) {
             const int gi = my_offset + li, ti = all_types[gi];
             for (const auto& nb : nl.get_neighbors(gi)) {
                 const int gj = nb.index, tj = all_types[gj];
-                const double rc = r_max_per_type[ti] + r_max_per_type[tj];
+                const double rc = r_max_type[ti] + r_max_type[tj];
                 const double dx = all_pos[3 * gj]     - all_pos[3 * gi]     + nb.rx * cell[0] + nb.ry * cell[3] + nb.rz * cell[6];
                 const double dy = all_pos[3 * gj + 1] - all_pos[3 * gi + 1] + nb.rx * cell[1] + nb.ry * cell[4] + nb.rz * cell[7];
                 const double dz = all_pos[3 * gj + 2] - all_pos[3 * gi + 2] + nb.rx * cell[2] + nb.ry * cell[5] + nb.rz * cell[8];
@@ -1138,11 +1137,8 @@ private:
             local_infos[i] = {code, rank, i};
         }
         
-        // 3. Gather all info to Rank 0
-        // AtomInfo is POD? Need to be careful with struct layout.
-        // It's 8 (uint64) + 4 (int) + 4 (int) = 16 bytes.
-        // Use MPI_BYTE to transfer.
-        
+        // 3. Gather all info to Rank 0. AtomInfo is a 16-byte POD
+        // (uint64 + 2 ints), transferred as raw MPI_BYTE.
         std::vector<int> recv_counts(size);
         int local_bytes = my_n_atom * sizeof(AtomInfo);
         if (initialized) {
@@ -1167,34 +1163,19 @@ private:
         }
                     
         // 4. Sort and Assign (Rank 0)
-        std::vector<std::vector<int>> assignments; // [target_rank] -> vector of assignements (but need order)
-        // Better: [original_rank] -> vector of assignments, ordered by local_idx?
-        // No, we gathered arbitrarily.
-        // Let's store assignments for each rank as a vector of pairs (local_idx, assigned_part)
-        // Or simpler: We know the gathered buffer is ordered by rank blocks: Rank 0 block, Rank 1 block...
-        // But local_infos inside block are ordered by i=0..my_n_atom-1.
-        // So if we just send back a vector of ints `assigned_parts` for each rank, in the same order, it works.
-        
-        std::vector<int> parts_to_send; // Flat buffer to scatter back? No, variable size.
-        
-        // We will construct `std::vector<int> rank_parts` for each rank, update them based on sorted order.
+        // Each AtomInfo carries its (original rank, original local index), so the
+        // gathered buffer can be sorted freely and the assignments written back
+        // into per-rank vectors ordered by local index, then scattered.
         std::vector<std::vector<int>> per_rank_parts(size);
         if (rank == 0) {
             // First, initialize vectors with correct size
             for(int i=0; i<size; ++i) {
                 per_rank_parts[i].resize(recv_counts[i] / sizeof(AtomInfo));
             }
-            
-            // Create a vector of pointers or just copy required data for sorting
-            // We need to carry (original_rank, original_local_index) to fill per_rank_parts.
-            // Casting recv_buf back to AtomInfo
+
             AtomInfo* all_data = (AtomInfo*)recv_buf.data();
             int total_atoms = displs[size] / sizeof(AtomInfo);
-            
-            // We want to sort all_data but we can't shuffle the blocks if we rely on block order for implicit indexing.
-            // But we have (rank, local_idx) explicitly in AtomInfo.
-            // So we can copy valid data to a vector, sort it, and then use (rank, local_idx) to fill `per_rank_parts`.
-            
+
             std::vector<AtomInfo> global_infos(all_data, all_data + total_atoms);
             std::sort(global_infos.begin(), global_infos.end());
             
@@ -1274,10 +1255,17 @@ private:
         for(int i=0; i<n_global; ++i) atom_types[i] = z_to_type[z[i]];
         
         if (type_norb.empty()) type_norb.assign(n_types, 1);
-        
+        else if ((int)type_norb.size() < n_types) type_norb.resize(n_types, type_norb.back());
+
+        // Callers may pass fewer cutoffs than types (e.g. one uniform cutoff);
+        // pad with the last entry so per-type lookups stay in bounds.
+        std::vector<double> r_max_type = r_max_per_type;
+        if (r_max_type.empty()) r_max_type.assign(n_types, 0.0);
+        else if ((int)r_max_type.size() < n_types) r_max_type.resize(n_types, r_max_type.back());
+
         // 1.2 NeighborList
         double max_r = 0;
-        for(double r : r_max_per_type) max_r = std::max(max_r, r);
+        for(double r : r_max_type) max_r = std::max(max_r, r);
         NeighborList nl;
         nl.build(pos, cell, pbc, max_r * 2.0); 
         
@@ -1353,7 +1341,7 @@ private:
                 int inter_j = old_to_inter_gid[old_j];
                 int type_j = atom_types[old_j];
                 
-                double r_cut = r_max_per_type[type_i] + r_max_per_type[type_j];
+                double r_cut = r_max_type[type_i] + r_max_type[type_j];
                 
                 double dx = pos[3*old_j] - pos[3*old_i] + n.rx*cell[0] + n.ry*cell[3] + n.rz*cell[6];
                 double dy = pos[3*old_j+1] - pos[3*old_i+1] + n.rx*cell[1] + n.ry*cell[4] + n.rz*cell[7];

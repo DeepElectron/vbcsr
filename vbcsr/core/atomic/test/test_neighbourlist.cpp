@@ -1,3 +1,6 @@
+// Test assertions must stay active in Release builds.
+#undef NDEBUG
+
 #include "../neighbourlist.hpp"
 #include <iostream>
 #include <vector>

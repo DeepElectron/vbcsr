@@ -45,7 +45,7 @@ def test_spmf_diagonal():
     # 2. Compute exp(S)
     if rank == 0:
         print("  Computing exp(S)...")
-    mat_exp = mat.spmf("exp", method="dense", verbose=False)
+    mat_exp = mat.spmf("exp", verbose=False)
     
     # 3. Verify
     local_dense = mat_exp.to_dense()

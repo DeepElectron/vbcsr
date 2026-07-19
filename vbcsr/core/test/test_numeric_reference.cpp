@@ -1,3 +1,6 @@
+// Test assertions must stay active in Release builds.
+#undef NDEBUG
+
 #include "../block_csr.hpp"
 
 #include <algorithm>
@@ -377,10 +380,31 @@ void load_vector(DistVector<T>& vec, const std::vector<T>& values) {
     std::copy(values.begin(), values.end(), vec.data.begin());
 }
 
+// `values` is the legacy column-major flat layout with leading dimension
+// local_rows + ghost_rows; load it through the (row, vec) accessor.
 template <typename T>
 void load_multivector(DistMultiVector<T>& mv, const std::vector<T>& values) {
-    assert(mv.data.size() == values.size());
-    std::copy(values.begin(), values.end(), mv.data.begin());
+    const int n_rows = mv.local_rows + mv.ghost_rows;
+    assert(static_cast<size_t>(n_rows) * mv.num_vectors == values.size());
+    for (int vec = 0; vec < mv.num_vectors; ++vec) {
+        for (int row = 0; row < n_rows; ++row) {
+            mv(row, vec) = values[static_cast<size_t>(vec) * n_rows + row];
+        }
+    }
+}
+
+// Snapshot of a DistMultiVector in the legacy column-major flat layout
+// (leading dimension = local_rows + ghost_rows) for reference comparisons.
+template <typename T>
+std::vector<T> multivector_col_major(const DistMultiVector<T>& mv) {
+    const int n_rows = mv.local_rows + mv.ghost_rows;
+    std::vector<T> out(static_cast<size_t>(n_rows) * mv.num_vectors, T(0));
+    for (int vec = 0; vec < mv.num_vectors; ++vec) {
+        for (int row = 0; row < n_rows; ++row) {
+            out[static_cast<size_t>(vec) * n_rows + row] = mv(row, vec);
+        }
+    }
+    return out;
 }
 
 template <typename T>
@@ -437,14 +461,14 @@ void run_reference_suite(const MatrixProfile& profile) {
     DistMultiVector<T> y_multi(a.matrix.graph, num_vecs);
     load_multivector(x_multi, multi_values);
     a.matrix.mult_dense(x_multi, y_multi);
-    assert_close(y_multi.data, dense_matmat(a.dense, rows, rows, multi_values, num_vecs));
+    assert_close(multivector_col_major(y_multi), dense_matmat(a.dense, rows, rows, multi_values, num_vecs));
 
     const std::vector<T> multi_adj_values = controlled_random_vector<T>(rows * num_vecs, 707);
     DistMultiVector<T> x_multi_adj(a.matrix.graph, num_vecs);
     DistMultiVector<T> y_multi_adj(a.matrix.graph, num_vecs);
     load_multivector(x_multi_adj, multi_adj_values);
     a.matrix.mult_dense_adjoint(x_multi_adj, y_multi_adj);
-    assert_close(y_multi_adj.data, dense_matmat_adjoint(a.dense, rows, rows, multi_adj_values, num_vecs));
+    assert_close(multivector_col_major(y_multi_adj), dense_matmat_adjoint(a.dense, rows, rows, multi_adj_values, num_vecs));
 
     BlockSpMat<T> transposed = a.matrix.transpose();
     assert(transposed.matrix_kind() == profile.kind);

@@ -9,7 +9,7 @@ class DistMultiVector:
     Distributed multi-vector class wrapping the C++ DistMultiVector.
     
     Represents a collection of vectors (columns) distributed across MPI ranks.
-    Stored in column-major format.
+    Stored in row-major format with a padded leading dimension.
     """
     
     def __init__(self, core_obj: Any, comm: Any = None):
@@ -79,7 +79,7 @@ class DistMultiVector:
         Returns:
             np.ndarray: A 2D array of shape (local_rows, num_vectors).
         """
-        # Buffer is (rows, cols) F-contiguous
+        # Buffer is (rows, cols), row-major (strided over padding lanes)
         return self._local_buffer()
 
     def from_numpy(self, arr: np.ndarray) -> None:

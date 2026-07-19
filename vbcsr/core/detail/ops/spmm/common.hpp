@@ -5,6 +5,7 @@
 #include "../../distributed/mpi_utils.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <set>
@@ -21,6 +22,21 @@ struct BlockMeta {
 };
 
 namespace detail {
+
+// SpGEMM results ship with the vendor's export order inside each row by
+// default: no library consumer requires a matrix's own adjacency sorted
+// (every lower_bound/binary_search target is a separately constructed,
+// sorted-by-construction structure — audited in the migration plan Phase 5
+// record), and the Python to_scipy boundary sorts scipy-side. Set
+// VBCSR_SPGEMM_SORTED=1 to restore sorted-column output (per-row packed-key
+// sort in the copy-out; still far cheaper than mkl_sparse_order).
+inline bool spgemm_sorted_output_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("VBCSR_SPGEMM_SORTED");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
 
 struct SymbolicMultiplyResult {
     std::vector<int> c_row_ptr;

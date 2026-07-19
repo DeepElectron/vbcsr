@@ -56,9 +56,6 @@ struct BSRVendorBatchEntry {
     BSRPageBatch<const T> batch;
 
 #ifdef VBCSR_HAVE_MKL_BSR_SPARSE
-    std::vector<MKL_INT> mm_rows_start_one;
-    std::vector<MKL_INT> mm_rows_end_one;
-    std::vector<MKL_INT> mm_cols_one;
     BSRVendorMKLHandle mkl;
 #endif
 
@@ -70,10 +67,7 @@ struct BSRVendorBatchEntry {
         : row_block_offsets_storage(std::move(other.row_block_offsets_storage)),
           batch(other.batch)
 #ifdef VBCSR_HAVE_MKL_BSR_SPARSE
-          , mm_rows_start_one(std::move(other.mm_rows_start_one)),
-          mm_rows_end_one(std::move(other.mm_rows_end_one)),
-          mm_cols_one(std::move(other.mm_cols_one)),
-          mkl(std::move(other.mkl))
+          , mkl(std::move(other.mkl))
 #endif
     {
         batch.row_block_offsets =
@@ -85,9 +79,6 @@ struct BSRVendorBatchEntry {
             row_block_offsets_storage = std::move(other.row_block_offsets_storage);
             batch = other.batch;
 #ifdef VBCSR_HAVE_MKL_BSR_SPARSE
-            mm_rows_start_one = std::move(other.mm_rows_start_one);
-            mm_rows_end_one = std::move(other.mm_rows_end_one);
-            mm_cols_one = std::move(other.mm_cols_one);
             mkl = std::move(other.mkl);
 #endif
             batch.row_block_offsets =
@@ -130,7 +121,6 @@ bool build_bsr_mkl_mv_handle(
     }
 
     sparse_matrix_t raw_handle = nullptr;
-    destroy_mkl_sparse_handle(raw_handle);
 
     sparse_status_t status = SPARSE_STATUS_NOT_SUPPORTED;
     const MKL_INT rows = static_cast<MKL_INT>(batch.row_count());
@@ -144,7 +134,7 @@ bool build_bsr_mkl_mv_handle(
         status = mkl_sparse_d_create_bsr(
             &raw_handle,
             SPARSE_INDEX_BASE_ZERO,
-            SPARSE_LAYOUT_COLUMN_MAJOR,
+            SPARSE_LAYOUT_ROW_MAJOR,
             rows,
             cols,
             mkl_block_size,
@@ -156,7 +146,7 @@ bool build_bsr_mkl_mv_handle(
         status = mkl_sparse_z_create_bsr(
             &raw_handle,
             SPARSE_INDEX_BASE_ZERO,
-            SPARSE_LAYOUT_COLUMN_MAJOR,
+            SPARSE_LAYOUT_ROW_MAJOR,
             rows,
             cols,
             mkl_block_size,
@@ -215,21 +205,27 @@ bool build_bsr_mkl_mm_variant(
     }
 
     sparse_matrix_t raw_handle = nullptr;
-    destroy_mkl_sparse_handle(raw_handle);
 
     sparse_status_t status = SPARSE_STATUS_NOT_SUPPORTED;
     const MKL_INT rows = static_cast<MKL_INT>(batch.row_count());
     const MKL_INT cols = static_cast<MKL_INT>(num_block_cols);
     const MKL_INT mkl_block_size = static_cast<MKL_INT>(batch.block_size);
-    auto* row_begin = const_cast<MKL_INT*>(entry.mm_rows_start_one.data());
-    auto* row_end = const_cast<MKL_INT*>(entry.mm_rows_end_one.data());
-    auto* col_index = const_cast<MKL_INT*>(entry.mm_cols_one.data());
+    // Zero-based indexing, same arrays as the mv handle. MKL's BSR mm with a
+    // row-major dense operand supports exactly the (row-major blocks,
+    // zero-based) and (column-major blocks, one-based) pairings — measured on
+    // this MKL build; the other two combinations return NOT_SUPPORTED at
+    // apply time. Canonical block storage is row-major (Phase 4), so the mm
+    // handles must be zero-based (the pre-flip code kept one-based copies for
+    // the column-major pairing).
+    auto* row_begin = reinterpret_cast<MKL_INT*>(const_cast<int*>(batch.row_block_offsets));
+    auto* row_end = row_begin + 1;
+    auto* col_index = reinterpret_cast<MKL_INT*>(const_cast<int*>(batch.cols));
 
     if constexpr (std::is_same_v<T, double>) {
         status = mkl_sparse_d_create_bsr(
             &raw_handle,
-            SPARSE_INDEX_BASE_ONE,
-            SPARSE_LAYOUT_COLUMN_MAJOR,
+            SPARSE_INDEX_BASE_ZERO,
+            SPARSE_LAYOUT_ROW_MAJOR,
             rows,
             cols,
             mkl_block_size,
@@ -240,8 +236,8 @@ bool build_bsr_mkl_mm_variant(
     } else if constexpr (std::is_same_v<T, std::complex<double>>) {
         status = mkl_sparse_z_create_bsr(
             &raw_handle,
-            SPARSE_INDEX_BASE_ONE,
-            SPARSE_LAYOUT_COLUMN_MAJOR,
+            SPARSE_INDEX_BASE_ZERO,
+            SPARSE_LAYOUT_ROW_MAJOR,
             rows,
             cols,
             mkl_block_size,
@@ -260,11 +256,13 @@ bool build_bsr_mkl_mm_variant(
     }
 
     const matrix_descr descr = make_mkl_descr();
+    // Dense-operand layout is ROW major (the multivector layout), matching
+    // the row-major canonical block layout above.
     if (mkl_sparse_set_mm_hint(
             raw_handle,
             SPARSE_OPERATION_NON_TRANSPOSE,
             descr,
-            SPARSE_LAYOUT_COLUMN_MAJOR,
+            SPARSE_LAYOUT_ROW_MAJOR,
             static_cast<MKL_INT>(num_rhs),
             1) != SPARSE_STATUS_SUCCESS) {
         destroy_mkl_sparse_handle(raw_handle);
@@ -333,24 +331,6 @@ void build_bsr_vendor_cache(
             switch (cache.kind) {
             case BSRVendorBackendKind::MKL:
 #ifdef VBCSR_HAVE_MKL_BSR_SPARSE
-                entry.mm_rows_start_one.resize(
-                    static_cast<size_t>(entry.batch.row_count()));
-                entry.mm_rows_end_one.resize(
-                    static_cast<size_t>(entry.batch.row_count()));
-                for (int row = 0; row < entry.batch.row_count(); ++row) {
-                    entry.mm_rows_start_one[static_cast<size_t>(row)] = static_cast<MKL_INT>(
-                        entry.batch.row_block_offsets[static_cast<size_t>(row)] + 1);
-                    entry.mm_rows_end_one[static_cast<size_t>(row)] = static_cast<MKL_INT>(
-                        entry.batch.row_block_offsets[static_cast<size_t>(row + 1)] + 1);
-                }
-
-                entry.mm_cols_one.resize(static_cast<size_t>(entry.batch.block_count));
-                for (uint32_t block_index = 0;
-                     block_index < entry.batch.block_count;
-                     ++block_index) {
-                    entry.mm_cols_one[static_cast<size_t>(block_index)] =
-                        static_cast<MKL_INT>(entry.batch.cols[block_index] + 1);
-                }
                 ok = build_bsr_mkl_mv_handle(entry.mkl, entry, num_block_cols);
 #endif
                 break;

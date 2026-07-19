@@ -5,7 +5,8 @@
 #include <vector>
 #include <mpi.h>
 #include <algorithm>
-#include <numeric>
+#include <cstring>
+#include <map>
 
 namespace vbcsr {
 
@@ -30,8 +31,8 @@ struct DistCSR {
     DistCSR() = default;
 };
 
-template <typename T, typename Kernel>
-DistCSR<T> convert_to_csr(const BlockSpMat<T, Kernel>& mat) {
+template <typename T>
+DistCSR<T> convert_to_csr(const BlockSpMat<T>& mat) {
     DistCSR<T> csr;
     csr.comm = mat.graph->comm;
     const auto& row_ptr = mat.row_ptr();
@@ -194,13 +195,10 @@ DistCSR<T> convert_to_csr(const BlockSpMat<T, Kernel>& mat) {
             int col_blk = col_ind[k]; // local index of block
             int c_dim = block_sizes[col_blk];
             const T* data = mat.block_data(k);
-            
-            // Check non-zeros in block
-            // Assume dense blocks are fully non-zero for now, OR check explicit zeros?
-            // Usually in BlockSparse, we treat the whole block as structural non-zeros.
-            // But for PARDISO efficiency, we might want to drop explicit zeros?
-            // Standard CSR conversion usually keeps stored values.
-            
+
+            // Every stored block is treated as fully dense: all r_dim x c_dim
+            // values become structural nonzeros (standard CSR conversion keeps
+            // stored values, explicit zeros included).
             for (int r = 0; r < r_dim; ++r) {
                  row_nnz[start_row + r] += c_dim;
             }
@@ -228,13 +226,9 @@ DistCSR<T> convert_to_csr(const BlockSpMat<T, Kernel>& mat) {
         int blk_start = row_ptr[i];
         int blk_end = row_ptr[i+1];
         
-        // Sort blocks by column index? 
-        // VBCSR col_ind is sorted by local block ID?
-        // No, adj_ind in graph is sorted by LocalID, which usually doesn't mean GlobalID sorted.
-        // PARDISO requires column indices to be sorted within each row.
-        // We need to fetch blocks in Global Column order.
-        
-        // Let's collect blocks for this row block
+        // adj_ind is sorted by local block ID, which does not imply global
+        // column order. PARDISO requires sorted column indices within each
+        // row, so collect this row's blocks and sort by global column start.
         struct BlockInfo {
             int col_blk_idx;
             int global_scalar_start;
@@ -267,17 +261,19 @@ DistCSR<T> convert_to_csr(const BlockSpMat<T, Kernel>& mat) {
         // Fill
         for (const auto& blk : row_blocks) {
             int c_dim = blk.c_dim;
-            
+
             for (int r = 0; r < r_dim; ++r) {
                 int row_idx = start_row + r;
                 int base_ptr = csr.row_ptr[row_idx] + row_nnz[row_idx];
-                
+
                 for (int c = 0; c < c_dim; ++c) {
                     csr.col_ind[base_ptr + c] = blk.global_scalar_start + c;
-                    // VBCSR is ColMajor
-                    // value is data[c * r_dim + r]
-                    csr.values[base_ptr + c] = blk.data[c * r_dim + r];
                 }
+                // Canonical row-major block: one contiguous copy per block row.
+                std::memcpy(
+                    csr.values.data() + base_ptr,
+                    blk.data + static_cast<size_t>(r) * c_dim,
+                    static_cast<size_t>(c_dim) * sizeof(T));
                 row_nnz[row_idx] += c_dim;
             }
         }

@@ -422,8 +422,8 @@ void bind_atomic_module(py::module& m) {
         // 2-body edges PLUS all (j, k) pairs for which there is some atom i with
         // |R_ij| <= r_max_left[type_i] + r_max_right[type_j] and the same for
         // (i, k). Required by 3-center operators like Vnl =
-        // Sum_K |beta_K> D_K <beta_K|.  See
-        // ``vbcsr/core/atomic/atomic_data.hpp:632`` and the rsatb backend
+        // Sum_K |beta_K> D_K <beta_K|.  See ``AtomicData::get_graph3b`` in
+        // ``vbcsr/core/atomic/atomic_data.hpp`` and the rsatb backend
         // ``operator_construction.hpp::velocity_graph`` for the canonical use.
         .def("get_graph3b", [](AtomicData& self, py::object r_max_left, py::object r_max_right) {
                 auto to_double_vec = [](py::object obj, const char* label) {

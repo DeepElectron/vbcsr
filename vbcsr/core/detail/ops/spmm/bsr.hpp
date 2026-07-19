@@ -44,31 +44,10 @@ struct BSRSpMMExecutor {
         const T* a_block,
         const T* b_block,
         T* dest) {
-        if constexpr (BlockSize == 0) {
-            SmartKernel<T>::gemm(
-                runtime_block_size,
-                runtime_block_size,
-                runtime_block_size,
-                T(1),
-                a_block,
-                runtime_block_size,
-                b_block,
-                runtime_block_size,
-                T(1),
-                dest,
-                runtime_block_size);
-        } else {
-            FixedBlockKernel<T, BlockSize, BlockSize>::gemm(
-                BlockSize,
-                a_block,
-                BlockSize,
-                b_block,
-                BlockSize,
-                dest,
-                BlockSize,
-                T(1),
-                T(1));
-        }
+        // dest += a_block * b_block, all bs x bs blocks in canonical
+        // row-major storage.
+        const int bs = BlockSize == 0 ? runtime_block_size : BlockSize;
+        rowmajor_kernels::rm_gemm<T>(bs, bs, bs, a_block, b_block, bs, dest, bs);
     }
 
     static Matrix run(const Matrix& A, const Matrix& B, double threshold) {
@@ -203,7 +182,7 @@ private:
             status = mkl_sparse_d_create_bsr(
                 &out_handle,
                 SPARSE_INDEX_BASE_ZERO,
-                SPARSE_LAYOUT_COLUMN_MAJOR,
+                SPARSE_LAYOUT_ROW_MAJOR,
                 rows,
                 cols,
                 mkl_block_size,
@@ -215,7 +194,7 @@ private:
             status = mkl_sparse_z_create_bsr(
                 &out_handle,
                 SPARSE_INDEX_BASE_ZERO,
-                SPARSE_LAYOUT_COLUMN_MAJOR,
+                SPARSE_LAYOUT_ROW_MAJOR,
                 rows,
                 cols,
                 mkl_block_size,
@@ -384,9 +363,10 @@ private:
         const auto t_spmm = std::chrono::steady_clock::now();
 
         sparse_matrix_t export_handle = product_handle.handle;
-        if (mkl_sparse_order(export_handle) != SPARSE_STATUS_SUCCESS) {
-            return nullptr;
-        }
+        // No mkl_sparse_order (measured ~6x the multiply on CSR, similar cost
+        // class here). Default keeps the vendor's per-row export order (see
+        // spgemm_sorted_output_enabled in spmm/common.hpp);
+        // VBCSR_SPGEMM_SORTED=1 restores sorted columns in the copy-out.
         const auto t_order_initial = std::chrono::steady_clock::now();
 
         sparse_index_base_t index_base = SPARSE_INDEX_BASE_ZERO;
@@ -413,16 +393,13 @@ private:
             if (mkl_sparse_convert_bsr(
                     product_handle.handle,
                     static_cast<MKL_INT>(A.active_bsr_backend().block_size),
-                    SPARSE_LAYOUT_COLUMN_MAJOR,
+                    SPARSE_LAYOUT_ROW_MAJOR,
                     SPARSE_OPERATION_NON_TRANSPOSE,
                     &converted_handle.handle) != SPARSE_STATUS_SUCCESS ||
                 converted_handle.handle == nullptr) {
                 return nullptr;
             }
             export_handle = converted_handle.handle;
-            if (mkl_sparse_order(export_handle) != SPARSE_STATUS_SUCCESS) {
-                return nullptr;
-            }
             if (!export_mkl_bsr(
                     export_handle,
                     index_base,
@@ -463,9 +440,47 @@ private:
             c_row_ptr[static_cast<size_t>(row)] = row_begin;
             c_row_ptr[static_cast<size_t>(row) + 1] = row_end_offset;
         }
+        // Optional sorted output (VBCSR_SPGEMM_SORTED=1): unsorted rows sort
+        // a permutation that the block copy below places values through.
+        std::vector<MKL_INT> value_perm;
+        if (spgemm_sorted_output_enabled()) {
+            int any_unsorted = 0;
+            #pragma omp parallel for reduction(|:any_unsorted)
+            for (int row = 0; row < n_rows; ++row) {
+                const MKL_INT* src = col_ind + first + c_row_ptr[row];
+                const int deg = c_row_ptr[row + 1] - c_row_ptr[row];
+                if (!std::is_sorted(src, src + deg)) {
+                    any_unsorted = 1;
+                }
+            }
+            if (any_unsorted) {
+                value_perm.resize(exported_nnz);
+                // Packed (col << 32 | entry) keys sort as plain integers and
+                // unpack into sorted columns + the block permutation below.
+                std::vector<uint64_t> keys(exported_nnz);
+                #pragma omp parallel for
+                for (int row = 0; row < n_rows; ++row) {
+                    const int row_begin = c_row_ptr[row];
+                    const int row_end_off = c_row_ptr[row + 1];
+                    const MKL_INT* src = col_ind + first;
+                    for (int i = row_begin; i < row_end_off; ++i) {
+                        keys[static_cast<size_t>(i)] =
+                            (static_cast<uint64_t>(static_cast<uint32_t>(src[i] - base)) << 32) |
+                            static_cast<uint32_t>(i);
+                    }
+                    std::sort(keys.begin() + row_begin, keys.begin() + row_end_off);
+                }
+                for (size_t entry = 0; entry < exported_nnz; ++entry) {
+                    value_perm[entry] = static_cast<MKL_INT>(keys[entry] & 0xffffffffu);
+                }
+            }
+        }
         for (size_t entry = 0; entry < exported_nnz; ++entry) {
+            const MKL_INT src_entry = value_perm.empty()
+                ? static_cast<MKL_INT>(entry)
+                : value_perm[entry];
             const int local_col =
-                static_cast<int>(col_ind[first + static_cast<MKL_INT>(entry)] - base);
+                static_cast<int>(col_ind[first + src_entry] - base);
             if (local_col < 0 || local_col >= static_cast<int>(B.graph->block_sizes.size())) {
                 throw std::runtime_error("MKL BSR SpGEMM exported an invalid column index");
             }
@@ -489,7 +504,8 @@ private:
             throw std::runtime_error("MKL BSR SpGEMM exported an unsupported block layout");
         }
         if (exported_nnz > 0 &&
-            block_layout == SPARSE_LAYOUT_COLUMN_MAJOR &&
+            value_perm.empty() &&
+            block_layout == SPARSE_LAYOUT_ROW_MAJOR &&
             C_backend.values.page_count() == 1) {
             auto page = C_backend.page(C->col_ind(), 0);
             copy_contiguous_export_values(
@@ -499,18 +515,20 @@ private:
         } else {
             #pragma omp parallel for
             for (int slot = 0; slot < static_cast<int>(exported_nnz); ++slot) {
+                const size_t src_slot = value_perm.empty()
+                    ? static_cast<size_t>(slot)
+                    : static_cast<size_t>(value_perm[static_cast<size_t>(slot)]);
                 const T* src =
                     values +
-                    (static_cast<size_t>(first) + static_cast<size_t>(slot)) *
-                        values_per_block;
+                    (static_cast<size_t>(first) + src_slot) * values_per_block;
                 T* dest = C->mutable_block_data(slot);
-                if (block_layout == SPARSE_LAYOUT_COLUMN_MAJOR) {
+                if (block_layout == SPARSE_LAYOUT_ROW_MAJOR) {
                     std::memcpy(dest, src, values_per_block * sizeof(T));
-                } else if (block_layout == SPARSE_LAYOUT_ROW_MAJOR) {
+                } else if (block_layout == SPARSE_LAYOUT_COLUMN_MAJOR) {
                     for (int row = 0; row < block_size; ++row) {
                         for (int col = 0; col < block_size; ++col) {
-                            dest[static_cast<size_t>(col) * block_size + row] =
-                                src[static_cast<size_t>(row) * block_size + col];
+                            dest[static_cast<size_t>(row) * block_size + col] =
+                                src[static_cast<size_t>(col) * block_size + row];
                         }
                     }
                 }

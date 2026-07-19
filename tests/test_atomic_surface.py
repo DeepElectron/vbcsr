@@ -151,7 +151,9 @@ class TestAtomicSurface(unittest.TestCase):
         atomic_numbers = np.array([6 + 2 * rank], dtype=np.int32)
         type_norb = np.array([1, 1], dtype=np.int32)
 
-        atoms = vbcsr.AtomicData.from_distributed(
+        # from_distributed was split into the caller-partition points API;
+        # the graph-arrays positional form now lives on from_graph_arrays.
+        atoms = vbcsr.AtomicData.from_graph_arrays(
             1,
             2,
             rank,
@@ -174,7 +176,7 @@ class TestAtomicSurface(unittest.TestCase):
         np.testing.assert_array_equal(atoms.edge_index, np.array([[0, 1]], dtype=np.int32))
         np.testing.assert_array_equal(atoms.edge_shift, edge_shift)
 
-        missing_numbers = vbcsr.AtomicData.from_distributed(
+        missing_numbers = vbcsr.AtomicData.from_graph_arrays(
             1,
             2,
             rank,

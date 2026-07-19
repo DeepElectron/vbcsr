@@ -5,6 +5,54 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# ---------------------------------------------------------------------------
+# Build hygiene (doc/row_major_migration_plan.md, Phase 0)
+# ---------------------------------------------------------------------------
+# Default to an optimized build. Without this, toolchain environment flags
+# (e.g. conda's -march=nocona -O2) decide the ISA and compile out the AVX2
+# kernels silently.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Release RelWithDebInfo Debug)
+endif()
+
+# Target ISA for SIMD kernels: native (local builds), avx2 (portable wheels),
+# none (pure baseline, scalar fallback kernels only).
+set(VBCSR_ARCH "native" CACHE STRING "Target ISA: native, avx2, or none")
+set_property(CACHE VBCSR_ARCH PROPERTY STRINGS native avx2 none)
+if(VBCSR_ARCH STREQUAL "native")
+    set(VBCSR_ARCH_FLAGS -march=native)
+elseif(VBCSR_ARCH STREQUAL "avx2")
+    set(VBCSR_ARCH_FLAGS -mavx2 -mfma)
+elseif(VBCSR_ARCH STREQUAL "none")
+    set(VBCSR_ARCH_FLAGS "")
+else()
+    message(FATAL_ERROR "VBCSR_ARCH must be native, avx2, or none (got '${VBCSR_ARCH}')")
+endif()
+
+# Sanitizer configuration for the test tree.
+set(VBCSR_SANITIZE "" CACHE STRING "Sanitizer: address, undefined, or empty")
+if(VBCSR_SANITIZE STREQUAL "address")
+    add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address)
+elseif(VBCSR_SANITIZE STREQUAL "undefined")
+    add_compile_options(-fsanitize=undefined -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=undefined)
+elseif(NOT VBCSR_SANITIZE STREQUAL "")
+    message(FATAL_ERROR "VBCSR_SANITIZE must be address, undefined, or empty")
+endif()
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set(VBCSR_WARNING_FLAGS -Wall -Wextra)
+else()
+    set(VBCSR_WARNING_FLAGS "")
+endif()
+
+# Build-tree-only flags carrier: propagated to vbcsr_core and tests via the
+# vbcsr interface target, stripped from the installed/exported interface.
+add_library(vbcsr_build_flags INTERFACE)
+target_compile_options(vbcsr_build_flags INTERFACE ${VBCSR_ARCH_FLAGS} ${VBCSR_WARNING_FLAGS})
+
 # Find dependencies
 
 # Find dependencies
@@ -392,6 +440,7 @@ endif()
 # Create the interface library for C++ core
 add_library(vbcsr INTERFACE)
 add_library(vbcsr::vbcsr ALIAS vbcsr)
+target_link_libraries(vbcsr INTERFACE $<BUILD_INTERFACE:vbcsr_build_flags>)
 
 # Link dependencies
 target_link_libraries(vbcsr INTERFACE MPI::MPI_C MPI::MPI_CXX OpenMP::OpenMP_CXX)
@@ -618,6 +667,9 @@ if(VBCSR_ENABLE_TESTS)
     add_vbcsr_mpi_test(test_axpby vbcsr/core/test/test_axpby.cpp)
     add_vbcsr_mpi_test(test_axpby_diff_graph vbcsr/core/test/test_axpby_diff_graph.cpp)
     add_vbcsr_benchmark(benchmark_axpby vbcsr/core/test/benchmark_axpby.cpp)
+    # Phase-1 kernel prototype A/B harness (doc/row_major_migration_plan.md).
+    add_vbcsr_benchmark(debug_dense_kernel_microbench tests/benchmark/debug_dense_kernel_microbench.cpp)
+    target_include_directories(debug_dense_kernel_microbench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     add_vbcsr_mpi_test(test_density vbcsr/core/test/test_density.cpp)
     add_vbcsr_mpi_test(test_asymmetric_filter vbcsr/core/test/test_asymmetric_filter.cpp)
     add_vbcsr_mpi_test(test_extract_batched vbcsr/core/test/test_extract_batched.cpp)
@@ -628,6 +680,10 @@ if(VBCSR_ENABLE_TESTS)
     add_vbcsr_mpi_test(test_subgraph vbcsr/core/test/test_subgraph.cpp)
     add_vbcsr_mpi_test(test_graphmf vbcsr/core/test/test_graphmf.cpp)
     add_vbcsr_mpi_test(test_dist_csr vbcsr/core/test/test_dist_csr.cpp)
+    # Strongest numeric/layout gates — previously only runnable via
+    # vbcsr/core/test/run_all_tests.py (never ran in ctest or CI).
+    add_vbcsr_mpi_test(test_numeric_reference vbcsr/core/test/test_numeric_reference.cpp)
+    add_vbcsr_mpi_test(test_migration_contract vbcsr/core/test/test_migration_contract.cpp)
     add_vbcsr_gtest(test_block_csr_export vbcsr/core/test/test_block_csr_export.cpp MPI_RANKS 2)
     add_vbcsr_plain_test(test_shape_paged_storage vbcsr/core/test/test_shape_paged_storage.cpp)
 

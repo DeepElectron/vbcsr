@@ -1,3 +1,6 @@
+// Test assertions must stay active in Release builds.
+#undef NDEBUG
+
 #include "../block_csr.hpp"
 #include "../dist_multivector.hpp"
 #include "../dist_vector.hpp"
@@ -146,11 +149,9 @@ void test_dist_multivector_duplicate() {
     mv.scale(3.0);
 
     for (int col = 0; col < dup.num_vectors; ++col) {
-        const double* dup_col = dup.col_data(col);
-        const double* mv_col = mv.col_data(col);
         for (int row = 0; row < dup.local_rows; ++row) {
-            assert(std::abs(dup_col[row] - 1.0) < 1e-12);
-            assert(std::abs(mv_col[row] - 3.0) < 1e-12);
+            assert(std::abs(dup(row, col) - 1.0) < 1e-12);
+            assert(std::abs(mv(row, col) - 3.0) < 1e-12);
         }
     }
 }

@@ -53,7 +53,7 @@ The matrix structure is defined by a `DistGraph`, which manages:
 
 ### Vectors and MultiVectors
 - **DistVector**: A distributed vector (1D).
-- **DistMultiVector**: A collection of vectors (2D, column-major), useful for block solvers (e.g., solving $AX=B$).
+- **DistMultiVector**: A collection of vectors (2D, row-major — `to_numpy()` returns a C-contiguous array), useful for block solvers (e.g., solving $AX=B$).
 
 ---
 

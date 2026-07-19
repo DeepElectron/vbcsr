@@ -33,8 +33,8 @@ void bsr_mult_native_benchmark(
     DistVector<T>& y) {
     BLASKernel::configure_native_threading();
     detail::bsr_dispatch_block_size(backend.block_size, [&](auto block_tag) {
-        constexpr int BlockSize = decltype(block_tag)::value;
-        detail::bsr_mult_impl<BlockSize>(graph, backend, x, y);
+        constexpr int kBlockSize = decltype(block_tag)::value;
+        detail::bsr_mult_impl<kBlockSize>(graph, backend, x, y);
     });
 }
 
@@ -45,10 +45,7 @@ void bsr_mult_dense_native_benchmark(
     DistMultiVector<T>& x,
     DistMultiVector<T>& y) {
     BLASKernel::configure_native_threading();
-    detail::bsr_dispatch_block_size(backend.block_size, [&](auto block_tag) {
-        constexpr int BlockSize = decltype(block_tag)::value;
-        detail::bsr_mult_dense_impl<BlockSize>(graph, backend, x, y);
-    });
+    detail::bsr_mult_dense_impl(graph, backend, x, y);
 }
 
 template <typename T>
@@ -59,8 +56,8 @@ void bsr_mult_adjoint_native_benchmark(
     DistVector<T>& y) {
     BLASKernel::configure_native_threading();
     detail::bsr_dispatch_block_size(backend.block_size, [&](auto block_tag) {
-        constexpr int BlockSize = decltype(block_tag)::value;
-        detail::bsr_mult_adjoint_impl<BlockSize>(graph, backend, x, y);
+        constexpr int kBlockSize = decltype(block_tag)::value;
+        detail::bsr_mult_adjoint_impl<kBlockSize>(graph, backend, x, y);
     });
 }
 
@@ -71,10 +68,7 @@ void bsr_mult_dense_adjoint_native_benchmark(
     DistMultiVector<T>& x,
     DistMultiVector<T>& y) {
     BLASKernel::configure_native_threading();
-    detail::bsr_dispatch_block_size(backend.block_size, [&](auto block_tag) {
-        constexpr int BlockSize = decltype(block_tag)::value;
-        detail::bsr_mult_dense_adjoint_impl<BlockSize>(graph, backend, x, y);
-    });
+    detail::bsr_mult_dense_adjoint_impl(graph, backend, x, y);
 }
 
 double mpi_max_double(MPI_Comm comm, double value) {
@@ -319,13 +313,12 @@ int main(int argc, char** argv) {
     DistMultiVector<double> Y_vendor(&graph, n_vecs);
     DistMultiVector<double> Y_native(&graph, n_vecs);
     
-    // Init X
+    // Init X (row-major storage: element (row, vec) at data[row * ld + vec])
     for (int v = 0; v < n_vecs; ++v) {
-        double* col = X.col_data(v);
         for (int i = 0; i < n_owned; ++i) {
             int gid = graph.owned_global_indices[i];
             for (int k = 0; k < block_size; ++k) {
-                col[i * block_size + k] = get_vec_val(gid, k, v);
+                X(i * block_size + k, v) = get_vec_val(gid, k, v);
             }
         }
     }
@@ -337,15 +330,13 @@ int main(int argc, char** argv) {
     max_native_ref_err = 0.0;
     max_vendor_native_diff = 0.0;
     for (int v = 0; v < n_vecs; ++v) {
-        double* vendor_col_ptr = Y_vendor.col_data(v);
-        double* native_col_ptr = Y_native.col_data(v);
         for (int i = 0; i < n_owned; ++i) {
             int gid_r = graph.owned_global_indices[i];
             std::vector<double> y_ref(block_size, 0.0);
             fill_forward_reference(gid_r, v, y_ref);
             for (int r = 0; r < block_size; ++r) {
-                const double vendor_val = vendor_col_ptr[i * block_size + r];
-                const double native_val = native_col_ptr[i * block_size + r];
+                const double vendor_val = Y_vendor(i * block_size + r, v);
+                const double native_val = Y_native(i * block_size + r, v);
                 max_vendor_ref_err = std::max(max_vendor_ref_err, std::abs(vendor_val - y_ref[r]));
                 max_native_ref_err = std::max(max_native_ref_err, std::abs(native_val - y_ref[r]));
                 max_vendor_native_diff = std::max(
@@ -467,11 +458,10 @@ int main(int argc, char** argv) {
     DistMultiVector<double> Y_adj_native(&graph, n_vecs);
 
     for (int v = 0; v < n_vecs; ++v) {
-        double* col = X_adj.col_data(v);
         for (int i = 0; i < n_owned; ++i) {
             const int gid = graph.owned_global_indices[i];
             for (int k = 0; k < block_size; ++k) {
-                col[i * block_size + k] = get_vec_val(gid, k, 100 + v);
+                X_adj(i * block_size + k, v) = get_vec_val(gid, k, 100 + v);
             }
         }
     }
@@ -483,15 +473,13 @@ int main(int argc, char** argv) {
     max_native_ref_err = 0.0;
     max_vendor_native_diff = 0.0;
     for (int v = 0; v < n_vecs; ++v) {
-        double* vendor_col_ptr = Y_adj_vendor.col_data(v);
-        double* native_col_ptr = Y_adj_native.col_data(v);
         for (int i = 0; i < n_owned; ++i) {
             const int gid_c = graph.owned_global_indices[i];
             std::vector<double> y_ref(block_size, 0.0);
             fill_adjoint_reference(gid_c, 100 + v, y_ref);
             for (int c = 0; c < block_size; ++c) {
-                const double vendor_val = vendor_col_ptr[i * block_size + c];
-                const double native_val = native_col_ptr[i * block_size + c];
+                const double vendor_val = Y_adj_vendor(i * block_size + c, v);
+                const double native_val = Y_adj_native(i * block_size + c, v);
                 max_vendor_ref_err = std::max(max_vendor_ref_err, std::abs(vendor_val - y_ref[c]));
                 max_native_ref_err = std::max(max_native_ref_err, std::abs(native_val - y_ref[c]));
                 max_vendor_native_diff = std::max(

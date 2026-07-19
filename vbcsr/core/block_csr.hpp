@@ -13,6 +13,14 @@ enum class MatrixLayout {
     ColMajor
 };
 
+// Canonical within-block element order for block STORAGE, pending assembly
+// buffers, and every MPI payload that carries raw block values
+// (doc/row_major_migration_plan.md §2.1). Element (i, j) of an r×c block sits
+// at block[i * c + j]. Every staging/transport call site names this constant
+// instead of a literal enum so the invariant stays single-sourced and
+// greppable.
+inline constexpr MatrixLayout kCanonicalBlockLayout = MatrixLayout::RowMajor;
+
 // Block-redistribution reduction (doc/design/35). Copy = each source block is
 // written to every target owner of its row (one->one, or one->many = broadcast /
 // send-down). Sum = contributions from several source ranks that hold the same
@@ -59,12 +67,13 @@ inline const char* matrix_kind_name(MatrixKind kind) {
 #include "detail/ops/transpose.hpp"
 #include "detail/distributed/block_payload_exchange.hpp"
 #include "detail/distributed/mpi_utils.hpp"
-#include <xmmintrin.h>
 #include <algorithm>
 #include <vector>
 #include <omp.h>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
+#include <sstream>
 #include <complex>
 #include <cmath>
 #include <limits>
@@ -72,7 +81,6 @@ inline const char* matrix_kind_name(MatrixKind kind) {
 #include <stdexcept>
 #include <type_traits>
 #include <variant>
-#include <set>
 #include <map>
 #include <unordered_map>
 #include <cstring>
@@ -100,11 +108,11 @@ struct MMWriter<std::complex<T>> {
     static bool is_complex() { return true; }
 };
 
-template <typename T, typename Kernel = DefaultKernel<T>>
+template <typename T>
 class BlockSpMat {
 private:
     // Friend access for backend-specialized executors and builders.
-    template <typename, typename>
+    template <typename>
     friend class BlockSpMat;
     template <typename>
     friend struct detail::CSRSpMMExecutor;
@@ -124,16 +132,15 @@ private:
     friend struct detail::VBCSRAxpbyExecutor;
     template <typename>
     friend struct detail::VBCSRSpMMExecutor;
-    template <typename U, typename K>
+    template <typename U>
     friend void graph_matrix_function(
-        BlockSpMat<U, K>&,
-        BlockSpMat<U, K>*,
+        BlockSpMat<U>&,
+        BlockSpMat<U>*,
         std::function<U(double)>,
-        std::string,
         bool);
 
     MatrixKind kind = MatrixKind::CSR;
-    using VBCSRBackendStorage = detail::VBCSRMatrixBackend<T, Kernel>;
+    using VBCSRBackendStorage = detail::VBCSRMatrixBackend<T>;
     using CSRBackendStorage = detail::CSRMatrixBackend<T>;
     using BSRBackendStorage = detail::BSRMatrixBackend<T>;
     using BackendHandle = std::variant<
@@ -151,7 +158,6 @@ public:
     // Public facade state and view types.
     DistGraph* graph;
     using value_type = T;
-    using KernelType = Kernel;
 
     struct ConstLocalBlockView {
         // Flat local nonzero-block index. Slots run across the local sparsity pattern:
@@ -479,7 +485,7 @@ public:
     BlockSpMat& operator=(const BlockSpMat&) = delete;
 
     // Create a deep copy of the matrix
-    BlockSpMat<T, Kernel> duplicate(bool independent_graph = true) const {
+    BlockSpMat<T> duplicate(bool independent_graph = true) const {
         require_assembled_for_state_copy("duplicate");
         DistGraph* new_graph = graph;
         bool new_owns_graph = false;
@@ -492,7 +498,7 @@ public:
             // delete-on-last-release before exposing the shared pointer.
             prepare_graph_for_shared_use();
         }
-        BlockSpMat<T, Kernel> new_mat(new_graph);
+        BlockSpMat<T> new_mat(new_graph);
         new_mat.owns_graph = new_owns_graph;
         if (new_mat.owns_graph) {
             new_mat.graph->enable_matrix_lifetime_management();
@@ -513,7 +519,7 @@ public:
 
     // Add a block (local or remote)
     // Input data layout is specified by `layout`
-    void add_block(int global_row, int global_col, const T* data, int rows, int cols, AssemblyMode mode = AssemblyMode::ADD, MatrixLayout layout = MatrixLayout::ColMajor) {
+    void add_block(int global_row, int global_col, const T* data, int rows, int cols, AssemblyMode mode = AssemblyMode::ADD, MatrixLayout layout = kCanonicalBlockLayout) {
         int owner = graph->find_owner(global_row);
         
         if (owner == graph->rank) {
@@ -565,25 +571,26 @@ public:
                 throw std::runtime_error("Dimension mismatch in add_block accumulation");
             }
             
-            // We store pending blocks in ColMajor (canonical format for transport)
-            
+            // Pending blocks are stored in kCanonicalBlockLayout (row-major,
+            // the canonical format for transport).
+
             if (mode == AssemblyMode::INSERT) {
                 // Overwrite
                 pb.mode_code = static_cast<int>(AssemblyMode::INSERT);
-                if (layout == MatrixLayout::ColMajor) {
+                if (layout == kCanonicalBlockLayout) {
                     std::memcpy(pb.data.data(), data, rows * cols * sizeof(T));
                 } else {
-                    // Transpose RowMajor -> ColMajor
+                    // Transpose ColMajor -> canonical RowMajor
                     for (int i = 0; i < rows; ++i) {
                         for (int j = 0; j < cols; ++j) {
-                            pb.data[j * rows + i] = data[i * cols + j];
+                            pb.data[i * cols + j] = data[j * rows + i];
                         }
                     }
                 }
             } else {
                 // ADD
                 // Accumulate
-                if (layout == MatrixLayout::ColMajor) {
+                if (layout == kCanonicalBlockLayout) {
                     for (size_t i = 0; i < pb.data.size(); ++i) {
                         pb.data[i] += data[i];
                     }
@@ -591,7 +598,7 @@ public:
                     // Transpose add
                     for (int i = 0; i < rows; ++i) {
                         for (int j = 0; j < cols; ++j) {
-                            pb.data[j * rows + i] += data[i * cols + j];
+                            pb.data[i * cols + j] += data[j * rows + i];
                         }
                     }
                 }
@@ -603,14 +610,14 @@ public:
             pb.cols = cols;
             pb.mode_code = static_cast<int>(mode);
             pb.data.resize(rows * cols);
-            
-            if (layout == MatrixLayout::ColMajor) {
+
+            if (layout == kCanonicalBlockLayout) {
                 std::memcpy(pb.data.data(), data, rows * cols * sizeof(T));
             } else {
-                // Transpose RowMajor -> ColMajor
+                // Transpose ColMajor -> canonical RowMajor
                 for (int i = 0; i < rows; ++i) {
                     for (int j = 0; j < cols; ++j) {
-                        pb.data[j * rows + i] = data[i * cols + j];
+                        pb.data[i * cols + j] = data[j * rows + i];
                     }
                 }
             }
@@ -630,12 +637,10 @@ public:
         BlockSpMat result(target);
         const DistGraph* g = graph;
         const int n_owned = static_cast<int>(g->owned_global_indices.size());
-        const int n_ghost = static_cast<int>(g->ghost_global_indices.size());
         auto l2g = [&](int lb) -> int {
             return lb < n_owned ? g->owned_global_indices[lb]
                                 : g->ghost_global_indices[lb - n_owned];
         };
-        (void)n_ghost;
         // ``target`` must be a fully-constructed graph (ghost block sizes backfilled,
         // as any assembled operator graph is) — add_block needs the column dim.
         for (int i = 0; i < n_owned; ++i) {
@@ -645,7 +650,7 @@ public:
                 const int lcol = g->adj_ind[k];
                 const int gj = l2g(lcol);
                 const int c_dim = g->block_sizes[lcol];
-                result.add_block(gi, gj, block_data(k), r_dim, c_dim, mode, MatrixLayout::ColMajor);
+                result.add_block(gi, gj, block_data(k), r_dim, c_dim, mode, kCanonicalBlockLayout);
             }
         }
         result.assemble();
@@ -664,10 +669,8 @@ public:
     // partials held by several source ranks make Sum accumulate at the unique target
     // owner (= reduce-up). ``target`` must be assembled (ghost block sizes backfilled).
     BlockSpMat redistribute(DistGraph* target, RedistOp op, MPI_Comm common_comm) const {
-        int cc_rank, cc_size;
-        MPI_Comm_rank(common_comm, &cc_rank);
+        int cc_size;
         MPI_Comm_size(common_comm, &cc_size);
-        (void)cc_rank;
 
         // 1. Derive global-row -> owner cc-ranks in the target layout.
         const int my_n = static_cast<int>(target->owned_global_indices.size());
@@ -757,7 +760,7 @@ public:
             std::memcpy(&r_dim, ptr, sizeof(int)); ptr += sizeof(int);
             std::memcpy(&c_dim, ptr, sizeof(int)); ptr += sizeof(int);
             result.add_block(gi, gj, reinterpret_cast<const T*>(ptr), r_dim, c_dim,
-                             amode, MatrixLayout::ColMajor);
+                             amode, kCanonicalBlockLayout);
             ptr += static_cast<size_t>(r_dim) * c_dim * sizeof(T);
         }
         result.assemble();
@@ -864,7 +867,7 @@ public:
 
                 size_t data_bytes = rows * cols * sizeof(T);
 
-                if (l_col == -1 || !update_local_block(l_row, l_col, (const T*)ptr, rows, cols, mode, MatrixLayout::ColMajor)) {
+                if (l_col == -1 || !update_local_block(l_row, l_col, (const T*)ptr, rows, cols, mode, kCanonicalBlockLayout)) {
                     std::cerr << "Warning: Received block (row=" << g_row << ", col=" << g_col << ") not in graph. Ignoring." << std::endl;
                     // Fall through to ptr += data_bytes
                 }
@@ -885,7 +888,7 @@ public:
         int rows,
         int cols,
         AssemblyMode mode,
-        MatrixLayout layout = MatrixLayout::ColMajor);
+        MatrixLayout layout = kCanonicalBlockLayout);
 
     // Matrix-Vector Multiplication
     void mult(DistVector<T>& x, DistVector<T>& y) {
@@ -975,7 +978,7 @@ public:
         }
     }
 
-    void copy_from(const BlockSpMat<T, Kernel>& other) {
+    void copy_from(const BlockSpMat<T>& other) {
         require_assembled_for_state_copy("copy_from");
         other.require_assembled_for_state_copy("copy_from");
         if (!has_same_logical_structure(other)) {
@@ -996,15 +999,14 @@ public:
     }
     
 
-    // Return real part as a new matrix (Double)
-    // Only valid if T is complex, otherwise returns copy?
-    // Actually we need to return BlockSpMat<RealType>
+    // Return the real part as a new BlockSpMat<real_type>. For real T this is
+    // a plain copy.
     auto get_real() const {
         using RealT = typename ScalarTraits<T>::real_type;
         // The result reuses the same graph with a different scalar type, so a
         // matrix-owned graph must be promoted before the pointer is shared.
         prepare_graph_for_shared_use();
-        BlockSpMat<RealT, DefaultKernel<RealT>> res(graph);
+        BlockSpMat<RealT> res(graph);
         res.set_page_size(configured_page_size_);
         
         // Copy and cast data
@@ -1029,7 +1031,7 @@ public:
         // As in get_real(), the graph is shared between two matrix objects with
         // independent value storage.
         prepare_graph_for_shared_use();
-        BlockSpMat<RealT, DefaultKernel<RealT>> res(graph);
+        BlockSpMat<RealT> res(graph);
         res.set_page_size(configured_page_size_);
         
         #pragma omp parallel for
@@ -1067,27 +1069,28 @@ public:
                 
                 std::vector<T> result(sz);
                 const T* block_ptr = block_data(k);
-                
-                if (layout == MatrixLayout::ColMajor) {
+
+                if (layout == kCanonicalBlockLayout) {
                     std::memcpy(result.data(), block_ptr, sz * sizeof(T));
                 } else {
-                    // Transpose ColMajor -> RowMajor
+                    // Transpose canonical RowMajor -> ColMajor
                     for (int r = 0; r < r_dim; ++r) {
                         for (int c = 0; c < c_dim; ++c) {
-                            result[r * c_dim + c] = block_ptr[c * r_dim + r];
+                            result[c * r_dim + r] = block_ptr[r * c_dim + c];
                         }
                     }
                 }
                 return result;
             }
         }
-        return std::vector<T>(); // Empty if not found (or throw?)
+        return std::vector<T>(); // Empty if not found
     }
 
     // Export packed data for Python/Scipy
     // Returns a single vector containing all blocks concatenated.
     // Blocks are ordered by (row, col) as in col_ind.
-    // If layout is RowMajor, blocks are transposed (if internal is ColMajor).
+    // Internal storage is canonical RowMajor, so the default export is a
+    // straight copy; ColMajor requests transpose per block.
     std::vector<T> get_values(MatrixLayout layout = MatrixLayout::RowMajor) const {
         // Calculate total size
         size_t total_size = 0;
@@ -1111,17 +1114,17 @@ public:
                 size_t sz = block_size_elements(k); // should be r_dim * c_dim
                 
                 T* dest = result.data() + offset;
-                
-                // Internal storage is ColMajor
-                if (layout == MatrixLayout::ColMajor) {
+
+                // Internal storage is canonical RowMajor
+                if (layout == kCanonicalBlockLayout) {
                     std::memcpy(dest, block_ptr, sz * sizeof(T));
                 } else {
-                    // Transpose ColMajor -> RowMajor
-                    // Internal: A[j*r_dim + i]
-                    // Output:   A[i*c_dim + j]
+                    // Transpose canonical RowMajor -> ColMajor
+                    // Internal: A[i*c_dim + j]
+                    // Output:   A[j*r_dim + i]
                     for (int r = 0; r < r_dim; ++r) {
                         for (int c = 0; c < c_dim; ++c) {
-                            dest[r * c_dim + c] = block_ptr[c * r_dim + r];
+                            dest[c * r_dim + r] = block_ptr[r * c_dim + c];
                         }
                     }
                 }
@@ -1131,7 +1134,7 @@ public:
         return result;
     }
 
-    void axpby(T alpha, const BlockSpMat<T, Kernel>& X, T beta) {
+    void axpby(T alpha, const BlockSpMat<T>& X, T beta) {
         if (this == &X) {
             this->scale(alpha + beta);
             return;
@@ -1155,17 +1158,17 @@ public:
         }
 
         if (kind == MatrixKind::CSR && X.kind == MatrixKind::CSR) {
-            detail::CSRAxpbyExecutor<BlockSpMat<T, Kernel>>::run(*this, X, alpha, beta);
+            detail::CSRAxpbyExecutor<BlockSpMat<T>>::run(*this, X, alpha, beta);
             return;
         }
         if (kind == MatrixKind::BSR && X.kind == MatrixKind::BSR) {
-            detail::BSRAxpbyExecutor<BlockSpMat<T, Kernel>>::run(*this, X, alpha, beta);
+            detail::BSRAxpbyExecutor<BlockSpMat<T>>::run(*this, X, alpha, beta);
             return;
         }
-        detail::VBCSRAxpbyExecutor<BlockSpMat<T, Kernel>>::run(*this, X, alpha, beta);
+        detail::VBCSRAxpbyExecutor<BlockSpMat<T>>::run(*this, X, alpha, beta);
     }
 
-    void axpy(T alpha, const BlockSpMat<T, Kernel>& other) {
+    void axpy(T alpha, const BlockSpMat<T>& other) {
         axpby(alpha, other, T(1));
     }
 
@@ -1193,15 +1196,15 @@ public:
                     int r_dim = graph->block_sizes[i];
                     int c_dim = graph->block_sizes[local_col];
                     
-                    // Add alpha to diagonal of the block
-                    // Block is ColMajor or RowMajor? Internal is ColMajor.
-                    // Diagonal elements are at [j*r_dim + j] for j=0..min(r,c)
-                    
+                    // Add alpha to diagonal of the block.
+                    // Canonical RowMajor storage: element (j, j) sits at
+                    // [j*c_dim + j] for j=0..min(r,c).
+
                     int min_dim = std::min(r_dim, c_dim);
                     for (int j = 0; j < min_dim; ++j) {
-                        target[j * r_dim + j] += alpha;
+                        target[j * c_dim + j] += alpha;
                     }
-                    break; 
+                    break;
                 }
             }
         }
@@ -1234,9 +1237,9 @@ public:
                     
                     int min_dim = std::min(r_dim, c_dim);
                     for (int j = 0; j < min_dim; ++j) {
-                        target[j * r_dim + j] += diag[row_offset + j];
+                        target[j * c_dim + j] += diag[row_offset + j];
                     }
-                    break; 
+                    break;
                 }
             }
         }
@@ -1245,7 +1248,7 @@ public:
 
     // Compute C = [H, R] where R is a scalar diagonal operator stored in a DistVector.
     // Each block entry follows C(rc) = H(rc) * (R_col(c) - R_row(r)).
-    void commutator_diagonal(const DistVector<T>& diag, BlockSpMat<T, Kernel>& result) {
+    void commutator_diagonal(const DistVector<T>& diag, BlockSpMat<T>& result) {
         if (!result.has_same_logical_structure(*this)) {
             result = this->duplicate(false);
             result.fill(T(0));
@@ -1270,9 +1273,9 @@ public:
                 const T* H_ptr = block_data(k);
                 T* C_ptr = result.mutable_block_data(k);
                 
-                for (int c = 0; c < col_dim; ++c) {
-                    for (int r = 0; r < row_dim; ++r) {
-                        const int idx = c * row_dim + r;
+                for (int r = 0; r < row_dim; ++r) {
+                    for (int c = 0; c < col_dim; ++c) {
+                        const int idx = r * col_dim + c;
                         C_ptr[idx] = H_ptr[idx] * (R[col_offset + c] - R[row_offset + r]);
                     }
                 }
@@ -1361,13 +1364,13 @@ public:
         }
 
         if (kind == MatrixKind::CSR && B.kind == MatrixKind::CSR) {
-            return detail::CSRSpMMExecutor<BlockSpMat<T, Kernel>>::run(*this, B, threshold);
+            return detail::CSRSpMMExecutor<BlockSpMat<T>>::run(*this, B, threshold);
         }
         if (kind == MatrixKind::BSR && B.kind == MatrixKind::BSR) {
-            return detail::BSRSpMMExecutor<BlockSpMat<T, Kernel>>::run(*this, B, threshold);
+            return detail::BSRSpMMExecutor<BlockSpMat<T>>::run(*this, B, threshold);
         }
         
-        return detail::VBCSRSpMMExecutor<BlockSpMat<T, Kernel>>::run(*this, B, threshold);
+        return detail::VBCSRSpMMExecutor<BlockSpMat<T>>::run(*this, B, threshold);
     }
 
     BlockSpMat spmm_self(double threshold, bool transA = false) {
@@ -1413,13 +1416,13 @@ public:
 
     BlockSpMat transpose() const {
         if (kind == MatrixKind::CSR) {
-            return detail::CSRTransposeExecutor<BlockSpMat<T, Kernel>>::run(*this);
+            return detail::CSRTransposeExecutor<BlockSpMat<T>>::run(*this);
         }
         if (kind == MatrixKind::BSR) {
-            return detail::BSRTransposeExecutor<BlockSpMat<T, Kernel>>::run(*this);
+            return detail::BSRTransposeExecutor<BlockSpMat<T>>::run(*this);
         }
 
-        return detail::VBCSRTransposeExecutor<BlockSpMat<T, Kernel>>::run(*this);
+        return detail::VBCSRTransposeExecutor<BlockSpMat<T>>::run(*this);
     }
 
     void save_matrix_market(const std::string& filename) {
@@ -1480,14 +1483,13 @@ public:
                 int c_dim = graph->block_sizes[col];
                 int col_start_idx = graph->block_offsets[col] + 1; // 1-based
                 
-                // long long offset = blk_ptr[k];
                 const T* block_data = this->block_data(k);
-                
-                // Block is stored in ColMajor
-                for (int c = 0; c < c_dim; ++c) {
-                    for (int r = 0; r < r_dim; ++r) {
-                        T value = block_data[c * r_dim + r];
-                        
+
+                // Block is stored in canonical RowMajor
+                for (int r = 0; r < r_dim; ++r) {
+                    for (int c = 0; c < c_dim; ++c) {
+                        T value = block_data[r * c_dim + c];
+
                         // Write (row, col, val)
                         file << (row_start_idx + r) << " " << (col_start_idx + c) << " ";
                         MMWriter<T>::write(file, value);
@@ -1499,15 +1501,15 @@ public:
     }
 
     // Extract submatrix defined by global_indices
-    BlockSpMat<T, Kernel> extract_submatrix(const std::vector<int>& global_indices) {
+    BlockSpMat<T> extract_submatrix(const std::vector<int>& global_indices) {
         auto ctx = detail::fetch_batched_block_payloads(*this, {global_indices});
         return construct_submatrix(global_indices, ctx);
     }
 
     // Extract multiple submatrices efficiently
-    std::vector<BlockSpMat<T, Kernel>> extract_submatrix_batched(const std::vector<std::vector<int>>& batch_indices) {
+    std::vector<BlockSpMat<T>> extract_submatrix_batched(const std::vector<std::vector<int>>& batch_indices) {
         auto ctx = detail::fetch_batched_block_payloads(*this, batch_indices);
-        std::vector<BlockSpMat<T, Kernel>> results;
+        std::vector<BlockSpMat<T>> results;
         results.reserve(batch_indices.size());
         // TODO: threading?
         for(const auto& indices : batch_indices) {
@@ -1517,7 +1519,7 @@ public:
     }
 
     // Insert submatrix back (In-Place)
-    void insert_submatrix(const BlockSpMat<T, Kernel>& submat, const std::vector<int>& global_indices) {
+    void insert_submatrix(const BlockSpMat<T>& submat, const std::vector<int>& global_indices) {
         // global_indices maps submat indices 0..M-1 to global indices
         if(submat.graph->owned_global_indices.size() != global_indices.size()) {
             throw std::runtime_error("insert_submatrix: global_indices size mismatch");
@@ -1539,10 +1541,10 @@ public:
                 
                 const T* data = submat.block_data(k);
                 
-                // Use add_block with INSERT mode. 
+                // Use add_block with INSERT mode.
                 // It handles local update and remote buffering.
-                // Data is in ColMajor (internal storage of submat).
-                this->add_block(global_row, global_col, data, r_dim, c_dim, AssemblyMode::INSERT, MatrixLayout::ColMajor);
+                // Data is in the canonical layout (internal storage of submat).
+                this->add_block(global_row, global_col, data, r_dim, c_dim, AssemblyMode::INSERT, kCanonicalBlockLayout);
             }
         }
         
@@ -1575,19 +1577,19 @@ public:
                 int c_dim = graph->block_sizes[col];
                 int col_offset = graph->block_offsets[col];
                 
-                // const T* data = val.data() + blk_ptr[k];
                 const T* data = block_data(k);
-                
-                // Copy block to dense (ColMajor block to RowMajor dense)
-                for(int c=0; c<c_dim; ++c) {
-                    for(int r=0; r<r_dim; ++r) {
-                        // Dense index
-                        int dr = row_offset + r;
-                        int dc = col_offset + c;
-                        if(dr < my_rows && dc < my_cols) {
-                            dense[dr * my_cols + dc] = data[c * r_dim + r];
-                        }
+
+                // Copy block to dense: both are row-major now, so each block
+                // row is one contiguous memcpy into the dense view.
+                for(int r=0; r<r_dim; ++r) {
+                    int dr = row_offset + r;
+                    if (dr >= my_rows || col_offset + c_dim > my_cols) {
+                        continue;
                     }
+                    std::memcpy(
+                        dense.data() + static_cast<size_t>(dr) * my_cols + col_offset,
+                        data + static_cast<size_t>(r) * c_dim,
+                        static_cast<size_t>(c_dim) * sizeof(T));
                 }
             }
         }
@@ -1617,18 +1619,18 @@ public:
                 int c_dim = graph->block_sizes[col];
                 int col_offset = graph->block_offsets[col];
                 
-                // T* data = val.data() + blk_ptr[k];
                 T* data = mutable_block_data(k);
-                
-                // Copy dense to block (RowMajor dense to ColMajor block)
-                for(int c=0; c<c_dim; ++c) {
-                    for(int r=0; r<r_dim; ++r) {
-                        int dr = row_offset + r;
-                        int dc = col_offset + c;
-                        if(dr < my_rows && dc < my_cols) {
-                            data[c * r_dim + r] = dense[dr * my_cols + dc];
-                        }
+
+                // Copy dense to block: both row-major, contiguous per block row.
+                for(int r=0; r<r_dim; ++r) {
+                    int dr = row_offset + r;
+                    if (dr >= my_rows || col_offset + c_dim > my_cols) {
+                        continue;
                     }
+                    std::memcpy(
+                        data + static_cast<size_t>(r) * c_dim,
+                        dense.data() + static_cast<size_t>(dr) * my_cols + col_offset,
+                        static_cast<size_t>(c_dim) * sizeof(T));
                 }
             }
         }
@@ -1794,7 +1796,7 @@ private:
     using FetchContext = detail::FetchedBlockContext<T>;
 
     // Construct a submatrix from fetched data
-    BlockSpMat<T, Kernel> construct_submatrix(const std::vector<int>& global_indices, const FetchContext& ctx) {
+    BlockSpMat<T> construct_submatrix(const std::vector<int>& global_indices, const FetchContext& ctx) {
         // 1. Map global index to local index in the submatrix (0 to M-1)
         std::map<int, int> global_to_sub;
         for(size_t i=0; i<global_indices.size(); ++i) {
@@ -1827,7 +1829,7 @@ private:
         DistGraph* sub_graph = new DistGraph(this->graph->comm == MPI_COMM_NULL ? MPI_COMM_NULL : MPI_COMM_SELF); // this make this method thread safe
         sub_graph->construct_serial(M, sub_block_sizes, sub_adj);
 
-        BlockSpMat<T, Kernel> sub_mat(sub_graph);
+        BlockSpMat<T> sub_mat(sub_graph);
         sub_mat.owns_graph = true;
         sub_mat.graph->enable_matrix_lifetime_management();
 
@@ -1835,10 +1837,7 @@ private:
             int sub_row = global_to_sub[bd->global_row];
             int sub_col = global_to_sub[bd->global_col];
 
-            // printf("Rank %d: Adding block (%d, %d)\n", rank, sub_row, sub_col);
-            // fflush(stdout);
-
-            sub_mat.add_block(sub_row, sub_col, bd->data.data(), bd->r_dim, bd->c_dim, AssemblyMode::INSERT, MatrixLayout::ColMajor);
+            sub_mat.add_block(sub_row, sub_col, bd->data.data(), bd->r_dim, bd->c_dim, AssemblyMode::INSERT, kCanonicalBlockLayout);
         }
 
         sub_mat.assemble();
@@ -1846,8 +1845,8 @@ private:
     }
 };
 
-template <typename T, typename Kernel>
-double BlockSpMat<T, Kernel>::get_sq_norm(const T& v) {
+template <typename T>
+double BlockSpMat<T>::get_sq_norm(const T& v) {
     if constexpr (std::is_same<T, std::complex<double>>::value ||
                   std::is_same<T, std::complex<float>>::value) {
         return std::norm(v);
@@ -1856,8 +1855,8 @@ double BlockSpMat<T, Kernel>::get_sq_norm(const T& v) {
     }
 }
 
-template <typename T, typename Kernel>
-std::vector<double> BlockSpMat<T, Kernel>::compute_block_norms() const {
+template <typename T>
+std::vector<double> BlockSpMat<T>::compute_block_norms() const {
     int nnz = static_cast<int>(graph->adj_ind.size());
     std::vector<double> norms(nnz);
 
@@ -1874,8 +1873,8 @@ std::vector<double> BlockSpMat<T, Kernel>::compute_block_norms() const {
     return norms;
 }
 
-template <typename T, typename Kernel>
-int BlockSpMat<T, Kernel>::max_omp_threads() {
+template <typename T>
+int BlockSpMat<T>::max_omp_threads() {
     int max_threads = 1;
     #ifdef _OPENMP
     max_threads = omp_get_max_threads();
@@ -1883,14 +1882,14 @@ int BlockSpMat<T, Kernel>::max_omp_threads() {
     return max_threads;
 }
 
-template <typename T, typename Kernel>
-typename BlockSpMat<T, Kernel>::RemoteAssemblyRegistry& BlockSpMat<T, Kernel>::remote_assembly_registry() {
+template <typename T>
+typename BlockSpMat<T>::RemoteAssemblyRegistry& BlockSpMat<T>::remote_assembly_registry() {
     static RemoteAssemblyRegistry instance;
     return instance;
 }
 
-template <typename T, typename Kernel>
-void BlockSpMat<T, Kernel>::release_graph_reference() const {
+template <typename T>
+void BlockSpMat<T>::release_graph_reference() const {
     if (graph == nullptr) {
         return;
     }
@@ -1905,8 +1904,8 @@ void BlockSpMat<T, Kernel>::release_graph_reference() const {
     }
 }
 
-template <typename T, typename Kernel>
-void BlockSpMat<T, Kernel>::prepare_graph_for_shared_use() const {
+template <typename T>
+void BlockSpMat<T>::prepare_graph_for_shared_use() const {
     DistGraph* live_graph = require_live_graph(graph, "prepare_graph_for_shared_use");
     if (owns_graph && !live_graph->has_managed_matrix_lifetime()) {
         // Promote a singly owned graph before another matrix starts sharing it.
@@ -1914,8 +1913,8 @@ void BlockSpMat<T, Kernel>::prepare_graph_for_shared_use() const {
     }
 }
 
-template <typename T, typename Kernel>
-void BlockSpMat<T, Kernel>::require_assembled_for_state_copy(const char* op_name) const {
+template <typename T>
+void BlockSpMat<T>::require_assembled_for_state_copy(const char* op_name) const {
     if (has_pending_remote_assembly(this)) {
         throw std::runtime_error(
             std::string(op_name) +
@@ -1923,8 +1922,8 @@ void BlockSpMat<T, Kernel>::require_assembled_for_state_copy(const char* op_name
     }
 }
 
-template <typename T, typename Kernel>
-BlockSpMat<T, Kernel>::BlockSpMat(
+template <typename T>
+BlockSpMat<T>::BlockSpMat(
     DistGraph* g,
     MatrixKind matrix_kind,
     bool owns_graph,
@@ -1942,9 +1941,9 @@ BlockSpMat<T, Kernel>::BlockSpMat(
     }
 }
 
-template <typename T, typename Kernel>
+template <typename T>
 template <typename Backend>
-Backend& BlockSpMat<T, Kernel>::active_backend_storage() {
+Backend& BlockSpMat<T>::active_backend_storage() {
     auto* storage = std::get_if<Backend>(&backend_handle_);
     if (storage == nullptr) {
         throw std::logic_error("Active backend does not match requested storage path");
@@ -1952,9 +1951,9 @@ Backend& BlockSpMat<T, Kernel>::active_backend_storage() {
     return *storage;
 }
 
-template <typename T, typename Kernel>
+template <typename T>
 template <typename Backend>
-const Backend& BlockSpMat<T, Kernel>::active_backend_storage() const {
+const Backend& BlockSpMat<T>::active_backend_storage() const {
     const auto* storage = std::get_if<Backend>(&backend_handle_);
     if (storage == nullptr) {
         throw std::logic_error("Active backend does not match requested storage path");
@@ -1962,38 +1961,38 @@ const Backend& BlockSpMat<T, Kernel>::active_backend_storage() const {
     return *storage;
 }
 
-template <typename T, typename Kernel>
-typename BlockSpMat<T, Kernel>::VBCSRBackendStorage& BlockSpMat<T, Kernel>::active_vbcsr_backend() {
+template <typename T>
+typename BlockSpMat<T>::VBCSRBackendStorage& BlockSpMat<T>::active_vbcsr_backend() {
     return active_backend_storage<VBCSRBackendStorage>();
 }
 
-template <typename T, typename Kernel>
-const typename BlockSpMat<T, Kernel>::VBCSRBackendStorage& BlockSpMat<T, Kernel>::active_vbcsr_backend() const {
+template <typename T>
+const typename BlockSpMat<T>::VBCSRBackendStorage& BlockSpMat<T>::active_vbcsr_backend() const {
     return active_backend_storage<VBCSRBackendStorage>();
 }
 
-template <typename T, typename Kernel>
-typename BlockSpMat<T, Kernel>::CSRBackendStorage& BlockSpMat<T, Kernel>::active_csr_backend() {
+template <typename T>
+typename BlockSpMat<T>::CSRBackendStorage& BlockSpMat<T>::active_csr_backend() {
     return active_backend_storage<CSRBackendStorage>();
 }
 
-template <typename T, typename Kernel>
-const typename BlockSpMat<T, Kernel>::CSRBackendStorage& BlockSpMat<T, Kernel>::active_csr_backend() const {
+template <typename T>
+const typename BlockSpMat<T>::CSRBackendStorage& BlockSpMat<T>::active_csr_backend() const {
     return active_backend_storage<CSRBackendStorage>();
 }
 
-template <typename T, typename Kernel>
-typename BlockSpMat<T, Kernel>::BSRBackendStorage& BlockSpMat<T, Kernel>::active_bsr_backend() {
+template <typename T>
+typename BlockSpMat<T>::BSRBackendStorage& BlockSpMat<T>::active_bsr_backend() {
     return active_backend_storage<BSRBackendStorage>();
 }
 
-template <typename T, typename Kernel>
-const typename BlockSpMat<T, Kernel>::BSRBackendStorage& BlockSpMat<T, Kernel>::active_bsr_backend() const {
+template <typename T>
+const typename BlockSpMat<T>::BSRBackendStorage& BlockSpMat<T>::active_bsr_backend() const {
     return active_backend_storage<BSRBackendStorage>();
 }
 
-template <typename T, typename Kernel>
-typename BlockSpMat<T, Kernel>::RemoteThreadBuffers& BlockSpMat<T, Kernel>::remote_assembly_buffers() const {
+template <typename T>
+typename BlockSpMat<T>::RemoteThreadBuffers& BlockSpMat<T>::remote_assembly_buffers() const {
     auto& reg = remote_assembly_registry();
     std::lock_guard<std::mutex> lock(reg.mutex);
     auto& buffers = reg.buffers[this];
@@ -2003,8 +2002,8 @@ typename BlockSpMat<T, Kernel>::RemoteThreadBuffers& BlockSpMat<T, Kernel>::remo
     return buffers;
 }
 
-template <typename T, typename Kernel>
-bool BlockSpMat<T, Kernel>::has_pending_remote_assembly(const BlockSpMat* matrix) {
+template <typename T>
+bool BlockSpMat<T>::has_pending_remote_assembly(const BlockSpMat* matrix) {
     auto& reg = remote_assembly_registry();
     std::lock_guard<std::mutex> lock(reg.mutex);
     auto it = reg.buffers.find(matrix);
@@ -2021,8 +2020,8 @@ bool BlockSpMat<T, Kernel>::has_pending_remote_assembly(const BlockSpMat* matrix
     return false;
 }
 
-template <typename T, typename Kernel>
-void BlockSpMat<T, Kernel>::transfer_remote_assembly_state(const BlockSpMat* from, const BlockSpMat* to) {
+template <typename T>
+void BlockSpMat<T>::transfer_remote_assembly_state(const BlockSpMat* from, const BlockSpMat* to) {
     auto& reg = remote_assembly_registry();
     std::lock_guard<std::mutex> lock(reg.mutex);
     auto it = reg.buffers.find(from);
@@ -2033,31 +2032,31 @@ void BlockSpMat<T, Kernel>::transfer_remote_assembly_state(const BlockSpMat* fro
     reg.buffers.erase(it);
 }
 
-template <typename T, typename Kernel>
-void BlockSpMat<T, Kernel>::clear_remote_assembly_state(const BlockSpMat* matrix) {
+template <typename T>
+void BlockSpMat<T>::clear_remote_assembly_state(const BlockSpMat* matrix) {
     auto& reg = remote_assembly_registry();
     std::lock_guard<std::mutex> lock(reg.mutex);
     reg.buffers.erase(matrix);
 }
 
-template <typename T, typename Kernel>
-DistGraph* BlockSpMat<T, Kernel>::require_live_graph(DistGraph* graph, const char* op_name) {
+template <typename T>
+DistGraph* BlockSpMat<T>::require_live_graph(DistGraph* graph, const char* op_name) {
     if (graph == nullptr) {
         throw std::invalid_argument(std::string(op_name) + " requires a live DistGraph");
     }
     return graph;
 }
 
-template <typename T, typename Kernel>
-const DistGraph* BlockSpMat<T, Kernel>::require_live_graph(const DistGraph* graph, const char* op_name) {
+template <typename T>
+const DistGraph* BlockSpMat<T>::require_live_graph(const DistGraph* graph, const char* op_name) {
     if (graph == nullptr) {
         throw std::invalid_argument(std::string(op_name) + " requires a live DistGraph");
     }
     return graph;
 }
 
-template <typename T, typename Kernel>
-uint32_t BlockSpMat<T, Kernel>::default_page_size_for(
+template <typename T>
+uint32_t BlockSpMat<T>::default_page_size_for(
     MatrixKind matrix_kind,
     const DistGraph* graph) {
     graph = require_live_graph(graph, "default_page_size_for");
@@ -2084,8 +2083,8 @@ uint32_t BlockSpMat<T, Kernel>::default_page_size_for(
     throw std::runtime_error("Unsupported matrix kind in default_page_size_for");
 }
 
-template <typename T, typename Kernel>
-uint32_t BlockSpMat<T, Kernel>::normalize_page_size(
+template <typename T>
+uint32_t BlockSpMat<T>::normalize_page_size(
     MatrixKind matrix_kind,
     const DistGraph* graph,
     uint32_t page_size) {
@@ -2117,8 +2116,8 @@ uint32_t BlockSpMat<T, Kernel>::normalize_page_size(
     throw std::runtime_error("Unsupported matrix kind in normalize_page_size");
 }
 
-template <typename T, typename Kernel>
-void BlockSpMat<T, Kernel>::rebuild_backend_for_page_size(const char* op_name) {
+template <typename T>
+void BlockSpMat<T>::rebuild_backend_for_page_size(const char* op_name) {
     require_assembled_for_state_copy(op_name);
     const bool had_norms = norms_valid;
     std::vector<double> saved_norms = had_norms ? block_norms : std::vector<double>{};
@@ -2135,8 +2134,8 @@ void BlockSpMat<T, Kernel>::rebuild_backend_for_page_size(const char* op_name) {
     }
 }
 
-template <typename T, typename Kernel>
-MatrixKind BlockSpMat<T, Kernel>::detect_matrix_kind(const DistGraph* g) {
+template <typename T>
+MatrixKind BlockSpMat<T>::detect_matrix_kind(const DistGraph* g) {
     g = require_live_graph(g, "detect_matrix_kind");
 
     const int n_owned = static_cast<int>(g->owned_global_indices.size());
@@ -2165,8 +2164,8 @@ MatrixKind BlockSpMat<T, Kernel>::detect_matrix_kind(const DistGraph* g) {
     return MatrixKind::VBCSR;
 }
 
-template <typename T, typename Kernel>
-typename BlockSpMat<T, Kernel>::BackendHandle BlockSpMat<T, Kernel>::build_backend_for_structure(
+template <typename T>
+typename BlockSpMat<T>::BackendHandle BlockSpMat<T>::build_backend_for_structure(
     MatrixKind matrix_kind,
     DistGraph* graph,
     uint32_t page_size) {
@@ -2246,32 +2245,32 @@ typename BlockSpMat<T, Kernel>::BackendHandle BlockSpMat<T, Kernel>::build_backe
     throw std::runtime_error("Unsupported matrix kind in build_backend_for_structure");
 }
 
-template <typename T, typename Kernel>
-void BlockSpMat<T, Kernel>::attach_backend(VBCSRBackendStorage backend) {
+template <typename T>
+void BlockSpMat<T>::attach_backend(VBCSRBackendStorage backend) {
     configured_page_size_ = backend.configured_blocks_per_page();
     backend_handle_.template emplace<VBCSRBackendStorage>(std::move(backend));
     block_norms.clear();
     norms_valid = false;
 }
 
-template <typename T, typename Kernel>
-void BlockSpMat<T, Kernel>::attach_backend(CSRBackendStorage backend) {
+template <typename T>
+void BlockSpMat<T>::attach_backend(CSRBackendStorage backend) {
     configured_page_size_ = backend.configured_page_size();
     backend_handle_.template emplace<CSRBackendStorage>(std::move(backend));
     block_norms.clear();
     norms_valid = false;
 }
 
-template <typename T, typename Kernel>
-void BlockSpMat<T, Kernel>::attach_backend(BSRBackendStorage backend) {
+template <typename T>
+void BlockSpMat<T>::attach_backend(BSRBackendStorage backend) {
     configured_page_size_ = backend.configured_blocks_per_page();
     backend_handle_.template emplace<BSRBackendStorage>(std::move(backend));
     block_norms.clear();
     norms_valid = false;
 }
 
-template <typename T, typename Kernel>
-void BlockSpMat<T, Kernel>::attach_backend(BackendHandle backend) {
+template <typename T>
+void BlockSpMat<T>::attach_backend(BackendHandle backend) {
     std::visit(
         [this](auto&& committed_backend) {
             using Backend = std::decay_t<decltype(committed_backend)>;
@@ -2284,8 +2283,8 @@ void BlockSpMat<T, Kernel>::attach_backend(BackendHandle backend) {
         std::move(backend));
 }
 
-template <typename T, typename Kernel>
-void BlockSpMat<T, Kernel>::ensure_same_backend_family(
+template <typename T>
+void BlockSpMat<T>::ensure_same_backend_family(
     const BlockSpMat& lhs,
     const BlockSpMat& rhs,
     const char* op_name) {
@@ -2297,15 +2296,15 @@ void BlockSpMat<T, Kernel>::ensure_same_backend_family(
     }
 }
 
-template <typename T, typename Kernel>
-void BlockSpMat<T, Kernel>::ensure_csr_binary_compatibility(const BlockSpMat& lhs, const BlockSpMat& rhs) {
+template <typename T>
+void BlockSpMat<T>::ensure_csr_binary_compatibility(const BlockSpMat& lhs, const BlockSpMat& rhs) {
     if (lhs.graph->owned_global_indices != rhs.graph->owned_global_indices) {
         throw std::runtime_error("CSR binary operation requires matching owned row distribution");
     }
 }
 
-template <typename T, typename Kernel>
-void BlockSpMat<T, Kernel>::ensure_bsr_binary_compatibility(const BlockSpMat& lhs, const BlockSpMat& rhs) {
+template <typename T>
+void BlockSpMat<T>::ensure_bsr_binary_compatibility(const BlockSpMat& lhs, const BlockSpMat& rhs) {
     if (lhs.graph->owned_global_indices != rhs.graph->owned_global_indices) {
         throw std::runtime_error("BSR binary operation requires matching owned row distribution");
     }
@@ -2316,8 +2315,8 @@ void BlockSpMat<T, Kernel>::ensure_bsr_binary_compatibility(const BlockSpMat& lh
     }
 }
 
-template <typename T, typename Kernel>
-void BlockSpMat<T, Kernel>::ensure_vbcsr_binary_compatibility(const BlockSpMat& lhs, const BlockSpMat& rhs) {
+template <typename T>
+void BlockSpMat<T>::ensure_vbcsr_binary_compatibility(const BlockSpMat& lhs, const BlockSpMat& rhs) {
     if (lhs.graph->owned_global_indices != rhs.graph->owned_global_indices) {
         throw std::runtime_error("VBCSR binary operation requires matching owned row distribution");
     }
@@ -2332,8 +2331,8 @@ void BlockSpMat<T, Kernel>::ensure_vbcsr_binary_compatibility(const BlockSpMat& 
     }
 }
 
-template <typename T, typename Kernel>
-bool BlockSpMat<T, Kernel>::has_same_logical_structure(const BlockSpMat& other) const {
+template <typename T>
+bool BlockSpMat<T>::has_same_logical_structure(const BlockSpMat& other) const {
     if (kind != other.kind) {
         return false;
     }
@@ -2348,8 +2347,8 @@ bool BlockSpMat<T, Kernel>::has_same_logical_structure(const BlockSpMat& other) 
            graph->adj_ind == other.graph->adj_ind;
 }
 
-template <typename T, typename Kernel>
-bool BlockSpMat<T, Kernel>::update_local_block(
+template <typename T>
+bool BlockSpMat<T>::update_local_block(
     int local_row,
     int local_col,
     const T* data,
@@ -2376,24 +2375,25 @@ bool BlockSpMat<T, Kernel>::update_local_block(
             }
 
             if (mode == AssemblyMode::INSERT) {
-                if (layout == MatrixLayout::ColMajor) {
+                if (layout == kCanonicalBlockLayout) {
                     std::memcpy(target, data, r_dim * c_dim * sizeof(T));
                 } else {
+                    // Transpose ColMajor input into canonical RowMajor storage.
                     for (int i = 0; i < r_dim; ++i) {
                         for (int j = 0; j < c_dim; ++j) {
-                            target[j * r_dim + i] = data[i * c_dim + j];
+                            target[i * c_dim + j] = data[j * r_dim + i];
                         }
                     }
                 }
             } else {
-                if (layout == MatrixLayout::ColMajor) {
+                if (layout == kCanonicalBlockLayout) {
                     for (int i = 0; i < r_dim * c_dim; ++i) {
                         target[i] += data[i];
                     }
                 } else {
                     for (int i = 0; i < r_dim; ++i) {
                         for (int j = 0; j < c_dim; ++j) {
-                            target[j * r_dim + i] += data[i * c_dim + j];
+                            target[i * c_dim + j] += data[j * r_dim + i];
                         }
                     }
                 }

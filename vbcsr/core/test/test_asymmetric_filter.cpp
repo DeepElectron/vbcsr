@@ -10,6 +10,7 @@ int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
     int rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    int failures = 0;
 
     // Simple Asymmetric Graph
     // 0 connects to 1.
@@ -37,7 +38,7 @@ int main(int argc, char** argv) {
     DistGraph graph(MPI_COMM_WORLD);
     graph.construct_distributed(owned, sizes, adj);
     
-    BlockSpMat<double, BLASKernel> A(&graph);
+    BlockSpMat<double> A(&graph);
     
     double one = 1.0;
     double v_L = 0.8; // Large value
@@ -101,11 +102,13 @@ int main(int argc, char** argv) {
         
         if (std::abs(c03 - c30) > 1e-9) {
             std::cout << "FAILURE: Asymmetry detected. Diff = " << std::abs(c03 - c30) << std::endl;
+            failures++;
         } else {
             std::cout << "SUCCESS: Symmetric." << std::endl;
         }
     }
-    
+
+    MPI_Allreduce(MPI_IN_PLACE, &failures, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
     MPI_Finalize();
-    return 0;
+    return failures > 0 ? 1 : 0;
 }

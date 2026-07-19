@@ -12,6 +12,31 @@
 
 namespace vbcsr::detail {
 
+// Two matrices only share a slot-for-slot structure when each slot refers to
+// the same (row, global column). Local col_ind values are graph-specific:
+// distinct graphs can assign the same local ghost ID to different global
+// columns, so raw col_ind comparison is only valid for the same graph object.
+template <typename Matrix>
+inline bool local_structure_matches(const Matrix& self, const Matrix& X) {
+    if (self.row_ptr() != X.row_ptr()) {
+        return false;
+    }
+    if (self.graph == X.graph) {
+        return self.col_ind() == X.col_ind();
+    }
+    const auto& self_cols = self.col_ind();
+    const auto& x_cols = X.col_ind();
+    if (self_cols.size() != x_cols.size()) {
+        return false;
+    }
+    for (size_t k = 0; k < self_cols.size(); ++k) {
+        if (self.graph->get_global_index(self_cols[k]) != X.graph->get_global_index(x_cols[k])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 template <typename Matrix>
 struct CSRAxpbyExecutor {
     using T = typename Matrix::value_type;
@@ -19,7 +44,7 @@ struct CSRAxpbyExecutor {
     static void run(Matrix& self, const Matrix& X, T alpha, T beta) {
         Matrix::ensure_csr_binary_compatibility(self, X);
 
-        const bool local_same_structure = (self.row_ptr() == X.row_ptr() && self.col_ind() == X.col_ind());
+        const bool local_same_structure = local_structure_matches(self, X);
         int same_structure_flag = local_same_structure ? 1 : 0;
         if (self.graph->size > 1) {
             MPI_Allreduce(MPI_IN_PLACE, &same_structure_flag, 1, MPI_INT, MPI_MIN, self.graph->comm);
@@ -113,7 +138,7 @@ struct BSRAxpbyExecutor {
     static void run(Matrix& self, const Matrix& X, T alpha, T beta) {
         Matrix::ensure_bsr_binary_compatibility(self, X);
 
-        const bool local_same_structure = (self.row_ptr() == X.row_ptr() && self.col_ind() == X.col_ind());
+        const bool local_same_structure = local_structure_matches(self, X);
         int same_structure_flag = local_same_structure ? 1 : 0;
         if (self.graph->size > 1) {
             MPI_Allreduce(MPI_IN_PLACE, &same_structure_flag, 1, MPI_INT, MPI_MIN, self.graph->comm);
@@ -244,7 +269,7 @@ struct VBCSRAxpbyExecutor {
                 return;
             }
 
-            const bool same_structure = (self.row_ptr() == X.row_ptr() && self.col_ind() == X.col_ind());
+            const bool same_structure = local_structure_matches(self, X);
             if (same_structure) {
                 copy_scaled_structure(self, X, alpha);
                 return;

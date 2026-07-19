@@ -1,86 +1,128 @@
 #include "../block_csr.hpp"
+#include <cmath>
+#include <complex>
 #include <iostream>
 #include <vector>
-#include <complex>
-#include <cmath>
 
 using namespace vbcsr;
+using cd = std::complex<double>;
+
+namespace {
+
+// Global matrix: two 2x2 blocks (4x4 scalars), dense block structure so the
+// distributed transpose genuinely exchanges off-diagonal blocks between ranks.
+// A = [[ 1   2i   5   6  ]
+//      [ 3   4    7i   8  ]
+//      [ 9   10   13   14i]
+//      [ 11  12i  15   16 ]]
+const cd kA[4][4] = {
+    {{1, 0}, {0, 2}, {5, 0}, {6, 0}},
+    {{3, 0}, {4, 0}, {0, 7}, {8, 0}},
+    {{9, 0}, {10, 0}, {13, 0}, {0, 14}},
+    {{11, 0}, {0, 12}, {15, 0}, {16, 0}},
+};
+
+cd adjoint_entry(int r, int c) { return std::conj(kA[c][r]); }
+
+// Value at (owned-local scalar row, global scalar col) of the local dense
+// view, resolving the column offset through the matrix graph so the check is
+// independent of local ghost ordering. Structurally absent blocks read 0.
+template <typename Mat>
+cd dense_entry(const Mat& m, const std::vector<cd>& dense, int local_row, int g_col) {
+    const int g_block = g_col / 2;
+    const auto it = m.graph->global_to_local.find(g_block);
+    if (it == m.graph->global_to_local.end()) return cd(0, 0);
+    const int my_cols = m.graph->block_offsets.back();
+    const int col = m.graph->block_offsets[it->second] + (g_col % 2);
+    return dense[local_row * my_cols + col];
+}
+
+template <typename Mat>
+int check_adjoint(const Mat& m, int first_global_row, int n_rows, const char* label, int rank) {
+    const std::vector<cd> dense = m.to_dense();
+    int failures = 0;
+    for (int r = 0; r < n_rows; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            const cd got = dense_entry(m, dense, r, c);
+            const cd expected = adjoint_entry(first_global_row + r, c);
+            if (std::abs(got - expected) > 1e-9) {
+                std::cout << "[rank " << rank << "] " << label << " mismatch at ("
+                          << first_global_row + r << "," << c << "): got " << got
+                          << " expected " << expected << std::endl;
+                ++failures;
+            }
+        }
+    }
+    if (failures == 0) {
+        std::cout << "[rank " << rank << "] " << label << " OK" << std::endl;
+    }
+    return failures;
+}
+
+} // namespace
 
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
-    int rank;
+    int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    // Test 1: Transpose Correctness
-    // A = [[1, 2i], [3, 4]]
-    // A^H = [[1, 3], [-2i, 4]]
-    
-    std::vector<int> owned = {0};
-    std::vector<int> sizes = {2};
-    std::vector<std::vector<int>> adj(1);
-    adj[0] = {0};
-    
+    // Rank r owns global block row r; at np=1 rank 0 owns both blocks.
+    // Ownership must match construct_distributed's positional partition
+    // (rank r owns global ids [displs[r], displs[r+1])).
+    std::vector<int> owned, sizes;
+    std::vector<std::vector<int>> adj;
+    if (size == 1) {
+        owned = {0, 1};
+        sizes = {2, 2};
+        adj = {{0, 1}, {0, 1}};
+    } else if (rank < 2) {
+        owned = {rank};
+        sizes = {2};
+        adj = {{0, 1}};
+    }
+
     DistGraph graph(MPI_COMM_WORLD);
     graph.construct_distributed(owned, sizes, adj);
-    
-    BlockSpMat<std::complex<double>, BLASKernel> A(&graph);
-    std::complex<double> data_A[4] = {
-        {1.0, 0.0}, {3.0, 0.0}, // Col 0: 1, 3
-        {0.0, 2.0}, {4.0, 0.0}  // Col 1: 2i, 4
-    };
-    A.add_block(0, 0, data_A, 2, 2, AssemblyMode::INSERT);
-    A.assemble();
-    
-    auto AH = A.transpose();
-    
-    if (rank == 0) {
-        auto dense = AH.to_dense(); // RowMajor
-        // Expected:
-        // Row 0: 1, 3
-        // Row 1: -2i, 4
-        
-        std::complex<double> v00 = dense[0];
-        std::complex<double> v01 = dense[1];
-        std::complex<double> v10 = dense[2];
-        std::complex<double> v11 = dense[3];
-        
-        std::cout << "A^H:" << std::endl;
-        std::cout << v00 << " " << v01 << std::endl;
-        std::cout << v10 << " " << v11 << std::endl;
-        
-        bool ok = true;
-        if (std::abs(v00 - 1.0) > 1e-9) ok = false;
-        if (std::abs(v01 - 3.0) > 1e-9) ok = false;
-        if (std::abs(v10 - std::complex<double>(0, -2)) > 1e-9) ok = false;
-        if (std::abs(v11 - 4.0) > 1e-9) ok = false;
-        
-        if (ok) std::cout << "Transpose OK" << std::endl;
-        else std::cout << "Transpose FAILED" << std::endl;
-    }
-    
-    // Test 2: SpMM with TransA
-    // C = A^H * I = A^H
-    BlockSpMat<std::complex<double>, BLASKernel> I(&graph);
-    std::complex<double> data_I[4] = {
-        {1.0, 0.0}, {0.0, 0.0},
-        {0.0, 0.0}, {1.0, 0.0}
-    };
-    I.add_block(0, 0, data_I, 2, 2, AssemblyMode::INSERT);
-    I.assemble();
-    
-    auto C = A.spmm(I, 0.0, true, false);
-    
-    if (rank == 0) {
-        auto dense = C.to_dense();
-        std::complex<double> v10 = dense[2];
-        std::cout << "C_10 (should be -2i): " << v10 << std::endl;
-        if (std::abs(v10 - std::complex<double>(0, -2)) < 1e-9) {
-            std::cout << "SpMM TransA OK" << std::endl;
-        } else {
-            std::cout << "SpMM TransA FAILED" << std::endl;
+
+    BlockSpMat<cd> A(&graph);
+    for (int gb : owned) {
+        for (int cb = 0; cb < 2; ++cb) {
+            cd block[4]; // RowMajor 2x2 (canonical block layout)
+            for (int r = 0; r < 2; ++r)
+                for (int c = 0; c < 2; ++c)
+                    block[r * 2 + c] = kA[2 * gb + r][2 * cb + c];
+            A.add_block(gb, cb, block, 2, 2, AssemblyMode::INSERT, MatrixLayout::RowMajor);
         }
+    }
+    A.assemble();
+
+    int failures = 0;
+    const int first_row = owned.empty() ? 0 : owned.front() * 2;
+    const int n_local_rows = static_cast<int>(owned.size()) * 2;
+
+    // Test 1: A.transpose() must equal the conjugate transpose of A.
+    auto AH = A.transpose();
+    failures += check_adjoint(AH, first_row, n_local_rows, "transpose", rank);
+
+    // Test 2: C = A^H * I via spmm(transA) must equal A^H as well.
+    BlockSpMat<cd> I(&graph);
+    const cd eye[4] = {{1, 0}, {0, 0}, {0, 0}, {1, 0}};
+    for (int gb : owned) {
+        I.add_block(gb, gb, eye, 2, 2, AssemblyMode::INSERT);
+    }
+    I.assemble();
+
+    auto C = A.spmm(I, 0.0, true, false);
+    failures += check_adjoint(C, first_row, n_local_rows, "spmm transA", rank);
+
+    int global_failures = 0;
+    MPI_Allreduce(&failures, &global_failures, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    if (rank == 0) {
+        std::cout << (global_failures ? "Hermitian product FAILED" : "Hermitian product OK")
+                  << std::endl;
     }
 
     MPI_Finalize();
-    return 0;
+    return global_failures > 0 ? 1 : 0;
 }

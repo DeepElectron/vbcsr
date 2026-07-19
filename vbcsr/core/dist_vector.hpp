@@ -11,10 +11,6 @@
 #include <complex>
 #include "scalar_traits.hpp"
 
-#ifdef _OPENMP
-#include <omp.h>
-#endif
-
 namespace vbcsr {
 
 template <typename T>
@@ -41,17 +37,23 @@ public:
     int size() const { return local_size; } // Only owned size
     int full_size() const { return local_size + ghost_size; }
 
-    // Bind to a new graph (must have same owned structure)
+    // Bind to a new graph (must have same owned structure).
+    // Throws on any owned-structure mismatch, including graphs whose scalar
+    // sizes coincide but whose block partitions differ (e.g. two 1x1 blocks
+    // vs one 2x2 block). Used by BlockSpMat::mult and friends, so a
+    // vector/matrix graph mismatch is a hard error, never silently accepted.
     void bind_to_graph(DistGraph* new_graph) {
         if (graph == new_graph) return;
-        
+
+        if (!graph->same_owned_structure(*new_graph)) {
+            throw std::runtime_error(
+                "DistVector::bind_to_graph: graph mismatch - target graph has a "
+                "different owned block structure (partition or block sizes)");
+        }
+
         int new_local_size, new_ghost_size;
         new_graph->get_vector_structure(new_local_size, new_ghost_size);
-        
-        if (new_local_size != local_size) {
-            throw std::runtime_error("Cannot bind to graph with different owned structure");
-        }
-        
+
         graph = new_graph;
         ghost_size = new_ghost_size;
         // Resize preserves first local_size elements (owned data)
@@ -145,14 +147,13 @@ public:
             throw std::runtime_error("Vector size mismatch in copy_from");
         }
         // Copy data (including ghosts)
-        // We can use memcpy or std::copy
         std::copy(other.data.begin(), other.data.end(), data.begin());
     }
 
     void swap(DistVector<T>& other) {
         std::swap(data, other.data);
         std::swap(local_size, other.local_size);
-        std::swap(ghost_size, other.ghost_size); // Corrected: swap ghost_size, not global_size
+        std::swap(ghost_size, other.ghost_size);
         std::swap(graph, other.graph);
     }
 
@@ -260,8 +261,6 @@ template <> inline MPI_Datatype DistVector<double>::get_mpi_type() const { retur
 template <> inline MPI_Datatype DistVector<float>::get_mpi_type() const { return MPI_FLOAT; }
 template <> inline MPI_Datatype DistVector<int>::get_mpi_type() const { return MPI_INT; }
 template <> inline MPI_Datatype DistVector<std::complex<double>>::get_mpi_type() const { return MPI_CXX_DOUBLE_COMPLEX; }
-// Complex types need handling, assuming std::complex layout matches C struct
-// For simplicity, let's assume double for now or add complex support.
 
 } // namespace vbcsr
 

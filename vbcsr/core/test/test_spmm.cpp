@@ -13,7 +13,7 @@ using namespace vbcsr;
 
 // Helper to gather distributed block matrix to a global dense matrix on Rank 0
 template <typename T>
-std::vector<T> gather_dense(BlockSpMat<T, SmartKernel<T>>& A, int global_rows, int global_cols, const std::vector<int>& global_block_sizes) {
+std::vector<T> gather_dense(BlockSpMat<T>& A, int global_rows, int global_cols, const std::vector<int>& global_block_sizes) {
     int rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     
@@ -50,8 +50,8 @@ std::vector<T> gather_dense(BlockSpMat<T, SmartKernel<T>>& A, int global_rows, i
                 for(int c=0; c<c_dim; ++c) {
                     // Global dense index (Row-Major)
                     int dense_idx = (gid_row_start + r) * global_cols + (gid_col_start + c);
-                    // Block index (Col-Major)
-                    int blk_idx = c * r_dim + r;
+                    // Block index (canonical Row-Major storage)
+                    int blk_idx = r * c_dim + c;
                     local_dense[dense_idx] = val[blk_idx];
                     filled_count++;
                 }
@@ -121,10 +121,12 @@ void print_dense(const std::vector<T>& A, int rows, int cols, const std::string&
 
 // Generalized Random Test
 template <typename T>
-void test_random_spmm(int n_block_rows, double density, int min_blk, int max_blk, bool test_complex = false) {
+int test_random_spmm(int n_block_rows, double density, int min_blk, int max_blk, bool test_complex = false) {
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    int failures = 0;
     
     // 1. Generate random block sizes
     std::vector<int> block_sizes(n_block_rows);
@@ -170,7 +172,7 @@ void test_random_spmm(int n_block_rows, double density, int min_blk, int max_blk
     // std::cout << "Rank " << rank << " Graph constructed" << std::endl;
     MPI_Barrier(MPI_COMM_WORLD);
     
-    BlockSpMat<T, SmartKernel<T>> A(graph);
+    BlockSpMat<T> A(graph);
     
     // 5. Fill with random values
     int n_owned = graph->owned_global_indices.size();
@@ -196,7 +198,7 @@ void test_random_spmm(int n_block_rows, double density, int min_blk, int max_blk
     
     // We need to ensure A is square for A*A. It is (n_block_rows x n_block_rows).
     
-    BlockSpMat<T, SmartKernel<T>> C = A.spmm(A, 0.0); // Threshold 0.0 to keep all
+    BlockSpMat<T> C = A.spmm(A, 0.0); // Threshold 0.0 to keep all
 
     // 7. Verify
     auto dense_A = gather_dense(A, total_rows, total_rows, block_sizes);
@@ -215,11 +217,12 @@ void test_random_spmm(int n_block_rows, double density, int min_blk, int max_blk
             std::cout << "Random SpMM (" << (test_complex ? "Complex" : "Real") << ", N=" << n_block_rows << ", Den=" << density << ") PASSED" << std::endl;
         } else {
             std::cout << "Random SpMM (" << (test_complex ? "Complex" : "Real") << ", N=" << n_block_rows << ", Den=" << density << ") FAILED" << std::endl;
+            failures++;
         }
     }
     
     // 8. Test Transpose C = A^T
-    BlockSpMat<T, SmartKernel<T>> AT = A.transpose();
+    BlockSpMat<T> AT = A.transpose();
     auto dense_AT = gather_dense(AT, total_rows, total_rows, block_sizes);
     if (rank == 0) {
         if (n_block_rows <= 2) {
@@ -244,12 +247,13 @@ void test_random_spmm(int n_block_rows, double density, int min_blk, int max_blk
             std::cout << "Random Transpose (" << (test_complex ? "Complex" : "Real") << ") PASSED" << std::endl;
         } else {
             std::cout << "Random Transpose (" << (test_complex ? "Complex" : "Real") << ") FAILED" << std::endl;
+            failures++;
         }
     }
     
     // 9. Test SpMM with transA=true: C = A^T * A
     // std::cout << "Rank " << rank << " Starting SpMM (transA=true)" << std::endl;
-    BlockSpMat<T, SmartKernel<T>> Ct = A.spmm(A, 0.0, true, false);
+    BlockSpMat<T> Ct = A.spmm(A, 0.0, true, false);
     // std::cout << "Rank " << rank << " SpMM (transA=true) done" << std::endl;
     
     auto dense_Ct = gather_dense(Ct, total_rows, total_rows, block_sizes);
@@ -260,16 +264,21 @@ void test_random_spmm(int n_block_rows, double density, int min_blk, int max_blk
             std::cout << "Random SpMM transA (" << (test_complex ? "Complex" : "Real") << ") PASSED" << std::endl;
         } else {
             std::cout << "Random SpMM transA (" << (test_complex ? "Complex" : "Real") << ") FAILED" << std::endl;
+            failures++;
         }
     }
+
+    return failures;
 }
 
 // Diverse Connectivity Test
 template <typename T>
-void test_diverse_spmm(int n_block_rows, double base_density, int min_blk, int max_blk, bool test_complex = false) {
+int test_diverse_spmm(int n_block_rows, double base_density, int min_blk, int max_blk, bool test_complex = false) {
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    int failures = 0;
     
     // 1. Generate random block sizes
     std::vector<int> block_sizes(n_block_rows);
@@ -318,7 +327,7 @@ void test_diverse_spmm(int n_block_rows, double base_density, int min_blk, int m
     DistGraph* graph = new DistGraph(MPI_COMM_WORLD);
     graph->construct_distributed(my_indices, my_local_block_sizes, adj);
     
-    BlockSpMat<T, SmartKernel<T>> A(graph);
+    BlockSpMat<T> A(graph);
     
     // 6. Fill with random values
     std::uniform_real_distribution<> dis_val(-1.0, 1.0);
@@ -338,7 +347,7 @@ void test_diverse_spmm(int n_block_rows, double base_density, int min_blk, int m
     }
     
     // 7. Compute C = A * A
-    BlockSpMat<T, SmartKernel<T>> C = A.spmm(A, 0.0);
+    BlockSpMat<T> C = A.spmm(A, 0.0);
     
     // 8. Verify
     auto dense_A = gather_dense(A, total_rows, total_rows, block_sizes);
@@ -351,15 +360,20 @@ void test_diverse_spmm(int n_block_rows, double base_density, int min_blk, int m
             std::cout << "Diverse SpMM (" << (test_complex ? "Complex" : "Real") << ", N=" << n_block_rows << ") PASSED" << std::endl;
         } else {
             std::cout << "Diverse SpMM (" << (test_complex ? "Complex" : "Real") << ", N=" << n_block_rows << ") FAILED" << std::endl;
+            failures++;
         }
     }
+
+    return failures;
 }
 
 // Filtered SpMM Test
 template <typename T>
-void test_filtered_spmm(bool test_complex = false) {
+int test_filtered_spmm(bool test_complex = false) {
     int rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    int failures = 0;
     
     // Create a simple diagonal matrix with some off-diagonal elements
     // 4 blocks. 
@@ -377,9 +391,19 @@ void test_filtered_spmm(bool test_complex = false) {
     int size;
     MPI_Comm_size(MPI_COMM_WORLD, &size);
     
+    // The fixed 4-block ring only partitions cleanly when size divides
+    // n_blocks (1, 2, 4): otherwise the trailing rows are unowned and their
+    // ghost dims can never be backfilled. Skip on other rank counts.
+    if (n_blocks % size != 0) {
+        if (rank == 0) {
+            std::cout << "Filtered SpMM skipped (comm size " << size
+                      << " does not divide " << n_blocks << " blocks)" << std::endl;
+        }
+        return 0;
+    }
+
     int my_start = rank * (n_blocks / size);
     int my_count = n_blocks / size;
-    // Assume size divides n_blocks (e.g. 1, 2, 4)
     
     std::vector<int> my_indices;
     for(int i=0; i<my_count; ++i) my_indices.push_back(my_start + i);
@@ -395,7 +419,7 @@ void test_filtered_spmm(bool test_complex = false) {
     DistGraph* graph = new DistGraph(MPI_COMM_WORLD);
     graph->construct_distributed(my_indices, my_local_block_sizes, adj);
     
-    BlockSpMat<T, SmartKernel<T>> A(graph);
+    BlockSpMat<T> A(graph);
     
     // Fill values
     for(int i=0; i<my_count; ++i) {
@@ -444,7 +468,7 @@ void test_filtered_spmm(bool test_complex = false) {
     // P^2 dropped.
     
     // Let's try threshold 0.1.
-    BlockSpMat<T, SmartKernel<T>> C = A.spmm(A, 0.1);
+    BlockSpMat<T> C = A.spmm(A, 0.1);
     
     // Verify C structure
     // Should have 0->0, 0->1. Should NOT have 0->2.
@@ -457,20 +481,22 @@ void test_filtered_spmm(bool test_complex = false) {
         // It might vary if P^2 wraps around to diagonal (e.g. 2x2 system).
         // Here 4 blocks. P^2 is distance 2. Distinct from 0 and 1.
         if (rank == 0) std::cout << "Filtered SpMM: Unexpected NNZ. Got " << c_nnz << ", expected " << my_count * expected_nnz_per_row << std::endl;
+        failures++;
     }
     
     // Verify values?
     // Just verify graph detachment and duplicate.
     
     // Test Duplicate
-    BlockSpMat<T, SmartKernel<T>> C_dup = C.duplicate();
+    BlockSpMat<T> C_dup = C.duplicate();
     if (C_dup.col_ind().size() != C.col_ind().size()) {
         if (rank == 0) std::cout << "Duplicate failed to preserve structure size" << std::endl;
+        failures++;
     }
     
     // Test Graph Detachment
     // Create B sharing A's graph
-    BlockSpMat<T, SmartKernel<T>> B = A.duplicate(false); // independent_graph=false
+    BlockSpMat<T> B = A.duplicate(false); // independent_graph=false
     // Filter B aggressively to remove off-diagonals
     // Threshold 1.0. row_eps = 1.0/2 = 0.5.
     // Off-diag norm 0.14 < 0.5. Dropped.
@@ -480,18 +506,23 @@ void test_filtered_spmm(bool test_complex = false) {
     // Check B has only diagonals
     if (B.col_ind().size() != my_count) {
          if (rank == 0) std::cout << "Filter failed to remove off-diagonals. Size: " << B.col_ind().size() << std::endl;
+         failures++;
     }
-    
+
     // Check A is untouched
     if (A.col_ind().size() != my_count * 2) {
          if (rank == 0) std::cout << "Filter on B affected A! A size: " << A.col_ind().size() << std::endl;
+         failures++;
     }
-    
+
     if (B.graph == A.graph) {
          if (rank == 0) std::cout << "Graph not detached!" << std::endl;
+         failures++;
     }
-    
+
     if (rank == 0) std::cout << "Filtered SpMM (" << (test_complex ? "Complex" : "Real") << ") PASSED" << std::endl;
+
+    return failures;
 }
 
 int main(int argc, char** argv) {
@@ -501,30 +532,36 @@ int main(int argc, char** argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     
     if(rank == 0) std::cout << "Running Expanded SpMM Tests..." << std::endl;
-    
+
+    int failures = 0;
+
     // 0. Tiny Debug Test
-    test_random_spmm<double>(2, 1.0, 2, 3, false);
-    
+    failures += test_random_spmm<double>(2, 1.0, 2, 3, false);
+
     // 1. Small Real Test
-    test_random_spmm<double>(10, 0.3, 2, 5, false);
-    
+    failures += test_random_spmm<double>(10, 0.3, 2, 5, false);
+
     // 2. Small Complex Test
-    test_random_spmm<std::complex<double>>(10, 0.3, 2, 5, true);
-    
+    failures += test_random_spmm<std::complex<double>>(10, 0.3, 2, 5, true);
+
     // 3. Larger Real Test (N=50 blocks, ~250 rows)
-    test_random_spmm<double>(50, 0.1, 2, 8, false);
-    
+    failures += test_random_spmm<double>(50, 0.1, 2, 8, false);
+
     // 4. Larger Complex Test
-    test_random_spmm<std::complex<double>>(30, 0.1, 2, 6, true);
-    
+    failures += test_random_spmm<std::complex<double>>(30, 0.1, 2, 6, true);
+
     // 5. Diverse Connectivity Test
-    test_diverse_spmm<double>(20, 0.2, 2, 10, false);
-    test_diverse_spmm<std::complex<double>>(15, 0.2, 2, 8, true);
-    
+    failures += test_diverse_spmm<double>(20, 0.2, 2, 10, false);
+    failures += test_diverse_spmm<std::complex<double>>(15, 0.2, 2, 8, true);
+
     // 6. Filtered SpMM Test
-    test_filtered_spmm<double>(false);
-    test_filtered_spmm<std::complex<double>>(true);
-    
+    failures += test_filtered_spmm<double>(false);
+    failures += test_filtered_spmm<std::complex<double>>(true);
+
+    // Propagate failures across ranks so any rank failing fails all ranks
+    int global_failures = 0;
+    MPI_Allreduce(&failures, &global_failures, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+
     MPI_Finalize();
-    return 0;
+    return global_failures > 0 ? 1 : 0;
 }

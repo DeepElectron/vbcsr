@@ -1,5 +1,12 @@
 # CSR / BSR Kernel Design Note
 
+> **Historical note (2026-07):** this document predates the row-major
+> migration (`doc/row_major_migration_plan.md`). The `SmartKernel` family and
+> the `BlockSpMat<T, Kernel>` template parameter referenced below were removed
+> during that migration; the native dense block kernels now live in
+> `vbcsr/core/detail/kernels/rowmajor_kernels.hpp`. The vendor-path and
+> inspector-executor discussion remains useful background.
+
 This note records the recommended high-performance kernel direction for the `CSR` and `BSR` backends after the packed VBCSR apply work.
 
 It is intentionally a design reference, not a promise that every item is already implemented. The goal is to make future backend work converge on one mature architecture instead of growing several unrelated kernel paths.

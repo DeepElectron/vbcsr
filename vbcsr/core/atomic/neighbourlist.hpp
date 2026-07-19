@@ -4,8 +4,7 @@
 #include <cmath>
 #include <algorithm>
 #include <array>
-#include <iostream>
-#include <limits>
+#include <stdexcept>
 
 namespace vbcsr {
 namespace atomic {
@@ -106,11 +105,9 @@ public:
         std::array<double, 3> face_dist = {h_a, h_b, h_c};
 
         // 2. Determine Bin Size and Number of Bins
-        // We use a minimum bin size of 3.0 or cutoff, whichever is larger (similar to ASE)
-        // But strictly for efficiency, bin size >= cutoff is best to check only nearest bins.
-        // ASE uses max(cutoff, 3.0). Let's use cutoff. If cutoff is very small, we might have too many bins.
-        // Let's stick to cutoff.
-        double bin_size = cutoff; 
+        // Bin size = cutoff, so a fixed neighbourhood of bins suffices; the
+        // search range below still widens when the cell forces smaller bins.
+        double bin_size = cutoff;
         if (bin_size < 1e-5) bin_size = 1.0; // Safety
 
         std::array<int, 3> nbins_c;
@@ -120,12 +117,9 @@ public:
         }
 
         // 3. Sort Atoms into Bins
-        // We need scaled positions to easily map to bins.
-        // scaled = pos * inv_cell
-        // inv_cell columns are reciprocal vectors / 2pi? No, just standard matrix inverse.
-        // inv_cell = (1/vol) * [bxc; cxa; axb]^T
-        
-        // Inverse cell (column-major storage for convenience in multiplication? No, let's just do manual dot)
+        // Scaled (fractional) coordinates map atoms to bins: s = inv_cell * r,
+        // with inv_cell = (1/det) * [bxc; cxa; axb]^T.
+        // Inverse cell rows, applied below via manual dot products:
         // Row 0 of inv: bxc / vol
         // Row 1 of inv: cxa / vol
         // Row 2 of inv: axb / vol
@@ -207,19 +201,9 @@ public:
         }
 
         // 4. Neighbor Search
-        // Loop over all bins
-        // For each bin, loop over neighbor bins (including self)
-        // 27 neighbors in 3D
-        
-        // Pre-compute bin neighbors shifts
-        // We need to check -1, 0, 1 in each direction.
-        // If bin_size < cutoff, we might need more layers. 
-        // But we set bin_size = cutoff (approx), so 1 layer is enough (checking 3x3x3 block).
-        // Actually, if bin_size < cutoff, we need ceil(cutoff/bin_size).
-        // Here bin_size = cutoff (or slightly larger due to integer division of cell), so 1 is fine.
-        
-        // Wait, if nbins is small (e.g. 1), we still check it.
-        
+        // For each bin, scan the neighbouring bins (including self). With
+        // bin_size >= cutoff one layer per direction suffices; when the cell
+        // yields smaller physical bins, the range grows to ceil(cutoff/bin).
         int search_range_x = 1;
         int search_range_y = 1;
         int search_range_z = 1;
@@ -241,8 +225,6 @@ public:
         search_range_y = get_search_range(face_dist[1], nbins_c[1]);
         search_range_z = get_search_range(face_dist[2], nbins_c[2]);
 
-        // If not PBC and nbins=1, search range is 0? No, still need self check.
-        
         double cutoff_sq = cutoff * cutoff;
 
         for(int bz = 0; bz < nbins_c[2]; ++bz) {
@@ -311,12 +293,9 @@ public:
                                     double iz = working_positions[3*i+2];
                                     
                                     for(int j : atoms_in_neighbor_bin) {
-                                        // Avoid double counting? 
-                                        // The user wants "neighbour list will be a list of list of int".
-                                        // Usually this means for each atom i, list all j.
-                                        // So we check all pairs.
-                                        // But we should avoid self-interaction if shift is 0.
-                                        
+                                        // Full lists: every ordered (i, j) pair is
+                                        // recorded; only the self-pair in the home
+                                        // image is skipped.
                                         if (i == j && shift_x == 0 && shift_y == 0 && shift_z == 0) continue;
                                         
                                         // Distance vector r_ji = r_j + R - r_i

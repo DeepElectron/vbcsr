@@ -11,7 +11,6 @@
 #include <complex>
 #include <iostream>
 #include <algorithm>
-#include <set>
 #include <functional>
 #include <stdexcept>
 #include <string>
@@ -20,12 +19,11 @@
 namespace vbcsr {
 
 
-template <typename T, typename Kernel>
+template <typename T>
 void graph_matrix_function(
-    BlockSpMat<T, Kernel>& A,
-    BlockSpMat<T, Kernel>* Result,
+    BlockSpMat<T>& A,
+    BlockSpMat<T>* Result,
     std::function<T(double)> func,
-    std::string method,
     bool verbose) {
     
     DistGraph* graph = A.graph;
@@ -34,7 +32,7 @@ void graph_matrix_function(
     MPI_Comm comm = graph->comm;
 
     // 1. Initialize Result
-    if (rank == 0 && verbose) std::cout << "graph_matrix_function: Initializing using subgraph method (" << method << ")..." << std::endl;
+    if (rank == 0 && verbose) std::cout << "graph_matrix_function: Initializing (subgraph dense diagonalization)..." << std::endl;
 
     if (Result == nullptr) {
         throw std::invalid_argument("graph_matrix_function requires a valid output matrix pointer");
@@ -124,7 +122,7 @@ void graph_matrix_function(
             // Find block index of global_row
             auto it = std::find(neighbors.begin(), neighbors.end(), global_row);
             int block_idx = std::distance(neighbors.begin(), it);
-            BlockSpMat<T, Kernel> sub_mat = A.construct_submatrix(neighbors, batch_blocks);
+            BlockSpMat<T> sub_mat = A.construct_submatrix(neighbors, batch_blocks);
             
             int r_dim = sub_mat.graph->block_sizes[block_idx]; // getting from submat, where index is the neighbours order, safe
 
@@ -145,33 +143,25 @@ void graph_matrix_function(
             
             DistMultiVector<T> X(sub_mat.graph, r_dim);
 
-            if (method == "lanczos") {
-                // Compute f(M) using Lanczos
-                // We want the columns of f(M) corresponding to global_row
-                // These start at row_offset and have size r_dim
-                
-                // Use lanczos_matrix_function_dense with global_col_start = row_offset
-                lanczos_matrix_function_dense(M, X, func, r_dim, sub_mat.graph, 1e-8, 100, verbose, false, row_offset);
-            } else if (method == "dense") {
-                // Full diagonalization
-                // Optimized diagonalization (only compute needed columns)
-                dense_matrix_function(total_dim, M, func, r_dim, row_offset);
-                
-                // M is now f(M)[:, row_offset:row_offset+r_dim]
-                // Size: total_dim x r_dim
-                // Layout: ColMajor (from dense_gemm)
-                
-                X.bind_to_graph(sub_mat.graph);
-                // Copy M to X.data
-                // X.data expects ColMajor storage for local_rows=total_dim, n_cols=r_dim
-                // M is exactly that.
-                if (X.data.size() != M.size()) {
-                     // Should match if X was allocated with r_dim cols and total_dim rows
-                     // X(sub_mat.graph, r_dim) -> local_rows = total_dim
+            // Dense diagonalization of the subgraph matrix (the only route:
+            // the Lanczos variant was removed after measuring consistently
+            // worse efficiency than the direct dense diagonalization).
+            // Only the needed columns [row_offset, row_offset + r_dim) of
+            // f(M) are formed.
+            dense_matrix_function(total_dim, M, func, r_dim, row_offset);
+
+            // M is now f(M)[:, row_offset:row_offset+r_dim]
+            // Size: total_dim x r_dim
+            // Layout: ColMajor (from dense_gemm)
+
+            X.bind_to_graph(sub_mat.graph);
+            // X is row-major (padded ld): transpose-copy the column-major
+            // dense result across the boundary.
+            for (int r = 0; r < total_dim; ++r) {
+                T* dst = X.row_data(r);
+                for (int c = 0; c < r_dim; ++c) {
+                    dst[c] = M[static_cast<size_t>(c) * total_dim + r];
                 }
-                std::copy(M.begin(), M.end(), X.data.begin());
-            } else {
-                if (rank == 0) std::cerr << "Unknown method: " << method << std::endl;
             }
             
             // Iterate over columns (neighbors)
@@ -189,26 +179,24 @@ void graph_matrix_function(
                 // X has rows col_offset:col_offset+c_dim
                 
                 std::vector<T> block_data(r_dim * c_dim);
-                for(int c=0; c<c_dim; ++c) {
-                    for(int r=0; r<r_dim; ++r) {
-                        // X(row, col) = X.data[row + col * total_dim]
-                        // We want X(col_offset + c, r)
-                        block_data[c * r_dim + r] = X.data[(col_offset + c) + r * total_dim];
+                for(int r=0; r<r_dim; ++r) {
+                    for(int c=0; c<c_dim; ++c) {
+                        // We want X(col_offset + c, r); the accessor hides the
+                        // (row-major, padded-ld) multivector storage. The block
+                        // is packed in canonical row-major order.
+                        block_data[r * c_dim + c] = X(col_offset + c, r);
                     }
                 }
-                
-                Result->add_block(global_row, col_gid, block_data.data(), r_dim, c_dim, AssemblyMode::ADD, MatrixLayout::ColMajor);
+
+                Result->add_block(global_row, col_gid, block_data.data(), r_dim, c_dim, AssemblyMode::ADD, kCanonicalBlockLayout);
                 
                 col_offset += c_dim;
             }
         }
     }
     
-    // if (rank == 0 && verbose) std::cout << "graph_matrix_function: Loop Finished. Assembling..." << std::endl;
-    // if (rank == 0) std::cout << "graph_matrix_function: remote_blocks size: " << Result->remote_blocks.size() << std::endl;
-
     Result->assemble();
-    
+
 }
 
 }

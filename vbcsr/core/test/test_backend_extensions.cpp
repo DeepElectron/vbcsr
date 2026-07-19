@@ -69,53 +69,63 @@ void test_dist_multivector(DistGraph& graph, int rank) {
     std::mt19937 gen(rank);
     std::uniform_real_distribution<> dis(-1.0, 1.0);
     
-    for(size_t i=0; i<mv1.data.size(); ++i) mv1.data[i] = dis(gen);
-    for(size_t i=0; i<mv2.data.size(); ++i) mv2.data[i] = dis(gen);
-    
+    const int total_rows = mv1.local_rows + mv1.ghost_rows;
+    for(int r=0; r<total_rows; ++r)
+        for(int v=0; v<mv1.num_vectors; ++v) mv1(r, v) = dis(gen);
+    for(int r=0; r<total_rows; ++r)
+        for(int v=0; v<mv2.num_vectors; ++v) mv2(r, v) = dis(gen);
+
     // 1. Test scale
     DistMultiVector<double> mv3 = mv1; // Copy constructor (default)
     mv3.scale(2.0);
-    for(size_t i=0; i<mv1.data.size(); ++i) {
-        if (std::abs(mv3.data[i] - 2.0 * mv1.data[i]) > 1e-12) {
-            std::cerr << "DistMultiVector::scale failed" << std::endl;
-            MPI_Abort(MPI_COMM_WORLD, 1);
+    for(int r=0; r<total_rows; ++r) {
+        for(int v=0; v<n_vecs; ++v) {
+            if (std::abs(mv3(r, v) - 2.0 * mv1(r, v)) > 1e-12) {
+                std::cerr << "DistMultiVector::scale failed" << std::endl;
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
         }
     }
-    
+
     // 2. Test axpy: mv3 = 2.0 * mv2 + mv3 (mv3 is 2*mv1) -> 2*mv2 + 2*mv1
     mv3.axpy(2.0, mv2);
-    for(size_t i=0; i<mv1.data.size(); ++i) {
-        if (std::abs(mv3.data[i] - 2.0 * (mv1.data[i] + mv2.data[i])) > 1e-12) {
-            std::cerr << "DistMultiVector::axpy failed" << std::endl;
-            MPI_Abort(MPI_COMM_WORLD, 1);
+    for(int r=0; r<total_rows; ++r) {
+        for(int v=0; v<n_vecs; ++v) {
+            if (std::abs(mv3(r, v) - 2.0 * (mv1(r, v) + mv2(r, v))) > 1e-12) {
+                std::cerr << "DistMultiVector::axpy failed" << std::endl;
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
         }
     }
-    
+
     // 3. Test axpby: mv3 = 2*mv1 + 3*mv2
     mv3 = mv2; // Reset to mv2
     mv3.axpby(2.0, mv1, 3.0);
-    for(size_t i=0; i<mv1.data.size(); ++i) {
-        if (std::abs(mv3.data[i] - (2.0 * mv1.data[i] + 3.0 * mv2.data[i])) > 1e-12) {
-            std::cerr << "DistMultiVector::axpby failed" << std::endl;
-            MPI_Abort(MPI_COMM_WORLD, 1);
+    for(int r=0; r<total_rows; ++r) {
+        for(int v=0; v<n_vecs; ++v) {
+            if (std::abs(mv3(r, v) - (2.0 * mv1(r, v) + 3.0 * mv2(r, v))) > 1e-12) {
+                std::cerr << "DistMultiVector::axpby failed" << std::endl;
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
         }
     }
-    
+
     // 4. Test pointwise_mult
     mv3 = mv1;
     mv3.pointwise_mult(mv2);
-    for(size_t i=0; i<mv1.data.size(); ++i) {
-        if (std::abs(mv3.data[i] - mv1.data[i] * mv2.data[i]) > 1e-12) {
-            std::cerr << "DistMultiVector::pointwise_mult failed" << std::endl;
-            MPI_Abort(MPI_COMM_WORLD, 1);
+    for(int r=0; r<total_rows; ++r) {
+        for(int v=0; v<n_vecs; ++v) {
+            if (std::abs(mv3(r, v) - mv1(r, v) * mv2(r, v)) > 1e-12) {
+                std::cerr << "DistMultiVector::pointwise_mult failed" << std::endl;
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
         }
     }
     
     // 5. Test get_col
     DistVector<double> v_col = mv1.get_col(1);
-    double* col1_ptr = mv1.col_data(1);
     for(int i=0; i<v_col.local_size; ++i) {
-        if (v_col[i] != col1_ptr[i]) { // Only check owned
+        if (v_col[i] != mv1(i, 1)) { // Only check owned
             std::cerr << "DistMultiVector::get_col failed" << std::endl;
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
@@ -127,8 +137,7 @@ void test_dist_multivector(DistGraph& graph, int rank) {
     // Manual check
     for(int v=0; v<n_vecs; ++v) {
         double local_dot = 0;
-        double* col = mv1.col_data(v);
-        for(int i=0; i<mv1.local_rows; ++i) local_dot += col[i] * col[i];
+        for(int i=0; i<mv1.local_rows; ++i) local_dot += mv1(i, v) * mv1(i, v);
         
         double global_dot;
         MPI_Allreduce(&local_dot, &global_dot, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);

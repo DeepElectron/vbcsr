@@ -5,16 +5,6 @@
 
 namespace vbcsr::detail {
 
-enum class VBCSRApplyMode {
-    Scalar,
-    Batched
-};
-
-struct VBCSRApplyStats {
-    std::atomic<uint64_t> scalar_batches{0};
-    std::atomic<uint64_t> batched_batches{0};
-};
-
 template <typename T>
 struct VBCSRPageBatch {
     int shape_id = -1;
@@ -28,7 +18,6 @@ struct VBCSRPageBatch {
     uint32_t live_block_count = 0;
     uint32_t blocks_per_page = 0;
     size_t block_value_count = 0;
-    const VBCSRApplyStats* apply_stats = nullptr;
 
     uint32_t block_count() const {
         return live_block_count;
@@ -71,18 +60,6 @@ struct VBCSRPageBatch {
         }
         return values + static_cast<size_t>(block_index) * block_value_count;
     }
-
-    uint64_t scalar_apply_batch_count() const {
-        return apply_stats == nullptr
-            ? 0
-            : apply_stats->scalar_batches.load(std::memory_order_relaxed);
-    }
-
-    uint64_t batched_apply_batch_count() const {
-        return apply_stats == nullptr
-            ? 0
-            : apply_stats->batched_batches.load(std::memory_order_relaxed);
-    }
 };
 
 template <typename T>
@@ -98,13 +75,11 @@ struct VBCSRForwardRowTask {
     int block_end = 0;
     int block_degree = 0;
     bool packed_output = false;
-    bool rhs_pair_candidate = false;
     size_t work = 0;
 };
 
 struct VBCSRForwardApplyPlan {
     int direct_dense_row_degree_limit = 0;
-    int rhs_pair_dense_row_degree_limit = 0;
     int max_row_dim = 0;
     size_t total_work = 0;
     std::vector<VBCSRForwardRowTask> rows;
@@ -130,11 +105,9 @@ struct VBCSRAdjointApplyPlan {
     std::vector<VBCSRAdjointColumnTask> columns;
 };
 
-template <typename T, typename Kernel>
+template <typename T>
 struct VBCSRMatrixBackend {
     using Storage = ShapeBlockStore<T>;
-    using ApplyMode = VBCSRApplyMode;
-    using ApplyStats = VBCSRApplyStats;
     using PageBatch = VBCSRPageBatch<T>;
     using ApplyPlan = VBCSRApplyPlan<T>;
     using ForwardApplyPlan = VBCSRForwardApplyPlan;
@@ -169,14 +142,12 @@ struct VBCSRMatrixBackend {
 
     VBCSRMatrixBackend(VBCSRMatrixBackend&& other) noexcept
         : graph_block_handles_(std::move(other.graph_block_handles_)),
-          storage(std::move(other.storage)),
-          apply_stats_by_shape(std::move(other.apply_stats_by_shape)) {}
+          storage(std::move(other.storage)) {}
 
     VBCSRMatrixBackend& operator=(VBCSRMatrixBackend&& other) noexcept {
         if (this != &other) {
             graph_block_handles_ = std::move(other.graph_block_handles_);
             storage = std::move(other.storage);
-            apply_stats_by_shape = std::move(other.apply_stats_by_shape);
             invalidate_apply_plan();
         }
         return *this;
@@ -200,7 +171,6 @@ struct VBCSRMatrixBackend {
     int ensure_shape(int row_dim, int col_dim, size_t expected_block_count = 0) {
         const int shape_id =
             storage.get_or_create_shape(row_dim, col_dim, expected_block_count);
-        ensure_apply_stats(shape_id);
         invalidate_apply_plan();
         return shape_id;
     }
@@ -300,8 +270,7 @@ struct VBCSRMatrixBackend {
                     col_ind.data(),
                     page.block_count,
                     page.blocks_per_page,
-                    page.elements_per_block,
-                    apply_stats_for_shape(page.shape_id)});
+                    page.elements_per_block});
             });
             apply_plan = std::move(plan);
         }
@@ -313,16 +282,13 @@ struct VBCSRMatrixBackend {
         const std::vector<int>& col_ind,
         const std::vector<int>& block_sizes,
         int n_rows,
-        int direct_dense_row_degree_limit,
-        int rhs_pair_dense_row_degree_limit) const {
+        int direct_dense_row_degree_limit) const {
         std::lock_guard<std::mutex> lock(apply_plan_mutex);
         if (!forward_apply_plan ||
             forward_apply_plan->direct_dense_row_degree_limit != direct_dense_row_degree_limit ||
-            forward_apply_plan->rhs_pair_dense_row_degree_limit != rhs_pair_dense_row_degree_limit ||
             static_cast<int>(forward_apply_plan->rows.size()) != n_rows) {
             auto plan = std::make_unique<ForwardApplyPlan>();
             plan->direct_dense_row_degree_limit = direct_dense_row_degree_limit;
-            plan->rhs_pair_dense_row_degree_limit = rhs_pair_dense_row_degree_limit;
             plan->rows.reserve(static_cast<size_t>(std::max(0, n_rows)));
             for (int row = 0; row < n_rows; ++row) {
                 const int row_dim = block_sizes[row];
@@ -344,7 +310,6 @@ struct VBCSRMatrixBackend {
                     block_end,
                     block_degree,
                     block_degree > direct_dense_row_degree_limit,
-                    block_degree > rhs_pair_dense_row_degree_limit,
                     row_work});
             }
             forward_apply_plan = std::move(plan);
@@ -436,18 +401,6 @@ struct VBCSRMatrixBackend {
         }
     }
 
-    void record_apply_batch(int shape_id, ApplyMode mode) const {
-        auto* stats = apply_stats_for_shape(shape_id);
-        if (stats == nullptr) {
-            return;
-        }
-        if (mode == ApplyMode::Batched) {
-            stats->batched_batches.fetch_add(1, std::memory_order_relaxed);
-            return;
-        }
-        stats->scalar_batches.fetch_add(1, std::memory_order_relaxed);
-    }
-
 private:
     void invalidate_apply_plan() const {
         std::lock_guard<std::mutex> lock(apply_plan_mutex);
@@ -464,30 +417,8 @@ private:
         return storage.block_ptr(handle);
     }
 
-    ApplyStats* ensure_apply_stats(int shape_id) {
-        if (shape_id < 0) {
-            throw std::logic_error("Negative VBCSR shape id");
-        }
-        if (static_cast<size_t>(shape_id) >= apply_stats_by_shape.size()) {
-            apply_stats_by_shape.resize(static_cast<size_t>(shape_id) + 1);
-        }
-        if (!apply_stats_by_shape[static_cast<size_t>(shape_id)]) {
-            apply_stats_by_shape[static_cast<size_t>(shape_id)] =
-                std::make_unique<ApplyStats>();
-        }
-        return apply_stats_by_shape[static_cast<size_t>(shape_id)].get();
-    }
-
-    ApplyStats* apply_stats_for_shape(int shape_id) const {
-        if (shape_id < 0 || static_cast<size_t>(shape_id) >= apply_stats_by_shape.size()) {
-            return nullptr;
-        }
-        return apply_stats_by_shape[static_cast<size_t>(shape_id)].get();
-    }
-
     std::vector<uint64_t> graph_block_handles_;
     Storage storage;
-    std::vector<std::unique_ptr<ApplyStats>> apply_stats_by_shape;
     mutable std::mutex apply_plan_mutex;
     mutable std::unique_ptr<ApplyPlan> apply_plan;
     mutable std::unique_ptr<ForwardApplyPlan> forward_apply_plan;
