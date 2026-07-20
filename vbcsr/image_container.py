@@ -125,7 +125,7 @@ class ImageContainer:
         return self._core.get_block(R, int(g_row), int(g_col))
 
     def redistribute_into(self, target, op, common_comm):
-        """Batched cross-comm redistribute of all images (doc/design/35 incr3).
+        """Batched cross-comm redistribute of all images.
 
         Move every image block from this container's partition to ``target``'s
         partition in one Alltoallv on ``common_comm`` (an mpi4py comm spanning both
@@ -139,7 +139,7 @@ class ImageContainer:
     def axpy_into(self, other, alpha):
         """In-place per-image ``self += alpha * other`` (matched by lattice shift R). ``self`` must
         be a superset graph of ``other`` — e.g. the graph3b V_nl absorbing the 2-body kinetic to
-        form the combined static Hamiltonian H_static = T + V_nl (doc/design/41 §3). ``other`` is a
+        form the combined static Hamiltonian H_static = T + V_nl. ``other`` is a
         (Python) :class:`ImageContainer` on the same owned-row partition."""
         self._core.axpy_into(other._core, float(alpha))
 
@@ -150,6 +150,8 @@ class ImageContainer:
         Args:
             k_point (array-like): Length-3 fractional k-point.
             convention (str): ``"R"`` | ``"R+tau"``.
+            symm (bool): If True, return the Hermitian-symmetrized matrix
+                ``(A + A^H) / 2`` (``VBCSR.T`` is the conjugate transpose).
 
         Returns:
             VBCSR: Complex-valued block-sparse matrix at this k-point.

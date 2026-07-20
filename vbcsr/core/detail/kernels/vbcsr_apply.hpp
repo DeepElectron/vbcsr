@@ -27,7 +27,18 @@ struct ShapeBatchKernel {
         x.bind_to_graph(graph);
         y.bind_to_graph(graph);
         x.sync_ghosts();
-        std::fill(y.data.begin(), y.data.end(), T(0));
+        if (max_parallel_threads() == 1) {
+            // Single thread: iterate in shape-page order. The block payload
+            // streams contiguously (hardware-prefetch friendly, unlike the
+            // per-row order that hops between shape pages), while the small
+            // x/y windows (~row_dim scalars) are the only random accesses.
+            // Not used multi-threaded: different blocks of one row would be
+            // scattered across threads and race on the y row.
+            run_mult_page_order_serial(graph, backend, x, y);
+            return;
+        }
+        // Y zeroing happens inside the parallel compute region (per-chunk
+        // ranges): parallel fill and NUMA-local first touch.
         run_mult_row_direct(graph, backend, x, y);
     }
 
@@ -40,7 +51,8 @@ struct ShapeBatchKernel {
         X.bind_to_graph(graph);
         Y.bind_to_graph(graph);
         X.sync_ghosts();
-        std::fill(Y.data.begin(), Y.data.end(), T(0));
+        // Y zeroing happens inside the parallel compute region (per-chunk
+        // ranges): parallel fill and NUMA-local first touch.
         run_mult_dense_row_direct(graph, backend, X, Y);
     }
 
@@ -48,7 +60,9 @@ struct ShapeBatchKernel {
         BLASKernel::configure_native_threading();
         x.bind_to_graph(graph);
         y.bind_to_graph(graph);
-        std::fill(y.data.begin(), y.data.end(), T(0));
+        // The adjoint plan skips empty columns, so zero the whole buffer up
+        // front (parallel fill, NUMA-local first touch).
+        parallel_zero(y.data.data(), y.data.size());
         run_mult_adjoint_col_direct(graph, backend, x, y);
         y.reduce_ghosts();
     }
@@ -57,7 +71,8 @@ struct ShapeBatchKernel {
         BLASKernel::configure_native_threading();
         X.bind_to_graph(graph);
         Y.bind_to_graph(graph);
-        std::fill(Y.data.begin(), Y.data.end(), T(0));
+        // Same whole-buffer parallel zero as the vector adjoint above.
+        parallel_zero(Y.data.data(), Y.data.size());
         run_mult_dense_adjoint_col_direct(graph, backend, X, Y);
         Y.reduce_ghosts();
     }
@@ -170,9 +185,28 @@ private:
 
         const auto chunks = build_forward_work_chunks(plan);
         const int chunk_count = static_cast<int>(chunks.size()) - 1;
+        if (chunk_count == 0) {
+            std::fill(y.data.begin(), y.data.end(), T(0));
+            return;
+        }
+        const auto& block_offsets = graph->block_offsets;
+        const size_t y_size = y.data.size();
 
         #pragma omp parallel for schedule(static)
         for (int chunk = 0; chunk < chunk_count; ++chunk) {
+            // Zero this chunk's Y rows in-region (parallel fill, NUMA-local
+            // first touch). The plan covers every row, so chunks tile
+            // [0, n_rows); the last chunk also clears the ghost tail. No
+            // barrier: each chunk accumulates only into its own rows.
+            {
+                const int row_begin = chunks[static_cast<size_t>(chunk)];
+                const int row_end = chunks[static_cast<size_t>(chunk) + 1];
+                const size_t zero_begin = static_cast<size_t>(block_offsets[row_begin]);
+                const size_t zero_end = chunk == chunk_count - 1
+                    ? y_size
+                    : static_cast<size_t>(block_offsets[row_end]);
+                std::fill(y.data.data() + zero_begin, y.data.data() + zero_end, T(0));
+            }
             for (int task_index = chunks[static_cast<size_t>(chunk)];
                  task_index < chunks[static_cast<size_t>(chunk) + 1];
                  ++task_index) {
@@ -185,6 +219,37 @@ private:
                     task.row,
                     task.block_begin,
                     task.block_end);
+            }
+        }
+    }
+
+    static void run_mult_page_order_serial(
+        DistGraph* graph,
+        const Backend& backend,
+        DistVector<T>& x,
+        DistVector<T>& y) {
+        const auto& plan = backend.ensure_apply_plan(graph->adj_ptr, graph->adj_ind);
+        std::fill(y.data.begin(), y.data.end(), T(0));
+        const auto& block_offsets = graph->block_offsets;
+        const T* x_data = x.data.data();
+        T* y_data = y.data.data();
+        for (const auto& batch : plan.batches) {
+            const int row_dim = batch.row_dim;
+            const int col_dim = batch.col_dim;
+            const T* values = batch.values;
+            const size_t stride = batch.block_value_count;
+            const int* graph_blocks = batch.graph_block_indices;
+            const int* block_rows = batch.graph_block_rows;
+            const int* block_cols = batch.graph_block_cols;
+            const uint32_t count = batch.live_block_count;
+            for (uint32_t index = 0; index < count; ++index) {
+                const int graph_block = graph_blocks[index];
+                rowmajor_kernels::rm_gemv<T>(
+                    row_dim,
+                    col_dim,
+                    values + static_cast<size_t>(index) * stride,
+                    x_data + block_offsets[block_cols[graph_block]],
+                    y_data + block_offsets[block_rows[graph_block]]);
             }
         }
     }
@@ -207,14 +272,31 @@ private:
 
         const auto chunks = build_forward_work_chunks(plan);
         const int chunk_count = static_cast<int>(chunks.size()) - 1;
+        if (chunk_count == 0) {
+            std::fill(Y.data.begin(), Y.data.end(), T(0));
+            return;
+        }
         const auto& col_ind = graph->adj_ind;
         const auto& block_offsets = graph->block_offsets;
         const auto& block_sizes = graph->block_sizes;
         const T* x_data = X.data.data();
         T* y_data = Y.data.data();
+        const size_t y_size = Y.data.size();
 
         #pragma omp parallel for schedule(static)
         for (int chunk = 0; chunk < chunk_count; ++chunk) {
+            // Same in-region per-chunk zeroing as the SpMV path above
+            // (row offsets scaled by the padded ld).
+            {
+                const int row_begin = chunks[static_cast<size_t>(chunk)];
+                const int row_end = chunks[static_cast<size_t>(chunk) + 1];
+                const size_t zero_begin =
+                    static_cast<size_t>(block_offsets[row_begin]) * y_ld;
+                const size_t zero_end = chunk == chunk_count - 1
+                    ? y_size
+                    : static_cast<size_t>(block_offsets[row_end]) * y_ld;
+                std::fill(y_data + zero_begin, y_data + zero_end, T(0));
+            }
             for (int task_index = chunks[static_cast<size_t>(chunk)];
                  task_index < chunks[static_cast<size_t>(chunk) + 1];
                  ++task_index) {

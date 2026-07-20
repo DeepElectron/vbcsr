@@ -4,6 +4,7 @@
 #include "../../backend/csr_vendor_cache.hpp"
 #include "../../distributed/block_payload_exchange.hpp"
 #include "../../distributed/result_graph.hpp"
+#include "../../kernels/dense_kernels.hpp"
 #include "common.hpp"
 
 #include <algorithm>
@@ -92,8 +93,8 @@ private:
 
     static DistGraph* construct_serial_result_graph(
         const Matrix& A,
-        const std::vector<int>& row_ptr,
-        const std::vector<int>& local_cols) {
+        std::vector<int>&& row_ptr,
+        std::vector<int>&& local_cols) {
         auto* graph = new DistGraph(A.graph->comm);
         graph->owned_global_indices = A.graph->owned_global_indices;
         graph->global_to_local = A.graph->global_to_local;
@@ -105,8 +106,8 @@ private:
             A.graph->block_sizes.begin() + n_owned);
         graph->ghost_global_indices.clear();
 
-        graph->adj_ptr = row_ptr;
-        graph->adj_ind = local_cols;
+        graph->adj_ptr = std::move(row_ptr);
+        graph->adj_ind = std::move(local_cols);
 
         graph->block_offsets.resize(graph->block_sizes.size() + 1);
         graph->block_offsets[0] = 0;
@@ -194,6 +195,12 @@ private:
             return std::make_unique<Matrix>(make_empty_like_product(A));
         }
 
+        // The vendor multiply owns parallelism: align the MKL pool with the
+        // OpenMP thread budget (OMP_NUM_THREADS is the single source of
+        // truth). Without this the multiply inherits whatever pool size the
+        // previous call left behind.
+        BLASKernel::configure_vendor_sparse_threading();
+
         MKLSparseHandleOwner a_handle;
         MKLSparseHandleOwner b_handle;
         MKLSparseHandleOwner c_handle;
@@ -225,8 +232,6 @@ private:
         // matrix's own adjacency sorted (see spgemm_sorted_output_enabled in
         // spmm/common.hpp); VBCSR_SPGEMM_SORTED=1 restores sorted columns via
         // a per-row packed-key sort in the copy-out below.
-        const auto t_order = std::chrono::steady_clock::now();
-
         sparse_index_base_t index_base = SPARSE_INDEX_BASE_ZERO;
         MKL_INT rows = 0;
         MKL_INT cols = 0;
@@ -374,11 +379,21 @@ private:
         }
         const auto t_rows = std::chrono::steady_clock::now();
 
-        DistGraph* c_graph = construct_serial_result_graph(A, c_row_ptr, c_cols_local);
-        auto C = std::make_unique<Matrix>(c_graph);
-        C->owns_graph = true;
-        C->graph->enable_matrix_lifetime_management();
-        C->set_page_size(A.configured_page_size());
+        const size_t result_nnz = c_cols_local.size();
+        DistGraph* c_graph =
+            construct_serial_result_graph(A, std::move(c_row_ptr), std::move(c_cols_local));
+        const auto t_graph_construct = std::chrono::steady_clock::now();
+        // Token construction + direct backend build: skips the default
+        // zero-filled allocation (every value slot is overwritten below) and
+        // the set_page_size rebuild.
+        auto C = std::unique_ptr<Matrix>(new Matrix(
+            c_graph, MatrixKind::CSR, true, typename Matrix::ConstructionToken{}));
+        {
+            typename Matrix::CSRBackendStorage backend;
+            backend.initialize_structure_for_complete_overwrite(
+                result_nnz, A.configured_page_size());
+            C->attach_backend(std::move(backend));
+        }
         const auto t_graph = std::chrono::steady_clock::now();
 
         if (threshold <= 0.0 && !value_perm.empty()) {
@@ -387,27 +402,27 @@ private:
             if (C->active_csr_backend().page_count() == 1) {
                 auto page = C->active_csr_backend().page(C->col_ind(), 0);
                 #pragma omp parallel for
-                for (int slot = 0; slot < static_cast<int>(c_cols_local.size()); ++slot) {
+                for (int slot = 0; slot < static_cast<int>(result_nnz); ++slot) {
                     page.values[slot] = values[first + value_perm[static_cast<size_t>(slot)]];
                 }
                 C->norms_valid = false;
             } else {
                 #pragma omp parallel for
-                for (int slot = 0; slot < static_cast<int>(c_cols_local.size()); ++slot) {
+                for (int slot = 0; slot < static_cast<int>(result_nnz); ++slot) {
                     *C->mutable_block_data(slot) = values[first + value_perm[static_cast<size_t>(slot)]];
                 }
             }
-        } else if (threshold <= 0.0 && !c_cols_local.empty() && C->active_csr_backend().page_count() == 1) {
+        } else if (threshold <= 0.0 && result_nnz > 0 && C->active_csr_backend().page_count() == 1) {
             auto page = C->active_csr_backend().page(C->col_ind(), 0);
             std::memcpy(
                 page.values,
                 values + (row_start[0] - base),
-                c_cols_local.size() * sizeof(T));
+                result_nnz * sizeof(T));
             C->norms_valid = false;
         } else if (threshold <= 0.0) {
             const MKL_INT first = row_start[0] - base;
             #pragma omp parallel for
-            for (int slot = 0; slot < static_cast<int>(c_cols_local.size()); ++slot) {
+            for (int slot = 0; slot < static_cast<int>(result_nnz); ++slot) {
                 *C->mutable_block_data(slot) = values[first + static_cast<MKL_INT>(slot)];
             }
         } else if (!c_values.empty() && C->active_csr_backend().page_count() == 1) {
@@ -430,10 +445,10 @@ private:
                 << "VBCSR_PROFILE_CSR_SPGEMM"
                 << " handles=" << seconds(t0, t_handles)
                 << " spmm=" << seconds(t_handles, t_spmm)
-                << " order=" << seconds(t_spmm, t_order)
-                << " export=" << seconds(t_order, t_export)
+                << " export=" << seconds(t_spmm, t_export)
                 << " rows=" << seconds(t_export, t_rows)
-                << " graph=" << seconds(t_rows, t_graph)
+                << " graph_construct=" << seconds(t_rows, t_graph_construct)
+                << " matrix_ctor=" << seconds(t_graph_construct, t_graph)
                 << " fill=" << seconds(t_graph, t_fill)
                 << " total=" << seconds(t0, t_fill)
                 << std::endl;
@@ -444,8 +459,10 @@ private:
 #endif
 
     static Matrix run_generic(const Matrix& A, const Matrix& B, double threshold) {
-        // TODO: spmm for csr is a bit wired since there is no block exist, then the symbolic filter step basically done the full multiplication
-        // therefore, the spmm performance is doubled. We should think of a good way to design new mechanism for this op in CSR case.
+        // Known limitation (distributed / non-MKL fallback only): with 1x1
+        // blocks the symbolic filter step already performs the work of a full
+        // multiplication, so this path costs roughly two multiplies. A fused
+        // symbolic+numeric single pass would remove the duplication.
         auto metadata = exchange_ghost_metadata(A, B);
         auto sym = symbolic_multiply_filtered(A, B, metadata, threshold);
         auto payload_ctx = fetch_required_block_payloads(B, sym.required_blocks);

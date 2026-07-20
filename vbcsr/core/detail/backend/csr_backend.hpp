@@ -107,6 +107,19 @@ struct CSRMatrixBackend {
         initialize_structure(logical_nnz);
     }
 
+    // Same as initialize_structure, but value pages are not zero-filled:
+    // for results whose every slot is immediately overwritten (SpGEMM
+    // copy-out).
+    void initialize_structure_for_complete_overwrite(uint64_t logical_nnz, uint32_t page_size) {
+        configured_page_size_ = normalize_page_size(page_size);
+        const uint32_t active_page_size = logical_nnz == 0
+            ? configured_page_size_
+            : static_cast<uint32_t>(std::min<uint64_t>(logical_nnz, configured_page_size_));
+        values = PagedBuffer<T>(active_page_size);
+        invalidate_vendor_cache();
+        values.resize_uninitialized(logical_nnz);
+    }
+
     T* value_ptr(int slot) {
         return values.element_ptr(static_cast<uint64_t>(slot));
     }

@@ -1352,7 +1352,8 @@ public:
     BlockSpMat spmm(const BlockSpMat& B, double threshold, bool transA = false, bool transB = false) const {
         ensure_same_backend_family(*this, B, "spmm");
 
-        // TODO: optimizable for direct branching on the trans condition without explicitly form the transpose matrix
+        // transA/transB materialize the transpose; a fused kernel that reads
+        // the original storage would avoid the extra copy.
         if (transA) {
             BlockSpMat A_T = this->transpose();
             return A_T.spmm(B, threshold, false, transB);
@@ -1511,8 +1512,7 @@ public:
         auto ctx = detail::fetch_batched_block_payloads(*this, batch_indices);
         std::vector<BlockSpMat<T>> results;
         results.reserve(batch_indices.size());
-        // TODO: threading?
-        for(const auto& indices : batch_indices) {
+        for (const auto& indices : batch_indices) {
             results.push_back(construct_submatrix(indices, ctx));
         }
         return results;
@@ -1635,10 +1635,9 @@ public:
             }
         }
     }
-    // Calculate block density (global nnz blocks / total global blocks^2)
+    // Block density = global nnz blocks / total global blocks^2. This counts
+    // structural blocks, not scalar elements; block-size variation is ignored.
     double get_block_density() const {
-        // TODO: can switch to a more precise method to targeting per element fidelity?
-        // need to use a weighted row based percentage average method.
         long long local_nnz = graph->adj_ind.size();
         long long global_nnz = 0;
         
@@ -2368,9 +2367,9 @@ bool BlockSpMat<T>::update_local_block(
 
             if (r_dim != rows || c_dim != cols) {
                 std::stringstream ss;
-                ss << "\n Dimension mismatch in update_local_block (DEBUG): "
-                   << "Row: " << local_row << " (Expected: " << r_dim << ", Got: " << rows << ") \n"
-                   << "Col: " << local_col << " (Expected: " << c_dim << ", Got: " << cols << ") \n";
+                ss << "update_local_block dimension mismatch: "
+                   << "row " << local_row << " expects " << r_dim << " (got " << rows << "), "
+                   << "col " << local_col << " expects " << c_dim << " (got " << cols << ")";
                 throw std::runtime_error(ss.str());
             }
 

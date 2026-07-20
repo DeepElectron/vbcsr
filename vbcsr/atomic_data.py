@@ -167,7 +167,7 @@ class AtomicData(vbcsr_core.AtomicData):
 
     @classmethod
     def from_distributed(cls, pos, z, input_index, cell, pbc, r_max, type_norb, comm=None):
-        """Build the distributed AtomicData from a CALLER-GIVEN partition (doc 42 §4).
+        """Build the distributed AtomicData from a caller-given partition.
 
         Each rank passes ONLY its owned atoms: ``pos`` (n_owned, 3), ``z`` (n_owned,),
         and ``input_index`` (n_owned,) — the original input-order index of each owned

@@ -102,13 +102,34 @@ This means VBCSR avoids repacking matrix blocks for apply, but still pays for op
 
 ### Threading Model
 
-Apply parallelism is in the outer OpenMP loop. The intended model is:
+`OMP_NUM_THREADS` is the single source of truth for parallelism. Every
+operation entry point declares which of the two execution models it uses
+*before* computing, via the two `BLASKernel` helpers
+(`detail/kernels/dense_kernels.hpp`):
 
--   one user-visible thread count for VBCSR apply
--   one BLAS thread per OpenMP worker
--   one private output accumulator per OpenMP thread, followed by a final reduction
+-   **Vendor-executed** (MKL sparse owns the parallelism — CSR applies, the
+    CSR/BSR MKL SpGEMM multiplies, opt-in BSR vendor applies):
+    `configure_vendor_sparse_threading()` sets the MKL pool to
+    `omp_get_max_threads()` so the vendor kernel uses the same budget the
+    OpenMP paths would.
+-   **Native** (our OpenMP loop owns the parallelism; BLAS/LAPACK may be
+    called from inside it — all native applies, the VBCSR SpGEMM numeric
+    phase with `gemm_batched`, the `spmf` per-subgraph `dsyevd`/`gemm`):
+    `configure_native_threading()` clamps the BLAS runtime to one thread so
+    a pool size left behind by a previous vendor call cannot oversubscribe.
 
-The current code exposes a helper to pin MKL/OpenBLAS to one thread, but VBCSR callers should still treat "outer OpenMP threads, inner BLAS thread = 1" as the supported execution model.
+Invariants: a vendor entry configures the pool *before* building/optimizing
+its handles (`mkl_sparse_optimize` records a schedule for the current pool);
+opt-in vendor branches (BSR: `VBCSR_BSR_VENDOR`) configure the pool and build
+handles only when the opt-in is active; native paths that call no BLAS at all
+(transpose, axpby, SpGEMM generic fallbacks) need no configuration — their
+OpenMP loops follow `OMP_NUM_THREADS` directly. Environment variables like
+`MKL_NUM_THREADS` only determine the pool state *before the first VBCSR
+call*; the entry-point configuration overrides them per operation.
+
+On multi-socket hosts, pin threads (e.g. `OMP_PROC_BIND=close
+OMP_PLACES=cores`) — native applies first-touch their output inside the
+parallel compute region, so placement follows the compute threads.
 
 ### Why Large Page Batches May Need Splitting
 

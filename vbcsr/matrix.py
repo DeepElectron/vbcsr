@@ -46,6 +46,7 @@ class VBCSR(LinearOperator):
         Args:
             graph: The underlying C++ DistGraph object.
             dtype: Data type (np.float64 or np.complex128).
+            comm: MPI communicator (optional; None for serial usage).
         """
         self.graph = graph
         self.dtype = np.dtype(dtype)
@@ -160,9 +161,16 @@ class VBCSR(LinearOperator):
 
     @property
     def T(self) -> 'VBCSR':
+        """Conjugate (Hermitian) transpose. See :meth:`transpose`."""
         return self.transpose()
 
     def transpose(self) -> 'VBCSR':
+        """Return the conjugate (Hermitian) transpose A^H.
+
+        Note: for complex data this conjugates as well as transposes —
+        unlike ``numpy.ndarray.T``, which never conjugates. For real data
+        the two coincide.
+        """
         core_T = self._core.transpose()
         shape = None
         if self.shape[0] is not None and self.shape[1] is not None:
@@ -300,13 +308,11 @@ class VBCSR(LinearOperator):
         
         np.random.seed(seed)
         
-        # 1. Generate block sizes (replicated on all ranks for simplicity in this helper)
-        # In a real large-scale scenario, we would generate distributedly, but for this helper
-        # we assume we can hold the structure metadata in memory.
+        # 1. Generate block sizes (replicated on all ranks; this helper assumes the
+        # structure metadata fits in memory).
         all_block_sizes = np.random.randint(block_size_min, block_size_max + 1, size=global_blocks).tolist()
-        
-        # 2. Partition blocks among ranks
-        # Simple linear partition
+
+        # 2. Simple linear partition of blocks among ranks
         blocks_per_rank = global_blocks // size
         remainder = global_blocks % size
         
@@ -317,10 +323,9 @@ class VBCSR(LinearOperator):
         owned_indices = list(range(start_block, end_block))
         my_block_sizes = all_block_sizes[start_block:end_block]
         
-        # 3. Generate Adjacency
-        # Ensure connectivity: Ring topology + random edges
-        # We generate adjacency for OWNED blocks.
-        
+        # 3. Generate adjacency for owned blocks: ring topology (guarantees
+        # connectivity) plus random extra edges, approx global_blocks * density
+        # per row.
         my_adj = []
         for i in owned_indices:
             neighbors = set()
@@ -328,18 +333,8 @@ class VBCSR(LinearOperator):
             neighbors.add((i - 1) % global_blocks)
             neighbors.add((i + 1) % global_blocks)
             neighbors.add(i) # Self-loop
-            
-            # Random edges
-            # Number of extra edges based on density
-            # density is fraction of TOTAL blocks.
-            # n_random = int(global_blocks * density)
-            # This might be too dense. Let's interpret density as prob of edge.
-            # Or just fixed average degree.
-            # Let's use density as probability.
-            
-            # Generating random edges efficiently:
-            # We want approx global_blocks * density edges per row.
-            n_random = max(0, int(global_blocks * density) - 2) # Subtract mandatory ones
+
+            n_random = max(0, int(global_blocks * density) - 2) # Minus the two ring edges
             if n_random > 0:
                 random_neighbors = np.random.choice(global_blocks, size=n_random, replace=False)
                 neighbors.update(random_neighbors)
@@ -350,15 +345,13 @@ class VBCSR(LinearOperator):
         mat = cls.create_distributed(owned_indices, my_block_sizes, my_adj, dtype, comm)
         
         # 5. Fill with random data
-        # We iterate over owned blocks and their neighbors
         for local_i, global_i in enumerate(owned_indices):
             r_dim = my_block_sizes[local_i]
             neighbors = my_adj[local_i]
-            
+
             for global_j in neighbors:
                 c_dim = all_block_sizes[global_j]
-                
-                # Generate random block
+
                 if dtype == np.dtype(np.float64):
                     data = np.random.rand(r_dim, c_dim)
                 else:
@@ -406,7 +399,7 @@ class VBCSR(LinearOperator):
     def redistribute(self, target_graph: Any, mode: AssemblyMode = AssemblyMode.INSERT,
                      comm: Any = None) -> 'VBCSR':
         """Redistribute to a different partition of the same global block structure
-        (same comm; doc/design/35). ``target_graph`` is a (core) ``DistGraph`` with
+        (same comm). ``target_graph`` is a (core) ``DistGraph`` with
         identical global blocks but different ``owned_global_indices``. ``mode``
         INSERT = repartition, ADD = reduce. Returns a new VBCSR on ``target_graph``."""
         core_result = self._core.redistribute(target_graph, mode)
@@ -416,7 +409,7 @@ class VBCSR(LinearOperator):
 
     def redistribute_cross(self, target_graph: Any, op: RedistOp, common_comm: Any,
                            target_comm: Any = None) -> 'VBCSR':
-        """Cross-comm redistribute (doc/design/35 incr2). Move blocks from this
+        """Cross-comm redistribute. Move blocks from this
         matrix's partition to ``target_graph``'s partition, transporting on
         ``common_comm`` (an mpi4py comm spanning both rank sets, e.g. comm_world).
         The result is built on ``target_graph``, so it lives on the target comm.
@@ -449,8 +442,7 @@ class VBCSR(LinearOperator):
         l_col = self.graph.get_local_index(g_col)
         if l_col == -1:
             return None
-            
-        # Call core get_block with local indices
+
         data = self._core.get_block(l_row, l_col)
         if data.size == 0:
             return None
@@ -460,6 +452,7 @@ class VBCSR(LinearOperator):
         """Finalize matrix assembly (exchange remote blocks)."""
         self._core.assemble()
         self._invalidate_nnz()
+        # Refresh the global nnz cache while all ranks are synchronized.
         _ = self.nnz
 
     def mult(self, x: Union[DistVector, DistMultiVector, np.ndarray], y: Optional[Union[DistVector, DistMultiVector]] = None) -> Union[DistVector, DistMultiVector]:
@@ -550,7 +543,6 @@ class VBCSR(LinearOperator):
         Returns:
             np.ndarray: Result array (local part).
         """
-        # Reuse mult which now handles numpy
         res = self.mult(x)
         return res.to_numpy()
 
@@ -564,7 +556,6 @@ class VBCSR(LinearOperator):
         Returns:
             np.ndarray: Result array.
         """
-        # Reuse mult which now handles numpy
         res = self.mult(X)
         return res.to_numpy()
 
@@ -704,7 +695,6 @@ class VBCSR(LinearOperator):
             return self.mult(other)
         else:
             return NotImplemented
-
 
     def spmm(self, B: 'VBCSR', threshold: float = 0.0, transA: bool = False, transB: bool = False) -> 'VBCSR':
         """
@@ -936,19 +926,17 @@ class VBCSR(LinearOperator):
             scipy.sparse.spmatrix: The local matrix.
         """
         import scipy.sparse as sp
-        # 1. Get Packed Values
-        # Layout: RowMajor for easy numpy/scipy compatibility
-        values = np.asarray(self._core.get_values(), dtype=self.dtype) # 1D array
-        
-        # 2. Get Structure
+        # 1. Packed values (row-major within each block, matching numpy/scipy)
+        values = np.asarray(self._core.get_values(), dtype=self.dtype)
+
+        # 2. Structure
         row_ptr = self.row_ptr
         col_ind = self.col_ind
-        
-        # 3. Check Uniformity
+
+        # 3. Check block-size uniformity
         block_sizes = self.graph.block_sizes
         matrix_kind = self.matrix_kind
 
-        # Check uniformity
         is_uniform = False
         uniform_size = 0
         if len(block_sizes) > 0:
@@ -967,10 +955,8 @@ class VBCSR(LinearOperator):
             
             R = uniform_size
             C = uniform_size
-            
-            # Reshape values to (nnz_blocks, R, C)
-            # values is flat.
-            # Total size = nnz_blocks * R * C
+
+            # Reshape flat values to (nnz_blocks, R, C)
             nnz_blocks = len(col_ind)
             if len(values) != nnz_blocks * R * C:
                 raise RuntimeError(f"Data size mismatch: expected {nnz_blocks*R*C}, got {len(values)}")
@@ -990,28 +976,21 @@ class VBCSR(LinearOperator):
             return result
 
         elif target_format == 'csr':
-            # Expand to Scalar CSR
-            
-            # 1. Calculate scalar row pointers
+            # Expand to scalar CSR
+
+            # 1. Scalar row offsets. block_sizes covers all local blocks;
+            # block row i corresponds to block i.
             n_block_rows = len(row_ptr) - 1
-            
-            # Pre-calculate offsets for scalar rows
             scalar_row_offsets = np.zeros(n_block_rows + 1, dtype=np.int32)
-            # block_sizes is list-like, convert to numpy for efficiency if needed, but it's fine.
-            # We need block sizes for owned rows.
-            # block_sizes contains ALL local blocks.
-            # We assume row i corresponds to block i?
-            # Yes, VBCSR graph assumes nodes 0..N.
-            
             for i in range(n_block_rows):
                 scalar_row_offsets[i+1] = scalar_row_offsets[i] + block_sizes[i]
-                
+
             total_scalar_rows = scalar_row_offsets[-1]
-            
-            # 2. Pre-calculate scalar column offsets
+
+            # 2. Scalar column offsets
             scalar_col_offsets = np.zeros(len(block_sizes) + 1, dtype=np.int32)
             np.cumsum(block_sizes, out=scalar_col_offsets[1:])
-            
+
             # 3. Prepare CSR arrays
             total_nnz = len(values)
             scalar_indptr = np.zeros(total_scalar_rows + 1, dtype=np.int32)
@@ -1039,23 +1018,20 @@ class VBCSR(LinearOperator):
                     scalar_indptr[scalar_row_idx] = current_nnz
                     
                     for (j, C_j, blk_start) in row_blocks:
-                        # Data copy
                         src_start = blk_start + r * C_j
                         src_end = src_start + C_j
                         dst_end = current_nnz + C_j
-                        
+
                         scalar_data_out[current_nnz:dst_end] = values[src_start:src_end]
-                        
-                        # Indices
+
                         col_start = scalar_col_offsets[j]
-                        # Manual loop for indices
                         for c in range(C_j):
                             scalar_indices[current_nnz + c] = col_start + c
-                            
+
                         current_nnz += C_j
-                        
+
             scalar_indptr[-1] = current_nnz
-            
+
             # Shape
             local_rows = len(scalar_indptr) - 1
             total_local_cols = sum(block_sizes)

@@ -367,8 +367,6 @@ private:
         // class here). Default keeps the vendor's per-row export order (see
         // spgemm_sorted_output_enabled in spmm/common.hpp);
         // VBCSR_SPGEMM_SORTED=1 restores sorted columns in the copy-out.
-        const auto t_order_initial = std::chrono::steady_clock::now();
-
         sparse_index_base_t index_base = SPARSE_INDEX_BASE_ZERO;
         sparse_layout_t block_layout = SPARSE_LAYOUT_COLUMN_MAJOR;
         MKL_INT rows = 0;
@@ -546,8 +544,7 @@ private:
                 << "VBCSR_PROFILE_BSR_SPGEMM"
                 << " handles=" << seconds(t0, t_handles)
                 << " spmm=" << seconds(t_handles, t_spmm)
-                << " order_initial=" << seconds(t_spmm, t_order_initial)
-                << " export=" << seconds(t_order_initial, t_export)
+                << " export=" << seconds(t_spmm, t_export)
                 << " rows=" << seconds(t_export, t_rows)
                 << " graph=" << seconds(t_rows, t_graph)
                 << " fill=" << seconds(t_graph, t_fill)

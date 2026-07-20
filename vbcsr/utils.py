@@ -1,5 +1,5 @@
 import numpy as np
-from vbcsr import VBCSR, MPI, HAS_MPI
+from vbcsr import VBCSR, MPI
 from scipy.linalg import eigh_tridiagonal
 
 def jackson_kernel(N):
@@ -27,35 +27,29 @@ def fermi_dirac(E, beta, mu):
 
 def gaussian(E, mu):
     """
-    Fermi-Dirac distribution function.
+    Gaussian function centered at mu.
     """
-    # Use expit for numerical stability to avoid overflow in exp
     return np.exp(-(E - mu)**2)
 
 
 def compute_kpm_coeffs(n_kpm, func):
     """
-    Generates Chebyshev moments for the Fermi-Dirac function using FFT.
-    
+    Generates Jackson-damped Chebyshev coefficients for a scalar function using FFT.
+
     Args:
         n_kpm (int): Number of moments (Chebyshev degree).
-        temp (float): Temperature in Kelvin.
-        mu (float): Chemical potential in eV.
-        scale (float): Half-width of the spectrum (eV).
-        center (float): Center of the spectrum (eV).
-        
+        func (callable): Function to expand, evaluated on the scaled grid [-1, 1].
+
     Returns:
-        coeffs (ndarray): The first n_kpm Chebyshev coefficients.
+        coeffs (ndarray): The first n_kpm damped Chebyshev coefficients.
     """
 
     # 1. Sample the function on the Chebyshev grid
     # We need 2*N points for the FFT to extract N moments correctly via orthogonality
     k = np.arange(2 * n_kpm)
-    theta_k = np.pi * k / n_kpm  # dE * i where dE = pi / n_kpm in your loop implies 2*n_kpm range
+    theta_k = np.pi * k / n_kpm
     x_k = np.cos(theta_k)
-    
-    # Calculate Fermi-Dirac on the scaled grid
-    # f_vals = fermi_dirac(x_k, beta_re, mu_re)
+
     f_vals = func(x_k)
 
     # 2. Compute Coefficients using FFT

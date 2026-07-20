@@ -675,6 +675,140 @@ ASAN 27/27 + Python suite + kernel verifier green after):
   pipelines and RAII handle owners in `spmm/{csr,bsr}.hpp`; `neighbor_comm`
   is dead public state in `DistGraph`.
 
+#### Post-migration optimization round (2026-07-20)
+
+Measurement-first review of the remaining losing cases, then five approved
+fixes. Two context corrections first: the benchmark host is **dual-socket**
+(2× EPYC 7352, 2 NUMA nodes — earlier reports said "24-core"), and the
+official 16-thread table in `REPORT_efficiency_2026-07-18.md` was partly
+**contaminated by box load** (clean paired re-measurement gave vbcsr/spmm
+16T 1.87 ms = 1.20× vs MKL where the table recorded 3.60 ms = 0.75×). All
+paired numbers below were taken sequentially on a quiet box, 16T runs with
+`OMP_PROC_BIND=close OMP_PLACES=cores`.
+
+The changes (all verified: ctest 27/27, Python suite 17/17, ASAN 27/27,
+plus a 15-case exact-vs-scipy probe at 3 and 16 threads):
+1. **Threading consistency** — `OMP_NUM_THREADS` is the single source of
+   truth. `CSRSpMMExecutor::run_mkl_serial` was missing
+   `configure_vendor_sparse_threading()` (its multiply inherited whatever
+   MKL pool state the previous call left; a fresh process ran it
+   single-threaded at any OMP setting: 0.26× vs MKL at 16T).
+   `graph_matrix_function` and the VBCSR SpGEMM numeric phase now use
+   `configure_native_threading()` instead of ad-hoc ifdefs/nothing.
+2. **CSR vendor replace mode** — forward applies use per-page `beta=0`
+   when the cached pages' row windows tile `[0, n_rows)` (checked by
+   `csr_vendor_pages_tile_output_rows`), zeroing only the ghost tail;
+   adjoint applies always run first-page-`beta=0` (every adjoint
+   page-product writes the full Y). Removes two of three Y passes.
+3. **SpGEMM result construction** — `PagedBuffer::resize_for_complete_overwrite`
+   + `CSRMatrixBackend::initialize_structure_for_complete_overwrite` skip
+   the zero-fill of value pages that the copy-out immediately overwrites;
+   the result matrix is built via the executor token constructor with the
+   backend attached directly (no default build + `set_page_size` rebuild;
+   `matrix_ctor` profile phase: 0.42 ms → 2.5 µs); the result adjacency is
+   moved, not copied, into the result graph.
+4. **NUMA-aware Y zeroing** — native forward applies zero each thread's own
+   Y range inside the parallel compute region (vbcsr: per work chunk; bsr:
+   per thread row range; no barrier needed — threads accumulate only into
+   their own rows); vbcsr adjoints use the new `parallel_zero()` helper;
+   bsr adjoint scatter buffers are now sized in-region by their owning
+   thread (previously the calling thread serially zeroed
+   `thread_count × |Y|`).
+5. **VBCSR SpMV page-order serial path** — at `thread_count == 1` the
+   forward SpMV iterates shape pages (`run_mult_page_order_serial`):
+   the block payload streams contiguously (hardware-prefetch friendly,
+   unlike row order which hops between shape pages) while only the small
+   x/y windows are random. 7.7 → 6.1 ms at 1T. (Software prefetch in the
+   row-order loop was tried and measured neutral — not kept. Multi-thread
+   keeps row order: page order would race on shared y rows.)
+6. **BSR vendor opt-in gating** — the four BSR apply entries configured the
+   MKL pool and built vendor handles (including `mkl_sparse_optimize`)
+   unconditionally, then took the native path anyway (vendor is opt-in via
+   `VBCSR_BSR_VENDOR` and off by default). Pool configuration and handle
+   building now happen only when the opt-in is active; the threading policy
+   is documented in `developer_guide.md` §Threading Model.
+7. **Uninitialized `PagedBuffer::reserve`** — `reserve` used the
+   zero-filling page path, so the VBCSR SpGEMM result's ~0.7 GB of value
+   pages were serially zeroed and then fully overwritten. `reserve` now has
+   standard semantics (capacity is not observable; `resize` zero-fills the
+   live range on growth itself). New `VBCSR_PROFILE_VBCSR_SPGEMM` phase
+   timers showed this `structure` phase at 137 ms — 60 % of the 16T
+   runtime — dropping to 6 ms with the fix: vbcsr/spgemm 16T 245 → 134 ms
+   (2.48× → 4.55× vs MKL), 1T 690 → 642 ms. The duplicate
+   `resize_for_complete_overwrite` I had added was folded into the existing
+   friend-gated `resize_uninitialized` (CSRMatrixBackend joined the friend
+   list).
+
+Verified paired results (this round, sequential quiet box, same process for
+both sides; ratio = sparse_dot_mkl time / VBCSR time, >1 → we are faster):
+
+| domain/op    | 1T ours | 1T MKL | 1T ratio | 16T ours | 16T MKL | 16T ratio |
+|--------------|--------:|-------:|---------:|---------:|--------:|----------:|
+| csr/spmv     | 0.030   | 0.091  | 3.00×    | 0.010    | 0.059   | 6.02×     |
+| csr/spmm     | 0.173   | 0.229  | 1.32×    | 0.018    | 0.074   | 3.97×     |
+| csr/spgemm   | 5.98    | 5.92   | 0.99×    | 1.74     | 1.72    | 0.99×     |
+| bsr/spmv     | 1.52    | 3.25   | 2.14×    | 0.050    | 0.220   | 4.42×     |
+| bsr/spmm     | 5.61    | 14.12  | 2.52×    | 0.331    | 0.841   | 2.55×     |
+| bsr/spgemm   | 302.1   | 302.8  | 1.00×    | 37.9     | 65.7    | 1.73×     |
+| vbcsr/spmv   | 6.15    | 8.22   | 1.34×    | 0.573    | 2.113   | 3.69×     |
+| vbcsr/spmm   | 17.42   | 31.54  | 1.81×    | 1.270    | 2.842   | 2.24×     |
+| vbcsr/spgemm | 641.5   | 5274.9 | 8.22×    | 133.9    | 609.8   | 4.55×     |
+
+(times in ms). VBCSR beats sparse_dot_mkl in 16 of 18 cells and exactly
+matches it in the other two (csr/bsr spgemm — the same MKL multiply
+underneath; our copy-out + block-graph construction now costs what their
+export-to-scipy costs). Headline changes vs the 2026-07-18 report:
+csr/spmm 16T 0.44×→3.97× (cached+optimized mm handle with `beta=0` beats
+sparse_dot_mkl's per-call handles outright), csr/spgemm 0.78×→0.99× (1T)
+and 0.54×→0.99× (16T), bsr/spmm 16T 0.94×→2.55×, bsr/spmv 16T
+0.196→0.050 ms, vbcsr/spmv 1T 1.06×→1.34×, vbcsr/spmm 16T (corrected)
+→2.24×.
+
+Remaining follow-ups (not done): `DistGraph::global_to_local` is a
+`std::map` copied per serial SpGEMM (~0.11 ms; also the lookup structure for
+all hot paths — a flat/hashed replacement helps both); bsr/spgemm Python
+wrapper ~11 ms; native-vs-MKL A/B for the bsr SpGEMM multiply; the
+`run_generic` CSR SpGEMM symbolic=full-multiply double work (distributed
+path); csr/bsr native adjoint critical-section merge. The official
+16-thread benchmark table should be re-baselined with the pinning protocol
+before publication.
+
+#### Publication-version cleanup (2026-07-20)
+
+Final polish before freezing this tree as the publication version (all
+gates green after: ctest 27/27, ASAN 27/27, Python suite 17/17, pyflakes
+clean, perf spot-checks stable):
+- C++: dead `DistGraph::neighbor_comm` state removed (declared/freed, never
+  assigned); `update_local_block` "(DEBUG)" exception text rewritten; seven
+  stream-of-consciousness TODOs converted to factual notes or deleted
+  (AOCL reuse rationale, transpose materialization, block-density
+  semantics, `run_generic` known-limitation note); vestigial `order` phase
+  timers removed from both SpGEMM profiles (they timed the deleted
+  `mkl_sparse_order`).
+- Python (dedicated pass over all 8 package files): dead import + relic
+  code removed in `utils.py`; ~40 lines of stream-of-consciousness /
+  restating comments condensed in `matrix.py`; five stale design-doc
+  references deleted; wrong docstrings fixed (`compute_kpm_coeffs` listed
+  four nonexistent args; `gaussian` claimed to be Fermi-Dirac;
+  `DistVector.to_numpy` returns a view, not a copy); misindented `raise`
+  fixed.
+- **Real bug fixed**: `DistMultiVector.__itruediv__` by a `DistVector`
+  broadcast `(rows, nv) / (rows,)` — raised `ValueError` for `nv != rows`
+  and would compute nonsense when equal. Now divides row-wise via a column
+  view, mirroring `__imul__`; verified exact.
+- Two flags resolved with the user (2026-07-20):
+  `sample_k(symm=True)` was a false alarm — `VBCSR.T` routes to the C++
+  transpose executor, which conjugates (`write_transposed_conjugate_block`),
+  so the symmetrization already is the Hermitian `(A + A^H)/2`; the
+  misleading docstrings were fixed and `transpose`/`T` now document the
+  conjugating semantics (deliberately unlike `numpy.ndarray.T`).
+  Unknown-global-extent conventions unified on "`None` in `.shape`, `0`
+  from int accessors": `DistVector.shape` now falls back to `(None,)`
+  instead of the local `(full_size,)` (its `size`/`__repr__` already
+  guarded for `None`). Structural refactors (shared MKL SpGEMM export
+  helper, assembly warn-vs-throw) stay deferred by choice — stability over
+  churn at freeze time.
+
 ---
 
 ## 4. Validation matrix (which gate catches which silent-transpose)

@@ -65,9 +65,6 @@ public:
     std::vector<int> recv_counts_scalar;
     std::vector<int> send_displs_scalar;
     std::vector<int> recv_displs_scalar;
-    
-    // For neighbor collectives (if used)
-    MPI_Comm neighbor_comm = MPI_COMM_NULL;
 
 private:
     // Matrix references and deletion permission are intentionally separate.
@@ -122,10 +119,6 @@ public:
         if (initialized) {
             MPI_Finalized(&finalized);
         }
-        if (initialized && !finalized && neighbor_comm != MPI_COMM_NULL) {
-            MPI_Comm_free(&neighbor_comm);
-        }
-        neighbor_comm = MPI_COMM_NULL;
     }
 
     // Copy constructor (deep copy except for MPI_Comm handles that shouldn't be shared)
@@ -150,8 +143,6 @@ public:
         recv_counts_scalar = other.recv_counts_scalar;
         send_displs_scalar = other.send_displs_scalar;
         recv_displs_scalar = other.recv_displs_scalar;
-        // neighbor_comm is NOT copied to avoid double-free or sharing managed handle
-        neighbor_comm = MPI_COMM_NULL;
         matrix_ref_count_.store(0, std::memory_order_release);
         matrix_lifetime_managed_.store(false, std::memory_order_release);
     }

@@ -351,11 +351,25 @@ void bsr_mult_impl(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistVec
     const auto& plan = backend.ensure_apply_plan(graph->adj_ptr, graph->adj_ind);
     const int n_rows = graph->adj_ptr.empty() ? 0 : static_cast<int>(graph->adj_ptr.size()) - 1;
 
-    std::fill(y.data.begin(), y.data.end(), T(0));
-
     #pragma omp parallel
     {
         const auto [thread_row_begin, thread_row_end] = bsr_thread_row_range(n_rows);
+#ifdef _OPENMP
+        const bool last_thread = omp_get_thread_num() == omp_get_num_threads() - 1;
+#else
+        const bool last_thread = true;
+#endif
+        // Zero this thread's Y row range in-region (parallel fill, NUMA-local
+        // first touch); the last thread also clears the ghost tail. No
+        // barrier: each thread accumulates only into its own rows.
+        std::fill(
+            y.data.data() + graph->block_offsets[thread_row_begin],
+            y.data.data() + graph->block_offsets[thread_row_end],
+            T(0));
+        if (last_thread) {
+            std::fill(
+                y.data.data() + graph->block_offsets[n_rows], y.data.data() + y.data.size(), T(0));
+        }
         for (const auto& batch_entry : plan.batches) {
             const auto& batch = batch_entry.batch;
             const int row_begin = std::max(batch.row_begin, thread_row_begin);
@@ -382,16 +396,19 @@ void bsr_mult(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistVector<T
     x.sync_ghosts();
 
 #ifdef VBCSR_HAVE_MKL_BSR_SPARSE
-    BLASKernel::configure_vendor_sparse_threading();
-    const auto& cache = backend.ensure_vendor_cache(
-        graph->adj_ptr,
-        graph->adj_ind,
-        static_cast<int>(graph->block_sizes.size()));
-    if (bsr_vendor_enabled() && cache.kind != BSRVendorBackendKind::None) {
-        std::fill(y.data.begin(), y.data.end(), T(0));
-        if (cache.kind == BSRVendorBackendKind::MKL &&
-            bsr_try_vendor_mkl_vector(graph, backend, cache, x, y, false)) {
-            return;
+    // Vendor path is opt-in (VBCSR_BSR_VENDOR): only then align the MKL pool
+    // with the OpenMP budget and build vendor handles.
+    if (bsr_vendor_enabled()) {
+        BLASKernel::configure_vendor_sparse_threading();
+        const auto& cache = backend.ensure_vendor_cache(
+            graph->adj_ptr,
+            graph->adj_ind,
+            static_cast<int>(graph->block_sizes.size()));
+        if (cache.kind == BSRVendorBackendKind::MKL) {
+            std::fill(y.data.begin(), y.data.end(), T(0));
+            if (bsr_try_vendor_mkl_vector(graph, backend, cache, x, y, false)) {
+                return;
+            }
         }
     }
 #endif
@@ -416,11 +433,27 @@ void bsr_mult_dense_impl(DistGraph* graph, const BSRMatrixBackend<T>& backend, D
     const int x_ld = x.ld;
     const int y_ld = y.ld;
 
-    std::fill(y.data.begin(), y.data.end(), T(0));
-
     #pragma omp parallel
     {
         const auto [thread_row_begin, thread_row_end] = bsr_thread_row_range(n_rows);
+#ifdef _OPENMP
+        const bool last_thread = omp_get_thread_num() == omp_get_num_threads() - 1;
+#else
+        const bool last_thread = true;
+#endif
+        // Same in-region per-thread zeroing as the SpMV impl above (row
+        // offsets scaled by the padded ld; full-ld rows keep the padding
+        // lanes zero).
+        std::fill(
+            y.data.data() + static_cast<size_t>(graph->block_offsets[thread_row_begin]) * y_ld,
+            y.data.data() + static_cast<size_t>(graph->block_offsets[thread_row_end]) * y_ld,
+            T(0));
+        if (last_thread) {
+            std::fill(
+                y.data.data() + static_cast<size_t>(graph->block_offsets[n_rows]) * y_ld,
+                y.data.data() + y.data.size(),
+                T(0));
+        }
         for (const auto& batch_entry : plan.batches) {
             const auto& batch = batch_entry.batch;
             const int row_begin = std::max(batch.row_begin, thread_row_begin);
@@ -454,21 +487,24 @@ void bsr_mult_dense(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistMu
     x.sync_ghosts();
 
 #ifdef VBCSR_HAVE_MKL_BSR_SPARSE
-    BLASKernel::configure_vendor_sparse_threading();
-    const auto& cache = backend.ensure_vendor_cache(
-        graph->adj_ptr,
-        graph->adj_ind,
-        static_cast<int>(graph->block_sizes.size()));
-    if (bsr_vendor_enabled() && cache.kind != BSRVendorBackendKind::None) {
-        const bool replace_output = bsr_vendor_batches_have_disjoint_output_rows(cache);
-        if (!replace_output) {
-            std::fill(y.data.begin(), y.data.end(), T(0));
-        } else {
-            bsr_zero_output_ghost_rows(y);
-        }
-        if (cache.kind == BSRVendorBackendKind::MKL &&
-            bsr_try_vendor_mkl_dense(graph, backend, cache, x, y, false, replace_output)) {
-            return;
+    // Vendor path is opt-in (VBCSR_BSR_VENDOR): only then align the MKL pool
+    // with the OpenMP budget and build vendor handles.
+    if (bsr_vendor_enabled()) {
+        BLASKernel::configure_vendor_sparse_threading();
+        const auto& cache = backend.ensure_vendor_cache(
+            graph->adj_ptr,
+            graph->adj_ind,
+            static_cast<int>(graph->block_sizes.size()));
+        if (cache.kind == BSRVendorBackendKind::MKL) {
+            const bool replace_output = bsr_vendor_batches_have_disjoint_output_rows(cache);
+            if (!replace_output) {
+                std::fill(y.data.begin(), y.data.end(), T(0));
+            } else {
+                bsr_zero_output_ghost_rows(y);
+            }
+            if (bsr_try_vendor_mkl_dense(graph, backend, cache, x, y, false, replace_output)) {
+                return;
+            }
         }
     }
 #endif
@@ -492,10 +528,9 @@ void bsr_mult_adjoint_impl(DistGraph* graph, const BSRMatrixBackend<T>& backend,
         1;
 #endif
 
-    std::fill(y.data.begin(), y.data.end(), T(0));
-
     if (thread_count == 1) {
         // Single thread: accumulate straight into y, no scatter buffers.
+        std::fill(y.data.begin(), y.data.end(), T(0));
         for (const auto& batch_entry : plan.batches) {
             const auto& batch = batch_entry.batch;
             for (int row = batch.row_begin; row < batch.row_end; ++row) {
@@ -517,9 +552,10 @@ void bsr_mult_adjoint_impl(DistGraph* graph, const BSRMatrixBackend<T>& backend,
         return;
     }
 
-    std::vector<std::vector<T>> thread_buffers(
-        static_cast<size_t>(thread_count),
-        std::vector<T>(y.data.size(), T(0)));
+    // Buffers are sized inside the parallel region: each thread zero-fills
+    // its own scatter buffer (parallel fill, NUMA-local first touch) instead
+    // of the calling thread serially zeroing thread_count full-Y copies.
+    std::vector<std::vector<T>> thread_buffers(static_cast<size_t>(thread_count));
 
     #pragma omp parallel
     {
@@ -529,6 +565,7 @@ void bsr_mult_adjoint_impl(DistGraph* graph, const BSRMatrixBackend<T>& backend,
         const int thread_id = 0;
 #endif
         auto& y_local = thread_buffers[static_cast<size_t>(thread_id)];
+        y_local.assign(y.data.size(), T(0));
         const auto [thread_row_begin, thread_row_end] = bsr_thread_row_range(n_rows);
 
         for (const auto& batch_entry : plan.batches) {
@@ -553,7 +590,11 @@ void bsr_mult_adjoint_impl(DistGraph* graph, const BSRMatrixBackend<T>& backend,
     for (size_t index = 0; index < y.data.size(); ++index) {
         T sum = T(0);
         for (const auto& thread_buffer : thread_buffers) {
-            sum += thread_buffer[index];
+            // A buffer stays empty when the region ran with fewer threads
+            // than thread_count.
+            if (!thread_buffer.empty()) {
+                sum += thread_buffer[index];
+            }
         }
         y.data[index] = sum;
     }
@@ -567,17 +608,20 @@ void bsr_mult_adjoint(DistGraph* graph, const BSRMatrixBackend<T>& backend, Dist
     y.bind_to_graph(graph);
 
 #ifdef VBCSR_HAVE_MKL_BSR_SPARSE
-    BLASKernel::configure_vendor_sparse_threading();
-    const auto& cache = backend.ensure_vendor_cache(
-        graph->adj_ptr,
-        graph->adj_ind,
-        static_cast<int>(graph->block_sizes.size()));
-    if (bsr_vendor_enabled() && cache.kind != BSRVendorBackendKind::None) {
-        std::fill(y.data.begin(), y.data.end(), T(0));
-        if (cache.kind == BSRVendorBackendKind::MKL &&
-            bsr_try_vendor_mkl_vector(graph, backend, cache, x, y, true)) {
-            y.reduce_ghosts();
-            return;
+    // Vendor path is opt-in (VBCSR_BSR_VENDOR): only then align the MKL pool
+    // with the OpenMP budget and build vendor handles.
+    if (bsr_vendor_enabled()) {
+        BLASKernel::configure_vendor_sparse_threading();
+        const auto& cache = backend.ensure_vendor_cache(
+            graph->adj_ptr,
+            graph->adj_ind,
+            static_cast<int>(graph->block_sizes.size()));
+        if (cache.kind == BSRVendorBackendKind::MKL) {
+            std::fill(y.data.begin(), y.data.end(), T(0));
+            if (bsr_try_vendor_mkl_vector(graph, backend, cache, x, y, true)) {
+                y.reduce_ghosts();
+                return;
+            }
         }
     }
 #endif
@@ -611,11 +655,10 @@ void bsr_mult_dense_adjoint_impl(
         1;
 #endif
 
-    std::fill(y.data.begin(), y.data.end(), T(0));
-
     if (thread_count == 1) {
         // Single thread owns every output row: accumulate straight into y and
         // skip the scatter buffers + merge (two full passes over y otherwise).
+        std::fill(y.data.begin(), y.data.end(), T(0));
         for (const auto& batch_entry : plan.batches) {
             const auto& batch = batch_entry.batch;
             for (int row = batch.row_begin; row < batch.row_end; ++row) {
@@ -642,10 +685,9 @@ void bsr_mult_dense_adjoint_impl(
     }
 
     // Row-driven scatter: per-thread ROW-major accumulation buffers (same
-    // layout as y), merged with one flat contiguous reduction.
-    std::vector<std::vector<T>> thread_buffers(
-        static_cast<size_t>(thread_count),
-        std::vector<T>(y.data.size(), T(0)));
+    // layout as y), merged with one flat contiguous reduction. Each thread
+    // sizes its own buffer in-region (parallel fill, NUMA-local first touch).
+    std::vector<std::vector<T>> thread_buffers(static_cast<size_t>(thread_count));
 
     #pragma omp parallel
     {
@@ -655,6 +697,7 @@ void bsr_mult_dense_adjoint_impl(
         const int thread_id = 0;
 #endif
         auto& y_local = thread_buffers[static_cast<size_t>(thread_id)];
+        y_local.assign(y.data.size(), T(0));
         const auto [thread_row_begin, thread_row_end] = bsr_thread_row_range(n_rows);
 
         for (const auto& batch_entry : plan.batches) {
@@ -686,7 +729,11 @@ void bsr_mult_dense_adjoint_impl(
     for (size_t index = 0; index < y.data.size(); ++index) {
         T sum = T(0);
         for (const auto& thread_buffer : thread_buffers) {
-            sum += thread_buffer[index];
+            // A buffer stays empty when the region ran with fewer threads
+            // than thread_count.
+            if (!thread_buffer.empty()) {
+                sum += thread_buffer[index];
+            }
         }
         y.data[index] = sum;
     }
@@ -704,17 +751,20 @@ void bsr_mult_dense_adjoint(
     y.bind_to_graph(graph);
 
 #ifdef VBCSR_HAVE_MKL_BSR_SPARSE
-    BLASKernel::configure_vendor_sparse_threading();
-    const auto& cache = backend.ensure_vendor_cache(
-        graph->adj_ptr,
-        graph->adj_ind,
-        static_cast<int>(graph->block_sizes.size()));
-    if (bsr_vendor_enabled() && cache.kind != BSRVendorBackendKind::None) {
-        std::fill(y.data.begin(), y.data.end(), T(0));
-        if (cache.kind == BSRVendorBackendKind::MKL &&
-            bsr_try_vendor_mkl_dense(graph, backend, cache, x, y, true, false)) {
-            y.reduce_ghosts();
-            return;
+    // Vendor path is opt-in (VBCSR_BSR_VENDOR): only then align the MKL pool
+    // with the OpenMP budget and build vendor handles.
+    if (bsr_vendor_enabled()) {
+        BLASKernel::configure_vendor_sparse_threading();
+        const auto& cache = backend.ensure_vendor_cache(
+            graph->adj_ptr,
+            graph->adj_ind,
+            static_cast<int>(graph->block_sizes.size()));
+        if (cache.kind == BSRVendorBackendKind::MKL) {
+            std::fill(y.data.begin(), y.data.end(), T(0));
+            if (bsr_try_vendor_mkl_dense(graph, backend, cache, x, y, true, false)) {
+                y.reduce_ghosts();
+                return;
+            }
         }
     }
 #endif

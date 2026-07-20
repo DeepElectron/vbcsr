@@ -29,6 +29,25 @@ struct ConjHelper<std::complex<T>> {
 // row-major migration: block storage is now canonical row-major and every
 // apply/SpGEMM path uses detail/kernels/rowmajor_kernels.hpp.
 
+// Zero a buffer with all OpenMP threads: parallel fill bandwidth and
+// NUMA-local first touch (a serial fill places every page on the calling
+// thread's node). Launches its own parallel region.
+template <typename T>
+inline void parallel_zero(T* data, size_t count) {
+#ifdef _OPENMP
+    #pragma omp parallel
+    {
+        const size_t thread_count = static_cast<size_t>(omp_get_num_threads());
+        const size_t thread_id = static_cast<size_t>(omp_get_thread_num());
+        const size_t begin = count * thread_id / thread_count;
+        const size_t end = count * (thread_id + 1) / thread_count;
+        std::fill(data + begin, data + end, T(0));
+    }
+#else
+    std::fill(data, data + count, T(0));
+#endif
+}
+
 // MKL/BLAS Kernel
 struct BLASKernel {
     static constexpr bool supports_strided_gemm() {

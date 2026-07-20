@@ -93,7 +93,7 @@ class DistMultiVector:
             ValueError: If shape mismatch.
         """
         if arr.shape != (self.local_rows, self.num_vectors):
-             raise ValueError(f"Array shape {arr.shape} mismatch. Expected ({self.local_rows}, {self.num_vectors})")
+            raise ValueError(f"Array shape {arr.shape} mismatch. Expected ({self.local_rows}, {self.num_vectors})")
         self._local_buffer()[:] = arr
 
     def __array__(self) -> np.ndarray:
@@ -250,7 +250,9 @@ class DistMultiVector:
         elif isinstance(other, DistMultiVector):
             self._local_buffer()[:] /= core_buffer(other._core)[:other.local_rows, :]
         elif isinstance(other, DistVector):
-            self._local_buffer()[:] /= core_buffer(other._core)[:other.local_size]
+            # Row-wise: divide every vector lane of row r by other[r]
+            # (mirrors the pointwise_mult_vec semantics of __imul__).
+            self._local_buffer()[:] /= core_buffer(other._core)[:other.local_size, None]
         elif isinstance(other, np.ndarray):
             self._local_buffer()[:] /= other
         else:

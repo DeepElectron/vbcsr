@@ -7,8 +7,11 @@
 #include "common.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <limits>
@@ -61,20 +64,46 @@ private:
 
 public:
     static Matrix run(const Matrix& A, const Matrix& B, double threshold) {
+        const bool profile = std::getenv("VBCSR_PROFILE_VBCSR_SPGEMM") != nullptr;
+        const auto t0 = std::chrono::steady_clock::now();
         auto metadata = exchange_ghost_metadata(A, B);
         auto sym = symbolic_multiply_filtered(A, B, metadata, threshold);
+        const auto t_symbolic = std::chrono::steady_clock::now();
         auto payload_ctx = fetch_required_block_payloads(B, sym.required_blocks);
         auto ghost_blocks = build_spmm_ghost_blocks(metadata, std::move(payload_ctx));
         auto adjacency = build_spmm_result_adjacency(A, sym);
+        const auto t_adjacency = std::chrono::steady_clock::now();
 
         const auto& A_norms = A.get_block_norms();
         const auto& B_local_norms = B.get_block_norms();
+        const auto t_norms = std::chrono::steady_clock::now();
 
         DistGraph* c_graph = construct_result_graph(A, adjacency, ghost_blocks.sizes, "spmm");
+        const auto t_graph = std::chrono::steady_clock::now();
         Matrix C = make_result_matrix_for_numeric_overwrite(A, c_graph);
+        const auto t_structure = std::chrono::steady_clock::now();
 
         numeric_multiply(A, B, ghost_blocks.rows, C, threshold, A_norms, B_local_norms);
+        const auto t_numeric = std::chrono::steady_clock::now();
         C.filter_blocks(threshold);
+        const auto t_filter = std::chrono::steady_clock::now();
+
+        if (profile) {
+            auto seconds = [](auto a, auto b) {
+                return std::chrono::duration<double>(b - a).count();
+            };
+            std::cerr
+                << "VBCSR_PROFILE_VBCSR_SPGEMM"
+                << " symbolic=" << seconds(t0, t_symbolic)
+                << " adjacency=" << seconds(t_symbolic, t_adjacency)
+                << " norms=" << seconds(t_adjacency, t_norms)
+                << " graph=" << seconds(t_norms, t_graph)
+                << " structure=" << seconds(t_graph, t_structure)
+                << " numeric=" << seconds(t_structure, t_numeric)
+                << " filter=" << seconds(t_numeric, t_filter)
+                << " total=" << seconds(t0, t_filter)
+                << std::endl;
+        }
         return C;
     }
 
@@ -146,6 +175,11 @@ private:
         const std::vector<double>& A_norms,
         const std::vector<double>& B_local_norms) {
         const int n_rows = static_cast<int>(A.row_ptr().size()) - 1;
+
+        // Numeric products call BLAS (gemm_batched) from inside the OpenMP
+        // region below: clamp the BLAS runtime to one thread so the pool
+        // state left by a previous vendor call cannot oversubscribe.
+        BLASKernel::configure_native_threading();
 
         int max_threads = 1;
         #ifdef _OPENMP

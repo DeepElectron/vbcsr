@@ -49,9 +49,12 @@ class DistVector:
 
     @property
     def shape(self):
+        # None marks an unknown global extent (consistent with
+        # DistMultiVector.shape and VBCSR.shape); int accessors (size,
+        # __len__) return 0 in that case.
         if self._global_size is not None:
             return (self._global_size,)
-        return (self.full_size,)
+        return (None,)
 
     @property
     def size(self) -> int:
@@ -81,9 +84,9 @@ class DistVector:
     def to_numpy(self) -> np.ndarray:
         """
         Convert the locally owned part of the vector to a NumPy array.
-        
+
         Returns:
-            np.ndarray: A copy (or view) of the locally owned data.
+            np.ndarray: A view of the locally owned data.
         """
         return self._local_buffer()
 

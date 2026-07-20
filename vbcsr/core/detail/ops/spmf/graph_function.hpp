@@ -66,13 +66,9 @@ void graph_matrix_function(
     std::vector<std::vector<int>> batch_indices(batch_size);
 
     for (int b = 0; b < nbatch; ++b) {
-        // Avoid thread oversubscription in BLAS/LAPACK
-        #ifdef VBCSR_USE_MKL
-        int one = 1;
-        mkl_set_num_threads_(&one);
-        #elif defined(VBCSR_USE_OPENBLAS)
-        openblas_set_num_threads(1);
-        #endif
+        // Avoid thread oversubscription in BLAS/LAPACK inside the parallel
+        // subgraph loop (shared threading policy: dense_kernels.hpp).
+        BLASKernel::configure_native_threading();
 
         batch_indices.clear();
         batch_indices.resize(batch_size);

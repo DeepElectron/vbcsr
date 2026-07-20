@@ -16,6 +16,9 @@ template <typename T>
 struct BSRMatrixBackend;
 
 template <typename T>
+struct CSRMatrixBackend;
+
+template <typename T>
 class ShapeBlockStore;
 
 template <typename T>
@@ -29,6 +32,7 @@ struct PageSlice {
 template <typename T>
 class PagedBuffer {
     friend struct BSRMatrixBackend<T>;
+    friend struct CSRMatrixBackend<T>;
     friend class ShapeBlockStore<T>;
 
 public:
@@ -68,8 +72,11 @@ public:
         size_ = 0;
     }
 
+    // Standard reserve semantics: capacity beyond size() is not observable,
+    // so the new pages are not zero-filled (resize() zero-fills the live
+    // range on growth itself).
     void reserve(uint64_t element_capacity) {
-        ensure_capacity(element_capacity);
+        ensure_capacity_uninitialized(element_capacity);
     }
 
     void resize(uint64_t element_count) {
