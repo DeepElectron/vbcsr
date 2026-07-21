@@ -6,6 +6,28 @@ This guide documents the internal design decisions and conventions of the VBCSR 
 
 The `DistGraph` class manages the distributed adjacency structure of the block sparse matrix. A key design decision involves the ordering of ghost indices.
 
+### Global-to-Local Lookup (`detail::IndexMap`)
+
+`DistGraph::global_to_local` is a `detail::IndexMap`
+(`detail/storage/index_map.hpp`), not a `std::map`: a flat, open-addressed
+int → int table. It is the hottest lookup in the library (every distributed
+apply, SpGEMM, transpose and assembly probes it), and building it dominated
+distributed result-graph construction when it was tree-based.
+
+It exposes a deliberate **subset** of the `std::map` API — `at`, `find`/`end`,
+`count`, `operator[]`, `size`, `empty`, `clear`, `reserve`, with `find`
+returning a handle exposing `->first`/`->second` — so call sites read exactly
+as they did before.
+
+It deliberately provides **no iteration**. The container has no key order, and
+omitting `begin()` turns a future ordering dependency into a compile error
+rather than a silent behavior change. Keys must be `>= 0` (`-1` marks a free
+slot), and `operator[]` references are invalidated by a later growing insert,
+the same rule `std::unordered_map` has for rehash.
+
+Rank-keyed maps (e.g. `ghosts_by_rank`) stay `std::map`: their ordered
+iteration is what makes ghost ordering deterministic across ranks.
+
 ### Ghost Index Convention: "Sort by Owner"
 
 In a distributed graph, local indices are assigned as follows:

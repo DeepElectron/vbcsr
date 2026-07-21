@@ -2,6 +2,7 @@
 #define VBCSR_DIST_GRAPH_HPP
 
 #include <mpi.h>
+#include "detail/storage/index_map.hpp"
 #include <atomic>
 #include <vector>
 #include <map>
@@ -27,7 +28,9 @@ public:
     // Map global block index to local index
     // 0 to n_owned-1 are owned
     // n_owned to n_owned+n_ghost-1 are ghosts
-    std::map<int, int> global_to_local;
+    // Lookup table, not an ordered container: see detail::IndexMap. Keeps the
+    // std::map call idioms (at/find/count/[]) it replaced.
+    detail::IndexMap global_to_local;
     
     // Number of rows/cols (orbitals) for each local block (owned + ghost)
     std::vector<int> block_sizes;
