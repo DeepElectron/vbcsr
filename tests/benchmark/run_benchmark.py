@@ -924,36 +924,33 @@ def benchmark_vbcsr_with_internal_diagnostics(
         )
         return timing, diagnostic
 
-    vbcsr_threading: dict[str, Any] | None = None
-    sparse_dot_mkl_for_threading: Any | None = None
-    if (
-        spec.domain == "csr"
-        and spec.operation == "spgemm"
-        and diagnostic.get("vendor_backend_name") == "mkl"
-        and comm is None
-    ):
-        try:
-            sparse_dot_mkl_for_threading = importlib.import_module("sparse_dot_mkl")
-            vbcsr_threading = configure_sparse_dot_mkl_threading(sparse_dot_mkl_for_threading)
-            diagnostic["vendor_threading"] = vbcsr_threading
-        except Exception as exc:
-            diagnostic["vendor_threading_error"] = f"{type(exc).__name__}: {exc}"
-
-    try:
-        timing = benchmark_repeated(
-            vbcsr_op(matrix, inputs, spec),
-            comm=comm,
-            repeats=repeats,
-            min_seconds=min_seconds,
-            min_iterations=min_iterations,
-            warmups=warmups,
-        )
-    finally:
-        if sparse_dot_mkl_for_threading is not None and vbcsr_threading is not None:
-            diagnostic["vendor_threading_restore"] = restore_sparse_dot_mkl_threading(
-                sparse_dot_mkl_for_threading,
-                vbcsr_threading,
-            )
+    # NOTE: do not touch MKL's thread count around the VBCSR timing.
+    #
+    # This used to call configure_sparse_dot_mkl_threading() for csr/spgemm, which
+    # applies `mkl_set_num_threads_local`. That is a *thread-local* override, and it
+    # wins over the global `mkl_set_num_threads` the library issues from
+    # configure_vendor_sparse_threading() at each vendor entry -- so the harness
+    # silently overrode the library's threading and the value it installed came from
+    # the sparse_dot_mkl *reference* env chain (SPARSE_DOT_MKL_NUM_THREADS ->
+    # MKL_REFERENCE_NUM_THREADS -> MKL_NUM_THREADS, default 1).
+    #
+    # Under the scaling sweep, which exports MKL_NUM_THREADS=1 and no
+    # SPARSE_DOT_MKL_NUM_THREADS, that pinned VBCSR's SpGEMM to one MKL thread at
+    # every thread count and produced a perfectly flat "speedup" of 1.0x. Measured
+    # at 400k blocks / 16 threads: 0.706 s with the override, 0.165 s without.
+    #
+    # `OMP_NUM_THREADS` is the library's single source of truth (doc/developer_guide.md
+    # §Threading Model) and the library configures its own vendor pool. The benchmark
+    # must observe that, not redefine it. Reference-baseline threading is still
+    # configured around the sparse_dot_mkl calls themselves, where it belongs.
+    timing = benchmark_repeated(
+        vbcsr_op(matrix, inputs, spec),
+        comm=comm,
+        repeats=repeats,
+        min_seconds=min_seconds,
+        min_iterations=min_iterations,
+        warmups=warmups,
+    )
 
     after = int(matrix.vendor_launch_count)
     local_calls = int(sum(int(item) for item in timing.get("iterations", []))) + int(repeats) * int(warmups)
@@ -1642,6 +1639,13 @@ def build_specs(args: argparse.Namespace, rank_count: int) -> list[BenchmarkSpec
         blocks = int(args.blocks)
         weak_blocks = None
 
+    selected_domains = [d.strip() for d in str(args.domains).split(",") if d.strip()]
+    unknown = [d for d in selected_domains if d not in DOMAINS]
+    if unknown:
+        raise ValueError(f"unknown domain(s) {unknown}; choose from {list(DOMAINS)}")
+    if not selected_domains:
+        raise ValueError("--domains selected nothing")
+
     target_bytes = int(args.target_storage_bytes) if args.target_storage_bytes else 0
     blocks_by_domain: dict[str, int] = {}
     if target_bytes > 0:
@@ -1650,11 +1654,11 @@ def build_specs(args: argparse.Namespace, rank_count: int) -> list[BenchmarkSpec
         mean_degree = calibrate_mean_degree(args, dtype)
         blocks_by_domain = {
             domain: blocks_for_target_storage(domain, target_bytes, mean_degree, args, dtype)
-            for domain in DOMAINS
+            for domain in selected_domains
         }
 
     specs: list[BenchmarkSpec] = []
-    for domain in DOMAINS:
+    for domain in selected_domains:
         domain_blocks = blocks_by_domain.get(domain, blocks)
         for operation in OPERATIONS:
             thresholds = spgemm_thresholds if operation == "spgemm" else [float(args.spgemm_threshold)]
@@ -1820,6 +1824,14 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--suite", choices=("efficiency", "distributed-strong", "distributed-weak"), default="efficiency")
     parser.add_argument("--blocks", type=int, default=4096, help="Global block count for efficiency and strong scaling")
     parser.add_argument("--weak-blocks-per-rank", type=int, default=4096)
+    parser.add_argument(
+        "--domains",
+        default=",".join(DOMAINS),
+        help=("comma-separated subset of %s. The weak suite takes a single "
+              "--weak-blocks-per-rank for whatever it runs, and a fixed block count is a "
+              "very different footprint per domain, so size a weak study by running one "
+              "domain per job." % (",".join(DOMAINS),)),
+    )
     parser.add_argument("--target-degree", type=int, default=12)
     parser.add_argument("--rhs", type=int, default=16)
     parser.add_argument("--dtype", choices=("real", "complex"), default="real")
