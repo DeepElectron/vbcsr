@@ -20,6 +20,7 @@ import csv
 import datetime as dt
 import importlib
 import io
+import itertools
 import json
 import math
 import os
@@ -35,6 +36,7 @@ from contextlib import redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean, median
+from collections.abc import Sequence
 from typing import Any, Callable
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -76,6 +78,8 @@ DOMAINS = ("csr", "bsr", "vbcsr")
 OPERATIONS = ("spmv", "spmm", "spgemm")
 VBCSR_BLOCK_SIZES = (9, 13, 15, 20)
 MPI_FALLBACK_STATUS: dict[str, Any] = {}
+# At most one entry: the matrix shared by the operations of the current domain.
+_CASE_MATRIX_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 
 
 @dataclass(frozen=True)
@@ -99,6 +103,7 @@ class BenchmarkSpec:
     magnitude_decay_length: float
     offdiagonal_scale: float
     diagonal_shift: float
+    geometry_ordering: str = "bisection"
     weak_blocks_per_rank: int | None = None
 
     @property
@@ -238,14 +243,6 @@ def partition_range(n_items: int, size: int, rank: int) -> tuple[int, int]:
     return start, start + base + (1 if rank < rem else 0)
 
 
-def owner_of_block(gid: int, blocks: int, size: int) -> int:
-    for rank in range(size):
-        start, end = partition_range(blocks, size, rank)
-        if start <= gid < end:
-            return rank
-    raise ValueError(f"block id {gid} outside [0, {blocks})")
-
-
 def geometric_grid_shape(blocks: int, dim: int) -> tuple[int, ...]:
     if blocks <= 0:
         raise ValueError("blocks must be positive")
@@ -255,11 +252,56 @@ def geometric_grid_shape(blocks: int, dim: int) -> tuple[int, ...]:
     return tuple([side] * dim)
 
 
+def bisection_order(coords: np.ndarray) -> np.ndarray:
+    """Permutation ordering points by orthogonal recursive bisection.
+
+    Ranks are assigned contiguous global id ranges (`partition_range`), so the
+    numbering decides the shape of each rank's subdomain. Under lexicographic
+    numbering a contiguous range is a *slab* of the box: at fixed volume per
+    rank its halo grows as P^(2/3), which is what made communication grow with
+    rank count. Recursively bisecting along the longest axis instead makes any
+    contiguous range a compact box, so the halo stays proportional to the
+    subdomain surface.
+
+    Splitting on the longest axis reproduces the lexicographic cut whenever
+    that is already optimal (e.g. a single planar cut at P = 2), so this never
+    costs communication relative to the old ordering.
+    """
+    n_points = coords.shape[0]
+    if n_points == 0:
+        return np.zeros(0, dtype=np.int64)
+    # Bounded leaf size: ordering inside a leaf is irrelevant as long as leaves
+    # are far smaller than a rank's share, and it keeps the split count linear.
+    leaf_size = max(8, n_points // 100_000)
+    order = np.empty(n_points, dtype=np.int64)
+    filled = 0
+    # Reverse-order stack so the traversal emits points left-to-right.
+    pending = [np.arange(n_points, dtype=np.int64)]
+    while pending:
+        selection = pending.pop()
+        if selection.size <= leaf_size:
+            order[filled:filled + selection.size] = selection
+            filled += selection.size
+            continue
+        points = coords[selection]
+        axis = int(np.argmax(points.max(axis=0) - points.min(axis=0)))
+        middle = selection.size // 2
+        split = np.argpartition(points[:, axis], middle)
+        pending.append(selection[split[middle:]])
+        pending.append(selection[split[:middle]])
+    return order
+
+
 def make_geometric_positions(spec: BenchmarkSpec) -> tuple[np.ndarray, np.ndarray, tuple[int, ...]]:
     shape = geometric_grid_shape(spec.blocks, spec.geometry_dim)
     grid_size = math.prod(shape)
     flat = (np.arange(spec.blocks, dtype=np.int64) * grid_size) // spec.blocks
-    grid = np.array(np.unravel_index(flat, shape), dtype=np.float64).T
+    grid_int = np.array(np.unravel_index(flat, shape), dtype=np.int64).T
+    if spec.geometry_ordering == "bisection":
+        grid_int = grid_int[bisection_order(grid_int)]
+    elif spec.geometry_ordering != "lexicographic":
+        raise ValueError(f"unknown geometry ordering {spec.geometry_ordering!r}")
+    grid = grid_int.astype(np.float64)
     positions = grid * spec.geometry_spacing
     box_lengths = np.array(shape, dtype=np.float64) * spec.geometry_spacing
     if spec.geometry_jitter > 0.0:
@@ -280,25 +322,76 @@ def calibrate_cutoff(positions: np.ndarray, box_lengths: np.ndarray, spec: Bench
         raise ValueError("--geometry-cutoff-quantile must be in (0, 1]")
     tree = cKDTree(positions, boxsize=box_lengths)
     kth = min(max(spec.target_degree, 2), spec.blocks)
-    distances, _ = tree.query(positions, k=kth)
+    # Calibrate from a bounded, evenly spread sample. The k-th neighbour
+    # distance is a property of the lattice, not of the block count, so a
+    # sample fixes the cutoff just as well as querying every point -- and it
+    # keeps the O(blocks * k) distance array from dominating memory on the
+    # large runs, where every rank performs this calibration.
+    sample_limit = 50000
+    if positions.shape[0] > sample_limit:
+        stride = positions.shape[0] // sample_limit
+        sample = positions[::stride]
+    else:
+        sample = positions
+    distances, _ = tree.query(sample, k=kth)
     kth_distances = np.asarray(distances)[:, kth - 1]
     cutoff = float(np.quantile(kth_distances[np.isfinite(kth_distances)], spec.geometry_cutoff_quantile))
     return max(cutoff * 1.000001, np.finfo(float).eps), "calibrated_from_target_degree"
 
 
-def periodic_distance(row: int, col: int, positions: np.ndarray, box_lengths: np.ndarray) -> float:
-    delta = positions[row] - positions[col]
+def flat_adjacency(adjacency: list[list[int]]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Adjacency as flat CSR-style arrays: (per-row counts, indptr, indices).
+
+    The scaling sizes reach tens of millions of block edges, where per-edge
+    Python loops over the list-of-lists dominate the whole run. Every O(nnz)
+    statistic is computed from these arrays instead.
+    """
+    counts = np.fromiter((len(cols) for cols in adjacency), dtype=np.int64, count=len(adjacency))
+    indptr = np.zeros(len(adjacency) + 1, dtype=np.int64)
+    np.cumsum(counts, out=indptr[1:])
+    indices = np.fromiter(
+        itertools.chain.from_iterable(adjacency), dtype=np.int64, count=int(indptr[-1])
+    )
+    return counts, indptr, indices
+
+
+def block_owners(blocks: int, size: int) -> np.ndarray:
+    """Owning rank of every global block id, as a lookup table."""
+    bounds = np.array([partition_range(blocks, size, r)[1] for r in range(size)], dtype=np.int64)
+    return np.searchsorted(bounds, np.arange(blocks, dtype=np.int64), side="right")
+
+
+def row_periodic_distances(
+    row: int,
+    cols: Sequence[int],
+    positions: np.ndarray,
+    box_lengths: np.ndarray,
+) -> np.ndarray:
+    """Minimum-image distances from one block-row to all of its neighbours."""
+    delta = positions[np.asarray(cols, dtype=np.int64)] - positions[row]
     delta = delta - box_lengths * np.round(delta / box_lengths)
-    return float(np.linalg.norm(delta))
+    return np.linalg.norm(delta, axis=1)
 
 
-def block_magnitude_scale(row: int, col: int, positions: np.ndarray, box_lengths: np.ndarray, spec: BenchmarkSpec) -> float:
-    if row == col:
-        return 1.0
+def row_magnitude_scales(
+    row: int,
+    cols: Sequence[int],
+    positions: np.ndarray,
+    box_lengths: np.ndarray,
+    spec: BenchmarkSpec,
+) -> np.ndarray:
+    """Off-diagonal magnitude envelope for one block-row's neighbours.
+
+    Exponential decay in minimum-image distance; the diagonal block is left at
+    unit scale.
+    """
     if spec.magnitude_decay_length <= 0.0:
         raise ValueError("--magnitude-decay-length must be positive")
-    distance = periodic_distance(row, col, positions, box_lengths)
-    return float(spec.offdiagonal_scale * math.exp(-distance / spec.magnitude_decay_length))
+    columns = np.asarray(cols, dtype=np.int64)
+    distances = row_periodic_distances(row, columns, positions, box_lengths)
+    scales = spec.offdiagonal_scale * np.exp(-distances / spec.magnitude_decay_length)
+    scales[columns == row] = 1.0
+    return scales
 
 
 def matrix_value_model_statistics(
@@ -306,19 +399,44 @@ def matrix_value_model_statistics(
     positions: np.ndarray,
     box_lengths: np.ndarray,
     spec: BenchmarkSpec,
+    row_offset: int = 0,
+    comm: Any = None,
 ) -> dict[str, Any]:
-    offdiag_distances: list[float] = []
-    offdiag_scales: list[float] = []
-    for row, cols in enumerate(adjacency):
-        for col in cols:
-            if row == col:
-                continue
-            distance = periodic_distance(row, col, positions, box_lengths)
-            offdiag_distances.append(distance)
-            offdiag_scales.append(float(spec.offdiagonal_scale * math.exp(-distance / spec.magnitude_decay_length)))
+    # Accumulated per row rather than materialized: at the sizes used for
+    # scaling runs the off-diagonal edge list has tens of millions of entries.
+    count = 0
+    distance_sum = 0.0
+    distance_min = math.inf
+    distance_max = -math.inf
+    scale_sum = 0.0
+    scale_min = math.inf
+    scale_max = -math.inf
+    for offset, cols in enumerate(adjacency):
+        row = row_offset + offset
+        columns = np.asarray(cols, dtype=np.int64)
+        columns = columns[columns != row]
+        if columns.size == 0:
+            continue
+        distances = row_periodic_distances(row, columns, positions, box_lengths)
+        scales = spec.offdiagonal_scale * np.exp(-distances / spec.magnitude_decay_length)
+        count += int(columns.size)
+        distance_sum += float(distances.sum())
+        distance_min = min(distance_min, float(distances.min()))
+        distance_max = max(distance_max, float(distances.max()))
+        scale_sum += float(scales.sum())
+        scale_min = min(scale_min, float(scales.min()))
+        scale_max = max(scale_max, float(scales.max()))
 
-    distances = np.asarray(offdiag_distances, dtype=np.float64)
-    scales = np.asarray(offdiag_scales, dtype=np.float64)
+    # Rows are rank-local; fold the partial accumulators into global values.
+    count = int(reduce_value(comm, count, "sum"))
+    distance_sum = float(reduce_value(comm, distance_sum, "sum"))
+    scale_sum = float(reduce_value(comm, scale_sum, "sum"))
+    if count:
+        distance_min = float(reduce_value(comm, distance_min, "min"))
+        distance_max = float(reduce_value(comm, distance_max, "max"))
+        scale_min = float(reduce_value(comm, scale_min, "min"))
+        scale_max = float(reduce_value(comm, scale_max, "max"))
+
     result: dict[str, Any] = {
         "model": "exponential_distance_decay_with_onsite_shift",
         "distance_metric": "periodic_minimum_image",
@@ -328,15 +446,15 @@ def matrix_value_model_statistics(
         "diagonal_random_scale": 1.0,
         "block_random_normalization": "1/sqrt(row_block_size * column_block_size)",
     }
-    if distances.size:
+    if count:
         result.update(
             {
-                "offdiagonal_distance_min": float(distances.min()),
-                "offdiagonal_distance_mean": float(distances.mean()),
-                "offdiagonal_distance_max": float(distances.max()),
-                "offdiagonal_magnitude_scale_min": float(scales.min()),
-                "offdiagonal_magnitude_scale_mean": float(scales.mean()),
-                "offdiagonal_magnitude_scale_max": float(scales.max()),
+                "offdiagonal_distance_min": distance_min,
+                "offdiagonal_distance_mean": distance_sum / count,
+                "offdiagonal_distance_max": distance_max,
+                "offdiagonal_magnitude_scale_min": scale_min,
+                "offdiagonal_magnitude_scale_mean": scale_sum / count,
+                "offdiagonal_magnitude_scale_max": scale_max,
             }
         )
     return result
@@ -344,7 +462,19 @@ def matrix_value_model_statistics(
 
 def make_geometric_adjacency(
     spec: BenchmarkSpec,
+    owned_range: tuple[int, int] | None = None,
 ) -> tuple[list[list[int]], dict[str, Any], np.ndarray, np.ndarray]:
+    """Cutoff-graph rows owned by this rank, with global column ids.
+
+    `owned_range` restricts the neighbour query to the rank's own rows. The
+    KD-tree still spans the whole box (neighbours may live anywhere), but the
+    returned neighbour lists do not: materializing the global adjacency as a
+    Python list-of-lists on every rank costs ~3 GB at the sizes used for
+    scaling runs, which does not fit 48 times over. Row `i` of the result is
+    global block `owned_range[0] + i`.
+
+    Degree statistics are local to the rank; `run_case` reduces them.
+    """
     if spec.geometry_spacing <= 0.0:
         raise ValueError("--geometry-spacing must be positive")
     if spec.geometry_jitter < 0.0:
@@ -352,17 +482,17 @@ def make_geometric_adjacency(
     positions, box_lengths, grid_shape = make_geometric_positions(spec)
     cutoff, cutoff_source = calibrate_cutoff(positions, box_lengths, spec)
     tree = cKDTree(positions, boxsize=box_lengths)
-    raw = tree.query_ball_point(positions, r=cutoff)
-    adjacency = [sorted({int(col) for col in cols} | {row}) for row, cols in enumerate(raw)]
+    start, end = owned_range if owned_range is not None else (0, spec.blocks)
+    raw = tree.query_ball_point(positions[start:end], r=cutoff)
+    adjacency = [
+        sorted({int(col) for col in cols} | {start + offset})
+        for offset, cols in enumerate(raw)
+    ]
     degrees = np.array([len(row) for row in adjacency], dtype=np.int64)
-    reciprocal = 0
-    adjacency_sets = [set(row) for row in adjacency]
-    for row, cols in enumerate(adjacency_sets):
-        reciprocal += sum(1 for col in cols if row in adjacency_sets[col])
-    directed_edges = int(degrees.sum())
     return adjacency, {
         "model": "geometric_finite_cutoff",
         "dimension": spec.geometry_dim,
+        "ordering": spec.geometry_ordering,
         "grid_shape": list(grid_shape),
         "periodic": True,
         "spacing": spec.geometry_spacing,
@@ -370,13 +500,24 @@ def make_geometric_adjacency(
         "cutoff": cutoff,
         "cutoff_source": cutoff_source,
         "cutoff_quantile": spec.geometry_cutoff_quantile,
-        "degree_min": int(degrees.min()) if degrees.size else 0,
-        "degree_max": int(degrees.max()) if degrees.size else 0,
-        "degree_mean": float(degrees.mean()) if degrees.size else 0.0,
-        "degree_std": float(degrees.std()) if degrees.size else 0.0,
-        "directed_block_edges": directed_edges,
-        "reciprocal_directed_edge_fraction": float(reciprocal / max(directed_edges, 1)),
+        "local_degree_min": int(degrees.min()) if degrees.size else 0,
+        "local_degree_max": int(degrees.max()) if degrees.size else 0,
+        "local_degree_sum": int(degrees.sum()),
+        "local_row_count": int(degrees.size),
     }, positions, box_lengths
+
+
+def reduce_degree_statistics(adjacency_info: dict[str, Any], comm: Any) -> dict[str, Any]:
+    """Fold the rank-local degree accumulators into global degree statistics."""
+    row_count = int(reduce_value(comm, adjacency_info.pop("local_row_count"), "sum"))
+    degree_sum = int(reduce_value(comm, adjacency_info.pop("local_degree_sum"), "sum"))
+    degree_min = int(reduce_value(comm, adjacency_info.pop("local_degree_min"), "min"))
+    degree_max = int(reduce_value(comm, adjacency_info.pop("local_degree_max"), "max"))
+    adjacency_info["degree_min"] = degree_min
+    adjacency_info["degree_max"] = degree_max
+    adjacency_info["degree_mean"] = float(degree_sum / row_count) if row_count else 0.0
+    adjacency_info["directed_block_edges"] = degree_sum
+    return adjacency_info
 
 
 def make_block_sizes(spec: BenchmarkSpec) -> list[int]:
@@ -390,25 +531,44 @@ def make_block_sizes(spec: BenchmarkSpec) -> list[int]:
     raise ValueError(f"unknown domain {spec.domain!r}")
 
 
-def make_block_data(
+def make_row_block_data(
     row: int,
-    col: int,
-    row_dim: int,
-    col_dim: int,
+    cols: Sequence[int],
+    block_sizes: Sequence[int],
     spec: BenchmarkSpec,
     positions: np.ndarray,
     box_lengths: np.ndarray,
-) -> np.ndarray:
-    rng = np.random.default_rng(stable_seed(spec.seed, 307, row, col, row_dim, col_dim))
-    scale = 1.0 / math.sqrt(max(row_dim * col_dim, 1))
-    magnitude = block_magnitude_scale(row, col, positions, box_lengths, spec)
-    real = rng.standard_normal((row_dim, col_dim)) * scale * magnitude
-    data = real
+) -> list[np.ndarray]:
+    """Every block of one block-row, drawn in a single batch.
+
+    The generator is seeded per row rather than per block, and `cols` is that
+    row's sorted adjacency. Assembly visits each owned row exactly once, so
+    values stay reproducible and independent of how rows are spread over ranks.
+    Batching is what makes large runs affordable: seeding a fresh generator and
+    computing a periodic distance per *block* cost roughly 48 us per nonzero,
+    which dominated everything else in the harness.
+    """
+    rng = np.random.default_rng(stable_seed(spec.seed, 307, row))
+    row_dim = block_sizes[row]
+    col_dims = [block_sizes[col] for col in cols]
+    magnitudes = row_magnitude_scales(row, cols, positions, box_lengths, spec)
+    counts = [row_dim * col_dim for col_dim in col_dims]
+    samples = rng.standard_normal(sum(counts))
     if spec.dtype == np.dtype(np.complex128):
-        data = real + 1j * rng.standard_normal((row_dim, col_dim)) * scale * magnitude
-    if row == col and row_dim == col_dim:
-        data = data + np.eye(row_dim, dtype=spec.dtype) * (spec.diagonal_shift + 0.01 * (row % 17))
-    return np.ascontiguousarray(data, dtype=spec.dtype)
+        samples = samples + 1j * rng.standard_normal(sum(counts))
+
+    blocks: list[np.ndarray] = []
+    offset = 0
+    for index, col in enumerate(cols):
+        col_dim = col_dims[index]
+        count = counts[index]
+        scale = float(magnitudes[index]) / math.sqrt(max(count, 1))
+        data = (samples[offset:offset + count] * scale).reshape(row_dim, col_dim)
+        offset += count
+        if row == col and row_dim == col_dim:
+            data = data + np.eye(row_dim, dtype=spec.dtype) * (spec.diagonal_shift + 0.01 * (row % 17))
+        blocks.append(np.ascontiguousarray(data, dtype=spec.dtype))
+    return blocks
 
 
 def build_matrix(
@@ -424,14 +584,13 @@ def build_matrix(
     start, end = partition_range(spec.blocks, size, rank)
     owned = list(range(start, end))
     local_sizes = [block_sizes[idx] for idx in owned]
-    local_adj = [adjacency[idx] for idx in owned]
 
     barrier(comm)
     t0 = time.perf_counter()
     matrix = vbcsr.VBCSR.create_distributed(
         owned_indices=owned,
         block_sizes=local_sizes,
-        adjacency=local_adj,
+        adjacency=adjacency,
         dtype=spec.dtype,
         comm=comm,
     )
@@ -439,10 +598,11 @@ def build_matrix(
     graph_seconds = time.perf_counter() - t0
 
     t1 = time.perf_counter()
-    for row in owned:
-        row_dim = block_sizes[row]
-        for col in adjacency[row]:
-            matrix.add_block(row, col, make_block_data(row, col, row_dim, block_sizes[col], spec, positions, box_lengths))
+    for offset, row in enumerate(owned):
+        cols = adjacency[offset]
+        row_blocks = make_row_block_data(row, cols, block_sizes, spec, positions, box_lengths)
+        for col, data in zip(cols, row_blocks):
+            matrix.add_block(row, col, data)
     matrix.assemble()
     barrier(comm)
     assembly_seconds = time.perf_counter() - t1
@@ -486,14 +646,14 @@ def benchmark_atomistic_conversion(
     cell = np.diag(box_lengths).astype(np.float64)
 
     start, end = partition_range(spec.blocks, size, rank)
-    local_edge_index = np.array(
-        [[row, col] for row in range(start, end) for col in adjacency[row]],
-        dtype=np.int32,
-    ).reshape(-1, 2)
+    counts, _, indices = flat_adjacency(adjacency)
+    local_edge_index = np.empty((indices.size, 2), dtype=np.int32)
+    local_edge_index[:, 0] = np.repeat(np.arange(start, end, dtype=np.int32), counts)
+    local_edge_index[:, 1] = indices
     local_edge_shift = np.zeros((local_edge_index.shape[0], 3), dtype=np.int32)
     z_to_type = {int(atomic_number): idx for idx, atomic_number in enumerate(unique_z)}
     local_atom_type = np.array([z_to_type[int(z)] for z in atomic_numbers[start:end]], dtype=np.int32)
-    global_edge_count = sum(len(row) for row in adjacency)
+    global_edge_count = int(reduce_value(comm, int(indices.size), "sum"))
 
     barrier(comm)
     t0 = time.perf_counter()
@@ -911,15 +1071,22 @@ def matrix_statistics(
         local_recv_scalar = int(vector.ghost_size)
         local_send_scalar = int(vector.ghost_size)
         communication_source = "DistVector ghost_size fallback"
-    local_cross_rank_edges = 0
-    for row, cols in enumerate(adjacency):
-        if owner_of_block(row, spec.blocks, size) != rank:
-            continue
-        row_owner = owner_of_block(row, spec.blocks, size)
-        local_cross_rank_edges += sum(1 for col in cols if owner_of_block(col, spec.blocks, size) != row_owner)
+    # `adjacency` holds only this rank's rows, so every edge statistic below is
+    # a partial sum that has to be reduced across ranks.
+    _, indptr, indices = flat_adjacency(adjacency)
+    owners = block_owners(spec.blocks, size)
+    local_cross_rank_edges = int((owners[indices] != rank).sum())
 
-    block_nnz = sum(len(row) for row in adjacency)
-    scalar_nnz = sum(block_sizes[row] * sum(block_sizes[col] for col in cols) for row, cols in enumerate(adjacency))
+    local_block_nnz = int(indptr[-1])
+    sizes = np.asarray(block_sizes, dtype=np.int64)
+    column_size_cumsum = np.zeros(local_block_nnz + 1, dtype=np.int64)
+    np.cumsum(sizes[indices], out=column_size_cumsum[1:])
+    row_column_scalars = column_size_cumsum[indptr[1:]] - column_size_cumsum[indptr[:-1]]
+    owned_start, _ = partition_range(spec.blocks, size, rank)
+    local_scalar_nnz = int((sizes[owned_start:owned_start + len(adjacency)] * row_column_scalars).sum())
+
+    block_nnz = int(reduce_value(comm, local_block_nnz, "sum"))
+    scalar_nnz = int(reduce_value(comm, local_scalar_nnz, "sum"))
     return {
         "global_shape": list(matrix.shape),
         "matrix_kind": matrix.matrix_kind,
@@ -953,7 +1120,14 @@ def matrix_statistics(
 
 
 def spgemm_candidate_count(adjacency: list[list[int]]) -> int:
-    return int(sum(len(adjacency[inner]) for row in adjacency for inner in row))
+    """Number of candidate A_ik * B_kj products. Single-rank only.
+
+    Indexes per-row degrees by *column* id, so it needs `adjacency` to cover
+    every global row -- true only when one rank owns everything. Callers must
+    keep the single-rank guard in `spgemm_threshold_audit`.
+    """
+    counts, _, indices = flat_adjacency(adjacency)
+    return int(counts[indices].sum())
 
 
 def spgemm_threshold_audit(
@@ -962,20 +1136,26 @@ def spgemm_threshold_audit(
     spec: BenchmarkSpec,
     positions: np.ndarray,
     box_lengths: np.ndarray,
+    size: int = 1,
 ) -> dict[str, Any]:
+    # The audit walks A_ik * B_kj, so it needs the rows of *inner* blocks that
+    # this rank does not own. Adjacency is rank-local, so it is only available
+    # on a single rank.
+    if size > 1:
+        return {"audited": False, "reason": "adjacency is rank-local; audit requires a single rank"}
     candidate_count = spgemm_candidate_count(adjacency)
     if candidate_count > spec.spgemm_audit_limit:
         return {"audited": False, "candidate_block_products": candidate_count, "audit_limit": spec.spgemm_audit_limit}
     exact_product_below_threshold = 0
     row_scaled_product_skips = 0
     for row, inners in enumerate(adjacency):
-        a_row_dim = block_sizes[row]
         row_eps = spec.spgemm_threshold / max(1, len(inners))
-        for inner in inners:
-            a = make_block_data(row, inner, a_row_dim, block_sizes[inner], spec, positions, box_lengths)
+        a_blocks = make_row_block_data(row, inners, block_sizes, spec, positions, box_lengths)
+        for inner, a in zip(inners, a_blocks):
             norm_a = float(np.linalg.norm(a))
-            for col in adjacency[inner]:
-                b = make_block_data(inner, col, block_sizes[inner], block_sizes[col], spec, positions, box_lengths)
+            inner_cols = adjacency[inner]
+            b_blocks = make_row_block_data(inner, inner_cols, block_sizes, spec, positions, box_lengths)
+            for col, b in zip(inner_cols, b_blocks):
                 norm_b = float(np.linalg.norm(b))
                 if norm_a * norm_b < row_eps:
                     row_scaled_product_skips += 1
@@ -992,21 +1172,35 @@ def spgemm_threshold_audit(
     }
 
 
-def run_case(
+def build_case_matrix(
     spec: BenchmarkSpec,
-    *,
     comm: Any,
     rank: int,
     size: int,
-    repeats: int,
-    min_seconds: float,
-    min_iterations: int,
-    warmups: int,
-    require_mkl: bool,
 ) -> dict[str, Any]:
+    """Graph, values and matrix for one (domain, size) point.
+
+    The operations of a domain all run against the same matrix, and building it
+    dominates a large run -- so the result is memoized on everything it depends
+    on, and the three operations of a domain share one build instead of
+    repeating it. The graph/assembly/atomistic timings therefore become a
+    per-domain measurement rather than a per-operation one.
+    """
+    key = (spec.domain, spec.blocks, str(spec.dtype), spec.bsr_block_size, spec.seed,
+           spec.target_degree, spec.geometry_ordering, size)
+    cached = _CASE_MATRIX_CACHE.get(key)
+    if cached is not None:
+        return cached
+    # Evict first: never hold two large matrices at once.
+    _CASE_MATRIX_CACHE.clear()
+
     block_sizes = make_block_sizes(spec)
-    adjacency, adjacency_info, positions, box_lengths = make_geometric_adjacency(spec)
-    value_model = matrix_value_model_statistics(adjacency, positions, box_lengths, spec)
+    owned_range = partition_range(spec.blocks, size, rank)
+    adjacency, adjacency_info, positions, box_lengths = make_geometric_adjacency(spec, owned_range)
+    adjacency_info = reduce_degree_statistics(adjacency_info, comm)
+    value_model = matrix_value_model_statistics(
+        adjacency, positions, box_lengths, spec, owned_range[0], comm
+    )
     matrix, build_timings = build_matrix(spec, block_sizes, adjacency, positions, box_lengths, comm, rank, size)
     atomistic_conversion = benchmark_atomistic_conversion(
         spec,
@@ -1020,6 +1214,45 @@ def run_case(
         rank,
         size,
     )
+    built = {
+        "block_sizes": block_sizes,
+        "adjacency": adjacency,
+        "adjacency_info": adjacency_info,
+        "positions": positions,
+        "box_lengths": box_lengths,
+        "value_model": value_model,
+        "matrix": matrix,
+        "build_timings": build_timings,
+        "atomistic_conversion": atomistic_conversion,
+        "matrix_statistics": matrix_statistics(matrix, block_sizes, adjacency, spec, comm, rank, size),
+    }
+    _CASE_MATRIX_CACHE[key] = built
+    return built
+
+
+def run_case(
+    spec: BenchmarkSpec,
+    *,
+    comm: Any,
+    rank: int,
+    size: int,
+    repeats: int,
+    min_seconds: float,
+    min_iterations: int,
+    warmups: int,
+    require_mkl: bool,
+    no_baselines: bool = False,
+) -> dict[str, Any]:
+    built = build_case_matrix(spec, comm, rank, size)
+    block_sizes = built["block_sizes"]
+    adjacency = built["adjacency"]
+    adjacency_info = built["adjacency_info"]
+    positions = built["positions"]
+    box_lengths = built["box_lengths"]
+    value_model = built["value_model"]
+    matrix = built["matrix"]
+    build_timings = built["build_timings"]
+    atomistic_conversion = built["atomistic_conversion"]
     inputs = make_inputs(matrix, spec, rank)
 
     result: dict[str, Any] = {
@@ -1039,6 +1272,7 @@ def run_case(
             "vbcsr_block_sizes": list(VBCSR_BLOCK_SIZES),
             "spgemm_threshold": spec.spgemm_threshold,
             "geometry_dim": spec.geometry_dim,
+            "geometry_ordering": spec.geometry_ordering,
             "geometry_spacing": spec.geometry_spacing,
             "geometry_jitter": spec.geometry_jitter,
             "geometry_cutoff": spec.geometry_cutoff,
@@ -1051,7 +1285,7 @@ def run_case(
         "matrix_value_model": value_model,
         "atomistic_conversion": atomistic_conversion,
         "timings": dict(build_timings),
-        "matrix": matrix_statistics(matrix, block_sizes, adjacency, spec, comm, rank, size),
+        "matrix": built["matrix_statistics"],
         "baselines": {},
         "validation": {"checked": False},
         "speedups": {},
@@ -1069,7 +1303,13 @@ def run_case(
     )
 
     scalar: sp.csr_matrix | None = None
-    if size == 1:
+    if no_baselines:
+        # VBCSR-only timing (scaling studies): skip the scipy/MKL baselines
+        # and the serial validation multiply. Correctness is covered by the
+        # gated test suite; here we measure only the library op.
+        result["baselines"]["scipy_csr"] = {"available": False, "reason": "no_baselines"}
+        result["baselines"]["mkl_sparse"] = {"available": False, "reason": "no_baselines"}
+    elif size == 1:
         t0 = time.perf_counter()
         scalar = scipy_baseline_matrix(matrix)
         result["timings"]["scipy_csr_build_seconds"] = time.perf_counter() - t0
@@ -1128,7 +1368,7 @@ def run_case(
         result["baselines"]["scipy_csr"] = {"available": False, "reason": "serial_efficiency_only"}
         result["baselines"]["mkl_sparse"] = {"available": False, "reason": "serial_efficiency_only"}
 
-    if spec.operation == "spgemm":
+    if spec.operation == "spgemm" and not no_baselines:
         output = matrix.spmm(matrix, spec.spgemm_threshold)
         result["spgemm"] = {
             "threshold": spec.spgemm_threshold,
@@ -1136,7 +1376,7 @@ def run_case(
             "output_block_nnz_sum": int(reduce_value(comm, output.local_block_nnz, "sum")),
             "output_scalar_nnz_sum": int(reduce_value(comm, output.local_nnz, "sum")),
             "fill_ratio_scalar": float(reduce_value(comm, output.local_nnz, "sum") / max(result["matrix"]["global_scalar_nnz"], 1)),
-            "threshold_audit": spgemm_threshold_audit(adjacency, block_sizes, spec, positions, box_lengths),
+            "threshold_audit": spgemm_threshold_audit(adjacency, block_sizes, spec, positions, box_lengths, size),
         }
 
     vbcsr_median = result["timings"]["vbcsr"]["median_seconds"]
@@ -1247,20 +1487,29 @@ def cpu_metadata() -> dict[str, Any]:
     return result
 
 
-def mpi_metadata(comm: Any, rank: int, size: int) -> dict[str, Any]:
+def gather_rank_hosts(comm: Any, rank: int) -> list[dict[str, Any]] | None:
+    # Collective: every rank must call it. Kept out of the rank-0-only
+    # finalization block so it cannot deadlock (root waiting on a gather the
+    # other ranks never enter).
+    if comm is None:
+        return [{"rank": rank, "hostname": socket.gethostname()}]
+    gathered = comm.gather({"rank": rank, "hostname": socket.gethostname()}, root=0)
+    return gathered if rank == 0 else None
+
+
+def mpi_metadata(comm: Any, rank: int, size: int, rank_hosts: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     result = {"rank_count": size, "mpi4py_available": MPI is not None, "python_reductions_available": comm is not None}
     if MPI is not None:
         result["mpi_library_version"] = MPI.Get_library_version()
         result["processor_name"] = MPI.Get_processor_name()
     if MPI_FALLBACK_STATUS:
         result["fallback_status"] = dict(MPI_FALLBACK_STATUS)
-    gathered = comm.gather({"rank": rank, "hostname": socket.gethostname()}, root=0) if comm is not None else None
     if rank == 0:
-        result["rank_hosts"] = gathered or [{"rank": rank, "hostname": socket.gethostname()}]
+        result["rank_hosts"] = rank_hosts or [{"rank": rank, "hostname": socket.gethostname()}]
     return result
 
 
-def environment_metadata(comm: Any, rank: int, size: int) -> dict[str, Any]:
+def environment_metadata(comm: Any, rank: int, size: int, rank_hosts: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     thread_vars = (
         "OMP_NUM_THREADS",
         "OMP_DYNAMIC",
@@ -1296,7 +1545,7 @@ def environment_metadata(comm: Any, rank: int, size: int) -> dict[str, Any]:
         "blas": numpy_blas_metadata(),
         "flexiblas": flexiblas_metadata(),
         "cpu": cpu_metadata(),
-        "mpi": mpi_metadata(comm, rank, size),
+        "mpi": mpi_metadata(comm, rank, size, rank_hosts),
         "environment": {
             "conda_default_env": os.environ.get("CONDA_DEFAULT_ENV"),
             "conda_prefix": os.environ.get("CONDA_PREFIX"),
@@ -1317,6 +1566,68 @@ def environment_metadata(comm: Any, rank: int, size: int) -> dict[str, Any]:
     }
 
 
+def mean_block_area(domain: str, args: argparse.Namespace) -> float:
+    """Expected scalar elements per stored block, for the domain's size model."""
+    if domain == "csr":
+        return 1.0
+    if domain == "bsr":
+        return float(args.bsr_block_size) ** 2
+    if domain == "vbcsr":
+        # Row and column sizes are drawn independently, so E[r*c] = E[r]*E[c].
+        return float(np.mean(VBCSR_BLOCK_SIZES)) ** 2
+    raise ValueError(f"unknown domain {domain!r}")
+
+
+def calibrate_mean_degree(args: argparse.Namespace, dtype: np.dtype) -> float:
+    """Mean block degree of the cutoff graph, measured on a small probe.
+
+    The cutoff is calibrated to `--target-degree` at a quantile, so the mean
+    degree is essentially independent of the block count. Probing once on a
+    cheap graph avoids sizing the real runs from a guessed degree.
+    """
+    probe = BenchmarkSpec(
+        suite=args.suite,
+        domain="csr",
+        operation="spmv",
+        blocks=min(20000, max(1000, int(args.blocks))),
+        target_degree=int(args.target_degree),
+        rhs=int(args.rhs),
+        dtype=dtype,
+        seed=int(args.seed),
+        bsr_block_size=int(args.bsr_block_size),
+        spgemm_threshold=0.0,
+        spgemm_audit_limit=0,
+        geometry_dim=int(args.geometry_dim),
+        geometry_spacing=float(args.geometry_spacing),
+        geometry_jitter=float(args.geometry_jitter),
+        geometry_ordering=str(args.geometry_ordering),
+        geometry_cutoff=args.geometry_cutoff,
+        geometry_cutoff_quantile=float(args.geometry_cutoff_quantile),
+        magnitude_decay_length=float(args.magnitude_decay_length),
+        offdiagonal_scale=float(args.offdiagonal_scale),
+        diagonal_shift=float(args.diagonal_shift),
+    )
+    _, info, _, _ = make_geometric_adjacency(probe)
+    return max(float(info["local_degree_sum"] / max(info["local_row_count"], 1)), 1.0)
+
+
+def blocks_for_target_storage(domain: str, target_bytes: int, mean_degree: float, args: argparse.Namespace, dtype: np.dtype) -> int:
+    """Block count putting `domain` at roughly `target_bytes` of matrix storage.
+
+    Comparing domains at a fixed *block count* compares wildly different
+    problems: with 8x8 BSR blocks and ~14x14 VBCSR blocks, the same block count
+    spans a 130x range in footprint, and scalar CSR stays entirely inside L3
+    while the others are far into DRAM. Sizing by footprint puts all three at
+    the same point on the memory hierarchy.
+    """
+    # Matches what `matrix_statistics` reports: values plus the CSR index
+    # arrays (int32 column index per block, int32 row pointer per block row).
+    # The indices are noise for blocked domains but ~50% of a scalar CSR
+    # matrix, so leaving them out would oversize CSR by half.
+    bytes_per_block = mean_degree * (mean_block_area(domain, args) * dtype.itemsize + 4) + 4
+    return max(1, int(round(target_bytes / bytes_per_block)))
+
+
 def build_specs(args: argparse.Namespace, rank_count: int) -> list[BenchmarkSpec]:
     dtype = parse_dtype(args.dtype)
     spgemm_thresholds = parse_thresholds(args.spgemm_thresholds, args.spgemm_threshold)
@@ -1331,8 +1642,20 @@ def build_specs(args: argparse.Namespace, rank_count: int) -> list[BenchmarkSpec
         blocks = int(args.blocks)
         weak_blocks = None
 
+    target_bytes = int(args.target_storage_bytes) if args.target_storage_bytes else 0
+    blocks_by_domain: dict[str, int] = {}
+    if target_bytes > 0:
+        if args.suite == "distributed-weak":
+            raise ValueError("--target-storage-bytes sizes a fixed global problem; use --weak-blocks-per-rank for the weak suite")
+        mean_degree = calibrate_mean_degree(args, dtype)
+        blocks_by_domain = {
+            domain: blocks_for_target_storage(domain, target_bytes, mean_degree, args, dtype)
+            for domain in DOMAINS
+        }
+
     specs: list[BenchmarkSpec] = []
     for domain in DOMAINS:
+        domain_blocks = blocks_by_domain.get(domain, blocks)
         for operation in OPERATIONS:
             thresholds = spgemm_thresholds if operation == "spgemm" else [float(args.spgemm_threshold)]
             for threshold in thresholds:
@@ -1341,7 +1664,7 @@ def build_specs(args: argparse.Namespace, rank_count: int) -> list[BenchmarkSpec
                         suite=args.suite,
                         domain=domain,
                         operation=operation,
-                        blocks=blocks,
+                        blocks=domain_blocks,
                         target_degree=int(args.target_degree),
                         rhs=int(args.rhs),
                         dtype=dtype,
@@ -1352,6 +1675,7 @@ def build_specs(args: argparse.Namespace, rank_count: int) -> list[BenchmarkSpec
                         geometry_dim=int(args.geometry_dim),
                         geometry_spacing=float(args.geometry_spacing),
                         geometry_jitter=float(args.geometry_jitter),
+                        geometry_ordering=str(args.geometry_ordering),
                         geometry_cutoff=args.geometry_cutoff,
                         geometry_cutoff_quantile=float(args.geometry_cutoff_quantile),
                         magnitude_decay_length=float(args.magnitude_decay_length),
@@ -1511,6 +1835,13 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--geometry-dim", type=int, default=3)
     parser.add_argument("--geometry-spacing", type=float, default=1.0)
     parser.add_argument("--geometry-jitter", type=float, default=0.12)
+    parser.add_argument(
+        "--target-storage-bytes",
+        type=int,
+        default=0,
+        help="size each domain to this many bytes of stored block values instead of using --blocks",
+    )
+    parser.add_argument("--geometry-ordering", choices=("bisection", "lexicographic"), default="bisection")
     parser.add_argument("--geometry-cutoff", type=float, default=None)
     parser.add_argument("--geometry-cutoff-quantile", type=float, default=0.90)
     parser.add_argument("--magnitude-decay-length", type=float, default=0.5)
@@ -1521,6 +1852,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-iterations", type=int, default=5)
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument("--require-mkl", action="store_true", help="Fail if sparse_dot_mkl cannot be used for serial efficiency data")
+    parser.add_argument("--no-baselines", action="store_true", help="Time only VBCSR (skip scipy/MKL baselines and validation). Used by scaling studies.")
     parser.add_argument("--output-dir", type=Path, default=SCRIPT_DIR / "results")
     parser.add_argument("--label", default=None)
     return parser
@@ -1574,6 +1906,7 @@ def main() -> int:
             min_iterations=int(args.min_iterations),
             warmups=int(args.warmups),
             require_mkl=bool(args.require_mkl),
+            no_baselines=bool(args.no_baselines),
         )
         if rank == 0:
             cases.append(case)
@@ -1589,6 +1922,10 @@ def main() -> int:
                 print(f"Validation failed for {case['label']}: {validation}", file=sys.stderr)
                 return 1
 
+    # Collective: all ranks participate in the host gather before rank 0
+    # builds the payload (see gather_rank_hosts).
+    rank_hosts = gather_rank_hosts(comm, rank)
+
     if rank == 0:
         label = args.label.strip() if isinstance(args.label, str) else args.label
         if label is None or label == "":
@@ -1596,7 +1933,7 @@ def main() -> int:
             label = f"vbcsr_publication_{args.suite}_np{size}_{stamp}"
         payload = {
             "schema_version": SCHEMA_VERSION,
-            "metadata": environment_metadata(comm, rank, size),
+            "metadata": environment_metadata(comm, rank, size, rank_hosts),
             "publication_coverage": {
                 "domains": list(DOMAINS),
                 "operations": list(OPERATIONS),
