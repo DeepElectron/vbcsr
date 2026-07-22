@@ -2208,9 +2208,11 @@ typename BlockSpMat<T>::BackendHandle BlockSpMat<T>::build_backend_for_structure
         const size_t nnz = graph->adj_ind.size();
         backend.initialize_graph_block_handles(nnz);
 
-        // count the #matrices per shape
+        // Sweep 1: per-shape totals and per-row scalar work (the same weight
+        // the forward apply plan uses for its thread split).
         std::map<std::pair<int, int>, size_t> shape_counts;
         const int n_rows = static_cast<int>(graph->owned_global_indices.size());
+        std::vector<size_t> row_work(static_cast<size_t>(std::max(0, n_rows)), 0);
         for (int row = 0; row < n_rows; ++row) {
             const int row_dim = graph->block_sizes[row];
             for (int graph_block_index = graph->adj_ptr[row];
@@ -2219,27 +2221,79 @@ typename BlockSpMat<T>::BackendHandle BlockSpMat<T>::build_backend_for_structure
                 const int col = graph->adj_ind[graph_block_index];
                 const int col_dim = graph->block_sizes[col];
                 ++shape_counts[std::make_pair(row_dim, col_dim)];
+                row_work[static_cast<size_t>(row)] +=
+                    static_cast<size_t>(row_dim) * static_cast<size_t>(col_dim);
             }
         }
 
+        std::map<std::pair<int, int>, int> shape_ids;
         for (const auto& [shape, count] : shape_counts) {
-            backend.ensure_shape(shape.first, shape.second, count);
+            shape_ids[shape] = backend.ensure_shape(shape.first, shape.second, count);
         }
+        const int shape_count = static_cast<int>(shape_ids.size());
 
-        for (int row = 0; row < n_rows; ++row) {
-            const int row_dim = graph->block_sizes[row];
-            for (int graph_block_index = graph->adj_ptr[row];
-                 graph_block_index < graph->adj_ptr[row + 1];
-                 ++graph_block_index) {
-                const int col = graph->adj_ind[graph_block_index];
-                const int col_dim = graph->block_sizes[col];
-                const int shape_id =
-                    backend.ensure_shape(row_dim, col_dim, shape_counts[std::make_pair(row_dim, col_dim)]);
-                backend.set_graph_block_handle(
-                    graph_block_index,
-                    backend.append_block_for_shape(shape_id, graph_block_index));
+        // Thread partition over rows, stored on the backend so the forward
+        // apply plan later splits work along the same boundaries the storage
+        // placement below is built for (doc/numa_locality_plan.md stage C).
+        auto domains = detail::build_thread_domain_partition(
+            n_rows,
+            detail::thread_domain_max_threads(),
+            [&](int row) {
+                return std::max<size_t>(size_t(1), row_work[static_cast<size_t>(row)]);
+            });
+
+        // Sweep 2, domain by domain in ascending row order: per-shape block
+        // index lists (so each shape buffer receives its blocks in row order
+        // and a row domain owns a contiguous block range in every shape) plus
+        // the per-shape block offset at each domain boundary.
+        std::vector<std::vector<int>> shape_blocks(static_cast<size_t>(shape_count));
+        for (const auto& [shape, count] : shape_counts) {
+            shape_blocks[static_cast<size_t>(shape_ids[shape])].reserve(count);
+        }
+        std::vector<std::vector<size_t>> shape_domain_offsets(
+            static_cast<size_t>(shape_count),
+            std::vector<size_t>(static_cast<size_t>(domains.thread_count) + 1, 0));
+        for (int domain = 0; domain < domains.thread_count; ++domain) {
+            for (int row = domains.domain_begin(domain);
+                 row < domains.domain_end(domain);
+                 ++row) {
+                const int row_dim = graph->block_sizes[row];
+                for (int graph_block_index = graph->adj_ptr[row];
+                     graph_block_index < graph->adj_ptr[row + 1];
+                     ++graph_block_index) {
+                    const int col = graph->adj_ind[graph_block_index];
+                    const int col_dim = graph->block_sizes[col];
+                    const int shape_id = shape_ids.at(std::make_pair(row_dim, col_dim));
+                    shape_blocks[static_cast<size_t>(shape_id)].push_back(graph_block_index);
+                }
+            }
+            for (int shape_id = 0; shape_id < shape_count; ++shape_id) {
+                shape_domain_offsets[static_cast<size_t>(shape_id)]
+                                    [static_cast<size_t>(domain) + 1] =
+                    shape_blocks[static_cast<size_t>(shape_id)].size();
             }
         }
+
+        // Bulk uninitialized appends (row-ordered within each shape), then
+        // first-touch: each domain's thread zeroes its own block ranges so
+        // their pages land on that thread's NUMA node. Every block belongs to
+        // exactly one (shape, domain) range, so the fill covers all payload.
+        for (int shape_id = 0; shape_id < shape_count; ++shape_id) {
+            backend.append_blocks_for_shape_uninitialized(
+                shape_id, shape_blocks[static_cast<size_t>(shape_id)]);
+        }
+        #pragma omp parallel for schedule(static)
+        for (int domain = 0; domain < domains.thread_count; ++domain) {
+            for (int shape_id = 0; shape_id < shape_count; ++shape_id) {
+                const auto& offsets = shape_domain_offsets[static_cast<size_t>(shape_id)];
+                backend.zero_fill_blocks_for_shape(
+                    shape_id,
+                    offsets[static_cast<size_t>(domain)],
+                    offsets[static_cast<size_t>(domain) + 1]);
+            }
+        }
+        backend.set_thread_domains(std::move(domains));
+
         return BackendHandle(
             std::in_place_type<VBCSRBackendStorage>,
             std::move(backend));

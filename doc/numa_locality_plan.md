@@ -7,7 +7,17 @@ reference host, BSR at 1 GiB, pinned (`OMP_PROC_BIND=close OMP_PLACES=cores`):
 SpMV 48T 20.8 → 9.9 ms (**2.11×**, ~108 GB/s ≈ the 113 GB/s MPI ceiling; the
 24→48-thread inversion is gone), SpMM 48T 38.1 → 25.8 ms (1.48×); 1T and 24T
 unchanged (A/B-verified against the pre-change binary in the same session).
-Stages C (VBCSR domain×shape tiling) and D (locality invariant test) remain.
+**Stage C implemented 2026-07-22** — and it needed no storage-format change:
+blocks are appended in ascending row order, so within every shape's buffer a
+contiguous row domain already owns a *contiguous block range*. The VBCSR
+construction path now bulk-appends uninitialized per shape, then each
+domain's thread zero-fills its own block ranges
+(`ShapeBlockStore::zero_fill_block_range`); the forward apply plan reuses the
+backend's stored partition. Handle encoding, page layout, and every iteration
+path are untouched — the explicit domain field sketched below was
+unnecessary. Measured (VBCSR 1 GiB, pinned): SpMV 48T 20.8 → 9.6 ms
+(**2.18×**, ~110 GB/s), SpMM 48T 31.9 → 18.9 ms (1.69×); 1T/24T and SpGEMM
+unchanged. Stage D (locality invariant test) remains.
 Caveat: array-new for `std::complex` value-initializes, so complex matrices
 keep today's placement; the win applies to trivially-constructible scalars.
 

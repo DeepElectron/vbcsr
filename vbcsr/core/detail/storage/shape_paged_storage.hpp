@@ -173,6 +173,21 @@ private:
     }
 
 public:
+    // First-touch support (numa_locality_plan.md stage C): zero the payload of
+    // shape blocks [block_begin, block_end). Blocks are appended in row order,
+    // so a contiguous row domain owns a contiguous block range in every shape;
+    // the caller parallelizes by domain and each owning thread fills its own
+    // ranges, placing the pages on that thread's NUMA node.
+    void zero_fill_block_range(int shape_id, size_t block_begin, size_t block_end) {
+        auto& record = require_shape(shape_id);
+        if (block_begin > block_end || block_end > record.used_blocks) {
+            throw std::out_of_range("ShapeBlockStore::zero_fill_block_range out of bounds");
+        }
+        record.values.zero_fill_range(
+            block_begin * record.elements_per_block,
+            block_end * record.elements_per_block);
+    }
+
     T* block_ptr(uint64_t handle) {
         return const_cast<T*>(static_cast<const ShapeBlockStore&>(*this).block_ptr(handle));
     }

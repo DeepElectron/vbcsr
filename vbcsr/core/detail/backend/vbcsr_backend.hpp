@@ -150,15 +150,34 @@ struct VBCSRMatrixBackend {
 
     VBCSRMatrixBackend(VBCSRMatrixBackend&& other) noexcept
         : graph_block_handles_(std::move(other.graph_block_handles_)),
-          storage(std::move(other.storage)) {}
+          storage(std::move(other.storage)),
+          thread_domains(std::move(other.thread_domains)) {}
 
     VBCSRMatrixBackend& operator=(VBCSRMatrixBackend&& other) noexcept {
         if (this != &other) {
             graph_block_handles_ = std::move(other.graph_block_handles_);
             storage = std::move(other.storage);
             invalidate_apply_plan();
+            thread_domains = std::move(other.thread_domains);
         }
         return *this;
+    }
+
+    // Storage-placement partition (see thread_domain.hpp): set by the
+    // first-touch construction path; the forward apply plan reuses it so the
+    // rows a thread reads are the rows whose pages it touched. Empty for
+    // backends built through other paths.
+    ThreadDomainPartition thread_domains;
+
+    void set_thread_domains(ThreadDomainPartition domains) {
+        thread_domains = std::move(domains);
+    }
+
+    // First-touch passthrough: zero the payload of shape blocks
+    // [block_begin, block_end); called per (domain, shape) from a parallel
+    // region during construction.
+    void zero_fill_blocks_for_shape(int shape_id, size_t block_begin, size_t block_end) {
+        storage.zero_fill_block_range(shape_id, block_begin, block_end);
     }
 
     size_t local_scalar_nnz() const {
@@ -320,13 +339,21 @@ struct VBCSRMatrixBackend {
                     block_degree > direct_dense_row_degree_limit,
                     row_work});
             }
-            plan->thread_domains = build_thread_domain_partition(
-                n_rows,
-                thread_domain_max_threads(),
-                [&](int row) {
-                    return std::max<size_t>(
-                        size_t(1), plan->rows[static_cast<size_t>(row)].work);
-                });
+            if (!thread_domains.empty() &&
+                thread_domains.row_bounds.back() == n_rows) {
+                // Reuse the storage-placement partition (same nnz-work
+                // weights, same builder) so apply access matches the pages
+                // each thread first-touched at construction.
+                plan->thread_domains = thread_domains;
+            } else {
+                plan->thread_domains = build_thread_domain_partition(
+                    n_rows,
+                    thread_domain_max_threads(),
+                    [&](int row) {
+                        return std::max<size_t>(
+                            size_t(1), plan->rows[static_cast<size_t>(row)].work);
+                    });
+            }
             forward_apply_plan = std::move(plan);
         }
         return *forward_apply_plan;
