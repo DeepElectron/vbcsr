@@ -105,6 +105,12 @@ class BenchmarkSpec:
     diagonal_shift: float
     geometry_ordering: str = "bisection"
     weak_blocks_per_rank: int | None = None
+    # "physical": per-block values from the geometric decay model (needed for
+    # accuracy validation and thresholded-SpGEMM realism). "random": one
+    # parallel C++ fill (VBCSR.fill_random) -- same structure and flop/byte
+    # pattern, no per-block Python assembly; assembly cost drops to ~zero.
+    # Timing-only runs (scaling sweeps at threshold 0) should use "random".
+    value_fill: str = "physical"
 
     @property
     def label(self) -> str:
@@ -598,11 +604,16 @@ def build_matrix(
     graph_seconds = time.perf_counter() - t0
 
     t1 = time.perf_counter()
-    for offset, row in enumerate(owned):
-        cols = adjacency[offset]
-        row_blocks = make_row_block_data(row, cols, block_sizes, spec, positions, box_lengths)
-        for col, data in zip(cols, row_blocks):
-            matrix.add_block(row, col, data)
+    if spec.value_fill == "random":
+        # One parallel C++ pass over the already-allocated (and NUMA
+        # first-touched) storage; no per-block Python assembly.
+        matrix.fill_random()
+    else:
+        for offset, row in enumerate(owned):
+            cols = adjacency[offset]
+            row_blocks = make_row_block_data(row, cols, block_sizes, spec, positions, box_lengths)
+            for col, data in zip(cols, row_blocks):
+                matrix.add_block(row, col, data)
     matrix.assemble()
     barrier(comm)
     assembly_seconds = time.perf_counter() - t1
@@ -1686,6 +1697,7 @@ def build_specs(args: argparse.Namespace, rank_count: int) -> list[BenchmarkSpec
                         offdiagonal_scale=float(args.offdiagonal_scale),
                         diagonal_shift=float(args.diagonal_shift),
                         weak_blocks_per_rank=weak_blocks,
+                        value_fill=str(args.value_fill),
                     )
                 )
     return specs
@@ -1865,6 +1877,14 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument("--require-mkl", action="store_true", help="Fail if sparse_dot_mkl cannot be used for serial efficiency data")
     parser.add_argument("--no-baselines", action="store_true", help="Time only VBCSR (skip scipy/MKL baselines and validation). Used by scaling studies.")
+    parser.add_argument(
+        "--value-fill",
+        choices=("physical", "random"),
+        default="physical",
+        help="Matrix value source: 'physical' assembles decay-model blocks from Python "
+        "(required for validation / thresholded SpGEMM); 'random' fills values in one "
+        "parallel C++ pass, eliminating assembly cost (timing-only scaling runs).",
+    )
     parser.add_argument("--output-dir", type=Path, default=SCRIPT_DIR / "results")
     parser.add_argument("--label", default=None)
     return parser

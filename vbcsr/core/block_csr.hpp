@@ -1414,18 +1414,30 @@ public:
     }
 
     void fill_random() {
-        std::mt19937 rng(42); // Fixed seed for reproducibility
-        std::uniform_real_distribution<double> dist(0.0, 1.0);
-        
-        #pragma omp parallel for
-        for (int i = 0; i < graph->adj_ind.size(); ++i) {
-            T* data = mutable_block_data(i);
-            const size_t size = block_size_elements(i);
-            for (size_t j = 0; j < size; ++j) {
-                if constexpr (std::is_same<T, std::complex<double>>::value || std::is_same<T, std::complex<float>>::value) {
-                    data[j] = T(dist(rng), dist(rng));
-                } else {
-                    data[j] = dist(rng);
+        const int block_count = static_cast<int>(graph->adj_ind.size());
+        #pragma omp parallel
+        {
+            // Per-thread generator: a shared engine across threads is a data
+            // race. Seeds are fixed per thread id, so results are
+            // reproducible for a given thread count.
+#ifdef _OPENMP
+            const unsigned thread_id = static_cast<unsigned>(omp_get_thread_num());
+#else
+            const unsigned thread_id = 0;
+#endif
+            std::mt19937 rng(42u + 0x9e3779b9u * thread_id);
+            std::uniform_real_distribution<double> dist(0.0, 1.0);
+
+            #pragma omp for schedule(static)
+            for (int i = 0; i < block_count; ++i) {
+                T* data = mutable_block_data(i);
+                const size_t size = block_size_elements(i);
+                for (size_t j = 0; j < size; ++j) {
+                    if constexpr (std::is_same<T, std::complex<double>>::value || std::is_same<T, std::complex<float>>::value) {
+                        data[j] = T(dist(rng), dist(rng));
+                    } else {
+                        data[j] = dist(rng);
+                    }
                 }
             }
         }

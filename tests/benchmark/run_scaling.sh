@@ -61,7 +61,7 @@ echo "=== [1/2] OpenMP thread strong scaling (${STRONG_BYTES} B/domain) ==="
 for t in "${WORKERS[@]}"; do
     echo "--- threads=${t} ---"
     OMP_NUM_THREADS="${t}" OMP_PROC_BIND=close OMP_PLACES=cores \
-        "${PYTHON}" "${SCRIPT_DIR}/run_benchmark.py" --suite efficiency \
+        "${PYTHON}" "${SCRIPT_DIR}/run_benchmark.py" --suite efficiency --value-fill random \
         "${SIZING[@]}" "${COMMON[@]}" "${TIMING[@]}" \
         --label "scaling_thread_strong_w${t}"
 done
@@ -71,7 +71,7 @@ for p in "${WORKERS[@]}"; do
     echo "--- ranks=${p} ---"
     OMP_NUM_THREADS=1 \
         mpiexec --bind-to core --map-by core -n "${p}" \
-        "${PYTHON}" "${SCRIPT_DIR}/run_benchmark.py" --suite distributed-strong \
+        "${PYTHON}" "${SCRIPT_DIR}/run_benchmark.py" --suite distributed-strong --value-fill random \
         "${SIZING[@]}" "${COMMON[@]}" "${TIMING[@]}" \
         --label "scaling_mpi_strong_w${p}"
 done
