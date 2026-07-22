@@ -439,13 +439,20 @@ void bsr_mult_dense_impl(DistGraph* graph, const BSRMatrixBackend<T>& backend, D
 #else
         const bool last_thread = true;
 #endif
-        // Same in-region per-thread zeroing as the SpMV impl above (row
-        // offsets scaled by the padded ld; full-ld rows keep the padding
-        // lanes zero).
-        std::fill(
-            y.data.data() + static_cast<size_t>(graph->block_offsets[thread_row_begin]) * y_ld,
-            y.data.data() + static_cast<size_t>(graph->block_offsets[thread_row_end]) * y_ld,
-            T(0));
+        // No bulk Y zeroing: each non-empty row's segment is zeroed in-cache
+        // right before its first block product below, saving a full streaming
+        // pass over Y (~10% of SpMM traffic at rhs=16). Only structurally
+        // empty rows (never visited by a batch) and the ghost tail need the
+        // explicit fill.
+        for (int row = thread_row_begin; row < thread_row_end; ++row) {
+            if (graph->adj_ptr[row] == graph->adj_ptr[row + 1]) {
+                T* y_rows = y.data.data() +
+                    static_cast<size_t>(graph->block_offsets[row]) * y_ld;
+                std::fill(y_rows,
+                          y_rows + static_cast<size_t>(runtime_block_size) * y_ld,
+                          T(0));
+            }
+        }
         if (last_thread) {
             std::fill(
                 y.data.data() + static_cast<size_t>(graph->block_offsets[n_rows]) * y_ld,
@@ -461,6 +468,15 @@ void bsr_mult_dense_impl(DistGraph* graph, const BSRMatrixBackend<T>& backend, D
                     static_cast<size_t>(graph->block_offsets[row]) * y_ld;
                 const uint32_t block_begin = batch.row_block_start(row);
                 const uint32_t block_end = batch.row_block_end(row);
+                // This batch holds the row's globally-first block iff the
+                // page-local start lines up with the row's adjacency slot
+                // (rows can span pages; only the first span zeroes).
+                if (static_cast<uint64_t>(batch.first_block) + block_begin ==
+                    static_cast<uint64_t>(graph->adj_ptr[row])) {
+                    std::fill(y_rows,
+                              y_rows + static_cast<size_t>(runtime_block_size) * y_ld,
+                              T(0));
+                }
                 for (uint32_t local_block = block_begin; local_block < block_end; ++local_block) {
                     const int col = batch.cols[local_block];
                     rowmajor_kernels::rm_gemm<T>(
