@@ -654,6 +654,13 @@ if(VBCSR_ENABLE_TESTS)
     endfunction()
 
     add_vbcsr_mpi_test(test_pb_csr vbcsr/core/test/test_pb_csr.cpp)
+    # Plain (no mpiexec: the launcher would bind the process to one core and
+    # the threads could never span NUMA nodes; MPI_Init works as a singleton).
+    # Spread pinned threads across sockets so a multi-NUMA host actually
+    # exercises the locality invariant (the test SKIPs when it cannot).
+    add_vbcsr_plain_test(test_numa_locality vbcsr/core/test/test_numa_locality.cpp)
+    set_tests_properties(test_numa_locality PROPERTIES
+        ENVIRONMENT "OMP_NUM_THREADS=4;OMP_PROC_BIND=spread;OMP_PLACES=cores")
     add_vbcsr_mpi_test(test_spmm vbcsr/core/test/test_spmm.cpp)
     add_vbcsr_mpi_test(test_block_csr vbcsr/core/test/test_block_csr.cpp)
     add_vbcsr_mpi_test(test_dist_graph vbcsr/core/test/test_dist_graph.cpp)

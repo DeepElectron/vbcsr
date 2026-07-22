@@ -175,7 +175,9 @@ private:
     // matches it; otherwise fall back to rebuilding dynamic chunks.
     static std::vector<int> select_forward_chunks(
         const typename Backend::ForwardApplyPlan& plan) {
-        if (!plan.rows.empty() && plan.thread_domains.matches(max_parallel_threads())) {
+        if (!plan.rows.empty() &&
+            plan.thread_domains.matches(
+                max_parallel_threads(), static_cast<int>(plan.rows.size()))) {
             return plan.thread_domains.row_bounds;
         }
         return build_forward_work_chunks(plan);
@@ -183,7 +185,9 @@ private:
 
     static std::vector<int> select_adjoint_chunks(
         const typename Backend::AdjointApplyPlan& plan) {
-        if (!plan.columns.empty() && plan.thread_domains.matches(max_parallel_threads())) {
+        if (!plan.columns.empty() &&
+            plan.thread_domains.matches(
+                max_parallel_threads(), static_cast<int>(plan.columns.size()))) {
             return plan.thread_domains.row_bounds;
         }
         return build_adjoint_work_chunks(plan);

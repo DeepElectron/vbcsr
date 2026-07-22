@@ -38,14 +38,42 @@ struct ThreadDomainPartition {
 
     bool empty() const { return row_bounds.empty(); }
 
-    bool matches(int threads) const {
+    // A partition is honored only when the team size matches AND the bounds
+    // tile exactly the caller's task span [0, task_count) — the second check
+    // makes "never mis-partition" structural: a partition that belongs to a
+    // different structure can never silently skip tasks.
+    bool matches(int threads, int task_count) const {
         return thread_count == threads &&
-            static_cast<int>(row_bounds.size()) == thread_count + 1;
+            static_cast<int>(row_bounds.size()) == thread_count + 1 &&
+            row_bounds.front() == 0 &&
+            row_bounds.back() == task_count;
     }
 
     int domain_begin(int tid) const { return row_bounds[static_cast<size_t>(tid)]; }
     int domain_end(int tid) const { return row_bounds[static_cast<size_t>(tid) + 1]; }
 };
+
+// Per-thread contiguous task range, for use INSIDE a parallel region: the
+// stored partition when it matches the live team (placement-consistent,
+// work-balanced), else an even split — correct, just not locality- or
+// balance-optimal.
+inline std::pair<int, int> thread_domain_range(
+    int task_count,
+    const ThreadDomainPartition& domains) {
+#ifdef _OPENMP
+    const int thread_count = omp_get_num_threads();
+    const int thread_id = omp_get_thread_num();
+#else
+    const int thread_count = 1;
+    const int thread_id = 0;
+#endif
+    if (domains.matches(thread_count, task_count)) {
+        return {domains.domain_begin(thread_id), domains.domain_end(thread_id)};
+    }
+    return {
+        static_cast<int>((static_cast<int64_t>(task_count) * thread_id) / thread_count),
+        static_cast<int>((static_cast<int64_t>(task_count) * (thread_id + 1)) / thread_count)};
+}
 
 // Split n_rows into `thread_count` contiguous domains with (approximately)
 // equal cumulative weight. `weight(row)` is any monotone per-row cost proxy —

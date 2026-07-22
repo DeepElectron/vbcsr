@@ -325,28 +325,13 @@ decltype(auto) bsr_dispatch_block_size(int block_size, Fn&& fn) {
     }
 }
 
-// Per-thread row range. Prefers the backend's stored work-balanced partition
-// (one source of truth with storage first-touch placement); a parallel region
-// whose thread count does not match the stored partition falls back to the
-// even row split — correct, just not locality- or balance-optimal.
+// Per-thread row range: the backend's stored work-balanced partition when it
+// matches the live team (one source of truth with storage first-touch
+// placement), else an even row split. See thread_domain_range.
 inline std::pair<int, int> bsr_thread_row_range(
     int n_rows,
     const ThreadDomainPartition& domains) {
-#ifdef _OPENMP
-    const int thread_count = omp_get_num_threads();
-    const int thread_id = omp_get_thread_num();
-#else
-    const int thread_count = 1;
-    const int thread_id = 0;
-#endif
-    if (domains.matches(thread_count)) {
-        return {domains.domain_begin(thread_id), domains.domain_end(thread_id)};
-    }
-    const int begin = static_cast<int>(
-        (static_cast<int64_t>(n_rows) * thread_id) / thread_count);
-    const int end = static_cast<int>(
-        (static_cast<int64_t>(n_rows) * (thread_id + 1)) / thread_count);
-    return {begin, end};
+    return thread_domain_range(n_rows, domains);
 }
 
 // SpMV impls keep the compile-time BlockSize dispatch: rm_gemv's k-loops

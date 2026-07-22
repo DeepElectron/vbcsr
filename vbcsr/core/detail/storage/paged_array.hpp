@@ -10,6 +10,10 @@
 #include <type_traits>
 #include <vector>
 
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
+
 namespace vbcsr::detail {
 
 template <typename T>
@@ -36,10 +40,55 @@ class PagedBuffer {
     friend class ShapeBlockStore<T>;
 
 public:
+    // Page payloads for trivial scalar types are mmap-backed on Linux
+    // (bytes != 0 in the deleter): heap-recycled memory keeps whatever NUMA
+    // placement its previous owner's writes gave it, which silently defeats
+    // the first-touch placement contract of the *_first_touch initializers
+    // (caught by test_numa_locality). Anonymous mmap pages are guaranteed
+    // untouched, so the domain that zero-fills a range is always the first
+    // toucher. Non-trivial T (std::complex: array-new zero-writes) and
+    // non-Linux keep plain new[].
+    struct PageDeleter {
+        size_t mmap_bytes = 0;  // 0 => delete[]
+        void operator()(T* ptr) const {
+            if (ptr == nullptr) {
+                return;
+            }
+#ifdef __linux__
+            if (mmap_bytes != 0) {
+                munmap(static_cast<void*>(ptr), mmap_bytes);
+                return;
+            }
+#endif
+            delete[] ptr;
+        }
+    };
+    using PageOwner = std::unique_ptr<T[], PageDeleter>;
+
     struct Page {
-        std::unique_ptr<T[]> data;
+        PageOwner data;
         uint32_t used = 0;
     };
+
+    static PageOwner allocate_page_payload(uint32_t element_count) {
+#ifdef __linux__
+        if constexpr (std::is_trivially_default_constructible_v<T> &&
+                      std::is_trivially_destructible_v<T>) {
+            const size_t bytes = static_cast<size_t>(element_count) * sizeof(T);
+            // Small pages stay on the heap: the mmap/munmap round-trip and
+            // per-page TLB cost only pay off at page granularity.
+            constexpr size_t kMinMmapBytes = 256u * 1024u;
+            if (bytes >= kMinMmapBytes) {
+                void* mem = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                if (mem != MAP_FAILED) {
+                    return PageOwner(static_cast<T*>(mem), PageDeleter{bytes});
+                }
+            }
+        }
+#endif
+        return PageOwner(new T[element_count], PageDeleter{});
+    }
 
     PagedBuffer()
         : elements_per_page_(default_elements_per_page()) {}
@@ -247,14 +296,14 @@ private:
 
     void append_page() {
         Page storage_page;
-        storage_page.data = std::make_unique<T[]>(elements_per_page_);
+        storage_page.data = allocate_page_payload(elements_per_page_);
         std::fill(storage_page.data.get(), storage_page.data.get() + elements_per_page_, T(0));
         pages_.push_back(std::move(storage_page));
     }
 
     void append_page_uninitialized() {
         Page storage_page;
-        storage_page.data.reset(new T[elements_per_page_]);
+        storage_page.data = allocate_page_payload(elements_per_page_);
         pages_.push_back(std::move(storage_page));
     }
 

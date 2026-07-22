@@ -17,7 +17,21 @@ backend's stored partition. Handle encoding, page layout, and every iteration
 path are untouched — the explicit domain field sketched below was
 unnecessary. Measured (VBCSR 1 GiB, pinned): SpMV 48T 20.8 → 9.6 ms
 (**2.18×**, ~110 GB/s), SpMM 48T 31.9 → 18.9 ms (1.69×); 1T/24T and SpGEMM
-unchanged. Stage D (locality invariant test) remains.
+unchanged.
+
+**Stage D implemented 2026-07-22** — `test_numa_locality` (ctest, pinned
+spread threads) asserts each domain's interior value pages reside on the
+owning thread's node via `get_mempolicy`; it SKIPs on hosts/configs that
+cannot exercise the invariant. The test immediately caught a real hole:
+**heap-recycled memory keeps its previous NUMA placement**, silently
+defeating first-touch when a process builds more than one matrix (glibc
+returns previously-touched arena memory). Fix: `PagedBuffer` page payloads
+for trivially-constructible scalars are mmap-backed (≥256 KiB, Linux) —
+anonymous mmap pages are guaranteed untouched, so the zero-filling domain
+thread is always the first toucher. A follow-up review also fixed the
+adjoint-plan partition (built over the task list, not the column-id space),
+wired the native CSR kernels to the stored partition, and made `matches()`
+verify the partition tiles the caller's task span.
 Caveat: array-new for `std::complex` value-initializes, so complex matrices
 keep today's placement; the win applies to trivially-constructible scalars.
 

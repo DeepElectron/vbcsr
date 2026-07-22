@@ -201,6 +201,23 @@ public:
         return kind;
     }
 
+    // The stored thread-domain partition that drives the apply work split and
+    // the storage first-touch placement (detail/backend/thread_domain.hpp).
+    // Empty for backends built through paths that do not first-touch (e.g.
+    // SpGEMM results). Read-only inspection: diagnostics and the locality
+    // invariant test.
+    const detail::ThreadDomainPartition& thread_domain_partition() const {
+        switch (kind) {
+        case MatrixKind::CSR:
+            return active_csr_backend().thread_domains;
+        case MatrixKind::BSR:
+            return active_bsr_backend().thread_domains;
+        case MatrixKind::VBCSR:
+            return active_vbcsr_backend().thread_domains;
+        }
+        throw std::logic_error("thread_domain_partition: unknown matrix kind");
+    }
+
     std::string matrix_kind_string() const {
         return std::string(vbcsr::matrix_kind_name(kind));
     }
@@ -2253,6 +2270,11 @@ typename BlockSpMat<T>::BackendHandle BlockSpMat<T>::build_backend_for_structure
         std::vector<std::vector<size_t>> shape_domain_offsets(
             static_cast<size_t>(shape_count),
             std::vector<size_t>(static_cast<size_t>(domains.thread_count) + 1, 0));
+        // Consecutive blocks along a row usually share their shape; caching
+        // the last (row_dim, col_dim) -> shape_id hit avoids a map lookup per
+        // block (the map itself stays tiny — one entry per distinct shape).
+        std::pair<int, int> cached_shape{-1, -1};
+        int cached_shape_id = -1;
         for (int domain = 0; domain < domains.thread_count; ++domain) {
             for (int row = domains.domain_begin(domain);
                  row < domains.domain_end(domain);
@@ -2262,9 +2284,12 @@ typename BlockSpMat<T>::BackendHandle BlockSpMat<T>::build_backend_for_structure
                      graph_block_index < graph->adj_ptr[row + 1];
                      ++graph_block_index) {
                     const int col = graph->adj_ind[graph_block_index];
-                    const int col_dim = graph->block_sizes[col];
-                    const int shape_id = shape_ids.at(std::make_pair(row_dim, col_dim));
-                    shape_blocks[static_cast<size_t>(shape_id)].push_back(graph_block_index);
+                    const std::pair<int, int> shape{row_dim, graph->block_sizes[col]};
+                    if (shape != cached_shape) {
+                        cached_shape = shape;
+                        cached_shape_id = shape_ids.at(shape);
+                    }
+                    shape_blocks[static_cast<size_t>(cached_shape_id)].push_back(graph_block_index);
                 }
             }
             for (int shape_id = 0; shape_id < shape_count; ++shape_id) {

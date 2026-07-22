@@ -198,7 +198,7 @@ struct VBCSRMatrixBackend {
     int ensure_shape(int row_dim, int col_dim, size_t expected_block_count = 0) {
         const int shape_id =
             storage.get_or_create_shape(row_dim, col_dim, expected_block_count);
-        invalidate_apply_plan();
+        invalidate_structural_caches();
         return shape_id;
     }
 
@@ -220,13 +220,13 @@ struct VBCSRMatrixBackend {
 
     uint64_t append_block_for_shape(int shape_id, int graph_block_index) {
         const uint64_t handle = storage.append(shape_id, graph_block_index);
-        invalidate_apply_plan();
+        invalidate_structural_caches();
         return handle;
     }
 
     uint64_t append_block_for_shape_uninitialized(int shape_id, int graph_block_index) {
         const uint64_t handle = storage.append_uninitialized(shape_id, graph_block_index);
-        invalidate_apply_plan();
+        invalidate_structural_caches();
         return handle;
     }
 
@@ -239,7 +239,7 @@ struct VBCSRMatrixBackend {
             [&](int graph_block_index, uint64_t handle) {
                 set_graph_block_handle(graph_block_index, handle);
             });
-        invalidate_apply_plan();
+        invalidate_structural_caches();
     }
 
     template <typename Fn>
@@ -340,10 +340,14 @@ struct VBCSRMatrixBackend {
                     row_work});
             }
             if (!thread_domains.empty() &&
-                thread_domains.row_bounds.back() == n_rows) {
+                thread_domains.row_bounds.back() == n_rows &&
+                thread_domains.thread_count == thread_domain_max_threads()) {
                 // Reuse the storage-placement partition (same nnz-work
                 // weights, same builder) so apply access matches the pages
-                // each thread first-touched at construction.
+                // each thread first-touched at construction. A thread-count
+                // mismatch takes the else-branch instead: caching a partition
+                // the applies' matches() would always reject would rebuild
+                // dynamic chunks on every apply.
                 plan->thread_domains = thread_domains;
             } else {
                 plan->thread_domains = build_thread_domain_partition(
@@ -427,12 +431,16 @@ struct VBCSRMatrixBackend {
                     incoming_degree > direct_dense_col_degree_limit,
                     col_work});
             }
+            // Partition over the TASK list, not the column-id space:
+            // plan->columns skips columns with no incoming blocks, so its
+            // size can be smaller than block_count and the chunk consumers
+            // index tasks, not columns.
             plan->thread_domains = build_thread_domain_partition(
-                block_count,
+                static_cast<int>(plan->columns.size()),
                 thread_domain_max_threads(),
-                [&](int col) {
+                [&](int task) {
                     return std::max<size_t>(
-                        size_t(1), plan->columns[static_cast<size_t>(col)].work);
+                        size_t(1), plan->columns[static_cast<size_t>(task)].work);
                 });
             adjoint_apply_plan = std::move(plan);
         }
@@ -456,6 +464,15 @@ private:
         apply_plan.reset();
         forward_apply_plan.reset();
         adjoint_apply_plan.reset();
+    }
+
+    // Structural mutation invalidates the storage-placement partition too:
+    // its weights and first-touch placement belong to the old structure.
+    // (The first-touch construction path calls set_thread_domains LAST, after
+    // its appends have gone through invalidate_structural_caches.)
+    void invalidate_structural_caches() {
+        invalidate_apply_plan();
+        thread_domains = ThreadDomainPartition{};
     }
 
     T* block_ptr_from_handle(uint64_t handle) {

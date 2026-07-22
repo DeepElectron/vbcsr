@@ -566,16 +566,23 @@ void csr_mult_native(DistGraph* graph, const CSRMatrixBackend<T>& backend, DistV
     const T* x_data = x.local_data();
     T* y_data = y.local_data();
 
-    #pragma omp parallel for schedule(static)
-    for (int row = 0; row < n_rows; ++row) {
-        T sum = T(0);
-        backend.for_each_row_slice(row_ptr, graph->adj_ind, row, [&](auto slice) {
-            for (uint32_t idx = 0; idx < slice.nnz_count; ++idx) {
-                const int col = slice.cols[idx];
-                sum += slice.values[idx] * x_data[block_offsets[col]];
-            }
-        });
-        y_data[block_offsets[row]] = sum;
+    // Rows split along the backend's stored nnz-weighted partition (falling
+    // back to an even split): the same boundaries the value pages were
+    // first-touched with, so each thread reads node-local pages.
+    #pragma omp parallel
+    {
+        const auto [row_begin, row_end] =
+            thread_domain_range(n_rows, backend.thread_domains);
+        for (int row = row_begin; row < row_end; ++row) {
+            T sum = T(0);
+            backend.for_each_row_slice(row_ptr, graph->adj_ind, row, [&](auto slice) {
+                for (uint32_t idx = 0; idx < slice.nnz_count; ++idx) {
+                    const int col = slice.cols[idx];
+                    sum += slice.values[idx] * x_data[block_offsets[col]];
+                }
+            });
+            y_data[block_offsets[row]] = sum;
+        }
     }
 }
 
@@ -598,8 +605,10 @@ void csr_mult_dense_native(
     {
         std::vector<T> sums(static_cast<size_t>(num_vecs), T(0));
 
-        #pragma omp for schedule(static)
-        for (int row = 0; row < n_rows; ++row) {
+        // Same stored-partition split as csr_mult_native above.
+        const auto [row_begin, row_end] =
+            thread_domain_range(n_rows, backend.thread_domains);
+        for (int row = row_begin; row < row_end; ++row) {
             std::fill(sums.begin(), sums.end(), T(0));
 
             backend.for_each_row_slice(row_ptr, graph->adj_ind, row, [&](auto slice) {

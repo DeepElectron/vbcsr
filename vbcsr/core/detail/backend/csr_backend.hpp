@@ -163,6 +163,7 @@ struct CSRMatrixBackend {
             ? configured_page_size_
             : static_cast<uint32_t>(std::min<uint64_t>(logical_nnz, configured_page_size_));
         values = PagedBuffer<T>(active_page_size);
+        thread_domains = ThreadDomainPartition{};
         invalidate_vendor_cache();
         values.resize_uninitialized(logical_nnz);
     }
