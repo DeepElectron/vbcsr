@@ -443,8 +443,28 @@ private:
                 *C->mutable_block_data(slot) = values[first + static_cast<MKL_INT>(slot)];
             }
         } else if (!c_values.empty() && C->active_csr_backend().page_count() == 1) {
-            auto page = C->active_csr_backend().page(C->col_ind(), 0);
-            std::memcpy(page.values, c_values.data(), c_values.size() * sizeof(T));
+            // Thresholded serial wrap: same first-touch treatment as the
+            // threshold<=0 branch above (fresh pages, copy per row-domain,
+            // partition stored for the applies).
+            auto& c_backend = C->active_csr_backend();
+            const auto& c_rows = C->row_ptr();
+            c_backend.thread_domains = build_thread_domain_partition(
+                n_rows,
+                thread_domain_max_threads(),
+                [&](int row) { return c_rows[row + 1] - c_rows[row]; });
+            const auto& c_domains = c_backend.thread_domains;
+            auto page = c_backend.page(C->col_ind(), 0);
+            #pragma omp parallel for schedule(static)
+            for (int domain = 0; domain < c_domains.thread_count; ++domain) {
+                const size_t begin =
+                    static_cast<size_t>(c_rows[c_domains.domain_begin(domain)]);
+                const size_t end =
+                    static_cast<size_t>(c_rows[c_domains.domain_end(domain)]);
+                if (end > begin) {
+                    std::memcpy(page.values + begin, c_values.data() + begin,
+                                (end - begin) * sizeof(T));
+                }
+            }
             C->norms_valid = false;
         } else {
             #pragma omp parallel for
