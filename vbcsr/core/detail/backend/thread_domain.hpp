@@ -1,4 +1,5 @@
-#pragma once
+#ifndef VBCSR_DETAIL_BACKEND_THREAD_DOMAIN_HPP
+#define VBCSR_DETAIL_BACKEND_THREAD_DOMAIN_HPP
 
 #include <algorithm>
 #include <cstdint>
@@ -127,3 +128,5 @@ inline ThreadDomainPartition build_thread_domain_partition(
 
 } // namespace detail
 } // namespace vbcsr
+
+#endif  // VBCSR_DETAIL_BACKEND_THREAD_DOMAIN_HPP

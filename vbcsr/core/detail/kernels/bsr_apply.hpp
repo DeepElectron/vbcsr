@@ -325,15 +325,6 @@ decltype(auto) bsr_dispatch_block_size(int block_size, Fn&& fn) {
     }
 }
 
-// Per-thread row range: the backend's stored work-balanced partition when it
-// matches the live team (one source of truth with storage first-touch
-// placement), else an even row split. See thread_domain_range.
-inline std::pair<int, int> bsr_thread_row_range(
-    int n_rows,
-    const ThreadDomainPartition& domains) {
-    return thread_domain_range(n_rows, domains);
-}
-
 // SpMV impls keep the compile-time BlockSize dispatch: rm_gemv's k-loops
 // fully unroll when bs is a constant (measured ~8% on bs=8 SpMV), unlike the
 // dense impls where the nv-axis loops dominate and runtime dims are neutral.
@@ -350,7 +341,7 @@ void bsr_mult_impl(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistVec
 
     #pragma omp parallel
     {
-        const auto [thread_row_begin, thread_row_end] = bsr_thread_row_range(n_rows, domains);
+        const auto [thread_row_begin, thread_row_end] = thread_domain_range(n_rows, domains);
 #ifdef _OPENMP
         const bool last_thread = omp_get_thread_num() == omp_get_num_threads() - 1;
 #else
@@ -433,7 +424,7 @@ void bsr_mult_dense_impl(DistGraph* graph, const BSRMatrixBackend<T>& backend, D
 
     #pragma omp parallel
     {
-        const auto [thread_row_begin, thread_row_end] = bsr_thread_row_range(n_rows, domains);
+        const auto [thread_row_begin, thread_row_end] = thread_domain_range(n_rows, domains);
 #ifdef _OPENMP
         const bool last_thread = omp_get_thread_num() == omp_get_num_threads() - 1;
 #else
@@ -581,7 +572,7 @@ void bsr_mult_adjoint_impl(DistGraph* graph, const BSRMatrixBackend<T>& backend,
 #endif
         auto& y_local = thread_buffers[static_cast<size_t>(thread_id)];
         y_local.assign(y.data.size(), T(0));
-        const auto [thread_row_begin, thread_row_end] = bsr_thread_row_range(n_rows, domains);
+        const auto [thread_row_begin, thread_row_end] = thread_domain_range(n_rows, domains);
 
         for (const auto& batch_entry : plan.batches) {
             const auto& batch = batch_entry.batch;
@@ -714,7 +705,7 @@ void bsr_mult_dense_adjoint_impl(
 #endif
         auto& y_local = thread_buffers[static_cast<size_t>(thread_id)];
         y_local.assign(y.data.size(), T(0));
-        const auto [thread_row_begin, thread_row_end] = bsr_thread_row_range(n_rows, domains);
+        const auto [thread_row_begin, thread_row_end] = thread_domain_range(n_rows, domains);
 
         for (const auto& batch_entry : plan.batches) {
             const auto& batch = batch_entry.batch;

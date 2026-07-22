@@ -17,6 +17,59 @@
 namespace vbcsr {
 namespace detail {
 
+// Fresh-buffer allocation shared by NumaVector and PagedBuffer.
+//
+// Heap-recycled memory keeps whatever NUMA placement its previous owner's
+// writes gave it, which silently defeats first-touch placement (caught by
+// test_numa_locality). Anonymous mmap pages are guaranteed untouched, so the
+// thread that zero-fills a range is always the first toucher. Non-trivial T
+// (std::complex: array-new zero-writes on the allocating thread) and
+// non-Linux keep plain new[]; buffers below kFreshMmapMinBytes stay on the
+// heap (cache-resident anyway; the mmap round-trip would not pay off).
+inline constexpr size_t kFreshMmapMinBytes = 256u * 1024u;
+
+template <typename T>
+struct FreshBufferDeleter {
+    size_t mmap_bytes = 0;  // 0 => delete[]
+    void operator()(T* ptr) const {
+        if (ptr == nullptr) {
+            return;
+        }
+#ifdef __linux__
+        if (mmap_bytes != 0) {
+            munmap(static_cast<void*>(ptr), mmap_bytes);
+            return;
+        }
+#endif
+        delete[] ptr;
+    }
+};
+
+template <typename T>
+using FreshBufferOwner = std::unique_ptr<T[], FreshBufferDeleter<T>>;
+
+template <typename T>
+inline FreshBufferOwner<T> allocate_fresh_buffer(size_t count) {
+    if (count == 0) {
+        return FreshBufferOwner<T>(nullptr, FreshBufferDeleter<T>{});
+    }
+#ifdef __linux__
+    if constexpr (std::is_trivially_default_constructible_v<T> &&
+                  std::is_trivially_destructible_v<T>) {
+        const size_t bytes = count * sizeof(T);
+        if (bytes >= kFreshMmapMinBytes) {
+            void* mem = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (mem != MAP_FAILED) {
+                return FreshBufferOwner<T>(static_cast<T*>(mem),
+                                           FreshBufferDeleter<T>{bytes});
+            }
+        }
+    }
+#endif
+    return FreshBufferOwner<T>(new T[count], FreshBufferDeleter<T>{});
+}
+
 // Contiguous vector-like buffer whose pages spread across NUMA nodes.
 //
 // std::vector value-initializes on resize, so the ALLOCATING thread touches
@@ -35,48 +88,9 @@ namespace detail {
 // zeroed, resize preserves the prefix.
 template <typename T>
 class NumaVector {
-    static constexpr bool kFreshMmap =
-        std::is_trivially_default_constructible_v<T> &&
-        std::is_trivially_destructible_v<T>;
-    // Below this the mmap round-trip outweighs placement (small buffers are
-    // cache-resident anyway).
-    static constexpr size_t kMinMmapBytes = 256u * 1024u;
+    using Owner = FreshBufferOwner<T>;
 
-    struct Deleter {
-        size_t mmap_bytes = 0;  // 0 => delete[]
-        void operator()(T* ptr) const {
-            if (ptr == nullptr) {
-                return;
-            }
-#ifdef __linux__
-            if (mmap_bytes != 0) {
-                munmap(static_cast<void*>(ptr), mmap_bytes);
-                return;
-            }
-#endif
-            delete[] ptr;
-        }
-    };
-    using Owner = std::unique_ptr<T[], Deleter>;
-
-    static Owner allocate(size_t count) {
-        if (count == 0) {
-            return Owner(nullptr, Deleter{});
-        }
-#ifdef __linux__
-        if constexpr (kFreshMmap) {
-            const size_t bytes = count * sizeof(T);
-            if (bytes >= kMinMmapBytes) {
-                void* mem = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
-                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-                if (mem != MAP_FAILED) {
-                    return Owner(static_cast<T*>(mem), Deleter{bytes});
-                }
-            }
-        }
-#endif
-        return Owner(new T[count], Deleter{});
-    }
+    static Owner allocate(size_t count) { return allocate_fresh_buffer<T>(count); }
 
     Owner buffer_;
     size_t size_ = 0;
