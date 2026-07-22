@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import hashlib
 import importlib
 import io
 import itertools
@@ -511,6 +512,110 @@ def make_geometric_adjacency(
         "local_degree_sum": int(degrees.sum()),
         "local_row_count": int(degrees.size),
     }, positions, box_lengths
+
+
+# Structure disk cache: the geometric graph is a pure function of the spec
+# fields below, yet every process (each thread count of a sweep, each rank
+# count of a panel) regenerated it serially -- minutes of single-core work per
+# point, dwarfing the measurements themselves. Rank 0 generates the GLOBAL
+# flat adjacency + positions once and stores them as .npy files; every later
+# process mmap-loads and slices its owned range in seconds. Files are keyed by
+# a hash of the generating parameters and validated against the stored meta.
+GEOMETRY_CACHE_VERSION = 1
+_GEOMETRY_CACHE_DIR: Path | None = None
+
+
+def geometry_cache_entry(spec: BenchmarkSpec, cache_dir: Path) -> tuple[dict[str, Any], dict[str, Path]]:
+    key_fields = {
+        "version": GEOMETRY_CACHE_VERSION,
+        "blocks": int(spec.blocks),
+        "dim": int(spec.geometry_dim),
+        "spacing": float(spec.geometry_spacing),
+        "jitter": float(spec.geometry_jitter),
+        "cutoff": None if spec.geometry_cutoff is None else float(spec.geometry_cutoff),
+        "cutoff_quantile": float(spec.geometry_cutoff_quantile),
+        "ordering": str(spec.geometry_ordering),
+        "target_degree": int(spec.target_degree),
+        "seed": int(spec.seed),
+    }
+    digest = hashlib.sha1(json.dumps(key_fields, sort_keys=True).encode()).hexdigest()[:16]
+    base = cache_dir / f"geom_{digest}"
+    paths = {
+        "meta": base.with_suffix(".meta.json"),
+        "adj_ptr": base.with_suffix(".adj_ptr.npy"),
+        "adj_ind": base.with_suffix(".adj_ind.npy"),
+        "positions": base.with_suffix(".positions.npy"),
+    }
+    return key_fields, paths
+
+
+def _geometry_cache_valid(key_fields: dict[str, Any], paths: dict[str, Path]) -> bool:
+    if not all(path.exists() for path in paths.values()):
+        return False
+    try:
+        meta = json.loads(paths["meta"].read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return meta.get("key_fields") == key_fields
+
+
+def _atomic_np_save(path: Path, array: np.ndarray) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    np.save(tmp, array)
+    # np.save appends .npy to names without it
+    tmp_actual = tmp if tmp.suffix == ".npy" else Path(str(tmp) + ".npy")
+    os.replace(tmp_actual, path)
+
+
+def cached_geometric_adjacency(
+    spec: BenchmarkSpec,
+    owned_range: tuple[int, int] | None,
+    comm: Any,
+    rank: int,
+    cache_dir: Path,
+) -> tuple[list[np.ndarray], dict[str, Any], np.ndarray, np.ndarray]:
+    """make_geometric_adjacency semantics, backed by the on-disk global graph.
+
+    Adjacency rows come back as numpy index arrays instead of Python lists;
+    every consumer only iterates them. Positions are a read-only mmap.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    key_fields, paths = geometry_cache_entry(spec, cache_dir)
+    if rank == 0 and not _geometry_cache_valid(key_fields, paths):
+        adjacency, info, positions, box_lengths = make_geometric_adjacency(spec, None)
+        _, adj_ptr, adj_ind = flat_adjacency(adjacency)
+        del adjacency
+        _atomic_np_save(paths["adj_ptr"], adj_ptr)
+        _atomic_np_save(paths["adj_ind"], adj_ind.astype(np.int32))
+        _atomic_np_save(paths["positions"], positions)
+        info.pop("local_degree_min", None)
+        info.pop("local_degree_max", None)
+        info.pop("local_degree_sum", None)
+        info.pop("local_row_count", None)
+        meta = {"key_fields": key_fields, "info": info, "box_lengths": list(map(float, box_lengths))}
+        tmp = paths["meta"].with_suffix(".tmp")
+        tmp.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, paths["meta"])
+    barrier(comm)
+
+    meta = json.loads(paths["meta"].read_text(encoding="utf-8"))
+    adj_ptr = np.load(paths["adj_ptr"], mmap_mode="r")
+    adj_ind = np.load(paths["adj_ind"], mmap_mode="r")
+    positions = np.load(paths["positions"], mmap_mode="r")
+    box_lengths = np.array(meta["box_lengths"], dtype=np.float64)
+
+    start, end = owned_range if owned_range is not None else (0, spec.blocks)
+    local_ptr = np.asarray(adj_ptr[start:end + 1], dtype=np.int64)
+    base_offset = int(local_ptr[0]) if local_ptr.size else 0
+    local_ind = np.asarray(adj_ind[base_offset:int(local_ptr[-1])], dtype=np.int64) if local_ptr.size else np.empty(0, np.int64)
+    rows = np.split(local_ind, (local_ptr - base_offset)[1:-1]) if local_ptr.size else []
+    degrees = np.diff(local_ptr)
+    info = dict(meta["info"])
+    info["local_degree_min"] = int(degrees.min()) if degrees.size else 0
+    info["local_degree_max"] = int(degrees.max()) if degrees.size else 0
+    info["local_degree_sum"] = int(degrees.sum())
+    info["local_row_count"] = int(degrees.size)
+    return rows, info, positions, box_lengths
 
 
 def reduce_degree_statistics(adjacency_info: dict[str, Any], comm: Any) -> dict[str, Any]:
@@ -1204,7 +1309,11 @@ def build_case_matrix(
 
     block_sizes = make_block_sizes(spec)
     owned_range = partition_range(spec.blocks, size, rank)
-    adjacency, adjacency_info, positions, box_lengths = make_geometric_adjacency(spec, owned_range)
+    if _GEOMETRY_CACHE_DIR is not None:
+        adjacency, adjacency_info, positions, box_lengths = cached_geometric_adjacency(
+            spec, owned_range, comm, rank, _GEOMETRY_CACHE_DIR)
+    else:
+        adjacency, adjacency_info, positions, box_lengths = make_geometric_adjacency(spec, owned_range)
     adjacency_info = reduce_degree_statistics(adjacency_info, comm)
     value_model = matrix_value_model_statistics(
         adjacency, positions, box_lengths, spec, owned_range[0], comm
@@ -1878,6 +1987,19 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--require-mkl", action="store_true", help="Fail if sparse_dot_mkl cannot be used for serial efficiency data")
     parser.add_argument("--no-baselines", action="store_true", help="Time only VBCSR (skip scipy/MKL baselines and validation). Used by scaling studies.")
     parser.add_argument(
+        "--geometry-cache-dir",
+        type=Path,
+        default=SCRIPT_DIR / "results" / "geom_cache",
+        help="Directory for the on-disk geometric-structure cache (global adjacency + "
+        "positions, keyed by the generating parameters). The same structure is reused "
+        "across every thread/rank count of a sweep instead of being regenerated.",
+    )
+    parser.add_argument(
+        "--no-geometry-cache",
+        action="store_true",
+        help="Regenerate the geometric structure in-process (previous behavior).",
+    )
+    parser.add_argument(
         "--value-fill",
         choices=("physical", "random"),
         default="physical",
@@ -1893,6 +2015,9 @@ def make_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = make_parser().parse_args()
     comm, rank, size = mpi_context()
+
+    global _GEOMETRY_CACHE_DIR
+    _GEOMETRY_CACHE_DIR = None if args.no_geometry_cache else Path(args.geometry_cache_dir)
 
     if args.suite != "efficiency" and comm is None:
         if rank == 0:
