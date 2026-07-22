@@ -501,15 +501,37 @@ private:
             block_layout != SPARSE_LAYOUT_ROW_MAJOR) {
             throw std::runtime_error("MKL BSR SpGEMM exported an unsupported block layout");
         }
+        // The result's value pages are fresh and untouched, so this copy IS
+        // the first touch: split it per row-domain and store the partition so
+        // C's placement matches the split later applies use
+        // (numa_locality_plan.md — operation results).
+        {
+            const auto& c_rows = C->row_ptr();
+            const int c_n_rows =
+                c_rows.empty() ? 0 : static_cast<int>(c_rows.size()) - 1;
+            C_backend.thread_domains = build_thread_domain_partition(
+                c_n_rows,
+                thread_domain_max_threads(),
+                [&](int row) { return c_rows[row + 1] - c_rows[row]; });
+        }
         if (exported_nnz > 0 &&
             value_perm.empty() &&
             block_layout == SPARSE_LAYOUT_ROW_MAJOR &&
             C_backend.values.page_count() == 1) {
             auto page = C_backend.page(C->col_ind(), 0);
-            copy_contiguous_export_values(
-                page.values,
-                values + static_cast<size_t>(first) * values_per_block,
-                exported_nnz * values_per_block);
+            const T* src = values + static_cast<size_t>(first) * values_per_block;
+            const auto& c_rows = C->row_ptr();
+            const auto& c_domains = C_backend.thread_domains;
+            #pragma omp parallel for schedule(static)
+            for (int domain = 0; domain < c_domains.thread_count; ++domain) {
+                const size_t begin =
+                    static_cast<size_t>(c_rows[c_domains.domain_begin(domain)]) * values_per_block;
+                const size_t end =
+                    static_cast<size_t>(c_rows[c_domains.domain_end(domain)]) * values_per_block;
+                if (end > begin) {
+                    copy_contiguous_export_values(page.values + begin, src + begin, end - begin);
+                }
+            }
         } else {
             #pragma omp parallel for
             for (int slot = 0; slot < static_cast<int>(exported_nnz); ++slot) {

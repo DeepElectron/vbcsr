@@ -140,27 +140,14 @@ private:
 
         using VBCSRBackendStorage = typename Matrix::VBCSRBackendStorage;
         VBCSRBackendStorage backend(A.configured_page_size());
-        const size_t nnz = C.graph->adj_ind.size();
-        backend.initialize_graph_block_handles(nnz);
-
-        std::map<std::pair<int, int>, std::vector<int>> graph_blocks_by_shape;
-        const int n_rows = static_cast<int>(C.graph->owned_global_indices.size());
-        for (int row = 0; row < n_rows; ++row) {
-            const int row_dim = C.graph->block_sizes[row];
-            for (int graph_block_index = C.graph->adj_ptr[row];
-                 graph_block_index < C.graph->adj_ptr[row + 1];
-                 ++graph_block_index) {
-                const int col = C.graph->adj_ind[graph_block_index];
-                const int col_dim = C.graph->block_sizes[col];
-                graph_blocks_by_shape[std::make_pair(row_dim, col_dim)].push_back(graph_block_index);
-            }
-        }
-
-        for (const auto& [shape, graph_blocks] : graph_blocks_by_shape) {
-            const int shape_id =
-                backend.ensure_shape(shape.first, shape.second, graph_blocks.size());
-            backend.append_blocks_for_shape_uninitialized(shape_id, graph_blocks);
-        }
+        // Shared first-touch structure build: the numeric fill below then
+        // overwrites pages already placed on the threads that later apply
+        // this result (numa_locality_plan.md — operation results).
+        backend.build_first_touch_structure(
+            C.graph->adj_ptr,
+            C.graph->adj_ind,
+            C.graph->block_sizes,
+            static_cast<int>(C.graph->owned_global_indices.size()));
 
         C.attach_backend(std::move(backend));
         return C;

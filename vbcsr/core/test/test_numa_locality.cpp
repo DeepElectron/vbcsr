@@ -225,6 +225,45 @@ int main(int argc, char** argv) {
             assert(mat.matrix_kind() == MatrixKind::VBCSR);
             exercised += check_locality("vbcsr", mat);
         }
+        {
+            // SpGEMM results must be placement-aligned too (workloads apply
+            // C = A*B repeatedly): the value fill is the first touch of the
+            // result's fresh pages and stores a matching partition. Smaller A
+            // so C (~degree^2 fill) still gives several MiB per domain.
+            {
+                const int n_rows = 120000;  // csr: C ~ 100+ MiB
+                std::vector<int> block_sizes(n_rows, 1);
+                DistGraph graph(MPI_COMM_SELF);
+                graph.construct_serial(n_rows, block_sizes, make_adjacency(n_rows));
+                BlockSpMat<double> mat(&graph);
+                mat.fill_random();
+                BlockSpMat<double> product = mat.spmm(mat, 0.0);
+                exercised += check_locality("csr spgemm result", product);
+            }
+            {
+                const int n_rows = 4000;  // bsr 8x8: C ~ 130 MiB
+                std::vector<int> block_sizes(n_rows, 8);
+                DistGraph graph(MPI_COMM_SELF);
+                graph.construct_serial(n_rows, block_sizes, make_adjacency(n_rows));
+                BlockSpMat<double> mat(&graph);
+                mat.fill_random();
+                BlockSpMat<double> product = mat.spmm(mat, 0.0);
+                exercised += check_locality("bsr spgemm result", product);
+            }
+            {
+                const int n_rows = 3000;  // vbcsr mixed: C ~ 150 MiB
+                std::vector<int> block_sizes(n_rows);
+                for (int row = 0; row < n_rows; ++row) {
+                    block_sizes[static_cast<size_t>(row)] = 4 + 4 * (row % 3);
+                }
+                DistGraph graph(MPI_COMM_SELF);
+                graph.construct_serial(n_rows, block_sizes, make_adjacency(n_rows));
+                BlockSpMat<double> mat(&graph);
+                mat.fill_random();
+                BlockSpMat<double> product = mat.spmm(mat, 0.0);
+                exercised += check_locality("vbcsr spgemm result", product);
+            }
+        }
     }
 #endif
 

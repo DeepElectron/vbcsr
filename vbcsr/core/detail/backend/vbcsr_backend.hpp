@@ -180,6 +180,93 @@ struct VBCSRMatrixBackend {
         storage.zero_fill_block_range(shape_id, block_begin, block_end);
     }
 
+    // One-stop first-touch structure build (numa_locality_plan.md stage C;
+    // also used for SpGEMM result matrices): one sweep for shape counts and
+    // per-row scalar work, thread partition, row-ordered uninitialized bulk
+    // appends (a contiguous row domain owns a contiguous block range in every
+    // shape), then each domain's thread zero-fills its own ranges so their
+    // pages land on that thread's NUMA node. Stores the partition so the
+    // forward apply plan splits along the same boundaries. Every block is in
+    // exactly one (shape, domain) range, so the fill covers all payload.
+    void build_first_touch_structure(
+        const std::vector<int>& adj_ptr,
+        const std::vector<int>& adj_ind,
+        const std::vector<int>& block_sizes,
+        int n_rows) {
+        initialize_graph_block_handles(adj_ind.size());
+
+        std::map<std::pair<int, int>, size_t> shape_counts;
+        std::vector<size_t> row_work(static_cast<size_t>(std::max(0, n_rows)), 0);
+        for (int row = 0; row < n_rows; ++row) {
+            const int row_dim = block_sizes[row];
+            for (int slot = adj_ptr[row]; slot < adj_ptr[row + 1]; ++slot) {
+                const int col_dim = block_sizes[adj_ind[slot]];
+                ++shape_counts[std::make_pair(row_dim, col_dim)];
+                row_work[static_cast<size_t>(row)] +=
+                    static_cast<size_t>(row_dim) * static_cast<size_t>(col_dim);
+            }
+        }
+
+        std::map<std::pair<int, int>, int> shape_ids;
+        for (const auto& [shape, count] : shape_counts) {
+            shape_ids[shape] = ensure_shape(shape.first, shape.second, count);
+        }
+        const int shape_count = static_cast<int>(shape_ids.size());
+
+        auto domains = build_thread_domain_partition(
+            n_rows,
+            thread_domain_max_threads(),
+            [&](int row) {
+                return std::max<size_t>(size_t(1), row_work[static_cast<size_t>(row)]);
+            });
+
+        std::vector<std::vector<int>> shape_blocks(static_cast<size_t>(shape_count));
+        for (const auto& [shape, count] : shape_counts) {
+            shape_blocks[static_cast<size_t>(shape_ids[shape])].reserve(count);
+        }
+        std::vector<std::vector<size_t>> shape_domain_offsets(
+            static_cast<size_t>(shape_count),
+            std::vector<size_t>(static_cast<size_t>(domains.thread_count) + 1, 0));
+        std::pair<int, int> cached_shape{-1, -1};
+        int cached_shape_id = -1;
+        for (int domain = 0; domain < domains.thread_count; ++domain) {
+            for (int row = domains.domain_begin(domain);
+                 row < domains.domain_end(domain);
+                 ++row) {
+                const int row_dim = block_sizes[row];
+                for (int slot = adj_ptr[row]; slot < adj_ptr[row + 1]; ++slot) {
+                    const std::pair<int, int> shape{row_dim, block_sizes[adj_ind[slot]]};
+                    if (shape != cached_shape) {
+                        cached_shape = shape;
+                        cached_shape_id = shape_ids.at(shape);
+                    }
+                    shape_blocks[static_cast<size_t>(cached_shape_id)].push_back(slot);
+                }
+            }
+            for (int shape_id = 0; shape_id < shape_count; ++shape_id) {
+                shape_domain_offsets[static_cast<size_t>(shape_id)]
+                                    [static_cast<size_t>(domain) + 1] =
+                    shape_blocks[static_cast<size_t>(shape_id)].size();
+            }
+        }
+
+        for (int shape_id = 0; shape_id < shape_count; ++shape_id) {
+            append_blocks_for_shape_uninitialized(
+                shape_id, shape_blocks[static_cast<size_t>(shape_id)]);
+        }
+        #pragma omp parallel for schedule(static)
+        for (int domain = 0; domain < domains.thread_count; ++domain) {
+            for (int shape_id = 0; shape_id < shape_count; ++shape_id) {
+                const auto& offsets = shape_domain_offsets[static_cast<size_t>(shape_id)];
+                zero_fill_blocks_for_shape(
+                    shape_id,
+                    offsets[static_cast<size_t>(domain)],
+                    offsets[static_cast<size_t>(domain) + 1]);
+            }
+        }
+        set_thread_domains(std::move(domains));
+    }
+
     size_t local_scalar_nnz() const {
         return storage.scalar_value_count();
     }
