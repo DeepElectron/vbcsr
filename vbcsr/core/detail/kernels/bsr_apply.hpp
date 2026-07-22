@@ -325,7 +325,13 @@ decltype(auto) bsr_dispatch_block_size(int block_size, Fn&& fn) {
     }
 }
 
-inline std::pair<int, int> bsr_thread_row_range(int n_rows) {
+// Per-thread row range. Prefers the backend's stored work-balanced partition
+// (one source of truth with storage first-touch placement); a parallel region
+// whose thread count does not match the stored partition falls back to the
+// even row split — correct, just not locality- or balance-optimal.
+inline std::pair<int, int> bsr_thread_row_range(
+    int n_rows,
+    const ThreadDomainPartition& domains) {
 #ifdef _OPENMP
     const int thread_count = omp_get_num_threads();
     const int thread_id = omp_get_thread_num();
@@ -333,8 +339,13 @@ inline std::pair<int, int> bsr_thread_row_range(int n_rows) {
     const int thread_count = 1;
     const int thread_id = 0;
 #endif
-    const int begin = (n_rows * thread_id) / thread_count;
-    const int end = (n_rows * (thread_id + 1)) / thread_count;
+    if (domains.matches(thread_count)) {
+        return {domains.domain_begin(thread_id), domains.domain_end(thread_id)};
+    }
+    const int begin = static_cast<int>(
+        (static_cast<int64_t>(n_rows) * thread_id) / thread_count);
+    const int end = static_cast<int>(
+        (static_cast<int64_t>(n_rows) * (thread_id + 1)) / thread_count);
     return {begin, end};
 }
 
@@ -349,11 +360,12 @@ void bsr_mult_impl(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistVec
     x.sync_ghosts();
 
     const auto& plan = backend.ensure_apply_plan(graph->adj_ptr, graph->adj_ind);
+    const auto& domains = backend.ensure_thread_domains(graph->adj_ptr);
     const int n_rows = graph->adj_ptr.empty() ? 0 : static_cast<int>(graph->adj_ptr.size()) - 1;
 
     #pragma omp parallel
     {
-        const auto [thread_row_begin, thread_row_end] = bsr_thread_row_range(n_rows);
+        const auto [thread_row_begin, thread_row_end] = bsr_thread_row_range(n_rows, domains);
 #ifdef _OPENMP
         const bool last_thread = omp_get_thread_num() == omp_get_num_threads() - 1;
 #else
@@ -427,6 +439,7 @@ void bsr_mult_dense_impl(DistGraph* graph, const BSRMatrixBackend<T>& backend, D
     x.sync_ghosts();
 
     const auto& plan = backend.ensure_apply_plan(graph->adj_ptr, graph->adj_ind);
+    const auto& domains = backend.ensure_thread_domains(graph->adj_ptr);
     const int n_rows = graph->adj_ptr.empty() ? 0 : static_cast<int>(graph->adj_ptr.size()) - 1;
     const int runtime_block_size = backend.block_size;
     const int nv = x.ld;  // padded; pad lanes are zero (invariant)
@@ -435,7 +448,7 @@ void bsr_mult_dense_impl(DistGraph* graph, const BSRMatrixBackend<T>& backend, D
 
     #pragma omp parallel
     {
-        const auto [thread_row_begin, thread_row_end] = bsr_thread_row_range(n_rows);
+        const auto [thread_row_begin, thread_row_end] = bsr_thread_row_range(n_rows, domains);
 #ifdef _OPENMP
         const bool last_thread = omp_get_thread_num() == omp_get_num_threads() - 1;
 #else
@@ -520,6 +533,7 @@ void bsr_mult_adjoint_impl(DistGraph* graph, const BSRMatrixBackend<T>& backend,
     y.bind_to_graph(graph);
 
     const auto& plan = backend.ensure_apply_plan(graph->adj_ptr, graph->adj_ind);
+    const auto& domains = backend.ensure_thread_domains(graph->adj_ptr);
     const int n_rows = graph->adj_ptr.empty() ? 0 : static_cast<int>(graph->adj_ptr.size()) - 1;
     const int thread_count =
 #ifdef _OPENMP
@@ -566,7 +580,7 @@ void bsr_mult_adjoint_impl(DistGraph* graph, const BSRMatrixBackend<T>& backend,
 #endif
         auto& y_local = thread_buffers[static_cast<size_t>(thread_id)];
         y_local.assign(y.data.size(), T(0));
-        const auto [thread_row_begin, thread_row_end] = bsr_thread_row_range(n_rows);
+        const auto [thread_row_begin, thread_row_end] = bsr_thread_row_range(n_rows, domains);
 
         for (const auto& batch_entry : plan.batches) {
             const auto& batch = batch_entry.batch;
@@ -643,6 +657,7 @@ void bsr_mult_dense_adjoint_impl(
     y.bind_to_graph(graph);
 
     const auto& plan = backend.ensure_apply_plan(graph->adj_ptr, graph->adj_ind);
+    const auto& domains = backend.ensure_thread_domains(graph->adj_ptr);
     const int n_rows = graph->adj_ptr.empty() ? 0 : static_cast<int>(graph->adj_ptr.size()) - 1;
     const int runtime_block_size = backend.block_size;
     const int nv = x.ld;
@@ -698,7 +713,7 @@ void bsr_mult_dense_adjoint_impl(
 #endif
         auto& y_local = thread_buffers[static_cast<size_t>(thread_id)];
         y_local.assign(y.data.size(), T(0));
-        const auto [thread_row_begin, thread_row_end] = bsr_thread_row_range(n_rows);
+        const auto [thread_row_begin, thread_row_end] = bsr_thread_row_range(n_rows, domains);
 
         for (const auto& batch_entry : plan.batches) {
             const auto& batch = batch_entry.batch;

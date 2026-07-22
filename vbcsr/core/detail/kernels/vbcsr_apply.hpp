@@ -170,6 +170,25 @@ private:
         return chunks;
     }
 
+    // Prefer the plan's stored thread partition (computed once with the plan;
+    // the future storage first-touch anchor) when the current thread budget
+    // matches it; otherwise fall back to rebuilding dynamic chunks.
+    static std::vector<int> select_forward_chunks(
+        const typename Backend::ForwardApplyPlan& plan) {
+        if (!plan.rows.empty() && plan.thread_domains.matches(max_parallel_threads())) {
+            return plan.thread_domains.row_bounds;
+        }
+        return build_forward_work_chunks(plan);
+    }
+
+    static std::vector<int> select_adjoint_chunks(
+        const typename Backend::AdjointApplyPlan& plan) {
+        if (!plan.columns.empty() && plan.thread_domains.matches(max_parallel_threads())) {
+            return plan.thread_domains.row_bounds;
+        }
+        return build_adjoint_work_chunks(plan);
+    }
+
     static void run_mult_row_direct(
         DistGraph* graph,
         const Backend& backend,
@@ -183,7 +202,7 @@ private:
             n_rows,
             kDirectDenseRowDegreeLimit);
 
-        const auto chunks = build_forward_work_chunks(plan);
+        const auto chunks = select_forward_chunks(plan);
         const int chunk_count = static_cast<int>(chunks.size()) - 1;
         if (chunk_count == 0) {
             std::fill(y.data.begin(), y.data.end(), T(0));
@@ -270,7 +289,7 @@ private:
             n_rows,
             kDirectDenseRowDegreeLimit);
 
-        const auto chunks = build_forward_work_chunks(plan);
+        const auto chunks = select_forward_chunks(plan);
         const int chunk_count = static_cast<int>(chunks.size()) - 1;
         if (chunk_count == 0) {
             std::fill(Y.data.begin(), Y.data.end(), T(0));
@@ -332,7 +351,7 @@ private:
             graph->block_sizes,
             n_rows,
             kDirectDenseRowDegreeLimit);
-        const auto chunks = build_adjoint_work_chunks(plan);
+        const auto chunks = select_adjoint_chunks(plan);
         const int chunk_count = static_cast<int>(chunks.size()) - 1;
         const auto& block_offsets = graph->block_offsets;
         const auto& block_sizes = graph->block_sizes;
@@ -373,7 +392,7 @@ private:
             graph->block_sizes,
             n_rows,
             kDirectDenseRowDegreeLimit);
-        const auto chunks = build_adjoint_work_chunks(plan);
+        const auto chunks = select_adjoint_chunks(plan);
         const int chunk_count = static_cast<int>(chunks.size()) - 1;
         const auto& block_offsets = graph->block_offsets;
         const auto& block_sizes = graph->block_sizes;

@@ -1,8 +1,15 @@
 # NUMA locality: partition-owned storage (design for the next round)
 
-Status: **design accepted, not implemented.** Written 2026-07-20 after the
-scaling study measured the defect. Nothing in the library implements this yet;
-the current behavior is described under "Today" below.
+Status: **stages A and B implemented 2026-07-22** (`ThreadDomainPartition` in
+`detail/backend/thread_domain.hpp`; first-touch structure initializers on the
+CSR/BSR backends, wired in `build_backend_for_structure`). Measured on the
+reference host, BSR at 1 GiB, pinned (`OMP_PROC_BIND=close OMP_PLACES=cores`):
+SpMV 48T 20.8 → 9.9 ms (**2.11×**, ~108 GB/s ≈ the 113 GB/s MPI ceiling; the
+24→48-thread inversion is gone), SpMM 48T 38.1 → 25.8 ms (1.48×); 1T and 24T
+unchanged (A/B-verified against the pre-change binary in the same session).
+Stages C (VBCSR domain×shape tiling) and D (locality invariant test) remain.
+Caveat: array-new for `std::complex` value-initializes, so complex matrices
+keep today's placement; the win applies to trivially-constructible scalars.
 
 ## The defect
 

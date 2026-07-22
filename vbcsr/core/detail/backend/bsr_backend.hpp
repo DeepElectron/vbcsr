@@ -2,6 +2,7 @@
 #define VBCSR_DETAIL_BACKEND_BSR_BACKEND_HPP
 
 #include "backend_common.hpp"
+#include "thread_domain.hpp"
 
 namespace vbcsr::detail {
 
@@ -128,6 +129,11 @@ struct BSRMatrixBackend {
 
     int block_size = 0;
     PagedBuffer<T> values;
+    // Stored thread work split (see thread_domain.hpp): computed once from the
+    // structure — lazily under apply_plan_mutex, or eagerly at construction —
+    // and kept stable so storage first-touch placement stays consistent with
+    // apply access. Cleared with the apply plan on structure changes.
+    mutable ThreadDomainPartition thread_domains;
     mutable std::unique_ptr<BSRApplyPlan<T>> apply_plan;
     mutable std::mutex apply_plan_mutex;
     mutable std::unique_ptr<BSRVendorCache<T>> vendor_cache;
@@ -153,6 +159,7 @@ struct BSRMatrixBackend {
     BSRMatrixBackend(BSRMatrixBackend&& other) noexcept
         : block_size(other.block_size),
           values(std::move(other.values)),
+          thread_domains(std::move(other.thread_domains)),
           configured_blocks_per_page_(other.configured_blocks_per_page_) {
         other.block_size = 0;
         other.configured_blocks_per_page_ = std::numeric_limits<uint32_t>::max();
@@ -165,6 +172,9 @@ struct BSRMatrixBackend {
             values = std::move(other.values);
             configured_blocks_per_page_ = other.configured_blocks_per_page_;
             invalidate_apply_plan();
+            // After the invalidate: the moved-in partition stays valid for the
+            // moved-in structure.
+            thread_domains = std::move(other.thread_domains);
             vendor_launch_count.store(0, std::memory_order_release);
             other.block_size = 0;
             other.configured_blocks_per_page_ = std::numeric_limits<uint32_t>::max();
@@ -222,6 +232,53 @@ struct BSRMatrixBackend {
             normalize_blocks_per_page(blocks_per_page, uniform_block_size);
         invalidate_apply_plan();
         initialize_structure(logical_blocks, uniform_block_size);
+    }
+
+    // Same sizing as initialize_structure(row_ptr.back(), ...), but value
+    // pages are zero-filled inside a parallel region, each domain by the
+    // thread that owns it in the stored partition ("first touch"): on a NUMA
+    // host the OS places each 4 KiB page on the node of the writing thread,
+    // so the blocks a thread later reads in the apply are node-local. For
+    // scalar types whose array-new is not trivial (std::complex), the
+    // allocation itself touches first and placement stays as today.
+    void initialize_structure_first_touch(
+        const std::vector<int>& row_ptr,
+        int uniform_block_size,
+        uint32_t blocks_per_page) {
+        block_size = uniform_block_size;
+        configured_blocks_per_page_ =
+            normalize_blocks_per_page(blocks_per_page, uniform_block_size);
+        const uint64_t logical_blocks =
+            row_ptr.empty() ? 0 : static_cast<uint64_t>(row_ptr.back());
+        const uint32_t page_blocks = logical_blocks == 0
+            ? configured_blocks_per_page_
+            : static_cast<uint32_t>(
+                  std::min<uint64_t>(logical_blocks, configured_blocks_per_page_));
+        values = PagedBuffer<T>(std::max<uint32_t>(
+            page_blocks * static_cast<uint32_t>(values_per_block()),
+            1u));
+        invalidate_apply_plan();
+        values.resize_uninitialized(
+            logical_blocks * static_cast<uint64_t>(values_per_block()));
+
+        const int n_rows = row_ptr.empty() ? 0 : static_cast<int>(row_ptr.size()) - 1;
+        thread_domains = build_thread_domain_partition(
+            n_rows,
+            thread_domain_max_threads(),
+            [&](int row) { return row_ptr[row + 1] - row_ptr[row]; });
+        if (row_ptr.empty()) {
+            return;
+        }
+        const uint64_t block_values = static_cast<uint64_t>(values_per_block());
+        // Static schedule maps domain d to thread d when the team is full; a
+        // smaller team still zeroes every element (multiple domains per
+        // thread), only losing locality.
+        #pragma omp parallel for schedule(static)
+        for (int domain = 0; domain < thread_domains.thread_count; ++domain) {
+            values.zero_fill_range(
+                static_cast<uint64_t>(row_ptr[thread_domains.domain_begin(domain)]) * block_values,
+                static_cast<uint64_t>(row_ptr[thread_domains.domain_end(domain)]) * block_values);
+        }
     }
 
     void initialize_structure_for_complete_overwrite(
@@ -307,6 +364,24 @@ struct BSRMatrixBackend {
             block_value_count,
             page_index,
             first_block};
+    }
+
+    // Stored thread work split, weighted by row nnz. Computed once; kept
+    // stable across applies so (stage B) storage placement first-touched
+    // against it stays consistent. A parallel region with a different thread
+    // count falls back to the dynamic split (see bsr_thread_row_range).
+    const ThreadDomainPartition& ensure_thread_domains(
+        const std::vector<int>& row_ptr) const {
+        std::lock_guard<std::mutex> lock(apply_plan_mutex);
+        if (thread_domains.empty()) {
+            const int n_rows =
+                row_ptr.empty() ? 0 : static_cast<int>(row_ptr.size()) - 1;
+            thread_domains = build_thread_domain_partition(
+                n_rows,
+                thread_domain_max_threads(),
+                [&](int row) { return row_ptr[row + 1] - row_ptr[row]; });
+        }
+        return thread_domains;
     }
 
     const BSRApplyPlan<T>& ensure_apply_plan(
@@ -403,6 +478,7 @@ private:
         {
             std::lock_guard<std::mutex> lock(apply_plan_mutex);
             apply_plan.reset();
+            thread_domains = ThreadDomainPartition{};
         }
         invalidate_vendor_cache();
     }

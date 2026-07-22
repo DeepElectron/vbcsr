@@ -2,6 +2,7 @@
 #define VBCSR_DETAIL_BACKEND_CSR_BACKEND_HPP
 
 #include "backend_common.hpp"
+#include "thread_domain.hpp"
 
 namespace vbcsr::detail {
 
@@ -41,6 +42,10 @@ struct CSRMatrixBackend {
     }
 
     PagedBuffer<T> values;
+    // Stored thread work split (see thread_domain.hpp). Set by the
+    // first-touch structure initializer so value-page placement matches it;
+    // empty for backends built through the other initializers.
+    ThreadDomainPartition thread_domains;
     // Lazily-built vendor cache used by benchmarks and vendor dispatch paths.
     mutable std::unique_ptr<CSRVendorCache<T>> vendor_cache;
     mutable std::mutex vendor_cache_mutex;
@@ -60,6 +65,7 @@ struct CSRMatrixBackend {
 
     CSRMatrixBackend(CSRMatrixBackend&& other) noexcept
         : values(std::move(other.values)),
+          thread_domains(std::move(other.thread_domains)),
           configured_page_size_(other.configured_page_size_) {
         other.vendor_launch_count.store(0, std::memory_order_release);
         other.configured_page_size_ = max_page_size();
@@ -68,6 +74,7 @@ struct CSRMatrixBackend {
     CSRMatrixBackend& operator=(CSRMatrixBackend&& other) noexcept {
         if (this != &other) {
             values = std::move(other.values);
+            thread_domains = std::move(other.thread_domains);
             configured_page_size_ = other.configured_page_size_;
             invalidate_vendor_cache();
             vendor_launch_count.store(0, std::memory_order_release);
@@ -98,8 +105,48 @@ struct CSRMatrixBackend {
             ? configured_page_size_
             : static_cast<uint32_t>(std::min<uint64_t>(logical_nnz, configured_page_size_));
         values = PagedBuffer<T>(page_size);
+        thread_domains = ThreadDomainPartition{};
         invalidate_vendor_cache();
         values.resize(logical_nnz);
+    }
+
+    // Same sizing as initialize_structure(row_ptr.back()), but value pages
+    // are zero-filled inside a parallel region, each domain by the thread
+    // that owns it in the stored partition ("first touch"): on a NUMA host
+    // the OS places each 4 KiB page on the node of the writing thread, so
+    // the values a thread later reads in the apply are node-local. For
+    // scalar types whose array-new is not trivial (std::complex), the
+    // allocation itself touches first and placement stays as today.
+    void initialize_structure_first_touch(
+        const std::vector<int>& row_ptr,
+        uint32_t page_size) {
+        const uint64_t logical_nnz =
+            row_ptr.empty() ? 0 : static_cast<uint64_t>(row_ptr.back());
+        configured_page_size_ = normalize_page_size(page_size);
+        const uint32_t active_page_size = logical_nnz == 0
+            ? configured_page_size_
+            : static_cast<uint32_t>(std::min<uint64_t>(logical_nnz, configured_page_size_));
+        values = PagedBuffer<T>(active_page_size);
+        invalidate_vendor_cache();
+        values.resize_uninitialized(logical_nnz);
+
+        const int n_rows = row_ptr.empty() ? 0 : static_cast<int>(row_ptr.size()) - 1;
+        thread_domains = build_thread_domain_partition(
+            n_rows,
+            thread_domain_max_threads(),
+            [&](int row) { return row_ptr[row + 1] - row_ptr[row]; });
+        if (row_ptr.empty()) {
+            return;
+        }
+        // Static schedule maps domain d to thread d when the team is full; a
+        // smaller team still zeroes every element (multiple domains per
+        // thread), only losing locality.
+        #pragma omp parallel for schedule(static)
+        for (int domain = 0; domain < thread_domains.thread_count; ++domain) {
+            values.zero_fill_range(
+                static_cast<uint64_t>(row_ptr[thread_domains.domain_begin(domain)]),
+                static_cast<uint64_t>(row_ptr[thread_domains.domain_end(domain)]));
+        }
     }
 
     void initialize_structure(uint64_t logical_nnz, uint32_t page_size) {

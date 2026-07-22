@@ -2,6 +2,7 @@
 #define VBCSR_DETAIL_BACKEND_VBCSR_BACKEND_HPP
 
 #include "backend_common.hpp"
+#include "thread_domain.hpp"
 
 namespace vbcsr::detail {
 
@@ -83,6 +84,10 @@ struct VBCSRForwardApplyPlan {
     int max_row_dim = 0;
     size_t total_work = 0;
     std::vector<VBCSRForwardRowTask> rows;
+    // Stored work-balanced thread split over `rows`, computed once with the
+    // plan (see thread_domain.hpp). Applies whose parallel region matches its
+    // thread count use it directly; otherwise they rebuild dynamic chunks.
+    ThreadDomainPartition thread_domains;
 };
 
 struct VBCSRAdjointColumnTask {
@@ -103,6 +108,9 @@ struct VBCSRAdjointApplyPlan {
     std::vector<int> incoming_slots;
     std::vector<int> incoming_rows;
     std::vector<VBCSRAdjointColumnTask> columns;
+    // Stored work-balanced thread split over `columns` (see
+    // VBCSRForwardApplyPlan::thread_domains).
+    ThreadDomainPartition thread_domains;
 };
 
 template <typename T>
@@ -312,6 +320,13 @@ struct VBCSRMatrixBackend {
                     block_degree > direct_dense_row_degree_limit,
                     row_work});
             }
+            plan->thread_domains = build_thread_domain_partition(
+                n_rows,
+                thread_domain_max_threads(),
+                [&](int row) {
+                    return std::max<size_t>(
+                        size_t(1), plan->rows[static_cast<size_t>(row)].work);
+                });
             forward_apply_plan = std::move(plan);
         }
         return *forward_apply_plan;
@@ -385,6 +400,13 @@ struct VBCSRMatrixBackend {
                     incoming_degree > direct_dense_col_degree_limit,
                     col_work});
             }
+            plan->thread_domains = build_thread_domain_partition(
+                block_count,
+                thread_domain_max_threads(),
+                [&](int col) {
+                    return std::max<size_t>(
+                        size_t(1), plan->columns[static_cast<size_t>(col)].work);
+                });
             adjoint_apply_plan = std::move(plan);
         }
         return *adjoint_apply_plan;

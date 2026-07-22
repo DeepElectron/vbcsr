@@ -2173,7 +2173,10 @@ typename BlockSpMat<T>::BackendHandle BlockSpMat<T>::build_backend_for_structure
     switch (matrix_kind) {
     case MatrixKind::CSR: {
         CSRBackendStorage backend;
-        backend.initialize_structure(graph->adj_ind.size(), normalized);
+        // First-touch initializer: value pages are zeroed by the thread that
+        // owns them in the stored thread partition, so on NUMA hosts page
+        // placement matches apply access (doc/numa_locality_plan.md stage B).
+        backend.initialize_structure_first_touch(graph->adj_ptr, normalized);
         return BackendHandle(
             std::in_place_type<CSRBackendStorage>,
             std::move(backend));
@@ -2194,7 +2197,8 @@ typename BlockSpMat<T>::BackendHandle BlockSpMat<T>::build_backend_for_structure
         }
 
         BSRBackendStorage backend;
-        backend.initialize_structure(graph->adj_ind.size(), block_size, normalized);
+        // First-touch initializer: see the CSR branch above.
+        backend.initialize_structure_first_touch(graph->adj_ptr, block_size, normalized);
         return BackendHandle(
             std::in_place_type<BSRBackendStorage>,
             std::move(backend));
