@@ -308,17 +308,15 @@ private:
 
         #pragma omp parallel for schedule(static)
         for (int chunk = 0; chunk < chunk_count; ++chunk) {
-            // Same in-region per-chunk zeroing as the SpMV path above
-            // (row offsets scaled by the padded ld).
-            {
-                const int row_begin = chunks[static_cast<size_t>(chunk)];
-                const int row_end = chunks[static_cast<size_t>(chunk) + 1];
-                const size_t zero_begin =
-                    static_cast<size_t>(block_offsets[row_begin]) * y_ld;
-                const size_t zero_end = chunk == chunk_count - 1
-                    ? y_size
-                    : static_cast<size_t>(block_offsets[row_end]) * y_ld;
-                std::fill(y_data + zero_begin, y_data + zero_end, T(0));
+            // No bulk Y zeroing: each row task zeroes its own segment
+            // in-cache just before accumulating (a whole row is one task, so
+            // no cross-task ordering exists), saving a streaming pass over Y
+            // (~10% of SpMM traffic at rhs=16). Only the ghost tail needs an
+            // explicit fill.
+            if (chunk == chunk_count - 1) {
+                const size_t tail_begin =
+                    static_cast<size_t>(block_offsets[n_rows]) * y_ld;
+                std::fill(y_data + tail_begin, y_data + y_size, T(0));
             }
             for (int task_index = chunks[static_cast<size_t>(chunk)];
                  task_index < chunks[static_cast<size_t>(chunk) + 1];
@@ -327,6 +325,7 @@ private:
                 const int row = task.row;
                 const int row_dim = task.row_dim;
                 T* y_rows = y_data + static_cast<size_t>(block_offsets[row]) * y_ld;
+                std::fill(y_rows, y_rows + static_cast<size_t>(row_dim) * y_ld, T(0));
                 for (int slot = task.block_begin; slot < task.block_end; ++slot) {
                     const int col = col_ind[slot];
                     rowmajor_kernels::rm_gemm<T>(
