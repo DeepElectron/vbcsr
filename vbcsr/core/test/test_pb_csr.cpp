@@ -41,11 +41,12 @@ void fill_random(std::vector<double>& v, int seed) {
     for (size_t i = 0; i < v.size(); ++i) v[i] = (double)i * 0.1;
 }
 
+template <typename XVec>
 std::vector<double> dense_matvec(
     const std::vector<double>& A,
     int rows,
     int cols,
-    const std::vector<double>& x) {
+    const XVec& x) {
     std::vector<double> y(rows, 0.0);
     for (int row = 0; row < rows; ++row) {
         for (int col = 0; col < cols; ++col) {
@@ -55,11 +56,12 @@ std::vector<double> dense_matvec(
     return y;
 }
 
+template <typename XVec>
 std::vector<double> dense_matvec_transpose(
     const std::vector<double>& A,
     int rows,
     int cols,
-    const std::vector<double>& x) {
+    const XVec& x) {
     std::vector<double> y(cols, 0.0);
     for (int row = 0; row < rows; ++row) {
         for (int col = 0; col < cols; ++col) {
@@ -140,12 +142,12 @@ std::complex<T> conjugate_if_needed(const std::complex<T>& value) {
     return std::conj(value);
 }
 
-template <typename T>
+template <typename T, typename XVec>
 std::vector<T> dense_matvec_adjoint_generic(
     const std::vector<T>& A,
     int rows,
     int cols,
-    const std::vector<T>& x) {
+    const XVec& x) {
     std::vector<T> y(cols, T(0));
     for (int row = 0; row < rows; ++row) {
         for (int col = 0; col < cols; ++col) {
@@ -155,12 +157,12 @@ std::vector<T> dense_matvec_adjoint_generic(
     return y;
 }
 
-template <typename T>
+template <typename T, typename XVec>
 std::vector<T> dense_matvec_generic(
     const std::vector<T>& A,
     int rows,
     int cols,
-    const std::vector<T>& x) {
+    const XVec& x) {
     std::vector<T> y(rows, T(0));
     for (int row = 0; row < rows; ++row) {
         for (int col = 0; col < cols; ++col) {
@@ -322,12 +324,12 @@ std::vector<T> dense_conjugated(const std::vector<T>& A) {
     return out;
 }
 
-template <typename T>
+template <typename T, typename DiagVec>
 std::vector<T> dense_commutator_diagonal(
     const std::vector<T>& A,
     int rows,
     int cols,
-    const std::vector<T>& diag) {
+    const DiagVec& diag) {
     std::vector<T> out(A.size(), T(0));
     for (int row = 0; row < rows; ++row) {
         for (int col = 0; col < cols; ++col) {
@@ -485,7 +487,7 @@ BlockSpMat<T> build_generated_matrix_via_backend(
 }
 
 template <typename T>
-void fill_generated_vector(std::vector<T>& data, double base_shift) {
+void fill_generated_vector(vbcsr::detail::NumaVector<T>& data, double base_shift) {
     for (size_t idx = 0; idx < data.size(); ++idx) {
         const double real = base_shift + 0.17 * static_cast<double>(idx + 1);
         const double imag = -0.11 * static_cast<double>(idx + 1);
@@ -493,12 +495,13 @@ void fill_generated_vector(std::vector<T>& data, double base_shift) {
     }
 }
 
-template <typename T>
+template <typename Vec>
 void fill_generated_multivector(
-    std::vector<T>& data,
+    Vec& data,
     int ld,
     int num_vecs,
     double base_shift) {
+    using T = typename Vec::value_type;
     for (int vec = 0; vec < num_vecs; ++vec) {
         for (int row = 0; row < ld; ++row) {
             const double real = base_shift + 0.09 * (vec + 1) + 0.13 * (row + 1);

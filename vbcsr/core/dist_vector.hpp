@@ -2,6 +2,11 @@
 #define VBCSR_DIST_VECTOR_HPP
 
 #include "dist_graph.hpp"
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+#include "detail/storage/numa_buffer.hpp"
 #include <vector>
 #include <cassert>
 #include <cstring>
@@ -17,7 +22,10 @@ template <typename T>
 class DistVector {
 public:
     DistGraph* graph;
-    std::vector<T> data; // Owned + Ghosts
+    // Owned + Ghosts. NumaVector, not std::vector: pages are first-touched by
+    // an even parallel split so streaming applies use both sockets' memory
+    // controllers (see detail/storage/numa_buffer.hpp).
+    detail::NumaVector<T> data;
     int local_size;
     int ghost_size;
 
@@ -115,14 +123,26 @@ public:
 
     void set_random_normal(bool normalize = true) {
         std::random_device rd;
-        std::mt19937 gen(rd());
-        std::normal_distribution<double> d(0.0, 1.0);
-        
-        for (int i = 0; i < local_size; ++i) {
-            if constexpr (std::is_same<T, std::complex<double>>::value) {
-                data[i] = std::complex<double>(d(gen), d(gen));
-            } else {
-                data[i] = (T)d(gen);
+        const unsigned base_seed = rd();
+        #pragma omp parallel
+        {
+            // Per-thread generator (a shared engine would race); each thread
+            // fills its static slice.
+            std::mt19937 gen(base_seed + 0x9e3779b9u *
+#ifdef _OPENMP
+                static_cast<unsigned>(omp_get_thread_num())
+#else
+                0u
+#endif
+            );
+            std::normal_distribution<double> d(0.0, 1.0);
+            #pragma omp for schedule(static)
+            for (int i = 0; i < local_size; ++i) {
+                if constexpr (std::is_same<T, std::complex<double>>::value) {
+                    data[i] = std::complex<double>(d(gen), d(gen));
+                } else {
+                    data[i] = (T)d(gen);
+                }
             }
         }
         

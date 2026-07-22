@@ -1272,7 +1272,7 @@ public:
         }
         result.norms_valid = false;
 
-        const std::vector<T>& R = diag.data; // Includes ghosts
+        const auto& R = diag.data; // Includes ghosts
         
         int n_rows = graph->adj_ptr.size() - 1;
         

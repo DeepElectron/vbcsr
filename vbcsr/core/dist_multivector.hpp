@@ -2,6 +2,10 @@
 #define VBCSR_DIST_MULTIVECTOR_HPP
 
 #include "dist_graph.hpp"
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include "dist_vector.hpp"
 #include <vector>
 #include <cassert>
@@ -34,7 +38,10 @@ public:
     int num_vectors;
     // Padded leading dimension in elements (>= num_vectors).
     int ld;
-    std::vector<T> data; // Row-major: (local_rows + ghost_rows) x ld
+    // Row-major: (local_rows + ghost_rows) x ld. NumaVector, not std::vector:
+    // at rhs=16 this buffer rivals the matrix in bytes streamed per apply, so
+    // its pages must spread across NUMA nodes too (numa_buffer.hpp).
+    detail::NumaVector<T> data;
     int local_rows;
     int ghost_rows;
 
@@ -251,18 +258,30 @@ public:
 
     void set_random_normal(bool normalize = true) {
         std::random_device rd;
-        std::mt19937 gen(rd());
-        std::normal_distribution<double> d(0.0, 1.0);
-
-        // Fill only the real lanes: padding must stay zero.
+        const unsigned base_seed = rd();
         const int total_rows = local_rows + ghost_rows;
-        for (int row = 0; row < total_rows; ++row) {
-            T* r = row_data(row);
-            for (int v = 0; v < num_vectors; ++v) {
-                if constexpr (std::is_same<T, std::complex<double>>::value) {
-                    r[v] = std::complex<double>(d(gen), d(gen));
-                } else {
-                    r[v] = (T)d(gen);
+        #pragma omp parallel
+        {
+            // Per-thread generator (a shared engine would race); each thread
+            // fills its static row slice. Fill only the real lanes: padding
+            // must stay zero.
+            std::mt19937 gen(base_seed + 0x9e3779b9u *
+#ifdef _OPENMP
+                static_cast<unsigned>(omp_get_thread_num())
+#else
+                0u
+#endif
+            );
+            std::normal_distribution<double> d(0.0, 1.0);
+            #pragma omp for schedule(static)
+            for (int row = 0; row < total_rows; ++row) {
+                T* r = row_data(row);
+                for (int v = 0; v < num_vectors; ++v) {
+                    if constexpr (std::is_same<T, std::complex<double>>::value) {
+                        r[v] = std::complex<double>(d(gen), d(gen));
+                    } else {
+                        r[v] = (T)d(gen);
+                    }
                 }
             }
         }
