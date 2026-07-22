@@ -389,6 +389,107 @@ public:
         build_comm_pattern(displ);
     }
 
+    // Build this graph directly from rank-local CSR arrays whose column indices
+    // are already in this graph's final local space: owned rows [0, n_owned)
+    // followed by `my_ghosts` in the given order.
+    //
+    // This is the bulk path for operation results (SpGEMM) whose structure is
+    // exported from a vendor kernel: the caller holds the local adjacency as
+    // flat arrays plus every ghost's block size, so the general
+    // construct_distributed — which re-derives ghosts from a global-column
+    // adjacency, re-sorts every row, fetches ghost sizes over MPI and
+    // allgathers the partition — would rebuild information the caller already
+    // has. The only collective work left here is the send/recv pattern.
+    //
+    // Contract:
+    //  - my_owned_indices sorted ascending; my_displs is the global block
+    //    partition consistent with them.
+    //  - my_ghosts sorted by (owner rank, gid) — the sync_ghosts zero-copy
+    //    convention — without duplicates or owned gids; my_ghost_sizes runs
+    //    parallel to it.
+    //  - local_adj_ptr / local_adj_ind form a CSR over n_owned rows with
+    //    column ids in [0, n_owned + my_ghosts.size()). Rows need not have
+    //    sorted columns (the library contract does not require it).
+    void construct_from_local_csr(const std::vector<int>& my_owned_indices,
+                                  const std::vector<int>& my_owned_sizes,
+                                  const std::vector<int>& my_ghosts,
+                                  const std::vector<int>& my_ghost_sizes,
+                                  const std::vector<int>& my_displs,
+                                  std::vector<int>&& local_adj_ptr,
+                                  std::vector<int>&& local_adj_ind) {
+        const int n_owned = static_cast<int>(my_owned_indices.size());
+        const int n_ghosts = static_cast<int>(my_ghosts.size());
+        if (!std::is_sorted(my_owned_indices.begin(), my_owned_indices.end())) {
+            throw std::runtime_error("construct_from_local_csr requires sorted owned_global_indices");
+        }
+        if (static_cast<int>(my_owned_sizes.size()) != n_owned ||
+            static_cast<int>(my_ghost_sizes.size()) != n_ghosts ||
+            static_cast<int>(my_displs.size()) != size + 1 ||
+            my_displs[rank + 1] - my_displs[rank] != n_owned) {
+            throw std::runtime_error("construct_from_local_csr: inconsistent inputs");
+        }
+        if (static_cast<int>(local_adj_ptr.size()) != n_owned + 1 ||
+            (n_owned > 0 && local_adj_ptr.front() != 0) ||
+            local_adj_ptr.back() != static_cast<int>(local_adj_ind.size())) {
+            throw std::runtime_error("construct_from_local_csr: malformed adjacency");
+        }
+        const int n_local = n_owned + n_ghosts;
+        for (const int col : local_adj_ind) {
+            if (col < 0 || col >= n_local) {
+                throw std::runtime_error("construct_from_local_csr: column index out of range");
+            }
+        }
+        for (int i = 0; i + 1 < n_ghosts; ++i) {
+            const int owner_a = find_owner(my_ghosts[i], my_displs);
+            const int owner_b = find_owner(my_ghosts[i + 1], my_displs);
+            if (owner_a > owner_b ||
+                (owner_a == owner_b && my_ghosts[i] >= my_ghosts[i + 1])) {
+                throw std::runtime_error("construct_from_local_csr: ghosts not sorted by (owner, gid)");
+            }
+        }
+
+        owned_global_indices = my_owned_indices;
+        block_displs = my_displs;
+        ghost_global_indices = my_ghosts;
+
+        global_to_local.clear();
+        global_to_local.reserve(static_cast<size_t>(n_local));
+        for (int i = 0; i < n_owned; ++i) {
+            global_to_local[owned_global_indices[i]] = i;
+        }
+        for (int i = 0; i < n_ghosts; ++i) {
+            global_to_local[my_ghosts[i]] = n_owned + i;
+        }
+
+        block_sizes = my_owned_sizes;
+        block_sizes.insert(block_sizes.end(), my_ghost_sizes.begin(), my_ghost_sizes.end());
+
+        adj_ptr = std::move(local_adj_ptr);
+        adj_ind = std::move(local_adj_ind);
+
+        if (comm == MPI_COMM_NULL || size == 1) {
+            block_offsets.resize(block_sizes.size() + 1);
+            block_offsets[0] = 0;
+            for (size_t i = 0; i < block_sizes.size(); ++i) {
+                block_offsets[i + 1] = block_offsets[i] + block_sizes[i];
+            }
+            send_counts.assign(size, 0);
+            recv_counts.assign(size, 0);
+            send_indices.clear();
+            recv_indices.clear();
+            send_displs.assign(static_cast<size_t>(size) + 1, 0);
+            recv_displs.assign(static_cast<size_t>(size) + 1, 0);
+            send_ranks.clear();
+            recv_ranks.clear();
+            send_counts_scalar.assign(size, 0);
+            recv_counts_scalar.assign(size, 0);
+            send_displs_scalar.assign(static_cast<size_t>(size) + 1, 0);
+            recv_displs_scalar.assign(static_cast<size_t>(size) + 1, 0);
+        } else {
+            build_comm_pattern(block_displs);
+        }
+    }
+
     void get_matrix_structure(std::vector<int>& row_ptr, std::vector<int>& col_ind) const {
         row_ptr = adj_ptr;
         col_ind = adj_ind;

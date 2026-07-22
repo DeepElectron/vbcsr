@@ -28,6 +28,47 @@ the same rule `std::unordered_map` has for rehash.
 Rank-keyed maps (e.g. `ghosts_by_rank`) stay `std::map`: their ordered
 iteration is what makes ghost ordering deterministic across ranks.
 
+### Distributed CSR SpGEMM: the fused wrap path
+
+The distributed CSR SpGEMM (`CSRSpMMExecutor::run_generic`) runs a **fused
+wrap** by default — the distributed generalization of the serial
+`run_mkl_serial` wrap, so serial and distributed are one algorithm:
+
+1. Build one extended operand `B_ext = [B's owned rows ; one row per A-ghost]`.
+   The ghost rows are laid out **in A's ghost order** (`ghost_global_indices`),
+   with an empty row where nothing was fetched. Because A's local column ids
+   are owned-first then owner-sorted ghosts, A's own CSR arrays then index
+   `B_ext`'s rows verbatim: **A passes to the vendor zero-copy**
+   (`full_mkl_batch(A)`). `B_ext`'s columns reuse **B's local column space**
+   plus a small tail for ghost-row columns that are not B blocks, so the
+   B-owned portion is two `memcpy`s.
+2. One `mkl_sparse_spmm(A, B_ext)` performs the owned+ghost merge internally.
+3. The exported CSR is **wrapped as the result**: used ghost columns are
+   compressed and merged into the (owner, gid) convention (B's ghosts are
+   already so ordered; only the surface-sized extras are sorted), column ids
+   are remapped in one linear pass, values copy in vendor order, and
+   `DistGraph::construct_from_local_csr` adopts the arrays. Ghost block sizes
+   and the partition are already known locally, so the only collective in
+   result construction is `build_comm_pattern`.
+
+**Collective-uniformity invariant.** The wrap and the fallback hash path
+execute *different MPI collective sequences* while building the result graph.
+The branch is therefore decided by a global vote (`MPI_Allreduce(MIN)` over
+each rank's local eligibility); after a unanimous vote the wrap must not fall
+back — vendor failures throw. Never add a per-rank early-return to this path.
+
+Eligibility: MKL scalar type, single-page operands, unsorted-output mode, and
+A/B sharing the ownership partition. Anything else takes the native hash path.
+Opt out globally with `VBCSR_FUSED_DIST_SPGEMM=0`. Profile either path with
+`VBCSR_PROFILE_CSR_DIST_SPGEMM=1`.
+
+`threshold > 0` follows the **serial MKL semantics**: the vendor product is
+exact, then entries with `|value| < threshold` are dropped in a compaction
+pass before the result graph is built — so thresholded CSR results are
+identical at every rank count. The hash path keeps the legacy per-product
+`row_eps` drop (its results can differ from the serial/fused ones within the
+threshold bound); it is only reached via opt-out or ineligibility.
+
 ### Ghost Index Convention: "Sort by Owner"
 
 In a distributed graph, local indices are assigned as follows:
@@ -81,6 +122,7 @@ The old column-major kernel family (`NaiveKernel`, `TinyBlockKernel`, `FixedBloc
 ### Runtime and Build Knobs
 
 -   `VBCSR_BSR_VENDOR=1` (legacy alias: `VBCSR_BSR_DENSE_VENDOR`): route BSR SpMV and dense applies through the MKL vendor paths. The default is the native path, which measured faster. MKL BSR quirk: `mm` with a row-major dense operand supports exactly the (row-major blocks, zero-based indexing) and (column-major blocks, one-based indexing) pairings — the other two combinations fail at apply time.
+-   `VBCSR_FUSED_DIST_SPGEMM=0`: opt out of the fused distributed CSR SpGEMM wrap (see §Distributed CSR SpGEMM) and use the native hash-accumulation path. Default is on.
 -   `VBCSR_SPGEMM_SORTED=1`: make MKL-path SpGEMM emit sorted column indices per row. The default keeps the vendor export order: no library consumer needs a matrix's own adjacency sorted (audited during the migration), and `to_scipy` sorts on the scipy side.
 -   Build options: `VBCSR_ARCH=native|avx2|none` selects the ISA flags; `VBCSR_SANITIZE=address|undefined` enables sanitizer builds.
 

@@ -619,6 +619,419 @@ private:
         return required;
     }
 
+#ifdef VBCSR_HAVE_MKL_SPARSE
+    // Default-on switch for the fused distributed path below. Opt out with
+    // VBCSR_FUSED_DIST_SPGEMM=0 (any other value, or unset, means enabled);
+    // the opt-out falls back to the native hash-accumulation path.
+    static bool fused_distributed_enabled() {
+        const char* value = std::getenv("VBCSR_FUSED_DIST_SPGEMM");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }
+
+    // Fused distributed CSR SpGEMM: one vendor multiply, then wrap the vendor
+    // output as the result -- the distributed generalization of run_mkl_serial.
+    //
+    // The hash path below hands the owned-block product to MKL
+    // (compute_local_product_mkl) but then re-inserts every output nonzero into
+    // a per-row hash table, rebuilds a global-column adjacency, and reconstructs
+    // the result graph from scratch (construct_distributed re-sorts rows,
+    // re-derives ghosts, fetches ghost sizes over MPI). Profiling put those
+    // accum/graph/fill phases at ~87% of the whole distributed multiply. This
+    // routine instead:
+    //   1. forms one extended operand B_ext = [ B's owned rows ; fetched ghost
+    //      rows ] in B's own local column space (plus a small tail for ghost-row
+    //      columns that are not B blocks), so owned rows copy through verbatim;
+    //   2. issues a single mkl_sparse_spmm(A_ext, B_ext) -- MKL performs the
+    //      owned+ghost merge internally;
+    //   3. wraps the exported CSR directly: the used ghost columns are
+    //      compressed and merged into the (owner, gid)-sorted convention, column
+    //      ids are remapped in one linear pass, and
+    //      DistGraph::construct_from_local_csr adopts the arrays. Ghost block
+    //      sizes are already local (B's graph plus ghost_blocks.sizes), so the
+    //      only collective left is the comm pattern. Values copy in vendor
+    //      order, exactly like the serial wrap (per-row sorted columns are not a
+    //      library invariant).
+    //
+    // Eligibility is decided by the caller with a global vote (see run_generic):
+    // this path and the hash path execute different MPI collectives while
+    // building the result graph, so the branch must be uniform across ranks.
+    // After a unanimous vote there is no fallback -- vendor failures throw.
+    // The caller guarantees: unsorted-output mode, MKL scalar type,
+    // single-page operands, and A/B sharing the ownership partition (which
+    // makes every owned inner an owned B row and makes C's owned column ids
+    // coincide with B's).
+    //
+    // threshold > 0 follows the serial MKL semantics: the vendor product is
+    // exact, then entries with |value| < threshold are dropped in a compaction
+    // pass before the result graph is built. This makes thresholded results
+    // identical across rank counts (the hash path's per-product norm drops
+    // remain only in the opt-out/fallback path).
+    static Matrix run_fused_distributed(
+        const Matrix& A,
+        const Matrix& B,
+        double threshold,
+        const SpMMGhostBlocks<T>& ghost_blocks,
+        bool profile,
+        double meta_seconds,
+        double fetch_seconds,
+        double ghost_seconds) {
+        auto stamp = [] { return std::chrono::steady_clock::now(); };
+        const auto t_begin = stamp();
+
+        const int n_rows = static_cast<int>(A.row_ptr().size()) - 1;
+        const int b_rows = static_cast<int>(B.row_ptr().size()) - 1;
+        const int n_owned = n_rows;  // == b_rows under the caller's partition guard
+
+        // B_ext row layout: owned B rows [0, b_rows) followed by ONE ROW PER
+        // A-GHOST, in A's ghost order. A's local column space is owned ids
+        // [0, n_owned) followed by its (owner, gid)-sorted ghosts, so with this
+        // layout every column id already stored in A points at exactly the
+        // right B_ext row: A's arrays pass to the vendor verbatim
+        // (full_mkl_batch(A)), and no A_ext is built at all. A-ghosts with no
+        // fetched blocks (their B row is structurally empty) become empty
+        // B_ext rows, which contribute nothing -- semantically identical to
+        // skipping them. The fetched set is derived from A's columns, so it is
+        // always a subset of A's ghost list and this directory is total.
+        const auto& a_ghosts = A.graph->ghost_global_indices;
+        const int n_a_ghosts = static_cast<int>(a_ghosts.size());
+        const int ext_rows = b_rows + n_a_ghosts;
+
+        // Column space: reuse B's own local column space [0, b_cols) for the owned
+        // rows verbatim -- no per-entry remap, so those rows copy straight through --
+        // and extend it only for ghost-row columns that are not already B blocks. B's
+        // local space is per-rank bounded (owned + B's ghosts), so MKL's accumulator
+        // stays sized to this rank's columns, not the global block count.
+        const int b_cols = static_cast<int>(B.graph->block_sizes.size());
+        std::vector<int> extra_to_global;   // ext column (>= b_cols) -> global
+        std::map<int, int> extra_index;     // global -> ext column, ghost-only columns
+        auto column_index = [&](int global_col) -> int {
+            const auto it = B.graph->global_to_local.find(global_col);
+            if (it != B.graph->global_to_local.end()) {
+                return it->second;  // an existing B block (owned or B's own ghost)
+            }
+            const auto ins = extra_index.emplace(
+                global_col, b_cols + static_cast<int>(extra_to_global.size()));
+            if (ins.second) {
+                extra_to_global.push_back(global_col);
+            }
+            return ins.first->second;
+        };
+
+        // B_ext CSR. Owned counts equal B's own row pointer, so after the prefix
+        // sum the owned prefix of b_ext_row_ptr coincides with B.row_ptr() and
+        // the owned columns/values copy as two flat memcpys -- B's columns are
+        // already in this space by construction.
+        std::vector<int> b_ext_row_ptr(static_cast<size_t>(ext_rows) + 1, 0);
+        for (int row = 0; row < b_rows; ++row) {
+            b_ext_row_ptr[static_cast<size_t>(row) + 1] =
+                B.row_ptr()[row + 1] - B.row_ptr()[row];
+        }
+        for (int t = 0; t < n_a_ghosts; ++t) {
+            const auto it = ghost_blocks.rows.find(a_ghosts[static_cast<size_t>(t)]);
+            b_ext_row_ptr[static_cast<size_t>(b_rows + t) + 1] =
+                it != ghost_blocks.rows.end() ? static_cast<int>(it->second.size()) : 0;
+        }
+        for (int row = 0; row < ext_rows; ++row) {
+            b_ext_row_ptr[static_cast<size_t>(row) + 1] += b_ext_row_ptr[static_cast<size_t>(row)];
+        }
+        const size_t b_owned_nnz = B.col_ind().size();
+        const size_t b_ext_nnz = static_cast<size_t>(b_ext_row_ptr[ext_rows]);
+        std::vector<int> b_ext_cols(b_ext_nnz);
+        std::vector<T> b_ext_vals(b_ext_nnz);
+        if (b_owned_nnz > 0) {
+            const CSRPageBatch<const T> b_src = full_mkl_batch(B);
+            std::memcpy(b_ext_cols.data(), b_src.cols, b_owned_nnz * sizeof(int));
+            std::memcpy(b_ext_vals.data(), b_src.values, b_owned_nnz * sizeof(T));
+        }
+        for (int t = 0; t < n_a_ghosts; ++t) {
+            const auto it = ghost_blocks.rows.find(a_ghosts[static_cast<size_t>(t)]);
+            if (it == ghost_blocks.rows.end()) {
+                continue;  // empty B_ext row
+            }
+            int dst = b_ext_row_ptr[static_cast<size_t>(b_rows + t)];
+            for (const auto& block : it->second) {
+                b_ext_cols[static_cast<size_t>(dst)] = column_index(block.col);
+                b_ext_vals[static_cast<size_t>(dst)] = block.data[0];
+                ++dst;
+            }
+        }
+        const int n_cols = b_cols + static_cast<int>(extra_to_global.size());
+
+        // Vendor multiply. Handles stay alive until the value copy below --
+        // the exported arrays are owned by c_handle.
+        std::vector<int> c_row_ptr;
+        std::vector<int> c_cols;
+        std::vector<int> c_ghost_globals;
+        std::vector<int> c_ghost_sizes;
+        size_t result_nnz = 0;
+        const T* exported_values = nullptr;
+        // threshold > 0 only: compacted survivors of the exported product.
+        // Declared here so exported_values can point at them until the value
+        // copy at the bottom.
+        std::vector<int> filtered_cols;
+        std::vector<T> filtered_vals;
+        MKLSparseHandleOwner a_handle;
+        MKLSparseHandleOwner b_handle;
+        MKLSparseHandleOwner c_handle;
+        const auto t_build = stamp();
+
+        if (A.local_block_nnz() > 0 && b_ext_nnz != 0) {
+            BLASKernel::configure_vendor_sparse_threading();
+
+            // A passes verbatim: its column ids already index B_ext's rows by
+            // the layout choice above. Same zero-copy wrapper the serial path
+            // uses.
+            const CSRPageBatch<const T> a_batch = full_mkl_batch(A);
+
+            CSRPageBatch<const T> b_batch;
+            b_batch.cols = b_ext_cols.data();
+            b_batch.values = b_ext_vals.data();
+            b_batch.row_offsets = b_ext_row_ptr.data();
+            b_batch.nnz_count = static_cast<uint32_t>(b_ext_nnz);
+            b_batch.page_index = 0;
+            b_batch.first_nnz = 0;
+            b_batch.row_begin = 0;
+            b_batch.row_end = ext_rows;
+
+            if (!build_csr_mkl_raw_handle(a_handle.handle, a_batch, ext_rows) ||
+                !build_csr_mkl_raw_handle(b_handle.handle, b_batch, n_cols)) {
+                throw std::runtime_error(
+                    "fused distributed CSR SpGEMM: vendor handle construction failed");
+            }
+            if (mkl_sparse_spmm(
+                    SPARSE_OPERATION_NON_TRANSPOSE,
+                    a_handle.handle,
+                    b_handle.handle,
+                    &c_handle.handle) != SPARSE_STATUS_SUCCESS ||
+                c_handle.handle == nullptr) {
+                throw std::runtime_error("fused distributed CSR SpGEMM: vendor multiply failed");
+            }
+            A.active_csr_backend().note_vendor_launch(1);
+
+            sparse_index_base_t index_base = SPARSE_INDEX_BASE_ZERO;
+            MKL_INT rows = 0;
+            MKL_INT cols = 0;
+            MKL_INT* row_start = nullptr;
+            MKL_INT* row_end = nullptr;
+            MKL_INT* col_ind = nullptr;
+            T* values = nullptr;
+            if (!export_mkl_csr(
+                    c_handle.handle, index_base, rows, cols, row_start, row_end, col_ind, values) ||
+                rows != static_cast<MKL_INT>(n_rows)) {
+                throw std::runtime_error("fused distributed CSR SpGEMM: vendor export failed");
+            }
+
+            const MKL_INT base = index_base == SPARSE_INDEX_BASE_ONE ? 1 : 0;
+            const MKL_INT first = row_start[0] - base;
+            const MKL_INT last = row_end[n_rows - 1] - base;
+            if (last < first) {
+                throw std::runtime_error("fused distributed CSR SpGEMM: invalid exported offsets");
+            }
+
+            if (threshold <= 0.0) {
+                result_nnz = static_cast<size_t>(last - first);
+                exported_values = values + first;
+
+                c_row_ptr.resize(static_cast<size_t>(n_rows) + 1);
+                for (int row = 0; row < n_rows; ++row) {
+                    c_row_ptr[static_cast<size_t>(row)] =
+                        static_cast<int>((row_start[row] - base) - first);
+                }
+                c_row_ptr[static_cast<size_t>(n_rows)] =
+                    static_cast<int>((row_end[n_rows - 1] - base) - first);
+            } else {
+                // Serial-aligned thresholding: drop |value| < threshold from
+                // the exact product. Two passes -- per-row survivor counts,
+                // then a compaction into filtered_cols/filtered_vals (columns
+                // rebased to the ext space, so the scans below read them
+                // uniformly). Ghosts referenced only by dropped entries fall
+                // out of C via the usage scan.
+                c_row_ptr.assign(static_cast<size_t>(n_rows) + 1, 0);
+                #pragma omp parallel for schedule(static)
+                for (int row = 0; row < n_rows; ++row) {
+                    const MKL_INT begin = row_start[row] - base;
+                    const MKL_INT end = row_end[row] - base;
+                    int count = 0;
+                    for (MKL_INT idx = begin; idx < end; ++idx) {
+                        if (scalar_abs(values[idx]) >= threshold) {
+                            ++count;
+                        }
+                    }
+                    c_row_ptr[static_cast<size_t>(row) + 1] = count;
+                }
+                for (int row = 0; row < n_rows; ++row) {
+                    c_row_ptr[static_cast<size_t>(row) + 1] +=
+                        c_row_ptr[static_cast<size_t>(row)];
+                }
+                result_nnz = static_cast<size_t>(c_row_ptr[static_cast<size_t>(n_rows)]);
+                filtered_cols.resize(result_nnz);
+                filtered_vals.resize(result_nnz);
+                #pragma omp parallel for schedule(static)
+                for (int row = 0; row < n_rows; ++row) {
+                    const MKL_INT begin = row_start[row] - base;
+                    const MKL_INT end = row_end[row] - base;
+                    int dst = c_row_ptr[static_cast<size_t>(row)];
+                    for (MKL_INT idx = begin; idx < end; ++idx) {
+                        if (scalar_abs(values[idx]) >= threshold) {
+                            filtered_cols[static_cast<size_t>(dst)] =
+                                static_cast<int>(col_ind[idx] - base);
+                            filtered_vals[static_cast<size_t>(dst)] = values[idx];
+                            ++dst;
+                        }
+                    }
+                }
+                exported_values = filtered_vals.data();
+            }
+
+            // Ext-space column of entry idx, regardless of which branch above
+            // produced the entries (threshold is loop-invariant, the branch
+            // hoists).
+            auto ext_col_at = [&](long long idx) -> int {
+                return threshold <= 0.0
+                    ? static_cast<int>(col_ind[first + idx] - base)
+                    : filtered_cols[static_cast<size_t>(idx)];
+            };
+
+            // Which non-owned ext columns does C actually use? One flag pass;
+            // racing byte stores of the same value are benign.
+            const int ghost_span = n_cols - n_owned;
+            std::vector<uint8_t> used(static_cast<size_t>(std::max(0, ghost_span)), 0);
+            #pragma omp parallel for schedule(static)
+            for (long long idx = 0; idx < static_cast<long long>(result_nnz); ++idx) {
+                const int col = ext_col_at(idx);
+                if (col >= n_owned) {
+                    used[static_cast<size_t>(col - n_owned)] = 1;
+                }
+            }
+
+            // C's ghost list. The B-ghost portion of the ext space is already
+            // (owner, gid)-sorted (B's convention) and filtering preserves that;
+            // only the surface-sized extras need sorting. Merging the two sorted
+            // sequences yields C's convention-ordered ghosts plus the ext->C
+            // remap in one pass.
+            std::vector<int> remap(static_cast<size_t>(std::max(0, ghost_span)), -1);
+            std::vector<std::pair<int, int>> used_bghost;   // (ext id, gid), owner-sorted
+            for (int id = n_owned; id < b_cols; ++id) {
+                if (used[static_cast<size_t>(id - n_owned)]) {
+                    used_bghost.emplace_back(id, B.graph->get_global_index(id));
+                }
+            }
+            std::vector<std::pair<int, int>> used_extra;    // (ext id, gid)
+            for (int id = b_cols; id < n_cols; ++id) {
+                if (used[static_cast<size_t>(id - n_owned)]) {
+                    used_extra.emplace_back(id, extra_to_global[static_cast<size_t>(id - b_cols)]);
+                }
+            }
+            auto owner_of = [&](int gid) { return A.graph->find_owner(gid); };
+            std::sort(used_extra.begin(), used_extra.end(),
+                      [&](const auto& lhs, const auto& rhs) {
+                          const int owner_l = owner_of(lhs.second);
+                          const int owner_r = owner_of(rhs.second);
+                          if (owner_l != owner_r) return owner_l < owner_r;
+                          return lhs.second < rhs.second;
+                      });
+
+            c_ghost_globals.reserve(used_bghost.size() + used_extra.size());
+            c_ghost_sizes.reserve(used_bghost.size() + used_extra.size());
+            size_t bg = 0;
+            size_t ex = 0;
+            auto take = [&](const std::pair<int, int>& entry, int size_of_block) {
+                remap[static_cast<size_t>(entry.first - n_owned)] =
+                    n_owned + static_cast<int>(c_ghost_globals.size());
+                c_ghost_globals.push_back(entry.second);
+                c_ghost_sizes.push_back(size_of_block);
+            };
+            while (bg < used_bghost.size() || ex < used_extra.size()) {
+                bool from_bghost;
+                if (bg == used_bghost.size()) {
+                    from_bghost = false;
+                } else if (ex == used_extra.size()) {
+                    from_bghost = true;
+                } else {
+                    const int owner_b = owner_of(used_bghost[bg].second);
+                    const int owner_e = owner_of(used_extra[ex].second);
+                    from_bghost = owner_b != owner_e
+                        ? owner_b < owner_e
+                        : used_bghost[bg].second < used_extra[ex].second;
+                }
+                if (from_bghost) {
+                    take(used_bghost[bg], B.graph->block_sizes[used_bghost[bg].first]);
+                    ++bg;
+                } else {
+                    take(used_extra[ex], ghost_blocks.sizes.at(used_extra[ex].second));
+                    ++ex;
+                }
+            }
+
+            // Columns: rebased copy with the ghost-range remap. Vendor order is
+            // preserved, so values below copy without a permutation.
+            c_cols.resize(result_nnz);
+            #pragma omp parallel for schedule(static)
+            for (long long idx = 0; idx < static_cast<long long>(result_nnz); ++idx) {
+                const int col = ext_col_at(idx);
+                c_cols[static_cast<size_t>(idx)] =
+                    col < n_owned ? col : remap[static_cast<size_t>(col - n_owned)];
+            }
+        } else {
+            c_row_ptr.assign(static_cast<size_t>(std::max(0, n_rows)) + 1, 0);
+        }
+        const auto t_wrap = stamp();
+
+        // Adopt the arrays as C's graph. build_comm_pattern inside is the one
+        // collective step; every rank reaches it (the vote guaranteed all ranks
+        // took this path), including ranks whose local product is empty.
+        auto c_graph = std::make_unique<DistGraph>(A.graph->comm);
+        c_graph->construct_from_local_csr(
+            A.graph->owned_global_indices,
+            owned_block_sizes(*A.graph),
+            c_ghost_globals,
+            c_ghost_sizes,
+            A.graph->block_displs,
+            std::move(c_row_ptr),
+            std::move(c_cols));
+        const auto t_graph = stamp();
+
+        Matrix C(c_graph.release(), MatrixKind::CSR, true, typename Matrix::ConstructionToken{});
+        {
+            typename Matrix::CSRBackendStorage backend;
+            backend.initialize_structure_for_complete_overwrite(
+                result_nnz, A.configured_page_size());
+            C.attach_backend(std::move(backend));
+        }
+        if (result_nnz > 0) {
+            if (C.active_csr_backend().page_count() == 1) {
+                auto page = C.active_csr_backend().page(C.col_ind(), 0);
+                std::memcpy(page.values, exported_values, result_nnz * sizeof(T));
+                C.norms_valid = false;
+            } else {
+                #pragma omp parallel for
+                for (int slot = 0; slot < static_cast<int>(result_nnz); ++slot) {
+                    *C.mutable_block_data(slot) = exported_values[static_cast<size_t>(slot)];
+                }
+            }
+        }
+        const auto t_fill = stamp();
+
+        if (profile) {
+            auto sec = [](auto a, auto b) {
+                return std::chrono::duration<double>(b - a).count();
+            };
+            std::cerr
+                << "VBCSR_PROFILE_CSR_DIST_SPGEMM fused=1"
+                << " meta=" << meta_seconds
+                << " fetch=" << fetch_seconds
+                << " ghost=" << ghost_seconds
+                << " operands=" << sec(t_begin, t_build)
+                << " spmm_wrap=" << sec(t_build, t_wrap)
+                << " graph=" << sec(t_wrap, t_graph)
+                << " fill=" << sec(t_graph, t_fill)
+                << " total=" << meta_seconds + fetch_seconds + ghost_seconds + sec(t_begin, t_fill)
+                << std::endl;
+        }
+        return C;
+    }
+#endif
+
     // Distributed (and non-MKL serial fallback) CSR SpGEMM.
     //
     // One fused pass: values are accumulated per row into a thread-local
@@ -628,12 +1041,18 @@ private:
     // products). Accumulation is O(1) per product instead of the old
     // lower_bound over the row's column list.
     //
-    // Filtering semantics are unchanged: the old symbolic pass only dropped
-    // columns whose accumulated norm product was <= threshold, and
-    // |sum a*b| <= sum |a||b|, so the final filter_blocks(threshold) below drops
-    // exactly those columns and no others. The per-product row_eps skip is kept,
-    // so thresholded results carry the same dropped contributions as before
-    // (accumulation order differs, so values can differ in the last ulp).
+    // Filtering semantics in this hash path are the legacy ones: the old
+    // symbolic pass only dropped columns whose accumulated norm product was
+    // <= threshold, and |sum a*b| <= sum |a||b|, so the final
+    // filter_blocks(threshold) below drops exactly those columns and no
+    // others. The per-product row_eps skip is kept, so thresholded results
+    // carry the same dropped contributions as before (accumulation order
+    // differs, so values can differ in the last ulp).
+    //
+    // Note this only applies when the fused wrap is ineligible or opted out:
+    // eligible runs (thresholded or not) take run_fused_distributed above,
+    // whose thresholding matches the serial MKL path (exact product, then
+    // drop |value| < threshold), so results agree across rank counts.
     static Matrix run_generic(const Matrix& A, const Matrix& B, double threshold) {
         const bool profile = std::getenv("VBCSR_PROFILE_CSR_DIST_SPGEMM") != nullptr;
         auto stamp = [] { return std::chrono::steady_clock::now(); };
@@ -645,9 +1064,42 @@ private:
         auto ghost_blocks = build_spmm_ghost_blocks(metadata, std::move(payload_ctx));
         const auto t_ghost = stamp();
 
+        const int n_rows = static_cast<int>(A.row_ptr().size()) - 1;
+
+#ifdef VBCSR_HAVE_MKL_SPARSE
+        // Fused wrap path (run_fused_distributed). The branch choice must be
+        // uniform across ranks: the wrap and the hash path execute different
+        // MPI collective sequences while building the result graph, so a
+        // per-rank divergence would interleave mismatched collectives. Each
+        // rank votes its local eligibility and an allreduce makes the branch
+        // global; after a unanimous vote the wrap has no fallback.
+        {
+            const int b_rows = static_cast<int>(B.row_ptr().size()) - 1;
+            int local_ok =
+                fused_distributed_enabled() &&
+                !spgemm_sorted_output_enabled() &&
+                is_mkl_supported_scalar_type() &&
+                (A.local_block_nnz() == 0 || A.active_csr_backend().page_count() == 1) &&
+                (B.local_block_nnz() == 0 || B.active_csr_backend().page_count() == 1) &&
+                n_rows == b_rows &&
+                A.graph->owned_global_indices == B.graph->owned_global_indices;
+            int global_ok = local_ok;
+            if (A.graph->comm != MPI_COMM_NULL && A.graph->size > 1) {
+                MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT, MPI_MIN, A.graph->comm);
+            }
+            if (global_ok) {
+                auto sec = [](auto a, auto b) {
+                    return std::chrono::duration<double>(b - a).count();
+                };
+                return run_fused_distributed(
+                    A, B, threshold, ghost_blocks, profile,
+                    sec(t0, t_meta), sec(t_meta, t_fetch), sec(t_fetch, t_ghost));
+            }
+        }
+#endif
+
         const auto& A_norms = A.get_block_norms();
         const auto& B_local_norms = B.get_block_norms();
-        const int n_rows = static_cast<int>(A.row_ptr().size()) - 1;
 
         // Hand the local-block product to MKL when nothing rules it out. Only
         // done for threshold <= 0: the native loop below drops individual
