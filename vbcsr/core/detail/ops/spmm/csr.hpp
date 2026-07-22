@@ -413,11 +413,28 @@ private:
                 }
             }
         } else if (threshold <= 0.0 && result_nnz > 0 && C->active_csr_backend().page_count() == 1) {
-            auto page = C->active_csr_backend().page(C->col_ind(), 0);
-            std::memcpy(
-                page.values,
-                values + (row_start[0] - base),
-                result_nnz * sizeof(T));
+            // First touch of the result's fresh pages: copy per row-domain and
+            // store the partition, so C's placement matches later applies
+            // (same as the distributed wrap).
+            auto& c_backend = C->active_csr_backend();
+            const auto& c_rows = C->row_ptr();
+            c_backend.thread_domains = build_thread_domain_partition(
+                n_rows,
+                thread_domain_max_threads(),
+                [&](int row) { return c_rows[row + 1] - c_rows[row]; });
+            const auto& c_domains = c_backend.thread_domains;
+            auto page = c_backend.page(C->col_ind(), 0);
+            const T* src = values + (row_start[0] - base);
+            #pragma omp parallel for schedule(static)
+            for (int domain = 0; domain < c_domains.thread_count; ++domain) {
+                const size_t begin =
+                    static_cast<size_t>(c_rows[c_domains.domain_begin(domain)]);
+                const size_t end =
+                    static_cast<size_t>(c_rows[c_domains.domain_end(domain)]);
+                if (end > begin) {
+                    std::memcpy(page.values + begin, src + begin, (end - begin) * sizeof(T));
+                }
+            }
             C->norms_valid = false;
         } else if (threshold <= 0.0) {
             const MKL_INT first = row_start[0] - base;
@@ -999,9 +1016,31 @@ private:
             C.attach_backend(std::move(backend));
         }
         if (result_nnz > 0) {
-            if (C.active_csr_backend().page_count() == 1) {
-                auto page = C.active_csr_backend().page(C.col_ind(), 0);
-                std::memcpy(page.values, exported_values, result_nnz * sizeof(T));
+            // The result's value pages are fresh and untouched
+            // (initialize_structure_for_complete_overwrite), so this copy IS
+            // the first touch: do it per row-domain so C's placement matches
+            // the split later applies use, and store the partition on the
+            // backend (numa_locality_plan.md — operation results).
+            auto& c_backend = C.active_csr_backend();
+            const auto& c_rows = C.row_ptr();
+            c_backend.thread_domains = build_thread_domain_partition(
+                n_rows,
+                thread_domain_max_threads(),
+                [&](int row) { return c_rows[row + 1] - c_rows[row]; });
+            const auto& c_domains = c_backend.thread_domains;
+            if (c_backend.page_count() == 1) {
+                auto page = c_backend.page(C.col_ind(), 0);
+                #pragma omp parallel for schedule(static)
+                for (int domain = 0; domain < c_domains.thread_count; ++domain) {
+                    const size_t begin =
+                        static_cast<size_t>(c_rows[c_domains.domain_begin(domain)]);
+                    const size_t end =
+                        static_cast<size_t>(c_rows[c_domains.domain_end(domain)]);
+                    if (end > begin) {
+                        std::memcpy(page.values + begin, exported_values + begin,
+                                    (end - begin) * sizeof(T));
+                    }
+                }
                 C.norms_valid = false;
             } else {
                 #pragma omp parallel for
