@@ -116,7 +116,8 @@ struct CSRMatrixBackend {
     // the OS places each 4 KiB page on the node of the writing thread, so
     // the values a thread later reads in the apply are node-local. For
     // scalar types whose array-new is not trivial (std::complex), the
-    // allocation itself touches first and placement stays as today.
+    // allocation itself touches first and placement follows the allocating
+    // thread.
     void initialize_structure_first_touch(
         const std::vector<int>& row_ptr,
         uint32_t page_size) {

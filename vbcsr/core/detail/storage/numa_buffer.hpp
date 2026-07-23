@@ -135,8 +135,19 @@ public:
         }
         return *this;
     }
-    NumaVector(NumaVector&&) noexcept = default;
-    NumaVector& operator=(NumaVector&&) noexcept = default;
+    // Explicit moves keep the moved-from vector empty (size 0, null buffer),
+    // matching the std::vector semantics the class documents; a defaulted
+    // move would leave size_ stale against a nulled buffer.
+    NumaVector(NumaVector&& other) noexcept
+        : buffer_(std::move(other.buffer_)), size_(other.size_) {
+        other.size_ = 0;
+    }
+    NumaVector& operator=(NumaVector&& other) noexcept {
+        buffer_ = std::move(other.buffer_);
+        size_ = other.size_;
+        other.size_ = 0;
+        return *this;
+    }
 
     // std::vector semantics: prefix preserved, new elements zeroed.
     void resize(size_t count) {

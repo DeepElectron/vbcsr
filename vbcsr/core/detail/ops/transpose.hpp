@@ -201,7 +201,14 @@ struct CSRTransposeExecutor {
                     continue;
                 }
                 const int dest_row = matrix.col_ind()[slot];
-                const int dest_col = graph_C->global_to_local.at(global_row);
+                // find(), not at(): a throw inside the OpenMP region would
+                // terminate instead of propagating.
+                auto dest_col_it = graph_C->global_to_local.find(global_row);
+                if (dest_col_it == graph_C->global_to_local.end()) {
+                    any_missing_dest = 1;
+                    continue;
+                }
+                const int dest_col = dest_col_it->second;
                 const int dest_start = graph_C->adj_ptr[dest_row];
                 const int dest_end = graph_C->adj_ptr[dest_row + 1];
                 auto begin = graph_C->adj_ind.begin() + dest_start;

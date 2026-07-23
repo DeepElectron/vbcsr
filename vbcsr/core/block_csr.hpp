@@ -51,6 +51,7 @@ inline const char* matrix_kind_name(MatrixKind kind) {
 } // namespace vbcsr
 
 #include "dist_graph.hpp"
+#include "detail/backend/thread_domain.hpp"
 #include "dist_vector.hpp"
 #include "dist_multivector.hpp"
 #include "detail/kernels/dense_kernels.hpp"

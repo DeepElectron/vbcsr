@@ -20,9 +20,9 @@ using namespace vbcsr;
 
 #include "pybind_common.hpp"
 
-// Chunked parallel element copy: matrix-scale exports (values, col_ind) are
-// GB-sized, and one serial memcpy at export was measured at the same cost as
-// the SpGEMM copy-out it mirrors. No Python API is touched inside the region.
+// Chunked parallel element copy: index exports (col_ind, adj_ind) are
+// GB-sized at matrix scale, so the copy must not be a single serial memcpy.
+// No Python API is touched inside the region.
 template <typename T>
 void copy_elements_parallel(T* dst, const T* src, size_t count) {
     const int64_t element_count = static_cast<int64_t>(count);
@@ -72,20 +72,6 @@ py::array_t<T> make_owned_array_1d(std::vector<T>&& data) {
     const py::ssize_t count = static_cast<py::ssize_t>(data.size());
     return adopt_vector_array(
         std::move(data), {count}, {static_cast<py::ssize_t>(sizeof(T))});
-}
-
-template <typename T>
-py::array_t<T> make_owned_array_2d_row_major(const std::vector<T>& data, py::ssize_t rows, py::ssize_t cols) {
-    auto* heap_data = new T[data.size()];
-    copy_elements_parallel(heap_data, data.data(), data.size());
-    py::capsule owner(heap_data, [](void* ptr) {
-        delete[] static_cast<T*>(ptr);
-    });
-    return py::array_t<T>(
-        {rows, cols},
-        {cols * static_cast<py::ssize_t>(sizeof(T)), static_cast<py::ssize_t>(sizeof(T))},
-        heap_data,
-        owner);
 }
 
 template <typename T>

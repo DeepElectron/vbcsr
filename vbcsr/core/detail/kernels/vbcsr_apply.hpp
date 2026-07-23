@@ -171,8 +171,9 @@ private:
     }
 
     // Prefer the plan's stored thread partition (computed once with the plan;
-    // the future storage first-touch anchor) when the current thread budget
-    // matches it; otherwise fall back to rebuilding dynamic chunks.
+    // the same partition storage first-touch used at construction) when the
+    // current thread budget matches it; otherwise fall back to rebuilding
+    // dynamic chunks.
     static std::vector<int> select_forward_chunks(
         const typename Backend::ForwardApplyPlan& plan) {
         if (!plan.rows.empty() &&

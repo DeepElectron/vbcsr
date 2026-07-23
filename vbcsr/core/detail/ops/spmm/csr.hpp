@@ -279,9 +279,9 @@ private:
                     "distribute over more ranks");
             }
             // Single-writer form (each slot written exactly once) so the row
-            // loop parallelizes. The trailing slot is the export window size,
-            // as before: the copy below takes [first, last) verbatim, which is
-            // only consistent when the vendor export is row-contiguous.
+            // loop parallelizes. The trailing slot is the export window size;
+            // the copy below takes [first, last) verbatim, which is only
+            // consistent when the vendor export is row-contiguous.
             #pragma omp parallel for schedule(static)
             for (int row = 0; row < n_rows; ++row) {
                 c_row_ptr[static_cast<size_t>(row)] =
@@ -303,9 +303,9 @@ private:
 
             if (!any_unsorted) {
                 // NumaVector resize is a parallel first-touch zero and the
-                // copy below is parallel too: no serial nnz-scale pass
-                // remains in the copy-out (the serial assign() this replaced
-                // was 44% of the 48-thread total).
+                // copy below is parallel too: nnz-scale serial passes
+                // dominate the copy-out at high thread counts, so none may
+                // remain here.
                 c_cols_local.resize(exported_nnz);
                 const int64_t nnz_count = static_cast<int64_t>(exported_nnz);
                 if (base == 0 && std::is_same_v<MKL_INT, int>) {
@@ -735,13 +735,10 @@ private:
     // Fused distributed CSR SpGEMM: one vendor multiply, then wrap the vendor
     // output as the result -- the distributed generalization of run_mkl_serial.
     //
-    // The hash path below hands the owned-block product to MKL
-    // (compute_local_product_mkl) but then re-inserts every output nonzero into
-    // a per-row hash table, rebuilds a global-column adjacency, and reconstructs
-    // the result graph from scratch (construct_distributed re-sorts rows,
-    // re-derives ghosts, fetches ghost sizes over MPI). Profiling put those
-    // accum/graph/fill phases at ~87% of the whole distributed multiply. This
-    // routine instead:
+    // Compared with the hash path (run_generic below), this avoids per-nonzero
+    // hash accumulation and a from-scratch construct_distributed rebuild of
+    // the result graph; the only collective left in result construction is
+    // the comm pattern. This routine:
     //   1. forms one extended operand B_ext = [ B's owned rows ; fetched ghost
     //      rows ] in B's own local column space (plus a small tail for ghost-row
     //      columns that are not B blocks), so owned rows copy through verbatim;
@@ -1167,13 +1164,12 @@ private:
     // products). Accumulation is O(1) per product instead of the old
     // lower_bound over the row's column list.
     //
-    // Filtering semantics in this hash path are the legacy ones: the old
-    // symbolic pass only dropped columns whose accumulated norm product was
-    // <= threshold, and |sum a*b| <= sum |a||b|, so the final
-    // filter_blocks(threshold) below drops exactly those columns and no
-    // others. The per-product row_eps skip is kept, so thresholded results
-    // carry the same dropped contributions as before (accumulation order
-    // differs, so values can differ in the last ulp).
+    // Filtering semantics in this hash path: a column is dropped iff its
+    // accumulated norm product is <= threshold (|sum a*b| <= sum |a||b|,
+    // enforced by the final filter_blocks call), plus the per-product
+    // row_eps skip. This differs from run_fused_distributed's exact-product
+    // |value| < threshold rule; this path is reached only via opt-out or
+    // ineligibility.
     //
     // Note this only applies when the fused wrap is ineligible or opted out:
     // eligible runs (thresholded or not) take run_fused_distributed above,

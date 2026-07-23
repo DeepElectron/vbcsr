@@ -573,11 +573,13 @@ def cached_geometric_adjacency(
     comm: Any,
     rank: int,
     cache_dir: Path,
-) -> tuple[list[np.ndarray], dict[str, Any], np.ndarray, np.ndarray]:
+) -> tuple[list[np.ndarray], dict[str, Any], np.ndarray, np.ndarray, tuple[np.ndarray, np.ndarray]]:
     """make_geometric_adjacency semantics, backed by the on-disk global graph.
 
     Adjacency rows come back as numpy index arrays instead of Python lists;
-    every consumer only iterates them. Positions are a read-only mmap.
+    every consumer only iterates them. Positions are a read-only mmap. The
+    fifth element is the rank-local flat CSR view (rebased adj_ptr, GLOBAL
+    column ids) consumed by VBCSR.create_distributed_flat.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
     key_fields, paths = geometry_cache_entry(spec, cache_dir)
@@ -694,7 +696,7 @@ def build_matrix(
     comm: Any,
     rank: int,
     size: int,
-    flat_adjacency: tuple[np.ndarray, np.ndarray] | None = None,
+    flat_local: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> tuple[vbcsr.VBCSR, dict[str, float]]:
     start, end = partition_range(spec.blocks, size, rank)
     owned = list(range(start, end))
@@ -702,10 +704,10 @@ def build_matrix(
 
     barrier(comm)
     t0 = time.perf_counter()
-    if flat_adjacency is not None:
+    if flat_local is not None:
         # Flat CSR arrays go to C++ via the buffer protocol — no per-edge
         # Python conversion (the list-of-lists path boxes every column id).
-        local_ptr, local_ind = flat_adjacency
+        local_ptr, local_ind = flat_local
         matrix = vbcsr.VBCSR.create_distributed_flat(
             owned_indices=np.arange(start, end, dtype=np.int32),
             block_sizes=np.asarray(local_sizes, dtype=np.int32),
@@ -1057,25 +1059,15 @@ def benchmark_vbcsr_with_internal_diagnostics(
         )
         return timing, diagnostic
 
-    # NOTE: do not touch MKL's thread count around the VBCSR timing.
-    #
-    # This used to call configure_sparse_dot_mkl_threading() for csr/spgemm, which
-    # applies `mkl_set_num_threads_local`. That is a *thread-local* override, and it
-    # wins over the global `mkl_set_num_threads` the library issues from
-    # configure_vendor_sparse_threading() at each vendor entry -- so the harness
-    # silently overrode the library's threading and the value it installed came from
-    # the sparse_dot_mkl *reference* env chain (SPARSE_DOT_MKL_NUM_THREADS ->
-    # MKL_REFERENCE_NUM_THREADS -> MKL_NUM_THREADS, default 1).
-    #
-    # Under the scaling sweep, which exports MKL_NUM_THREADS=1 and no
-    # SPARSE_DOT_MKL_NUM_THREADS, that pinned VBCSR's SpGEMM to one MKL thread at
-    # every thread count and produced a perfectly flat "speedup" of 1.0x. Measured
-    # at 400k blocks / 16 threads: 0.706 s with the override, 0.165 s without.
-    #
-    # `OMP_NUM_THREADS` is the library's single source of truth (doc/developer_guide.md
-    # §Threading Model) and the library configures its own vendor pool. The benchmark
-    # must observe that, not redefine it. Reference-baseline threading is still
-    # configured around the sparse_dot_mkl calls themselves, where it belongs.
+    # Do NOT configure MKL threading around the VBCSR timing.
+    # mkl_set_num_threads_local() (what sparse_dot_mkl's helper applies) is a
+    # thread-local override that beats the global mkl_set_num_threads the
+    # library issues at each vendor entry, silently pinning VBCSR's SpGEMM to
+    # the sparse_dot_mkl reference thread count. OMP_NUM_THREADS is the
+    # library's single source of truth (doc/developer_guide.md §Threading
+    # Model); reference-baseline threading is configured only around the
+    # sparse_dot_mkl calls themselves.
+
     # Ghost-exchange accounting for the apply ops: the X operand's core
     # object accumulates pack+MPI+unpack seconds per sync (multi-node runs
     # read the comm fraction from this — a weak-scaling curve without it is
@@ -1355,9 +1347,9 @@ def build_case_matrix(
 
     block_sizes = make_block_sizes(spec)
     owned_range = partition_range(spec.blocks, size, rank)
-    flat_adjacency = None
+    flat_local = None
     if _GEOMETRY_CACHE_DIR is not None:
-        adjacency, adjacency_info, positions, box_lengths, flat_adjacency = cached_geometric_adjacency(
+        adjacency, adjacency_info, positions, box_lengths, flat_local = cached_geometric_adjacency(
             spec, owned_range, comm, rank, _GEOMETRY_CACHE_DIR)
     else:
         adjacency, adjacency_info, positions, box_lengths = make_geometric_adjacency(spec, owned_range)
@@ -1378,7 +1370,7 @@ def build_case_matrix(
         )
     matrix, build_timings = build_matrix(
         spec, block_sizes, adjacency, positions, box_lengths, comm, rank, size,
-        flat_adjacency=flat_adjacency)
+        flat_local=flat_local)
     atomistic_conversion = benchmark_atomistic_conversion(
         spec,
         block_sizes,
@@ -2057,7 +2049,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-geometry-cache",
         action="store_true",
-        help="Regenerate the geometric structure in-process (previous behavior).",
+        help="Regenerate the geometric structure in-process instead of using the on-disk cache.",
     )
     parser.add_argument(
         "--value-fill",

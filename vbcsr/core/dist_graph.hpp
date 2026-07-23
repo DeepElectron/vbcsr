@@ -4,15 +4,15 @@
 #include <mpi.h>
 #include "detail/storage/index_map.hpp"
 #include "detail/storage/numa_buffer.hpp"
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
-#include <vector>
+#include <iostream>
+#include <limits>
 #include <map>
 #include <numeric>
-#include <algorithm>
-#include <limits>
-#include <iostream>
 #include <stdexcept>
+#include <vector>
 
 namespace vbcsr {
 
@@ -469,7 +469,6 @@ private:
     }
 
 public:
-
     // Build this graph directly from rank-local CSR arrays whose column indices
     // are already in this graph's final local space: owned rows [0, n_owned)
     // followed by `my_ghosts` in the given order.

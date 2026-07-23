@@ -2,12 +2,12 @@
 #define VBCSR_DIST_MULTIVECTOR_HPP
 
 #include "dist_graph.hpp"
+#include "dist_vector.hpp"
+#include "detail/distributed/mpi_utils.hpp"
 
 #ifdef _OPENMP
 #include <omp.h>
 #endif
-#include "dist_vector.hpp"
-#include "detail/distributed/mpi_utils.hpp"
 #include <vector>
 #include <cassert>
 #include <cstring>
@@ -412,6 +412,7 @@ public:
 
     void reduce_ghosts() {
         if (graph->size == 1) return;
+        const double comm_t0 = MPI_Wtime();
         const auto& block_offsets = graph->block_offsets;
         const auto& send_counts_scalar = graph->send_counts_scalar;
         const auto& recv_counts_scalar = graph->recv_counts_scalar;
@@ -480,6 +481,9 @@ public:
                 buf_ptr += static_cast<size_t>(blk_size) * num_vectors;
             }
         }
+
+        comm_seconds += MPI_Wtime() - comm_t0;
+        ++comm_calls;
     }
 
     MPI_Datatype get_mpi_type() const;

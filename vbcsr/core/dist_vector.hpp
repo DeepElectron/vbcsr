@@ -2,11 +2,11 @@
 #define VBCSR_DIST_VECTOR_HPP
 
 #include "dist_graph.hpp"
+#include "detail/storage/numa_buffer.hpp"
 
 #ifdef _OPENMP
 #include <omp.h>
 #endif
-#include "detail/storage/numa_buffer.hpp"
 #include <vector>
 #include <cassert>
 #include <cstring>
@@ -240,6 +240,7 @@ public:
 
     void reduce_ghosts() {
         if (graph->size == 1) return;
+        const double comm_t0 = MPI_Wtime();
 
         const auto& block_offsets = graph->block_offsets;
         const auto& send_counts_elems = graph->send_counts_scalar;
@@ -277,6 +278,9 @@ public:
                 buf_ptr += blk_size;
             }
         }
+
+        comm_seconds += MPI_Wtime() - comm_t0;
+        ++comm_calls;
     }
 
 private:

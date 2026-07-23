@@ -240,7 +240,8 @@ struct BSRMatrixBackend {
     // host the OS places each 4 KiB page on the node of the writing thread,
     // so the blocks a thread later reads in the apply are node-local. For
     // scalar types whose array-new is not trivial (std::complex), the
-    // allocation itself touches first and placement stays as today.
+    // allocation itself touches first and placement follows the allocating
+    // thread.
     void initialize_structure_first_touch(
         const std::vector<int>& row_ptr,
         int uniform_block_size,
@@ -369,7 +370,8 @@ struct BSRMatrixBackend {
     // Stored thread work split, weighted by row nnz. Computed once; kept
     // stable across applies so (stage B) storage placement first-touched
     // against it stays consistent. A parallel region with a different thread
-    // count falls back to the dynamic split (see bsr_thread_row_range).
+    // count falls back to the dynamic split (see thread_domain_range in
+    // thread_domain.hpp).
     const ThreadDomainPartition& ensure_thread_domains(
         const std::vector<int>& row_ptr) const {
         std::lock_guard<std::mutex> lock(apply_plan_mutex);
