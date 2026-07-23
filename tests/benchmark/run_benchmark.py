@@ -1315,9 +1315,20 @@ def build_case_matrix(
     else:
         adjacency, adjacency_info, positions, box_lengths = make_geometric_adjacency(spec, owned_range)
     adjacency_info = reduce_degree_statistics(adjacency_info, comm)
-    value_model = matrix_value_model_statistics(
-        adjacency, positions, box_lengths, spec, owned_range[0], comm
-    )
+    if spec.value_fill == "random":
+        # fill_random values are not drawn from the distance-decay model, so
+        # its statistics would be metadata about values the run does not use —
+        # and the per-row Python loop below costs ~310 s per point on the
+        # 6.5M-row scalar-CSR domain (untimed, once per worker count).
+        value_model = {
+            "model": "uniform_random",
+            "block_random_normalization": "1/sqrt(row_block_size * column_block_size)",
+            "note": "decay-model statistics skipped under --value-fill random",
+        }
+    else:
+        value_model = matrix_value_model_statistics(
+            adjacency, positions, box_lengths, spec, owned_range[0], comm
+        )
     matrix, build_timings = build_matrix(spec, block_sizes, adjacency, positions, box_lengths, comm, rank, size)
     atomistic_conversion = benchmark_atomistic_conversion(
         spec,
