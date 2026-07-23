@@ -299,8 +299,14 @@ SymbolicMultiplyResult symbolic_multiply_filtered(
     }
 
     for (int row = 0; row < n_rows; ++row) {
-        res.c_col_ind.insert(res.c_col_ind.end(), thread_cols[row].begin(), thread_cols[row].end());
-        res.c_row_ptr[row + 1] = static_cast<int>(res.c_col_ind.size());
+        res.c_row_ptr[row + 1] =
+            res.c_row_ptr[row] + static_cast<int>(thread_cols[row].size());
+    }
+    res.c_col_ind.resize(static_cast<size_t>(res.c_row_ptr[n_rows]));
+    #pragma omp parallel for schedule(static)
+    for (int row = 0; row < n_rows; ++row) {
+        std::copy(thread_cols[row].begin(), thread_cols[row].end(),
+                  res.c_col_ind.begin() + res.c_row_ptr[row]);
     }
 
     #pragma omp parallel

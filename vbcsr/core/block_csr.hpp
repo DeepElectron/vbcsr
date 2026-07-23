@@ -1002,14 +1002,20 @@ public:
             throw std::runtime_error("Incompatible graph structure in copy_from");
         }
 
-        int n_rows = graph->adj_ptr.size() - 1;
-        for (int i = 0; i < n_rows; ++i){
-            int start = graph->adj_ptr[i];
-            int end = graph->adj_ptr[i+1];
-            for (int k = start; k < end; ++k){
-                T* block_val = mutable_block_data(k);
-                const T* block_val_other = other.block_data(k);
-                std::memcpy(block_val, block_val_other, block_size_elements(k) * sizeof(T));
+        // Copy per stored row-domain: work-balanced and placement-consistent
+        // (each thread writes the pages its domain first-touched).
+        const int n_rows = static_cast<int>(graph->adj_ptr.size()) - 1;
+        const auto& domains = thread_domain_partition();
+        #pragma omp parallel
+        {
+            const auto [row_begin, row_end] = detail::thread_domain_range(n_rows, domains);
+            for (int i = row_begin; i < row_end; ++i) {
+                const int start = graph->adj_ptr[i];
+                const int end = graph->adj_ptr[i + 1];
+                for (int k = start; k < end; ++k) {
+                    std::memcpy(mutable_block_data(k), other.block_data(k),
+                                block_size_elements(k) * sizeof(T));
+                }
             }
         }
         norms_valid = false;
@@ -1109,27 +1115,32 @@ public:
     // Internal storage is canonical RowMajor, so the default export is a
     // straight copy; ColMajor requests transpose per block.
     std::vector<T> get_values(MatrixLayout layout = MatrixLayout::RowMajor) const {
-        // Calculate total size
-        size_t total_size = 0;
-        for (int slot = 0; slot < static_cast<int>(graph->adj_ind.size()); ++slot) {
-            total_size += block_size_elements(slot);
-        }
-        
-        std::vector<T> result(total_size);
-        size_t offset = 0;
-        
-        int n_rows = graph->adj_ptr.size() - 1;
+        // Two-pass parallel export: per-row element offsets (rows-scale
+        // memory), then every row copies into its final slice independently.
+        const int n_rows = static_cast<int>(graph->adj_ptr.size()) - 1;
+        std::vector<size_t> row_offsets(static_cast<size_t>(n_rows) + 1, 0);
+        #pragma omp parallel for schedule(static)
         for (int i = 0; i < n_rows; ++i) {
-            int r_dim = block_row_dim(i);
-            int start = graph->adj_ptr[i];
-            int end = graph->adj_ptr[i+1];
-            
-            for (int k = start; k < end; ++k) {
-                int col = graph->adj_ind[k];
-                int c_dim = block_col_dim(col);
+            size_t row_elements = 0;
+            for (int k = graph->adj_ptr[i]; k < graph->adj_ptr[i + 1]; ++k) {
+                row_elements += block_size_elements(k);
+            }
+            row_offsets[static_cast<size_t>(i) + 1] = row_elements;
+        }
+        for (int i = 0; i < n_rows; ++i) {
+            row_offsets[static_cast<size_t>(i) + 1] += row_offsets[static_cast<size_t>(i)];
+        }
+
+        std::vector<T> result(row_offsets[static_cast<size_t>(n_rows)]);
+        #pragma omp parallel for schedule(static)
+        for (int i = 0; i < n_rows; ++i) {
+            const int r_dim = block_row_dim(i);
+            size_t offset = row_offsets[static_cast<size_t>(i)];
+            for (int k = graph->adj_ptr[i]; k < graph->adj_ptr[i + 1]; ++k) {
+                const int col = graph->adj_ind[k];
+                const int c_dim = block_col_dim(col);
                 const T* block_ptr = block_data(k);
-                size_t sz = block_size_elements(k); // should be r_dim * c_dim
-                
+                const size_t sz = block_size_elements(k); // should be r_dim * c_dim
                 T* dest = result.data() + offset;
 
                 // Internal storage is canonical RowMajor

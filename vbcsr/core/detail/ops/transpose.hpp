@@ -186,11 +186,19 @@ struct CSRTransposeExecutor {
         result.graph->enable_matrix_lifetime_management();
         result.set_page_size(matrix.configured_page_size());
 
+        // Every source entry lands in a distinct destination slot, so rows
+        // parallelize freely (matches the BSR/VBCSR serial executors).
+        // Failures are flagged and thrown after the region — throwing inside
+        // an OpenMP loop would terminate instead of propagating.
+        int any_bad_payload = 0;
+        int any_missing_dest = 0;
+        #pragma omp parallel for schedule(static) reduction(|:any_bad_payload) reduction(|:any_missing_dest)
         for (int row = 0; row < n_rows; ++row) {
             const int global_row = matrix.graph->get_global_index(row);
             for (int slot = matrix.row_ptr()[row]; slot < matrix.row_ptr()[row + 1]; ++slot) {
                 if (matrix.block_size_elements(slot) != 1) {
-                    throw std::logic_error("CSR transpose expects scalar slot payloads");
+                    any_bad_payload = 1;
+                    continue;
                 }
                 const int dest_row = matrix.col_ind()[slot];
                 const int dest_col = graph_C->global_to_local.at(global_row);
@@ -200,13 +208,20 @@ struct CSRTransposeExecutor {
                 auto end = graph_C->adj_ind.begin() + dest_end;
                 auto it = std::lower_bound(begin, end, dest_col);
                 if (it == end || *it != dest_col) {
-                    throw std::runtime_error("CSR transpose could not locate destination block");
+                    any_missing_dest = 1;
+                    continue;
                 }
                 const int dest_graph_block =
                     static_cast<int>(std::distance(graph_C->adj_ind.begin(), it));
                 *result.mutable_block_data(dest_graph_block) =
                     ScalarTraits<T>::conjugate(*matrix.block_data(slot));
             }
+        }
+        if (any_bad_payload) {
+            throw std::logic_error("CSR transpose expects scalar slot payloads");
+        }
+        if (any_missing_dest) {
+            throw std::runtime_error("CSR transpose could not locate destination block");
         }
 
         return result;

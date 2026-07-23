@@ -272,14 +272,16 @@ private:
                 throw std::runtime_error("MKL CSR SpGEMM exported invalid row offsets");
             }
             const size_t exported_nnz = static_cast<size_t>(last - first);
+            // Single-writer form (each slot written exactly once) so the row
+            // loop parallelizes. The trailing slot is the export window size,
+            // as before: the copy below takes [first, last) verbatim, which is
+            // only consistent when the vendor export is row-contiguous.
+            #pragma omp parallel for schedule(static)
             for (int row = 0; row < n_rows; ++row) {
-                const int row_begin =
+                c_row_ptr[static_cast<size_t>(row)] =
                     static_cast<int>((row_start[row] - base) - first);
-                const int row_end_offset =
-                    static_cast<int>((row_end[row] - base) - first);
-                c_row_ptr[static_cast<size_t>(row)] = row_begin;
-                c_row_ptr[static_cast<size_t>(row) + 1] = row_end_offset;
             }
+            c_row_ptr[static_cast<size_t>(n_rows)] = static_cast<int>(exported_nnz);
 
             int any_unsorted = 0;
             if (spgemm_sorted_output_enabled()) {
@@ -294,17 +296,32 @@ private:
             }
 
             if (!any_unsorted) {
+                // A std::vector cannot grow without one serial pass, so keep
+                // the cheap pure-write zero-fill (resize) serial and
+                // parallelize the expensive read+write copy. The serial
+                // assign() this replaces was 44% of the 48-thread total.
+                c_cols_local.resize(exported_nnz);
+                const int64_t nnz_count = static_cast<int64_t>(exported_nnz);
                 if (base == 0 && std::is_same_v<MKL_INT, int>) {
-                    c_cols_local.assign(col_ind + first, col_ind + last);
+                    const MKL_INT* src = col_ind + first;
+                    #pragma omp parallel for schedule(static)
+                    for (int64_t entry = 0; entry < nnz_count; ++entry) {
+                        c_cols_local[static_cast<size_t>(entry)] = static_cast<int>(src[entry]);
+                    }
                 } else {
-                    c_cols_local.resize(exported_nnz);
-                    for (size_t entry = 0; entry < exported_nnz; ++entry) {
+                    const int num_cols = static_cast<int>(B.graph->block_sizes.size());
+                    int any_invalid = 0;
+                    #pragma omp parallel for schedule(static) reduction(|:any_invalid)
+                    for (int64_t entry = 0; entry < nnz_count; ++entry) {
                         const int local_col =
                             static_cast<int>(col_ind[first + static_cast<MKL_INT>(entry)] - base);
-                        if (local_col < 0 || local_col >= static_cast<int>(B.graph->block_sizes.size())) {
-                            throw std::runtime_error("MKL CSR SpGEMM exported an invalid column index");
+                        if (local_col < 0 || local_col >= num_cols) {
+                            any_invalid = 1;
                         }
-                        c_cols_local[entry] = local_col;
+                        c_cols_local[static_cast<size_t>(entry)] = local_col;
+                    }
+                    if (any_invalid) {
+                        throw std::runtime_error("MKL CSR SpGEMM exported an invalid column index");
                     }
                 }
             } else {
@@ -328,53 +345,97 @@ private:
                     std::sort(keys.begin() + row_begin, keys.begin() + row_end_off);
                 }
                 const int num_cols = static_cast<int>(B.graph->block_sizes.size());
-                for (size_t entry = 0; entry < exported_nnz; ++entry) {
-                    const int local_col = static_cast<int>(keys[entry] >> 32);
+                const int64_t nnz_count = static_cast<int64_t>(exported_nnz);
+                int any_invalid = 0;
+                #pragma omp parallel for schedule(static) reduction(|:any_invalid)
+                for (int64_t entry = 0; entry < nnz_count; ++entry) {
+                    const size_t slot = static_cast<size_t>(entry);
+                    const int local_col = static_cast<int>(keys[slot] >> 32);
                     if (local_col < 0 || local_col >= num_cols) {
-                        throw std::runtime_error("MKL CSR SpGEMM exported an invalid column index");
+                        any_invalid = 1;
                     }
-                    c_cols_local[entry] = local_col;
-                    value_perm[entry] = static_cast<MKL_INT>(keys[entry] & 0xffffffffu);
+                    c_cols_local[slot] = local_col;
+                    value_perm[slot] = static_cast<MKL_INT>(keys[slot] & 0xffffffffu);
+                }
+                if (any_invalid) {
+                    throw std::runtime_error("MKL CSR SpGEMM exported an invalid column index");
                 }
             }
         } else {
-            size_t exported_nnz = 0;
+            // Thresholded export: two-pass parallel compaction. Pass 1 counts
+            // surviving entries per row, a prefix sum places every row, pass 2
+            // emits columns and values into their final slots. Filter
+            // semantics are identical to the serial loop this replaces — an
+            // entry is dropped iff scalar_abs(value) < threshold (so
+            // non-finite values are kept), per-row order is export order,
+            // optionally sorted.
+            int any_invalid_rows = 0;
+            #pragma omp parallel for schedule(static) reduction(|:any_invalid_rows)
             for (int row = 0; row < n_rows; ++row) {
                 const MKL_INT begin = row_start[row] - base;
                 const MKL_INT end = row_end[row] - base;
                 if (end < begin) {
-                    throw std::runtime_error("MKL CSR SpGEMM exported invalid row offsets");
+                    any_invalid_rows = 1;
+                    c_row_ptr[static_cast<size_t>(row)] = 0;
+                    continue;
                 }
-                exported_nnz += static_cast<size_t>(end - begin);
-            }
-            c_cols_local.reserve(exported_nnz);
-            c_values.reserve(exported_nnz);
-            std::vector<std::pair<int, T>> row_entries;
-            for (int row = 0; row < n_rows; ++row) {
-                c_row_ptr[static_cast<size_t>(row)] = static_cast<int>(c_cols_local.size());
-                const MKL_INT begin = row_start[row] - base;
-                const MKL_INT end = row_end[row] - base;
-                row_entries.clear();
+                int kept = 0;
                 for (MKL_INT idx = begin; idx < end; ++idx) {
-                    const T value = values[idx];
-                    if (scalar_abs(value) < threshold) {
-                        continue;
+                    if (!(scalar_abs(values[idx]) < threshold)) {
+                        ++kept;
                     }
-                    const int local_col = static_cast<int>(col_ind[idx] - base);
-                    if (local_col < 0 || local_col >= static_cast<int>(B.graph->block_sizes.size())) {
-                        throw std::runtime_error("MKL CSR SpGEMM exported an invalid column index");
+                }
+                c_row_ptr[static_cast<size_t>(row)] = kept;
+            }
+            if (any_invalid_rows) {
+                throw std::runtime_error("MKL CSR SpGEMM exported invalid row offsets");
+            }
+
+            int running = 0;
+            for (int row = 0; row < n_rows; ++row) {
+                const int kept = c_row_ptr[static_cast<size_t>(row)];
+                c_row_ptr[static_cast<size_t>(row)] = running;
+                running += kept;
+            }
+            c_row_ptr[static_cast<size_t>(n_rows)] = running;
+
+            c_cols_local.resize(static_cast<size_t>(running));
+            c_values.resize(static_cast<size_t>(running));
+            const int num_cols = static_cast<int>(B.graph->block_sizes.size());
+            int any_invalid_cols = 0;
+            #pragma omp parallel reduction(|:any_invalid_cols)
+            {
+                std::vector<std::pair<int, T>> row_entries;
+                #pragma omp for schedule(static)
+                for (int row = 0; row < n_rows; ++row) {
+                    const MKL_INT begin = row_start[row] - base;
+                    const MKL_INT end = row_end[row] - base;
+                    row_entries.clear();
+                    for (MKL_INT idx = begin; idx < end; ++idx) {
+                        const T value = values[idx];
+                        if (scalar_abs(value) < threshold) {
+                            continue;
+                        }
+                        const int local_col = static_cast<int>(col_ind[idx] - base);
+                        if (local_col < 0 || local_col >= num_cols) {
+                            any_invalid_cols = 1;
+                        }
+                        row_entries.emplace_back(local_col, value);
                     }
-                    row_entries.emplace_back(local_col, value);
+                    if (spgemm_sorted_output_enabled()) {
+                        std::sort(row_entries.begin(), row_entries.end(),
+                                  [](const auto& a, const auto& b) { return a.first < b.first; });
+                    }
+                    size_t out = static_cast<size_t>(c_row_ptr[static_cast<size_t>(row)]);
+                    for (const auto& [col, value] : row_entries) {
+                        c_cols_local[out] = col;
+                        c_values[out] = value;
+                        ++out;
+                    }
                 }
-                if (spgemm_sorted_output_enabled()) {
-                    std::sort(row_entries.begin(), row_entries.end(),
-                              [](const auto& a, const auto& b) { return a.first < b.first; });
-                }
-                for (const auto& [col, value] : row_entries) {
-                    c_cols_local.push_back(col);
-                    c_values.push_back(value);
-                }
-                c_row_ptr[static_cast<size_t>(row) + 1] = static_cast<int>(c_cols_local.size());
+            }
+            if (any_invalid_cols) {
+                throw std::runtime_error("MKL CSR SpGEMM exported an invalid column index");
             }
         }
         const auto t_rows = std::chrono::steady_clock::now();

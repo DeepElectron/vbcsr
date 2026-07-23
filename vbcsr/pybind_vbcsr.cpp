@@ -20,10 +20,35 @@ using namespace vbcsr;
 
 #include "pybind_common.hpp"
 
+// Chunked parallel element copy: matrix-scale exports (values, col_ind) are
+// GB-sized, and one serial memcpy at export was measured at the same cost as
+// the SpGEMM copy-out it mirrors. No Python API is touched inside the region.
+template <typename T>
+void copy_elements_parallel(T* dst, const T* src, size_t count) {
+    const int64_t element_count = static_cast<int64_t>(count);
+    #pragma omp parallel for schedule(static)
+    for (int64_t idx = 0; idx < element_count; ++idx) {
+        dst[idx] = src[idx];
+    }
+}
+
+// Wraps a heap-allocated vector in a numpy array without copying: the capsule
+// owns the vector, numpy views its storage.
+template <typename T>
+py::array_t<T> adopt_vector_array(std::vector<T>&& data,
+                                  std::vector<py::ssize_t> shape,
+                                  std::vector<py::ssize_t> strides) {
+    auto* holder = new std::vector<T>(std::move(data));
+    py::capsule owner(holder, [](void* ptr) {
+        delete static_cast<std::vector<T>*>(ptr);
+    });
+    return py::array_t<T>(std::move(shape), std::move(strides), holder->data(), owner);
+}
+
 template <typename T>
 py::array_t<T> make_owned_array_1d(const T* data, py::ssize_t count) {
     auto* heap_data = new T[static_cast<size_t>(count)];
-    std::memcpy(heap_data, data, static_cast<size_t>(count) * sizeof(T));
+    copy_elements_parallel(heap_data, data, static_cast<size_t>(count));
     py::capsule owner(heap_data, [](void* ptr) {
         delete[] static_cast<T*>(ptr);
     });
@@ -35,10 +60,19 @@ py::array_t<T> make_owned_array_1d(const std::vector<T>& data) {
     return make_owned_array_1d(data.data(), static_cast<py::ssize_t>(data.size()));
 }
 
+// Rvalue overload: adopt the vector's storage instead of copying it (the
+// caller's temporary — e.g. get_values() — already owns a fresh buffer).
+template <typename T>
+py::array_t<T> make_owned_array_1d(std::vector<T>&& data) {
+    const py::ssize_t count = static_cast<py::ssize_t>(data.size());
+    return adopt_vector_array(
+        std::move(data), {count}, {static_cast<py::ssize_t>(sizeof(T))});
+}
+
 template <typename T>
 py::array_t<T> make_owned_array_2d_row_major(const std::vector<T>& data, py::ssize_t rows, py::ssize_t cols) {
     auto* heap_data = new T[data.size()];
-    std::memcpy(heap_data, data.data(), data.size() * sizeof(T));
+    copy_elements_parallel(heap_data, data.data(), data.size());
     py::capsule owner(heap_data, [](void* ptr) {
         delete[] static_cast<T*>(ptr);
     });
@@ -47,6 +81,14 @@ py::array_t<T> make_owned_array_2d_row_major(const std::vector<T>& data, py::ssi
         {cols * static_cast<py::ssize_t>(sizeof(T)), static_cast<py::ssize_t>(sizeof(T))},
         heap_data,
         owner);
+}
+
+template <typename T>
+py::array_t<T> make_owned_array_2d_row_major(std::vector<T>&& data, py::ssize_t rows, py::ssize_t cols) {
+    return adopt_vector_array(
+        std::move(data),
+        {rows, cols},
+        {cols * static_cast<py::ssize_t>(sizeof(T)), static_cast<py::ssize_t>(sizeof(T))});
 }
 
 template <typename T>
@@ -219,7 +261,7 @@ void bind_block_spmat(py::module& m, const std::string& name) {
             
             int r_dim = self.block_row_dim(row);
             int c_dim = self.block_col_dim(col);
-            return make_owned_array_2d_row_major(vec, r_dim, c_dim);
+            return make_owned_array_2d_row_major(std::move(vec), r_dim, c_dim);
         }, py::arg("row"), py::arg("col"))
         .def("get_values", [](const BlockSpMat<T>& self) {
             return make_owned_array_1d(self.get_values(MatrixLayout::RowMajor));
@@ -279,7 +321,7 @@ void bind_block_spmat(py::module& m, const std::string& name) {
             int n_owned = self.graph->owned_global_indices.size();
             int my_rows = self.graph->block_offsets[n_owned];
             int my_cols = self.graph->block_offsets.back();
-            return make_owned_array_2d_row_major(vec, my_rows, my_cols);
+            return make_owned_array_2d_row_major(std::move(vec), my_rows, my_cols);
         })
         .def("from_dense", [](BlockSpMat<T>& self, py::array_t<T> array) {
             auto contiguous = as_row_major_2d<T>(array, "from_dense");
