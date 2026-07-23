@@ -396,6 +396,28 @@ public:
         return graph->block_sizes[local_col];
     }
 
+    // Scalar rows owned by this rank (no ghosts).
+    int owned_scalar_rows() const {
+        return graph->owned_scalar_rows();
+    }
+
+    // Global scalar dimension of the matrix. Collective on the graph's
+    // communicator; see DistGraph::global_scalar_rows(). The block graph is
+    // square, so rows and columns coincide.
+    int global_scalar_rows() const {
+        return graph->global_scalar_rows();
+    }
+
+    int global_scalar_cols() const {
+        return global_scalar_rows();
+    }
+
+    // (rows, cols), matching the numpy/scipy `shape` convention.
+    std::pair<int, int> shape() const {
+        const int n = global_scalar_rows();
+        return std::make_pair(n, n);
+    }
+
     // Return the payload pointer for one flat local block index.
     const T* block_data(int idx) const {
         if (kind == MatrixKind::CSR) {

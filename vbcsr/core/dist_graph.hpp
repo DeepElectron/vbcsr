@@ -575,6 +575,37 @@ public:
         col_ind.assign(adj_ind.begin(), adj_ind.end());
     }
     
+    // Number of scalar (orbital) rows owned by this rank, excluding ghosts.
+    // block_offsets is the prefix sum of block_sizes over owned+ghost blocks, so
+    // block_offsets[n_owned] is exactly the owned scalar count.
+    int owned_scalar_rows() const {
+        const size_t n_owned = owned_global_indices.size();
+        if (block_offsets.size() <= n_owned) {
+            return 0;
+        }
+        return block_offsets[n_owned];
+    }
+
+    // Global scalar (orbital) dimension of the graph, summed across all ranks.
+    // This is the quantity trace estimators need: for a unit-norm random vector,
+    // <psi|A|psi> ~ Tr(A) / global_scalar_rows().
+    //
+    // Collective on comm when running distributed. Safe to call before MPI_Init
+    // and on a serial/NULL communicator, where it degenerates to the local count.
+    int global_scalar_rows() const {
+        const int local_rows = owned_scalar_rows();
+
+        int initialized = 0;
+        MPI_Initialized(&initialized);
+        if (!initialized || comm == MPI_COMM_NULL || size <= 1) {
+            return local_rows;
+        }
+
+        int global_rows = local_rows;
+        MPI_Allreduce(&local_rows, &global_rows, 1, MPI_INT, MPI_SUM, comm);
+        return global_rows;
+    }
+
     void get_vector_structure(int& local_size, int& ghost_size) {
         int n_owned = owned_global_indices.size();
         // block_offsets is prefix sum of block_sizes.

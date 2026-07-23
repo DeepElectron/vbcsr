@@ -18,6 +18,19 @@ def _owned_scalar_rows(graph: Any) -> int:
     return int(sum(graph.block_sizes[:owned_blocks]))
 
 
+def _shape_from_core(core: Any, graph: Any, comm: Any) -> Tuple[int, int]:
+    """Matrix shape, preferring the C++ BlockSpMat.shape property.
+
+    Falls back to the graph-level query (and then to a Python-side reduction) so
+    the wrapper keeps working against an older compiled core.
+    """
+    shape = getattr(core, "shape", None)
+    if shape is not None:
+        return (int(shape[0]), int(shape[1]))
+    total_rows = _global_scalar_rows(graph, comm)
+    return (total_rows, total_rows)
+
+
 def _global_scalar_rows(graph: Any, comm: Any) -> int:
     if hasattr(graph, "global_scalar_rows"):
         return int(graph.global_scalar_rows)
@@ -52,12 +65,13 @@ class VBCSR(LinearOperator):
         self.dtype = np.dtype(dtype)
         self.comm = comm
         self._global_nnz = None
-        self.shape = self._infer_square_shape(graph, comm)
-        
+
         if self.dtype == np.dtype(np.float64):
             self._core = vbcsr_core.BlockSpMat_Double(graph)
         else:
             self._core = vbcsr_core.BlockSpMat_Complex(graph)
+
+        self.shape = _shape_from_core(self._core, graph, comm)
 
     @staticmethod
     def _infer_square_shape(graph: Any, comm: Any) -> Tuple[int, int]:
@@ -78,7 +92,7 @@ class VBCSR(LinearOperator):
         obj.dtype = np.dtype(dtype)
         obj.comm = comm
         obj._core = core
-        obj.shape = shape if shape is not None else cls._infer_square_shape(core.graph, comm)
+        obj.shape = shape if shape is not None else _shape_from_core(core, core.graph, comm)
         obj._global_nnz = global_nnz
         return obj
 
@@ -185,7 +199,7 @@ class VBCSR(LinearOperator):
         if self.shape[0] is not None and self.shape[1] is not None:
             self.shape = (self.shape[1], self.shape[0])
         else:
-            self.shape = self._infer_square_shape(self.graph, self.comm)
+            self.shape = _shape_from_core(self._core, self.graph, self.comm)
 
     def conj_(self) -> None:
         """In-place conjugate."""

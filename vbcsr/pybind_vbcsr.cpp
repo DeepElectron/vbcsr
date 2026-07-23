@@ -296,6 +296,20 @@ void bind_block_spmat(py::module& m, const std::string& name) {
         .def_property_readonly("shape_class_count", [](const BlockSpMat<T>& self) {
             return self.shape_class_count();
         })
+        .def_property_readonly("owned_scalar_rows", [](const BlockSpMat<T>& self) {
+            return self.owned_scalar_rows();
+        })
+        // Collective on the graph communicator (MPI_Allreduce). The block graph
+        // is square, so `shape` is (n, n).
+        .def_property_readonly("global_scalar_rows", [](const BlockSpMat<T>& self) {
+            return self.global_scalar_rows();
+        })
+        .def_property_readonly("global_scalar_cols", [](const BlockSpMat<T>& self) {
+            return self.global_scalar_cols();
+        })
+        .def_property_readonly("shape", [](const BlockSpMat<T>& self) {
+            return py::make_tuple(self.shape().first, self.shape().second);
+        })
         .def_property_readonly("has_contiguous_layout", [](const BlockSpMat<T>& self) {
             return self.has_contiguous_layout();
         })
@@ -420,29 +434,14 @@ PYBIND11_MODULE(vbcsr_core, m) {
         .def_readonly("send_ranks", &DistGraph::send_ranks)
         .def_readonly("recv_ranks", &DistGraph::recv_ranks)
         .def_property_readonly("owned_scalar_rows", [](const DistGraph& self) {
-            const size_t owned_blocks = self.owned_global_indices.size();
-            if (self.block_offsets.size() <= owned_blocks) {
-                return 0;
-            }
-            return self.block_offsets[owned_blocks];
+            return self.owned_scalar_rows();
         })
         .def_property_readonly("local_scalar_cols", [](const DistGraph& self) {
             return self.block_offsets.empty() ? 0 : self.block_offsets.back();
         })
+        // Collective on the graph communicator; see DistGraph::global_scalar_rows().
         .def_property_readonly("global_scalar_rows", [](const DistGraph& self) {
-            int local_rows = 0;
-            const size_t owned_blocks = self.owned_global_indices.size();
-            if (self.block_offsets.size() > owned_blocks) {
-                local_rows = self.block_offsets[owned_blocks];
-            }
-
-            int global_rows = local_rows;
-            int initialized = 0;
-            MPI_Initialized(&initialized);
-            if (initialized && self.comm != MPI_COMM_NULL && self.size > 1) {
-                MPI_Allreduce(&local_rows, &global_rows, 1, MPI_INT, MPI_SUM, self.comm);
-            }
-            return global_rows;
+            return self.global_scalar_rows();
         })
         .def("get_local_index", [](const DistGraph& self, int gid) {
             auto it = self.global_to_local.find(gid);
