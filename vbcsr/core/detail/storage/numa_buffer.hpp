@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <memory>
 #include <type_traits>
+#include <vector>
 
 #ifdef __linux__
 #include <sys/mman.h>
@@ -153,6 +154,30 @@ public:
         size_ = count;
     }
 
+    void clear() {
+        buffer_.reset();
+        size_ = 0;
+    }
+
+    // Bulk assign: fresh buffer, parallel first-touch copy of [src, src+count).
+    void assign(const T* src, size_t count) {
+        if (count == 0) {
+            clear();
+            return;
+        }
+        Owner fresh = allocate(count);
+        parallel_fill(fresh.get(), src, count, count);
+        buffer_ = std::move(fresh);
+        size_ = count;
+    }
+
+    friend bool operator==(const NumaVector& a, const NumaVector& b) {
+        return a.size_ == b.size_ && std::equal(a.begin(), a.end(), b.begin());
+    }
+    friend bool operator!=(const NumaVector& a, const NumaVector& b) {
+        return !(a == b);
+    }
+
     size_t size() const { return size_; }
     bool empty() const { return size_ == 0; }
 
@@ -173,6 +198,48 @@ private:
         buffer_ = std::move(fresh);
         size_ = other.size_;
     }
+};
+
+template <typename T>
+inline bool operator==(const NumaVector<T>& a, const std::vector<T>& b) {
+    return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin());
+}
+
+template <typename T>
+inline bool operator==(const std::vector<T>& a, const NumaVector<T>& b) {
+    return b == a;
+}
+
+template <typename T>
+inline bool operator!=(const NumaVector<T>& a, const std::vector<T>& b) {
+    return !(a == b);
+}
+
+template <typename T>
+inline bool operator!=(const std::vector<T>& a, const NumaVector<T>& b) {
+    return !(a == b);
+}
+
+// Read-only view over a contiguous int array. Backends and kernels only read
+// column/adjacency indices, so their signatures take this span and accept
+// both std::vector<int> (staging, tests) and NumaVector<int> (graph storage)
+// without conversion or copies.
+class IndexSpan {
+public:
+    IndexSpan() = default;
+    IndexSpan(const std::vector<int>& v) : ptr_(v.data()), count_(v.size()) {}
+    IndexSpan(const NumaVector<int>& v) : ptr_(v.data()), count_(v.size()) {}
+
+    const int* data() const { return ptr_; }
+    size_t size() const { return count_; }
+    bool empty() const { return count_ == 0; }
+    const int* begin() const { return ptr_; }
+    const int* end() const { return ptr_ + count_; }
+    int operator[](size_t index) const { return ptr_[index]; }
+
+private:
+    const int* ptr_ = nullptr;
+    size_t count_ = 0;
 };
 
 } // namespace detail

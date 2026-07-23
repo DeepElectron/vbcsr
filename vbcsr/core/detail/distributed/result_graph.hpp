@@ -65,9 +65,10 @@ DistGraph* construct_result_graph(
         graph->block_sizes = owned_block_sizes;
         graph->block_displs.assign({0, n_owned});
         graph->adj_ptr.assign(static_cast<size_t>(n_owned) + 1, 0);
-        graph->adj_ind.clear();
+        std::vector<int> staged_adj_ind;
+        std::vector<int> row_cols;
         for (int row = 0; row < n_owned; ++row) {
-            std::vector<int> row_cols;
+            row_cols.clear();
             row_cols.reserve(adjacency[static_cast<size_t>(row)].size());
             for (int global_col : adjacency[static_cast<size_t>(row)]) {
                 auto it = graph->global_to_local.find(global_col);
@@ -77,10 +78,11 @@ DistGraph* construct_result_graph(
                 row_cols.push_back(it->second);
             }
             std::sort(row_cols.begin(), row_cols.end());
-            graph->adj_ind.insert(graph->adj_ind.end(), row_cols.begin(), row_cols.end());
+            staged_adj_ind.insert(staged_adj_ind.end(), row_cols.begin(), row_cols.end());
             graph->adj_ptr[static_cast<size_t>(row) + 1] =
-                static_cast<int>(graph->adj_ind.size());
+                static_cast<int>(staged_adj_ind.size());
         }
+        graph->adj_ind.assign(staged_adj_ind.data(), staged_adj_ind.size());
 
         graph->block_offsets.resize(graph->block_sizes.size() + 1);
         graph->block_offsets[0] = 0;

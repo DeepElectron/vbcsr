@@ -60,6 +60,11 @@ py::array_t<T> make_owned_array_1d(const std::vector<T>& data) {
     return make_owned_array_1d(data.data(), static_cast<py::ssize_t>(data.size()));
 }
 
+template <typename T>
+py::array_t<T> make_owned_array_1d(const vbcsr::detail::NumaVector<T>& data) {
+    return make_owned_array_1d(data.data(), static_cast<py::ssize_t>(data.size()));
+}
+
 // Rvalue overload: adopt the vector's storage instead of copying it (the
 // caller's temporary — e.g. get_values() — already owns a fresh buffer).
 template <typename T>
@@ -413,7 +418,9 @@ PYBIND11_MODULE(vbcsr_core, m) {
         .def_readonly("ghost_global_indices", &DistGraph::ghost_global_indices)
         .def_readonly("block_sizes", &DistGraph::block_sizes)
         .def_readonly("adj_ptr", &DistGraph::adj_ptr)
-        .def_readonly("adj_ind", &DistGraph::adj_ind)
+        .def_property_readonly("adj_ind", [](const DistGraph& self) {
+            return make_owned_array_1d(self.adj_ind);
+        })
         .def_readonly("send_counts", &DistGraph::send_counts)
         .def_readonly("recv_counts", &DistGraph::recv_counts)
         .def_readonly("send_counts_scalar", &DistGraph::send_counts_scalar)

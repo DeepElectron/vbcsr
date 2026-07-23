@@ -226,7 +226,7 @@ public:
         return require_live_graph(graph, "row_ptr")->adj_ptr;
     }
 
-    const std::vector<int>& col_ind() const {
+    const detail::NumaVector<int>& col_ind() const {
         return require_live_graph(graph, "col_ind")->adj_ind;
     }
 

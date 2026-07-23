@@ -324,7 +324,7 @@ struct BSRMatrixBackend {
             static_cast<uint64_t>(values_per_block()));
     }
 
-    BSRBlockSlice<T> page(const std::vector<int>& col_ind, uint32_t page_index) {
+    BSRBlockSlice<T> page(IndexSpan col_ind, uint32_t page_index) {
         auto value_page = values.page(page_index);
         const uint32_t block_value_count =
             static_cast<uint32_t>(this->values_per_block());
@@ -345,7 +345,7 @@ struct BSRMatrixBackend {
     }
 
     BSRBlockSlice<const T> page(
-        const std::vector<int>& col_ind,
+        IndexSpan col_ind,
         uint32_t page_index) const {
         auto value_page = values.page(page_index);
         const uint32_t block_value_count =
@@ -386,7 +386,7 @@ struct BSRMatrixBackend {
 
     const BSRApplyPlan<T>& ensure_apply_plan(
         const std::vector<int>& row_ptr,
-        const std::vector<int>& col_ind) const {
+        IndexSpan col_ind) const {
         std::lock_guard<std::mutex> lock(apply_plan_mutex);
         if (apply_plan == nullptr) {
             auto plan = std::make_unique<BSRApplyPlan<T>>();
@@ -434,7 +434,7 @@ struct BSRMatrixBackend {
 
     const BSRVendorCache<T>& ensure_vendor_cache(
         const std::vector<int>& row_ptr,
-        const std::vector<int>& col_ind,
+        IndexSpan col_ind,
         int num_block_cols) const {
         {
             std::lock_guard<std::mutex> lock(vendor_cache_mutex);

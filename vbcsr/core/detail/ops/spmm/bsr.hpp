@@ -119,7 +119,7 @@ private:
         graph->ghost_global_indices.clear();
 
         graph->adj_ptr = row_ptr;
-        graph->adj_ind = local_cols;
+        graph->adj_ind.assign(local_cols.data(), local_cols.size());
 
         graph->block_offsets.resize(graph->block_sizes.size() + 1);
         graph->block_offsets[0] = 0;

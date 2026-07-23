@@ -190,7 +190,7 @@ struct VBCSRMatrixBackend {
     // exactly one (shape, domain) range, so the fill covers all payload.
     void build_first_touch_structure(
         const std::vector<int>& adj_ptr,
-        const std::vector<int>& adj_ind,
+        IndexSpan adj_ind,
         const std::vector<int>& block_sizes,
         int n_rows) {
         initialize_graph_block_handles(adj_ind.size());
@@ -359,7 +359,7 @@ struct VBCSRMatrixBackend {
     // the graph col_ind array, and the contiguous same-shape page payload.
     const ApplyPlan& ensure_apply_plan(
         const std::vector<int>& row_ptr,
-        const std::vector<int>& col_ind) const {
+        IndexSpan col_ind) const {
         std::lock_guard<std::mutex> lock(apply_plan_mutex);
         if (!apply_plan) {
             auto plan = std::make_unique<ApplyPlan>();
@@ -393,7 +393,7 @@ struct VBCSRMatrixBackend {
 
     const ForwardApplyPlan& ensure_forward_apply_plan(
         const std::vector<int>& row_ptr,
-        const std::vector<int>& col_ind,
+        IndexSpan col_ind,
         const std::vector<int>& block_sizes,
         int n_rows,
         int direct_dense_row_degree_limit) const {
@@ -452,7 +452,7 @@ struct VBCSRMatrixBackend {
 
     const AdjointApplyPlan& ensure_adjoint_apply_plan(
         const std::vector<int>& row_ptr,
-        const std::vector<int>& col_ind,
+        IndexSpan col_ind,
         const std::vector<int>& block_sizes,
         int n_rows,
         int direct_dense_col_degree_limit) const {
@@ -537,7 +537,7 @@ struct VBCSRMatrixBackend {
     template <typename Fn>
     void for_each_shape_batch(
         const std::vector<int>& row_ptr,
-        const std::vector<int>& col_ind,
+        IndexSpan col_ind,
         Fn&& fn) const {
         const auto& plan = ensure_apply_plan(row_ptr, col_ind);
         for (const auto& batch : plan.batches) {

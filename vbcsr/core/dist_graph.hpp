@@ -3,6 +3,7 @@
 
 #include <mpi.h>
 #include "detail/storage/index_map.hpp"
+#include "detail/storage/numa_buffer.hpp"
 #include <atomic>
 #include <cstdint>
 #include <vector>
@@ -37,9 +38,13 @@ public:
     std::vector<int> block_sizes;
     
     // Adjacency list for the block graph (local rows to column blocks)
-    // Indices in adj_ind are LOCAL indices
+    // Indices in adj_ind are LOCAL indices.
+    // adj_ind is nnz-scale (for scalar CSR it is ~1/3 of SpMV traffic), so it
+    // lives in a NumaVector: fresh pages, parallel first touch — both fills
+    // and later parallel reads see node-local pages. adj_ptr is rows-scale
+    // and stays a plain vector.
     std::vector<int> adj_ptr;
-    std::vector<int> adj_ind;
+    detail::NumaVector<int> adj_ind;
 
     // IMPORTANT: Ghost Index Convention
     // Ghost blocks (indices >= n_owned) are sorted by OWNER RANK first, then by Global ID.
@@ -275,23 +280,26 @@ public:
             block_sizes.push_back(all_block_sizes[gid]);
         }
         
-        // 3.3 Build adjacency list
+        // 3.3 Build adjacency list (staged, then one parallel first-touch
+        // assign into the NumaVector).
         adj_ptr.resize(n_owned + 1);
         adj_ptr[0] = 0;
-        adj_ind.clear();
+        std::vector<int> staged_adj_ind;
+        std::vector<int> row_cols;
         for (int i = 0; i < n_owned; ++i) {
             int gid = owned_global_indices[i];
             int start = adj_offsets[gid];
             int end = adj_offsets[gid+1];
-            
-            std::vector<int> row_cols;
+
+            row_cols.clear();
             for (int k = start; k < end; ++k) {
                 row_cols.push_back(global_to_local[flat_adj[k]]);
             }
             std::sort(row_cols.begin(), row_cols.end());
-            adj_ind.insert(adj_ind.end(), row_cols.begin(), row_cols.end());
-            adj_ptr[i+1] = adj_ind.size();
+            staged_adj_ind.insert(staged_adj_ind.end(), row_cols.begin(), row_cols.end());
+            adj_ptr[i+1] = staged_adj_ind.size();
         }
+        adj_ind.assign(staged_adj_ind.data(), staged_adj_ind.size());
         
         // 4. Build communication pattern
         build_comm_pattern(displ);
@@ -423,10 +431,11 @@ private:
             block_sizes.push_back(0); // Placeholder
         }
         
-        // Build adjacency list
+        // Build adjacency list (staged, then one parallel first-touch assign
+        // into the NumaVector).
         adj_ptr.resize(n_owned + 1);
         adj_ptr[0] = 0;
-        adj_ind.clear();
+        std::vector<int> staged_adj_ind;
         std::vector<int> row_local_cols;
         for (int i = 0; i < n_owned; ++i) {
             const auto [cols, count] = row_cols(i);
@@ -436,9 +445,10 @@ private:
                 row_local_cols.push_back(global_to_local[cols[entry]]);
             }
             std::sort(row_local_cols.begin(), row_local_cols.end());
-            adj_ind.insert(adj_ind.end(), row_local_cols.begin(), row_local_cols.end());
-            adj_ptr[i+1] = adj_ind.size();
+            staged_adj_ind.insert(staged_adj_ind.end(), row_local_cols.begin(), row_local_cols.end());
+            adj_ptr[i+1] = staged_adj_ind.size();
         }
+        adj_ind.assign(staged_adj_ind.data(), staged_adj_ind.size());
 
         // Fetch ghost block sizes
         fetch_ghost_block_sizes(displ);
@@ -476,7 +486,7 @@ public:
                                   const std::vector<int>& my_ghost_sizes,
                                   const std::vector<int>& my_displs,
                                   std::vector<int>&& local_adj_ptr,
-                                  std::vector<int>&& local_adj_ind) {
+                                  detail::NumaVector<int>&& local_adj_ind) {
         const int n_owned = static_cast<int>(my_owned_indices.size());
         const int n_ghosts = static_cast<int>(my_ghosts.size());
         if (!std::is_sorted(my_owned_indices.begin(), my_owned_indices.end())) {
@@ -552,7 +562,7 @@ public:
 
     void get_matrix_structure(std::vector<int>& row_ptr, std::vector<int>& col_ind) const {
         row_ptr = adj_ptr;
-        col_ind = adj_ind;
+        col_ind.assign(adj_ind.begin(), adj_ind.end());
     }
     
     void get_vector_structure(int& local_size, int& ghost_size) {

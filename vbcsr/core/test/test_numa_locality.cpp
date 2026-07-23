@@ -94,7 +94,13 @@ std::vector<std::vector<int>> make_adjacency(int n_rows) {
 
 // Returns true when the invariant was actually exercised (threads spanned
 // more than one node and the samples resolved).
-bool check_locality(const char* label, BlockSpMat<double>& mat) {
+//
+// With `adjacency` set, samples the graph's adj_ind pages instead of value
+// blocks. adj_ind is first-touched in even nnz slices (NumaVector), which
+// coincides with the nnz-weighted domain partition when the partition weight
+// IS the per-row entry count — true for csr and bsr, not for vbcsr (work-
+// weighted), so adjacency checks run on csr/bsr only.
+bool check_locality(const char* label, BlockSpMat<double>& mat, bool adjacency = false) {
     const auto& domains = mat.thread_domain_partition();
     const auto& adj_ptr = mat.graph->adj_ptr;
     const int max_threads = omp_get_max_threads();
@@ -126,7 +132,10 @@ bool check_locality(const char* label, BlockSpMat<double>& mat) {
             if (slot >= adj_ptr[row + 1]) {
                 continue;  // structurally empty row
             }
-            const int node = node_of_address(mat.block_data(slot));
+            const void* addr = adjacency
+                ? static_cast<const void*>(&mat.col_ind()[static_cast<size_t>(slot)])
+                : static_cast<const void*>(mat.block_data(slot));
+            const int node = node_of_address(addr);
             const int own = thread_nodes[static_cast<size_t>(tid)];
             if (node < 0 || own < 0) {
                 continue;  // syscall unavailable; counted as unsampled
@@ -162,17 +171,21 @@ bool check_locality(const char* label, BlockSpMat<double>& mat) {
         for (int t = 0; t < thread_count; ++t) {
             const int row = domains.domain_begin(t);
             const int probe_row = (domains.domain_begin(t) + domains.domain_end(t)) / 2;
+            const int probe_slot = adj_ptr[probe_row];
+            const void* probe_addr = adjacency
+                ? static_cast<const void*>(&mat.col_ind()[static_cast<size_t>(probe_slot)])
+                : static_cast<const void*>(mat.block_data(probe_slot));
             std::printf("  thread %d: node=%d rows=[%d,%d) matched %d/%d, mid-row page node=%d\n",
                         t, thread_nodes[static_cast<size_t>(t)],
                         row, domains.domain_end(t),
                         matched[static_cast<size_t>(t)], sampled[static_cast<size_t>(t)],
-                        node_of_address(mat.block_data(adj_ptr[probe_row])));
+                        node_of_address(probe_addr));
         }
     }
     std::fflush(stdout);
     // 90%: tolerate stray pages (THP coalescing, OS balancing), catch the
     // defect mode (everything on node 0 => remote domains match ~0%).
-    assert(match_fraction >= 0.9 && "value pages are not domain-local");
+    assert(match_fraction >= 0.9 && "sampled pages are not domain-local");
     return true;
 }
 
@@ -201,6 +214,7 @@ int main(int argc, char** argv) {
             BlockSpMat<double> mat(&graph);
             assert(mat.matrix_kind() == MatrixKind::CSR);
             exercised += check_locality("csr", mat);
+            exercised += check_locality("csr adj_ind", mat, /*adjacency=*/true);
         }
         {
             // BSR: 8x8 blocks. ~13 blocks/row * 512 B: 8k rows ~= 53 MiB.
@@ -211,6 +225,7 @@ int main(int argc, char** argv) {
             BlockSpMat<double> mat(&graph);
             assert(mat.matrix_kind() == MatrixKind::BSR);
             exercised += check_locality("bsr", mat);
+            exercised += check_locality("bsr adj_ind", mat, /*adjacency=*/true);
         }
         {
             // VBCSR: mixed 4/8/12 blocks, mean block ~72 values: 10k rows ~= 75 MiB.
@@ -239,6 +254,7 @@ int main(int argc, char** argv) {
                 mat.fill_random();
                 BlockSpMat<double> product = mat.spmm(mat, 0.0);
                 exercised += check_locality("csr spgemm result", product);
+                exercised += check_locality("csr spgemm result adj_ind", product, /*adjacency=*/true);
             }
             {
                 const int n_rows = 4000;  // bsr 8x8: C ~ 130 MiB

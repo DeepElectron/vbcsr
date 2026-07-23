@@ -94,7 +94,7 @@ private:
     static DistGraph* construct_serial_result_graph(
         const Matrix& A,
         std::vector<int>&& row_ptr,
-        std::vector<int>&& local_cols) {
+        detail::NumaVector<int>&& local_cols) {
         auto* graph = new DistGraph(A.graph->comm);
         graph->owned_global_indices = A.graph->owned_global_indices;
         graph->global_to_local = A.graph->global_to_local;
@@ -259,7 +259,7 @@ private:
 
         const MKL_INT base = index_base == SPARSE_INDEX_BASE_ONE ? 1 : 0;
         std::vector<int> c_row_ptr(static_cast<size_t>(n_rows) + 1, 0);
-        std::vector<int> c_cols_local;
+        detail::NumaVector<int> c_cols_local;
         std::vector<T> c_values;
         // dst slot -> src entry offset (relative to `first`); empty when every
         // exported row is already sorted (then values copy straight through).
@@ -296,10 +296,10 @@ private:
             }
 
             if (!any_unsorted) {
-                // A std::vector cannot grow without one serial pass, so keep
-                // the cheap pure-write zero-fill (resize) serial and
-                // parallelize the expensive read+write copy. The serial
-                // assign() this replaces was 44% of the 48-thread total.
+                // NumaVector resize is a parallel first-touch zero and the
+                // copy below is parallel too: no serial nnz-scale pass
+                // remains in the copy-out (the serial assign() this replaced
+                // was 44% of the 48-thread total).
                 c_cols_local.resize(exported_nnz);
                 const int64_t nnz_count = static_cast<int64_t>(exported_nnz);
                 if (base == 0 && std::is_same_v<MKL_INT, int>) {
@@ -858,7 +858,7 @@ private:
         // Vendor multiply. Handles stay alive until the value copy below --
         // the exported arrays are owned by c_handle.
         std::vector<int> c_row_ptr;
-        std::vector<int> c_cols;
+        detail::NumaVector<int> c_cols;
         std::vector<int> c_ghost_globals;
         std::vector<int> c_ghost_sizes;
         size_t result_nnz = 0;

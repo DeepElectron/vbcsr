@@ -176,7 +176,7 @@ struct CSRMatrixBackend {
         return values.element_ptr(static_cast<uint64_t>(slot));
     }
 
-    CSRNnzSlice<T> page(const std::vector<int>& col_ind, uint32_t page_index) {
+    CSRNnzSlice<T> page(IndexSpan col_ind, uint32_t page_index) {
         auto value_page = values.page(page_index);
         if (value_page.first_element + value_page.count > static_cast<uint64_t>(col_ind.size())) {
             throw std::out_of_range("CSRMatrixBackend::page column span out of bounds");
@@ -190,7 +190,7 @@ struct CSRMatrixBackend {
         };
     }
 
-    CSRNnzSlice<const T> page(const std::vector<int>& col_ind, uint32_t page_index) const {
+    CSRNnzSlice<const T> page(IndexSpan col_ind, uint32_t page_index) const {
         auto value_page = values.page(page_index);
         if (value_page.first_element + value_page.count > static_cast<uint64_t>(col_ind.size())) {
             throw std::out_of_range("CSRMatrixBackend::page column span out of bounds");
@@ -207,7 +207,7 @@ struct CSRMatrixBackend {
     template <typename Fn>
     void for_each_row_slice(
         const std::vector<int>& row_ptr,
-        const std::vector<int>& col_ind,
+        IndexSpan col_ind,
         int row,
         Fn&& fn) const {
         uint64_t current = static_cast<uint64_t>(row_ptr[static_cast<size_t>(row)]);
@@ -236,7 +236,7 @@ struct CSRMatrixBackend {
     // Vendor execution support used by kernels/csr_apply.hpp.
     const CSRVendorCache<T>& ensure_vendor_cache(
         const std::vector<int>& row_ptr,
-        const std::vector<int>& col_ind,
+        IndexSpan col_ind,
         int num_cols) const {
         std::lock_guard<std::mutex> lock(vendor_cache_mutex);
         if (vendor_cache == nullptr) {
