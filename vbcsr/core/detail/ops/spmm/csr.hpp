@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -272,6 +273,11 @@ private:
                 throw std::runtime_error("MKL CSR SpGEMM exported invalid row offsets");
             }
             const size_t exported_nnz = static_cast<size_t>(last - first);
+            if (exported_nnz > static_cast<size_t>(std::numeric_limits<int>::max())) {
+                throw std::overflow_error(
+                    "scalar-CSR SpGEMM result exceeds 2^31 nonzeros on this rank; "
+                    "distribute over more ranks");
+            }
             // Single-writer form (each slot written exactly once) so the row
             // loop parallelizes. The trailing slot is the export window size,
             // as before: the copy below takes [first, last) verbatim, which is

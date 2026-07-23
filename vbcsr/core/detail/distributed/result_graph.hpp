@@ -4,6 +4,7 @@
 #include "../../dist_graph.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -81,6 +82,11 @@ DistGraph* construct_result_graph(
             staged_adj_ind.insert(staged_adj_ind.end(), row_cols.begin(), row_cols.end());
             graph->adj_ptr[static_cast<size_t>(row) + 1] =
                 static_cast<int>(staged_adj_ind.size());
+        }
+        if (staged_adj_ind.size() >
+            static_cast<size_t>(std::numeric_limits<int>::max())) {
+            throw std::overflow_error(
+                "result adjacency exceeds 2^31 blocks on this rank; distribute over more ranks");
         }
         graph->adj_ind.assign(staged_adj_ind.data(), staged_adj_ind.size());
 

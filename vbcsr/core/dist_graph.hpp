@@ -10,6 +10,7 @@
 #include <map>
 #include <numeric>
 #include <algorithm>
+#include <limits>
 #include <iostream>
 #include <stdexcept>
 
@@ -299,6 +300,11 @@ public:
             staged_adj_ind.insert(staged_adj_ind.end(), row_cols.begin(), row_cols.end());
             adj_ptr[i+1] = staged_adj_ind.size();
         }
+        if (staged_adj_ind.size() >
+            static_cast<size_t>(std::numeric_limits<int>::max())) {
+            throw std::overflow_error(
+                "adjacency exceeds 2^31 blocks on this rank; distribute over more ranks");
+        }
         adj_ind.assign(staged_adj_ind.data(), staged_adj_ind.size());
         
         // 4. Build communication pattern
@@ -447,6 +453,11 @@ private:
             std::sort(row_local_cols.begin(), row_local_cols.end());
             staged_adj_ind.insert(staged_adj_ind.end(), row_local_cols.begin(), row_local_cols.end());
             adj_ptr[i+1] = staged_adj_ind.size();
+        }
+        if (staged_adj_ind.size() >
+            static_cast<size_t>(std::numeric_limits<int>::max())) {
+            throw std::overflow_error(
+                "adjacency exceeds 2^31 blocks on this rank; distribute over more ranks");
         }
         adj_ind.assign(staged_adj_ind.data(), staged_adj_ind.size());
 

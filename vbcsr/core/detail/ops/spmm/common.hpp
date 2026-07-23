@@ -5,7 +5,9 @@
 #include "../../distributed/mpi_utils.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <cstring>
 #include <map>
 #include <set>
@@ -218,13 +220,15 @@ SymbolicMultiplyResult symbolic_multiply_filtered(
         double value;
         int tag;
     };
-    const size_t HASH_SIZE = 8192;
-    const size_t HASH_MASK = HASH_SIZE - 1;
-    const size_t MAX_ROW_NNZ = static_cast<size_t>(HASH_SIZE * 0.7);
+    // Per-thread tables grow to fit the widest row a thread actually sees: a
+    // fixed capacity is a hard wall at high degree (a 500-neighbor graph's
+    // C = A*B rows exceed any reasonable constant), while sum-of-B-degrees
+    // over the A row is a cheap exact upper bound on the row's result width.
+    constexpr size_t kInitialSymbolicHashSize = 8192;
 
     std::vector<std::vector<SymbolicHashEntry>> thread_tables(
         max_threads,
-        std::vector<SymbolicHashEntry>(HASH_SIZE, {-1, 0.0, 0}));
+        std::vector<SymbolicHashEntry>(kInitialSymbolicHashSize, {-1, 0.0, 0}));
     std::vector<std::vector<int>> thread_touched(max_threads);
     std::vector<int> thread_tags(max_threads, 0);
 
@@ -237,6 +241,39 @@ SymbolicMultiplyResult symbolic_multiply_filtered(
 
         #pragma omp for
         for (int row = 0; row < n_rows; ++row) {
+            const int start = A.row_ptr()[row];
+            const int end = A.row_ptr()[row + 1];
+
+            // Upper bound on this row's distinct result columns.
+            size_t row_width_bound = 0;
+            for (int a_slot = start; a_slot < end; ++a_slot) {
+                const int global_col_A = A.graph->get_global_index(A.col_ind()[a_slot]);
+                if (A.graph->find_owner(global_col_A) == A.graph->rank) {
+                    const int local_row_B = B.graph->global_to_local.at(global_col_A);
+                    row_width_bound += static_cast<size_t>(
+                        B.row_ptr()[local_row_B + 1] - B.row_ptr()[local_row_B]);
+                } else {
+                    auto it = meta.find(global_col_A);
+                    if (it != meta.end()) {
+                        row_width_bound += it->second.size();
+                    }
+                }
+            }
+            const size_t required = std::max<size_t>(
+                kInitialSymbolicHashSize, 2 * row_width_bound + 1);
+            if (required > table.size()) {
+                size_t new_size = table.size();
+                while (new_size < required) {
+                    if (new_size > std::numeric_limits<size_t>::max() / 2) {
+                        throw std::overflow_error("Symbolic hash table size overflow");
+                    }
+                    new_size <<= 1;
+                }
+                table.assign(new_size, {-1, 0.0, 0});
+                tag = 0;  // fresh tags: every entry of the new table is tag 0
+            }
+            const size_t hash_mask = table.size() - 1;
+
             ++tag;
             if (tag == 0) {
                 for (auto& entry : table) {
@@ -246,27 +283,24 @@ SymbolicMultiplyResult symbolic_multiply_filtered(
             }
             touched.clear();
 
-            const int start = A.row_ptr()[row];
-            const int end = A.row_ptr()[row + 1];
             for (int a_slot = start; a_slot < end; ++a_slot) {
                 const int global_col_A = A.graph->get_global_index(A.col_ind()[a_slot]);
                 const double norm_A = A_norms[a_slot];
 
                 auto process_block = [&](int global_col_B, double norm_B) {
-                    size_t h = static_cast<size_t>(global_col_B) & HASH_MASK;
+                    size_t h = static_cast<size_t>(global_col_B) & hash_mask;
                     size_t count = 0;
                     while (table[h].tag == tag) {
                         if (table[h].key == global_col_B) {
                             table[h].value += norm_A * norm_B;
                             return;
                         }
-                        h = (h + 1) & HASH_MASK;
-                        if (++count > HASH_SIZE) {
+                        h = (h + 1) & hash_mask;
+                        if (++count > table.size()) {
+                            // Unreachable when the width bound holds; kept as
+                            // a defensive invariant.
                             throw std::runtime_error("Hash table full in symbolic phase");
                         }
-                    }
-                    if (touched.size() > MAX_ROW_NNZ) {
-                        throw std::runtime_error("Row density exceeds symbolic hash table capacity");
                     }
                     table[h] = {global_col_B, norm_A * norm_B, tag};
                     touched.push_back(static_cast<int>(h));
@@ -298,9 +332,18 @@ SymbolicMultiplyResult symbolic_multiply_filtered(
         }
     }
 
+    // Block counts are int-indexed throughout the structural layer; C = A*B
+    // can inflate block counts well past A's, so guard the 2^31 per-rank
+    // ceiling explicitly instead of wrapping silently.
+    int64_t running_blocks = 0;
     for (int row = 0; row < n_rows; ++row) {
-        res.c_row_ptr[row + 1] =
-            res.c_row_ptr[row] + static_cast<int>(thread_cols[row].size());
+        running_blocks += static_cast<int64_t>(thread_cols[row].size());
+        if (running_blocks > static_cast<int64_t>(std::numeric_limits<int>::max())) {
+            throw std::overflow_error(
+                "SpGEMM result exceeds 2^31 blocks on this rank; "
+                "distribute over more ranks");
+        }
+        res.c_row_ptr[row + 1] = static_cast<int>(running_blocks);
     }
     res.c_col_ind.resize(static_cast<size_t>(res.c_row_ptr[n_rows]));
     #pragma omp parallel for schedule(static)

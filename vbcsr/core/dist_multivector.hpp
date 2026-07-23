@@ -7,6 +7,7 @@
 #include <omp.h>
 #endif
 #include "dist_vector.hpp"
+#include "detail/distributed/mpi_utils.hpp"
 #include <vector>
 #include <cassert>
 #include <cstring>
@@ -325,15 +326,18 @@ public:
         size_t total_recv_elements = static_cast<size_t>(recv_displs_scalar[graph->size]) * num_vectors;
         if (recv_buf.size() < total_recv_elements) recv_buf.resize(total_recv_elements);
 
-        std::vector<int> s_counts = send_counts_scalar;
-        std::vector<int> r_counts = recv_counts_scalar;
-        std::vector<int> s_displs = send_displs_scalar;
-        std::vector<int> r_displs = recv_displs_scalar;
-
-        for(auto& x : s_counts) x *= num_vectors;
-        for(auto& x : r_counts) x *= num_vectors;
-        for(auto& x : s_displs) x *= num_vectors;
-        for(auto& x : r_displs) x *= num_vectors;
+        // Element counts scale with num_vectors and overflow int at large
+        // halos (the buffer sizes above are already size_t for that reason),
+        // so the exchange uses 64-bit counts and the chunked safe_alltoallv —
+        // a plain MPI_Alltoallv caps every message at 2^31 elements.
+        const int np = graph->size;
+        std::vector<size_t> s_counts(np), r_counts(np), s_displs(np), r_displs(np);
+        for (int r = 0; r < np; ++r) {
+            s_counts[r] = static_cast<size_t>(send_counts_scalar[r]) * num_vectors;
+            r_counts[r] = static_cast<size_t>(recv_counts_scalar[r]) * num_vectors;
+            s_displs[r] = static_cast<size_t>(send_displs_scalar[r]) * num_vectors;
+            r_displs[r] = static_cast<size_t>(recv_displs_scalar[r]) * num_vectors;
+        }
 
         int current_idx = 0;
         size_t buf_ptr = 0;
@@ -362,8 +366,8 @@ public:
 
         // Exchange
         MPI_Datatype type = get_mpi_type();
-        MPI_Alltoallv(send_buf.data(), s_counts.data(), s_displs.data(), type,
-                      recv_buf.data(), r_counts.data(), r_displs.data(), type, graph->comm);
+        safe_alltoallv(send_buf.data(), s_counts, s_displs, type,
+                       recv_buf.data(), r_counts, r_displs, type, graph->comm);
 
         // Unpack
         current_idx = 0;
@@ -429,19 +433,19 @@ public:
         size_t total_recv_elements = static_cast<size_t>(send_displs_scalar[graph->size]) * num_vectors;
         std::vector<T> r_buf(total_recv_elements);
 
-        std::vector<int> s_counts = recv_counts_scalar;
-        std::vector<int> r_counts = send_counts_scalar;
-        std::vector<int> s_displs = recv_displs_scalar;
-        std::vector<int> r_displs = send_displs_scalar;
-
-        for(auto& x : s_counts) x *= num_vectors;
-        for(auto& x : r_counts) x *= num_vectors;
-        for(auto& x : s_displs) x *= num_vectors;
-        for(auto& x : r_displs) x *= num_vectors;
+        // Same 64-bit + chunked treatment as sync_ghosts (roles swapped).
+        const int np = graph->size;
+        std::vector<size_t> s_counts(np), r_counts(np), s_displs(np), r_displs(np);
+        for (int r = 0; r < np; ++r) {
+            s_counts[r] = static_cast<size_t>(recv_counts_scalar[r]) * num_vectors;
+            r_counts[r] = static_cast<size_t>(send_counts_scalar[r]) * num_vectors;
+            s_displs[r] = static_cast<size_t>(recv_displs_scalar[r]) * num_vectors;
+            r_displs[r] = static_cast<size_t>(send_displs_scalar[r]) * num_vectors;
+        }
 
         MPI_Datatype type = get_mpi_type();
-        MPI_Alltoallv(s_buf.data(), s_counts.data(), s_displs.data(), type,
-                      r_buf.data(), r_counts.data(), r_displs.data(), type, graph->comm);
+        safe_alltoallv(s_buf.data(), s_counts, s_displs, type,
+                       r_buf.data(), r_counts, r_displs, type, graph->comm);
 
         current_idx = 0;
         buf_ptr = 0;
