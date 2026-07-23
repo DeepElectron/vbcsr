@@ -307,12 +307,24 @@ public:
     std::vector<T> send_buf;
     std::vector<T> recv_buf;
 
+    // Communication diagnostics: cumulative wall seconds and call count of
+    // ghost exchanges (pack + MPI + unpack); read/reset by the benchmark
+    // harness to report comm fractions. Serial calls are not counted.
+    double comm_seconds = 0.0;
+    long comm_calls = 0;
+
+    void reset_comm_stats() {
+        comm_seconds = 0.0;
+        comm_calls = 0;
+    }
+
     // Sync ghosts for all vectors.
     // Wire format: per block, rows in order, each row's num_vectors lanes
     // (tight — padding lanes never travel). When ld == num_vectors a whole
     // block is one contiguous span and packs with a single memcpy.
     void sync_ghosts() {
         if (graph->size == 1) return;
+        const double comm_t0 = MPI_Wtime();
 
         const auto& block_offsets = graph->block_offsets;
         const auto& send_counts_scalar = graph->send_counts_scalar;
@@ -393,6 +405,9 @@ public:
                 buf_ptr += static_cast<size_t>(blk_size) * num_vectors;
             }
         }
+
+        comm_seconds += MPI_Wtime() - comm_t0;
+        ++comm_calls;
     }
 
     void reduce_ghosts() {

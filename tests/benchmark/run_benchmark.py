@@ -1076,6 +1076,20 @@ def benchmark_vbcsr_with_internal_diagnostics(
     # §Threading Model) and the library configures its own vendor pool. The benchmark
     # must observe that, not redefine it. Reference-baseline threading is still
     # configured around the sparse_dot_mkl calls themselves, where it belongs.
+    # Ghost-exchange accounting for the apply ops: the X operand's core
+    # object accumulates pack+MPI+unpack seconds per sync (multi-node runs
+    # read the comm fraction from this — a weak-scaling curve without it is
+    # a pass/fail black box).
+    comm_source = None
+    if spec.operation == "spmv":
+        comm_source = inputs.get("x_vector")
+    elif spec.operation == "spmm":
+        comm_source = inputs.get("x_multivector")
+    if comm_source is not None and not hasattr(comm_source, "reset_comm_stats"):
+        comm_source = None
+    if comm_source is not None:
+        comm_source.reset_comm_stats()
+
     timing = benchmark_repeated(
         vbcsr_op(matrix, inputs, spec),
         comm=comm,
@@ -1084,6 +1098,21 @@ def benchmark_vbcsr_with_internal_diagnostics(
         min_iterations=min_iterations,
         warmups=warmups,
     )
+
+    if comm_source is not None:
+        local_calls_comm = int(comm_source.comm_calls)
+        per_call = (
+            float(comm_source.comm_seconds) / local_calls_comm
+            if local_calls_comm
+            else 0.0
+        )
+        # The slowest rank's exchange bounds the collective op.
+        per_call_max = float(reduce_value(comm, per_call, "max"))
+        median = float(timing.get("median_seconds") or 0.0)
+        diagnostic["ghost_comm_seconds_per_call_max"] = per_call_max
+        diagnostic["ghost_comm_calls_local"] = local_calls_comm
+        if median > 0.0:
+            diagnostic["ghost_comm_fraction_of_median"] = per_call_max / median
 
     after = int(matrix.vendor_launch_count)
     local_calls = int(sum(int(item) for item in timing.get("iterations", []))) + int(repeats) * int(warmups)

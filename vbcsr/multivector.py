@@ -60,6 +60,20 @@ class DistMultiVector:
             return s[0] * s[1]
         return 0
 
+    def reset_comm_stats(self) -> None:
+        """Zero the cumulative ghost-exchange timing counters."""
+        self._core.reset_comm_stats()
+
+    @property
+    def comm_seconds(self) -> float:
+        """Cumulative wall seconds spent in ghost exchanges (pack+MPI+unpack)."""
+        return self._core.comm_seconds
+
+    @property
+    def comm_calls(self) -> int:
+        """Number of ghost exchanges accumulated in comm_seconds."""
+        return self._core.comm_calls
+
     def copy(self) -> 'DistMultiVector':
         return duplicate_wrapper(self)
 

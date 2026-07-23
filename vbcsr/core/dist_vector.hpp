@@ -182,8 +182,21 @@ public:
     std::vector<T> send_buf;
     // No recv_buf needed for zero-copy
 
+    // Communication diagnostics: cumulative wall seconds and call count of
+    // ghost exchanges (pack + MPI + unpack). The benchmark harness reads and
+    // resets these to report the comm fraction of distributed applies on
+    // real interconnects. Serial (size == 1) calls are not counted.
+    double comm_seconds = 0.0;
+    long comm_calls = 0;
+
+    void reset_comm_stats() {
+        comm_seconds = 0.0;
+        comm_calls = 0;
+    }
+
     void sync_ghosts() {
         if (graph->size == 1) return;
+        const double comm_t0 = MPI_Wtime();
 
         // 1. Pack send buffers
         const auto& block_offsets = graph->block_offsets;
@@ -220,6 +233,9 @@ public:
         MPI_Datatype type = get_mpi_type();
         MPI_Alltoallv(send_buf.data(), send_counts_elems.data(), sdispls_elems.data(), type,
                       recv_ptr, recv_counts_elems.data(), rdispls_elems.data(), type, graph->comm);
+
+        comm_seconds += MPI_Wtime() - comm_t0;
+        ++comm_calls;
     }
 
     void reduce_ghosts() {
