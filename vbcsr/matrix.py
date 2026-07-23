@@ -281,6 +281,39 @@ class VBCSR(LinearOperator):
         return cls(graph, dtype, comm)
 
     @classmethod
+    def create_distributed_flat(cls, owned_indices: Any, block_sizes: Any, adj_ptr: Any, adj_ind: Any, dtype: type = np.float64, comm: Any = None) -> 'VBCSR':
+        """
+        Create a VBCSR matrix from flat CSR-style adjacency arrays.
+
+        Semantically identical to create_distributed, but the adjacency is
+        passed as two flat arrays instead of a list of per-row lists — the
+        natural form for array-based pipelines, and far cheaper to hand to
+        C++ (no per-element Python conversion of tens of millions of edges).
+
+        Args:
+            owned_indices: 1-D integer array of global block indices owned by
+                this rank, sorted ascending.
+            block_sizes: 1-D integer array of owned block sizes (parallel to
+                owned_indices).
+            adj_ptr: 1-D integer array of length len(owned_indices) + 1; row i
+                owns adjacency entries [adj_ptr[i], adj_ptr[i + 1]).
+            adj_ind: 1-D integer array of GLOBAL block column indices.
+            dtype: Data type.
+            comm: MPI communicator.
+
+        Returns:
+            VBCSR: The initialized matrix.
+        """
+        graph = vbcsr_core.DistGraph(comm)
+        graph.construct_distributed_flat(
+            np.ascontiguousarray(owned_indices, dtype=np.int32),
+            np.ascontiguousarray(block_sizes, dtype=np.int32),
+            np.ascontiguousarray(adj_ptr, dtype=np.int64),
+            np.ascontiguousarray(adj_ind, dtype=np.int32),
+        )
+        return cls(graph, dtype, comm)
+
+    @classmethod
     def create_random(cls, global_blocks: int = 100, block_size_min: int = 1, block_size_max: int = 4, density: float = 0.01, dtype: type = np.float64, seed: int = 42, comm: Any = None) -> 'VBCSR':
         """
         Create a random connected VBCSR matrix for benchmarking.

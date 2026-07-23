@@ -379,6 +379,36 @@ PYBIND11_MODULE(vbcsr_core, m) {
         }), py::arg("comm") = py::none())
         .def("construct_serial", &DistGraph::construct_serial)
         .def("construct_distributed", &DistGraph::construct_distributed)
+        .def("construct_distributed_flat",
+            // Array-based construction: identical semantics to
+            // construct_distributed, but adjacency arrives as flat CSR-style
+            // numpy arrays (adj_ind holds GLOBAL block ids), avoiding the
+            // per-element list conversion that dominates large graphs.
+            [](DistGraph& self,
+               py::array_t<int, py::array::c_style | py::array::forcecast> owned_indices,
+               py::array_t<int, py::array::c_style | py::array::forcecast> block_sizes,
+               py::array_t<int64_t, py::array::c_style | py::array::forcecast> adj_ptr,
+               py::array_t<int, py::array::c_style | py::array::forcecast> adj_ind) {
+                if (owned_indices.ndim() != 1 || block_sizes.ndim() != 1 ||
+                    adj_ptr.ndim() != 1 || adj_ind.ndim() != 1) {
+                    throw std::runtime_error("construct_distributed_flat expects 1-D arrays");
+                }
+                const py::ssize_t n_owned = owned_indices.shape(0);
+                if (block_sizes.shape(0) != n_owned || adj_ptr.shape(0) != n_owned + 1) {
+                    throw std::runtime_error(
+                        "construct_distributed_flat: block_sizes must match owned_indices and "
+                        "adj_ptr must have one more entry than owned_indices");
+                }
+                std::vector<int> owned_vec(
+                    owned_indices.data(), owned_indices.data() + n_owned);
+                std::vector<int> sizes_vec(
+                    block_sizes.data(), block_sizes.data() + n_owned);
+                self.construct_distributed_flat(
+                    owned_vec, sizes_vec, adj_ptr.data(), adj_ind.data(),
+                    static_cast<int64_t>(adj_ind.shape(0)));
+            },
+            py::arg("owned_indices"), py::arg("block_sizes"),
+            py::arg("adj_ptr"), py::arg("adj_ind"))
         .def_readonly("owned_global_indices", &DistGraph::owned_global_indices)
         .def_readonly("ghost_global_indices", &DistGraph::ghost_global_indices)
         .def_readonly("block_sizes", &DistGraph::block_sizes)

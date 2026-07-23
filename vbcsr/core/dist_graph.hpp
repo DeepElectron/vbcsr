@@ -4,6 +4,7 @@
 #include <mpi.h>
 #include "detail/storage/index_map.hpp"
 #include <atomic>
+#include <cstdint>
 #include <vector>
 #include <map>
 #include <numeric>
@@ -297,9 +298,61 @@ public:
     }
 
     // Construct from distributed data
-    void construct_distributed(const std::vector<int>& my_owned_indices, 
-                             const std::vector<int>& my_block_sizes, 
+    void construct_distributed(const std::vector<int>& my_owned_indices,
+                             const std::vector<int>& my_block_sizes,
                              const std::vector<std::vector<int>>& my_adj) {
+        construct_distributed_core(
+            my_owned_indices, my_block_sizes,
+            [&my_adj](int row) {
+                return std::pair<const int*, int>(
+                    my_adj[static_cast<size_t>(row)].data(),
+                    static_cast<int>(my_adj[static_cast<size_t>(row)].size()));
+            });
+    }
+
+    // Flat-array variant of construct_distributed: the same construction from
+    // CSR-style arrays (adj_ptr over owned rows, adj_ind holding GLOBAL block
+    // ids). Exists because per-row containers are expensive to produce from
+    // array-based callers (numpy: tens of millions of element conversions);
+    // semantics are identical to the per-row overload.
+    void construct_distributed_flat(const std::vector<int>& my_owned_indices,
+                                    const std::vector<int>& my_block_sizes,
+                                    const int64_t* flat_adj_ptr,
+                                    const int* flat_adj_ind,
+                                    int64_t flat_nnz) {
+        const int n_owned = static_cast<int>(my_owned_indices.size());
+        if (flat_adj_ptr == nullptr || (flat_adj_ind == nullptr && flat_nnz != 0)) {
+            throw std::runtime_error("construct_distributed_flat: null adjacency arrays");
+        }
+        if (n_owned > 0 && flat_adj_ptr[0] != 0) {
+            throw std::runtime_error("construct_distributed_flat: adj_ptr must start at 0");
+        }
+        for (int row = 0; row < n_owned; ++row) {
+            if (flat_adj_ptr[row + 1] < flat_adj_ptr[row]) {
+                throw std::runtime_error("construct_distributed_flat: adj_ptr not monotone");
+            }
+        }
+        if (n_owned > 0 && flat_adj_ptr[n_owned] != flat_nnz) {
+            throw std::runtime_error("construct_distributed_flat: adj_ptr/adj_ind size mismatch");
+        }
+        construct_distributed_core(
+            my_owned_indices, my_block_sizes,
+            [flat_adj_ptr, flat_adj_ind](int row) {
+                const int64_t begin = flat_adj_ptr[row];
+                return std::pair<const int*, int>(
+                    flat_adj_ind + begin,
+                    static_cast<int>(flat_adj_ptr[row + 1] - begin));
+            });
+    }
+
+private:
+    // Shared construction core. `row_cols(row)` returns the row's neighbor
+    // GLOBAL block ids as a (pointer, count) span; rows are visited in order
+    // and may be visited more than once.
+    template <typename RowColsFn>
+    void construct_distributed_core(const std::vector<int>& my_owned_indices,
+                                    const std::vector<int>& my_block_sizes,
+                                    RowColsFn&& row_cols) {
         // Enforce sorted indices for Canonical Linear Scan correctness
         if (!std::is_sorted(my_owned_indices.begin(), my_owned_indices.end())) {
             throw std::runtime_error("DistGraph::construct_distributed requires sorted owned_global_indices");
@@ -340,7 +393,9 @@ public:
         // Collect ghosts
         std::vector<int> ghost_candidates;
         for (int i = 0; i < n_owned; ++i) {
-            for (int neighbor_gid : my_adj[i]) {
+            const auto [cols, count] = row_cols(i);
+            for (int entry = 0; entry < count; ++entry) {
+                const int neighbor_gid = cols[entry];
                 if (global_to_local.find(neighbor_gid) == global_to_local.end()) {
                     ghost_candidates.push_back(neighbor_gid);
                 }
@@ -372,22 +427,27 @@ public:
         adj_ptr.resize(n_owned + 1);
         adj_ptr[0] = 0;
         adj_ind.clear();
+        std::vector<int> row_local_cols;
         for (int i = 0; i < n_owned; ++i) {
-            std::vector<int> row_cols;
-            for (int neighbor_gid : my_adj[i]) {
-                row_cols.push_back(global_to_local[neighbor_gid]);
+            const auto [cols, count] = row_cols(i);
+            row_local_cols.clear();
+            row_local_cols.reserve(static_cast<size_t>(count));
+            for (int entry = 0; entry < count; ++entry) {
+                row_local_cols.push_back(global_to_local[cols[entry]]);
             }
-            std::sort(row_cols.begin(), row_cols.end());
-            adj_ind.insert(adj_ind.end(), row_cols.begin(), row_cols.end());
+            std::sort(row_local_cols.begin(), row_local_cols.end());
+            adj_ind.insert(adj_ind.end(), row_local_cols.begin(), row_local_cols.end());
             adj_ptr[i+1] = adj_ind.size();
         }
-        
+
         // Fetch ghost block sizes
         fetch_ghost_block_sizes(displ);
-        
+
         // Build comm pattern
         build_comm_pattern(displ);
     }
+
+public:
 
     // Build this graph directly from rank-local CSR arrays whose column indices
     // are already in this graph's final local space: owned rows [0, n_owned)

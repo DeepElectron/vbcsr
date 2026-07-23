@@ -615,7 +615,10 @@ def cached_geometric_adjacency(
     info["local_degree_max"] = int(degrees.max()) if degrees.size else 0
     info["local_degree_sum"] = int(degrees.sum())
     info["local_row_count"] = int(degrees.size)
-    return rows, info, positions, box_lengths
+    # Rank-local flat CSR view (row pointers rebased to 0, GLOBAL column ids):
+    # the zero-conversion input for VBCSR.create_distributed_flat.
+    flat_local = (local_ptr - base_offset, local_ind)
+    return rows, info, positions, box_lengths, flat_local
 
 
 def reduce_degree_statistics(adjacency_info: dict[str, Any], comm: Any) -> dict[str, Any]:
@@ -691,6 +694,7 @@ def build_matrix(
     comm: Any,
     rank: int,
     size: int,
+    flat_adjacency: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> tuple[vbcsr.VBCSR, dict[str, float]]:
     start, end = partition_range(spec.blocks, size, rank)
     owned = list(range(start, end))
@@ -698,13 +702,26 @@ def build_matrix(
 
     barrier(comm)
     t0 = time.perf_counter()
-    matrix = vbcsr.VBCSR.create_distributed(
-        owned_indices=owned,
-        block_sizes=local_sizes,
-        adjacency=adjacency,
-        dtype=spec.dtype,
-        comm=comm,
-    )
+    if flat_adjacency is not None:
+        # Flat CSR arrays go to C++ via the buffer protocol — no per-edge
+        # Python conversion (the list-of-lists path boxes every column id).
+        local_ptr, local_ind = flat_adjacency
+        matrix = vbcsr.VBCSR.create_distributed_flat(
+            owned_indices=np.arange(start, end, dtype=np.int32),
+            block_sizes=np.asarray(local_sizes, dtype=np.int32),
+            adj_ptr=local_ptr,
+            adj_ind=local_ind,
+            dtype=spec.dtype,
+            comm=comm,
+        )
+    else:
+        matrix = vbcsr.VBCSR.create_distributed(
+            owned_indices=owned,
+            block_sizes=local_sizes,
+            adjacency=adjacency,
+            dtype=spec.dtype,
+            comm=comm,
+        )
     barrier(comm)
     graph_seconds = time.perf_counter() - t0
 
@@ -1309,8 +1326,9 @@ def build_case_matrix(
 
     block_sizes = make_block_sizes(spec)
     owned_range = partition_range(spec.blocks, size, rank)
+    flat_adjacency = None
     if _GEOMETRY_CACHE_DIR is not None:
-        adjacency, adjacency_info, positions, box_lengths = cached_geometric_adjacency(
+        adjacency, adjacency_info, positions, box_lengths, flat_adjacency = cached_geometric_adjacency(
             spec, owned_range, comm, rank, _GEOMETRY_CACHE_DIR)
     else:
         adjacency, adjacency_info, positions, box_lengths = make_geometric_adjacency(spec, owned_range)
@@ -1329,7 +1347,9 @@ def build_case_matrix(
         value_model = matrix_value_model_statistics(
             adjacency, positions, box_lengths, spec, owned_range[0], comm
         )
-    matrix, build_timings = build_matrix(spec, block_sizes, adjacency, positions, box_lengths, comm, rank, size)
+    matrix, build_timings = build_matrix(
+        spec, block_sizes, adjacency, positions, box_lengths, comm, rank, size,
+        flat_adjacency=flat_adjacency)
     atomistic_conversion = benchmark_atomistic_conversion(
         spec,
         block_sizes,
