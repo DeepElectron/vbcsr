@@ -70,6 +70,7 @@ def main() -> int:
     for col, op in enumerate(OPS):
         ax_eff = axes[0][col]
         ax_comm = axes[1][col]
+        plotted_comm = False
         for domain in domains:
             series = medians.get((domain, op), {})
             if len(series) < 2:
@@ -81,6 +82,7 @@ def main() -> int:
             if frac:
                 fcounts = sorted(frac)
                 ax_comm.plot(fcounts, [frac[n] for n in fcounts], marker="s", label=domain)
+                plotted_comm = True
         ax_eff.axhline(1.0, color="grey", linestyle="--", linewidth=1)
         ax_eff.set_title(op.upper())
         ax_eff.set_ylabel("weak efficiency T(ref)/T(np)" if col == 0 else "")
@@ -92,6 +94,16 @@ def main() -> int:
         ax_comm.set_ylim(0.0, 1.0)
         ax_comm.set_xscale("log", base=2)
         ax_comm.grid(alpha=0.3)
+        if not plotted_comm:
+            ax_comm.text(
+                0.5,
+                0.5,
+                "not instrumented",
+                ha="center",
+                va="center",
+                transform=ax_comm.transAxes,
+                color="0.35",
+            )
     axes[0][0].legend()
     fig.suptitle("VBCSR weak scaling (fixed per-rank problem)")
     fig.tight_layout()

@@ -13,6 +13,7 @@
 #include "block_csr.hpp"
 #include "dist_vector.hpp"
 #include "dist_multivector.hpp"
+#include "detail/kernels/dense_kernels.hpp"
 #include "detail/ops/spmf/graph_function.hpp"
 
 namespace py = pybind11;
@@ -95,6 +96,31 @@ py::array_t<T, py::array::c_style | py::array::forcecast> as_row_major_2d(
 
 // Forward declaration for atomic module binding
 void bind_atomic_module(py::module& m);
+
+py::dict threading_diagnostics(bool configure_vendor_sparse) {
+    py::dict result;
+#ifdef _OPENMP
+    result["openmp_enabled"] = true;
+    result["omp_get_max_threads"] = omp_get_max_threads();
+#else
+    result["openmp_enabled"] = false;
+    result["omp_get_max_threads"] = 1;
+#endif
+
+#ifdef VBCSR_USE_MKL
+    result["mkl_enabled"] = true;
+    result["mkl_get_max_threads_before"] = mkl_get_max_threads();
+    if (configure_vendor_sparse) {
+        BLASKernel::configure_vendor_sparse_threading();
+    }
+    result["mkl_get_max_threads_after"] = mkl_get_max_threads();
+#else
+    result["mkl_enabled"] = false;
+    result["mkl_get_max_threads_before"] = py::none();
+    result["mkl_get_max_threads_after"] = py::none();
+#endif
+    return result;
+}
 
 template<typename T>
 void bind_dist_vector(py::module& m, const std::string& name) {
@@ -371,6 +397,10 @@ void bind_block_spmat(py::module& m, const std::string& name) {
 
 PYBIND11_MODULE(vbcsr_core, m) {
     m.doc() = "VBCSR C++ Core Bindings";
+    m.def(
+        "threading_diagnostics",
+        &threading_diagnostics,
+        py::arg("configure_vendor_sparse") = false);
 
     py::enum_<AssemblyMode>(m, "AssemblyMode")
         .value("INSERT", AssemblyMode::INSERT)

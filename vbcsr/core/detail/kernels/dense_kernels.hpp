@@ -318,7 +318,8 @@ struct BLASKernel {
 #ifdef VBCSR_USE_MKL
         int one = 1;
         if (mkl_get_max_threads() != one) {
-            mkl_set_num_threads_(&one);
+            mkl_set_num_threads(one);
+            mkl_set_num_threads_local(one);
         }
 #elif defined(VBCSR_USE_OPENBLAS)
         openblas_set_num_threads(1);
@@ -336,7 +337,8 @@ struct BLASKernel {
 #ifdef VBCSR_USE_MKL
         int threads = preferred_parallel_thread_count();
         if (mkl_get_max_threads() != threads) {
-            mkl_set_num_threads_(&threads);
+            mkl_set_num_threads(threads);
+            mkl_set_num_threads_local(threads);
         }
 #endif
     }

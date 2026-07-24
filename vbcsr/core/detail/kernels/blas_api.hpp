@@ -13,8 +13,7 @@ extern "C" void openblas_set_num_threads(int num_threads);
 #endif
 
 #ifdef VBCSR_USE_MKL
-extern "C" void mkl_set_num_threads_(int* num_threads);
-extern "C" int mkl_get_max_threads();
+#include <mkl_service.h>
 #endif
 
 extern "C" {

@@ -231,6 +231,18 @@ def parse_thresholds(value: str | None, fallback: float) -> list[float]:
     return thresholds
 
 
+def parse_operations(value: str | None) -> list[str]:
+    if value is None or value.strip() == "":
+        return list(OPERATIONS)
+    operations = [item.strip() for item in value.split(",") if item.strip()]
+    unknown = [operation for operation in operations if operation not in OPERATIONS]
+    if unknown:
+        raise argparse.ArgumentTypeError(f"unknown operation(s) {unknown}; choose from {list(OPERATIONS)}")
+    if not operations:
+        raise argparse.ArgumentTypeError("--operations selected nothing")
+    return operations
+
+
 def format_float_label(value: float) -> str:
     text = f"{value:.3e}"
     return text.replace("+", "").replace("-", "m").replace(".", "p")
@@ -1067,6 +1079,14 @@ def benchmark_vbcsr_with_internal_diagnostics(
     # library's single source of truth (doc/developer_guide.md §Threading
     # Model); reference-baseline threading is configured only around the
     # sparse_dot_mkl calls themselves.
+    try:
+        vbcsr_core = importlib.import_module("vbcsr_core")
+        threading_diagnostics = getattr(vbcsr_core, "threading_diagnostics", None)
+        if threading_diagnostics is not None:
+            diagnostic["threading_before_vendor_config"] = threading_diagnostics(False)
+            diagnostic["threading_after_vendor_config"] = threading_diagnostics(True)
+    except Exception as exc:
+        diagnostic["threading_diagnostics_error"] = f"{type(exc).__name__}: {exc}"
 
     # Ghost-exchange accounting for the apply ops: the X operand's core
     # object accumulates pack+MPI+unpack seconds per sync (multi-node runs
@@ -1090,6 +1110,13 @@ def benchmark_vbcsr_with_internal_diagnostics(
         min_iterations=min_iterations,
         warmups=warmups,
     )
+    try:
+        vbcsr_core = importlib.import_module("vbcsr_core")
+        threading_diagnostics = getattr(vbcsr_core, "threading_diagnostics", None)
+        if threading_diagnostics is not None:
+            diagnostic["threading_after_timing"] = threading_diagnostics(False)
+    except Exception as exc:
+        diagnostic["threading_after_timing_error"] = f"{type(exc).__name__}: {exc}"
 
     if comm_source is not None:
         local_calls_comm = int(comm_source.comm_calls)
@@ -1681,10 +1708,15 @@ def mpi_metadata(comm: Any, rank: int, size: int, rank_hosts: list[dict[str, Any
 def environment_metadata(comm: Any, rank: int, size: int, rank_hosts: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     thread_vars = (
         "OMP_NUM_THREADS",
+        "OMP_PROC_BIND",
+        "OMP_PLACES",
         "OMP_DYNAMIC",
         "SPARSE_DOT_MKL_NUM_THREADS",
         "MKL_NUM_THREADS",
+        "MKL_THREADING_LAYER",
         "MKL_DYNAMIC",
+        "KMP_AFFINITY",
+        "GOMP_CPU_AFFINITY",
         "OPENBLAS_NUM_THREADS",
         "BLIS_NUM_THREADS",
         "NUMEXPR_NUM_THREADS",
@@ -1830,9 +1862,11 @@ def build_specs(args: argparse.Namespace, rank_count: int) -> list[BenchmarkSpec
         }
 
     specs: list[BenchmarkSpec] = []
+    selected_operations = parse_operations(args.operations)
+
     for domain in selected_domains:
         domain_blocks = blocks_by_domain.get(domain, blocks)
-        for operation in OPERATIONS:
+        for operation in selected_operations:
             thresholds = spgemm_thresholds if operation == "spgemm" else [float(args.spgemm_threshold)]
             for threshold in thresholds:
                 specs.append(
@@ -1868,7 +1902,10 @@ def write_outputs(payload: dict[str, Any], output_dir: Path, label: str) -> tupl
     output_dir.mkdir(parents=True, exist_ok=True)
     json_path = output_dir / f"{label}.json"
     csv_path = output_dir / f"{label}.csv"
-    json_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    json_tmp = json_path.with_suffix(json_path.suffix + ".tmp")
+    csv_tmp = csv_path.with_suffix(csv_path.suffix + ".tmp")
+    json_tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(json_tmp, json_path)
 
     fields = [
         "label",
@@ -1925,7 +1962,7 @@ def write_outputs(payload: dict[str, Any], output_dir: Path, label: str) -> tupl
         "spgemm_output_scalar_nnz_sum",
         "spgemm_fill_ratio_scalar",
     ]
-    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+    with csv_tmp.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         for case in payload["cases"]:
@@ -1989,6 +2026,7 @@ def write_outputs(payload: dict[str, Any], output_dir: Path, label: str) -> tupl
                     "spgemm_fill_ratio_scalar": case.get("spgemm", {}).get("fill_ratio_scalar"),
                 }
             )
+    os.replace(csv_tmp, csv_path)
     return json_path, csv_path
 
 
@@ -2006,6 +2044,11 @@ def make_parser() -> argparse.ArgumentParser:
               "domain per job." % (",".join(DOMAINS),)),
     )
     parser.add_argument("--target-degree", type=int, default=12)
+    parser.add_argument(
+        "--operations",
+        default=",".join(OPERATIONS),
+        help="comma-separated subset of spmv,spmm,spgemm",
+    )
     parser.add_argument("--rhs", type=int, default=16)
     parser.add_argument("--dtype", choices=("real", "complex"), default="real")
     parser.add_argument("--seed", type=int, default=1729)
@@ -2100,6 +2143,41 @@ def main() -> int:
         comm = None
 
     specs = build_specs(args, size)
+    label = args.label.strip() if isinstance(args.label, str) else args.label
+    if label is None or label == "":
+        stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        label = f"vbcsr_publication_{args.suite}_np{size}_{stamp}"
+
+    # Collective: all ranks participate before rank 0 builds the payload.
+    # The rank-0 payload is written after every completed case, so a later
+    # memory kill in a heavier operation does not discard earlier timings.
+    rank_hosts = gather_rank_hosts(comm, rank)
+    payload: dict[str, Any] | None = None
+    if rank == 0:
+        payload = {
+            "schema_version": SCHEMA_VERSION,
+            "metadata": environment_metadata(comm, rank, size, rank_hosts),
+            "publication_coverage": {
+                "domains": [spec.domain for spec in specs],
+                "operations": [spec.operation for spec in specs],
+                "adjacency_model": "geometric_finite_cutoff",
+                "matrix_value_model": "exponential_distance_decay_with_onsite_shift",
+                "efficiency_baselines": ["scipy_csr", "mkl_sparse_if_available"],
+                "distributed_metrics": [
+                    "operation_time",
+                    "graph_construction_seconds",
+                    "assembly_seconds",
+                    "memory_estimates",
+                    "ghost_exchange_bytes",
+                    "atomistic_conversion_seconds",
+                    "spgemm_fill_ratio",
+                    "spgemm_threshold_audit",
+                ],
+                "partial_write_after_each_case": True,
+            },
+            "cases": [],
+        }
+
     cases: list[dict[str, Any]] = []
     for spec in specs:
         if rank == 0:
@@ -2119,6 +2197,9 @@ def main() -> int:
         )
         if rank == 0:
             cases.append(case)
+            assert payload is not None
+            payload["cases"] = cases
+            json_path, csv_path = write_outputs(payload, args.output_dir, label)
             elapsed = time.perf_counter() - case_start
             vbcsr_median = case.get("timings", {}).get("vbcsr", {}).get("median_seconds")
             print(
@@ -2126,42 +2207,14 @@ def main() -> int:
                 f"VBCSR median={vbcsr_median:.6g} s",
                 flush=True,
             )
+            print(f"[{spec.label}] checkpointed {json_path} and {csv_path}", flush=True)
             validation = case.get("validation", {})
             if validation.get("exact_validation_required", True) and validation.get("passed") is False:
                 print(f"Validation failed for {case['label']}: {validation}", file=sys.stderr)
                 return 1
 
-    # Collective: all ranks participate in the host gather before rank 0
-    # builds the payload (see gather_rank_hosts).
-    rank_hosts = gather_rank_hosts(comm, rank)
-
     if rank == 0:
-        label = args.label.strip() if isinstance(args.label, str) else args.label
-        if label is None or label == "":
-            stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-            label = f"vbcsr_publication_{args.suite}_np{size}_{stamp}"
-        payload = {
-            "schema_version": SCHEMA_VERSION,
-            "metadata": environment_metadata(comm, rank, size, rank_hosts),
-            "publication_coverage": {
-                "domains": list(DOMAINS),
-                "operations": list(OPERATIONS),
-                "adjacency_model": "geometric_finite_cutoff",
-                "matrix_value_model": "exponential_distance_decay_with_onsite_shift",
-                "efficiency_baselines": ["scipy_csr", "mkl_sparse_if_available"],
-                "distributed_metrics": [
-                    "operation_time",
-                    "graph_construction_seconds",
-                    "assembly_seconds",
-                    "memory_estimates",
-                    "ghost_exchange_bytes",
-                    "atomistic_conversion_seconds",
-                    "spgemm_fill_ratio",
-                    "spgemm_threshold_audit",
-                ],
-            },
-            "cases": cases,
-        }
+        assert payload is not None
         json_path, csv_path = write_outputs(payload, args.output_dir, label)
         print(f"Wrote {json_path}")
         print(f"Wrote {csv_path}")

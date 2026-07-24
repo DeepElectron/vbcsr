@@ -104,12 +104,37 @@ if(BLAS_FOUND)
     if(BLAS_LIBRARIES_LOWER MATCHES "mkl" OR BLAS_LIBRARIES_LOWER MATCHES "intel")
         set(VBCSR_HAS_MKL ON)
         message(STATUS "MKL detected in BLAS libraries.")
+        set(VBCSR_MKL_INCLUDE_HINTS
+            $ENV{CONDA_PREFIX}/include
+            $ENV{MKLROOT}/include
+            /opt/intel/oneapi/mkl/latest/include
+            /opt/intel/mkl/include)
+        if(DEFINED ENV{CONDA_PREFIX})
+            file(GLOB VBCSR_MKL_CONDA_INCLUDE_HINTS
+                "$ENV{CONDA_PREFIX}/../../pkgs/mkl-include-*/include")
+            list(APPEND VBCSR_MKL_INCLUDE_HINTS ${VBCSR_MKL_CONDA_INCLUDE_HINTS})
+        endif()
+        find_path(VBCSR_MKL_INCLUDE_DIR
+            NAMES mkl_service.h mkl.h
+            HINTS ${VBCSR_MKL_INCLUDE_HINTS})
+        if(VBCSR_MKL_INCLUDE_DIR)
+            message(STATUS "MKL include directory: ${VBCSR_MKL_INCLUDE_DIR}")
+        else()
+            message(WARNING "MKL headers not found; builds using VBCSR_USE_MKL may fail.")
+        endif()
         # Prefer mkl_rt (Single Dynamic Library) over individual MKL libraries.
         # When multiple MKL consumers coexist (e.g. vbcsr + PARDISO wrapper),
         # linking separate libs (mkl_intel_lp64 + mkl_intel_thread + mkl_core)
         # causes PARDISO dispatcher conflicts. mkl_rt avoids this by providing
         # a single entry point with consistent internal state.
-        find_library(MKL_RT_LIB NAMES mkl_rt HINTS $ENV{CONDA_PREFIX}/lib $ENV{MKLROOT}/lib)
+        find_library(MKL_RT_LIB
+            NAMES mkl_rt
+            HINTS
+                $ENV{CONDA_PREFIX}/lib
+                $ENV{MKLROOT}/lib/intel64
+                $ENV{MKLROOT}/lib
+                /opt/intel/oneapi/mkl/latest/lib/intel64
+                /opt/intel/mkl/lib/intel64)
         if(MKL_RT_LIB)
             message(STATUS "Swapping to MKL SDL (mkl_rt): ${MKL_RT_LIB}")
             set(BLAS_LIBRARIES ${MKL_RT_LIB})
@@ -191,21 +216,9 @@ if(VBCSR_USE_ILP64)
     message(STATUS "Skipping sparse vendor probes for ILP64 builds; CSR vendor sparse v1 currently assumes 32-bit sparse indices.")
 else()
     if(VBCSR_HAS_MKL)
-        set(VBCSR_MKL_SPARSE_HINTS
-            $ENV{CONDA_PREFIX}/include
-            $ENV{MKLROOT}/include
-            /opt/intel/oneapi/mkl/latest/include
-            /opt/intel/mkl/include)
-
-        if(DEFINED ENV{CONDA_PREFIX})
-            file(GLOB VBCSR_MKL_CONDA_INCLUDE_HINTS
-                "$ENV{CONDA_PREFIX}/../../pkgs/mkl-include-*/include")
-            list(APPEND VBCSR_MKL_SPARSE_HINTS ${VBCSR_MKL_CONDA_INCLUDE_HINTS})
-        endif()
-
         find_path(VBCSR_MKL_SPARSE_INCLUDE_DIR
             NAMES mkl_spblas.h mkl.h
-            HINTS ${VBCSR_MKL_SPARSE_HINTS})
+            HINTS ${VBCSR_MKL_INCLUDE_HINTS})
 
         if(VBCSR_MKL_SPARSE_INCLUDE_DIR)
             set(_vbcsr_saved_required_libs "${CMAKE_REQUIRED_LIBRARIES}")
@@ -466,6 +479,9 @@ target_include_directories(vbcsr INTERFACE
 )
 if(VBCSR_SPARSE_VENDOR_INCLUDE_DIRS)
     target_include_directories(vbcsr INTERFACE $<BUILD_INTERFACE:${VBCSR_SPARSE_VENDOR_INCLUDE_DIRS}>)
+endif()
+if(VBCSR_MKL_INCLUDE_DIR)
+    target_include_directories(vbcsr INTERFACE $<BUILD_INTERFACE:${VBCSR_MKL_INCLUDE_DIR}>)
 endif()
 
 # Compile definitions
