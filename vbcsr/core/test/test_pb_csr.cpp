@@ -2795,7 +2795,11 @@ void test_bsr_vendor_cache_invalidation_on_structure_change() {
 #ifdef VBCSR_HAVE_MKL_BSR_SPARSE
     const void* cache_b = backend.vendor_cache_identity();
     assert(cache_b != nullptr);
-    assert(cache_b != cache_a);
+    // No address comparison against cache_a: the invalidation itself is
+    // asserted above (identity() == nullptr right after the structure
+    // change), and the allocator may legally place the rebuilt cache at the
+    // freed object's address.
+    (void)cache_a;
     const auto& rebuilt_cache = backend.ensure_vendor_cache(
         graph_b.adj_ptr,
         graph_b.adj_ind,
@@ -3138,7 +3142,11 @@ void test_csr_vendor_cache_invalidation_on_structure_change() {
 
     const void* cache_b = backend.vendor_cache_identity();
     assert(cache_b != nullptr);
-    assert(cache_b != cache_a);
+    // No address comparison against cache_a: the invalidation itself is
+    // asserted above (identity() == nullptr right after the structure
+    // change), and the allocator may legally place the rebuilt cache at the
+    // freed object's address.
+    (void)cache_a;
 
     const auto& rebuilt_cache = backend.ensure_vendor_cache(
         graph_b.adj_ptr,
