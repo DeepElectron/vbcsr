@@ -16,9 +16,15 @@ public:
         int rx, ry, rz;
     };
 
-    // Neighbors for each atom: neighbors[i] contains list of Neighbor structs
+    // Neighbors for each atom: neighbors[i] contains list of Neighbor structs.
+    //
+    // Shift vectors are relative to the POSITIONS AS GIVEN. Wrapping into the
+    // cell happens internally, for binning only; the lattice translation each
+    // atom picked up there is undone before a neighbour is recorded, so a
+    // caller reconstructs a bond as r_j + R - r_i using its own coordinates and
+    // never has to know whether they were inside the cell.
     std::vector<std::vector<Neighbor>> neighbors;
-    
+
     NeighborList() = default;
 
     // Build the neighbor list
@@ -51,7 +57,7 @@ public:
 
         int n_atoms = positions.size() / 3;
         neighbors.assign(n_atoms, std::vector<Neighbor>());
-        
+
         if (n_atoms == 0) return;
 
         // 1. Compute Reciprocal Cell and Face Distances
@@ -130,6 +136,12 @@ public:
         // Create working positions (wrapped if PBC)
         std::vector<double> working_positions = positions;
 
+        // The integer lattice translation wrapping applied to each atom:
+        // r_working = r_input + wrap_shift * cell. Recorded so the shifts
+        // reported to the caller can be expressed against the input
+        // coordinates, whether or not those lay inside the cell.
+        std::vector<std::array<int, 3>> wrap_shift(n_atoms, {0, 0, 0});
+
         for(int i=0; i<n_atoms; ++i) {
             double rx = positions[3*i];
             double ry = positions[3*i+1];
@@ -140,16 +152,38 @@ public:
             double sy = dot({rx, ry, rz}, cxa) / det;
             double sz = dot({rx, ry, rz}, axb) / det;
 
-            // Wrap scaled coordinates if PBC
-            auto wrap = [](double val) {
-                return val - std::floor(val);
+            // Wrap scaled coordinates if PBC, remembering by how much: an atom
+            // at fractional -1/3 moves to 2/3 and gains one lattice vector.
+            // Shift vectors are ints, so a coordinate absurdly far outside the
+            // cell is rejected rather than silently wrapped into a plausible
+            // but wrong image.
+            auto wrap = [](double& val) {
+                double cells = std::floor(val);
+                if (!(std::abs(cells) < 1e6)) {
+                    throw std::invalid_argument(
+                        "Atom position is more than 1e6 cells outside the unit cell, or is "
+                        "not finite; its periodic image cannot be represented.");
+                }
+                val -= cells;
+                // `val - floor(val)` is not guaranteed to land in [0, 1): for a
+                // val that is a tiny negative number the subtraction rounds up
+                // to exactly 1.0. Left there, the atom is binned at the BOTTOM
+                // of the cell (see the clamp below) while its wrapped position
+                // sits at the TOP, so the one-bin search looks a whole lattice
+                // vector away from its real neighbours and silently drops the
+                // bonds. Fold once more so position and bin always agree.
+                if (val >= 1.0) {
+                    val = 0.0;
+                    cells += 1.0;
+                }
+                return -static_cast<int>(cells);
             };
-            
+
             bool modified = false;
-            if (pbc[0]) { sx = wrap(sx); modified = true; }
-            if (pbc[1]) { sy = wrap(sy); modified = true; }
-            if (pbc[2]) { sz = wrap(sz); modified = true; }
-            
+            if (pbc[0]) { wrap_shift[i][0] = wrap(sx); modified = true; }
+            if (pbc[1]) { wrap_shift[i][1] = wrap(sy); modified = true; }
+            if (pbc[2]) { wrap_shift[i][2] = wrap(sz); modified = true; }
+
             if (modified) {
                 // Update working_positions
                 // r = s * cell
@@ -163,38 +197,25 @@ public:
                 working_positions[3*i+2] = new_rz;
             }
 
-            // Bin indices
-            int bx, by, bz;
-            
-            // For binning, we use the (potentially wrapped) scaled coordinates
-            // Note: sx, sy, sz are already wrapped if PBC is true.
-            
-            if (pbc[0]) {
-                bx = static_cast<int>(std::floor(sx * nbins_c[0]));
-                bx = bx % nbins_c[0]; // Safety
-            } else {
-                bx = static_cast<int>(std::floor(sx * nbins_c[0]));
-                if (bx < 0) bx = 0;
-                if (bx >= nbins_c[0]) bx = nbins_c[0] - 1;
-            }
+            // Bin indices.
+            //
+            // A bin must be the one that CONTAINS the atom's working position:
+            // the search below scans a fixed neighbourhood of bins around it,
+            // so a bin that disagrees with the position by even one slab makes
+            // the search look in the wrong place. The out-of-range cases here
+            // are pure floating-point residue -- sx is already in [0, 1), but
+            // sx * nbins can still round to exactly nbins -- so they are
+            // CLAMPED to the nearest bin, never wrapped to the far side.
+            auto bin_of = [](double scaled, int nbins) {
+                int index = static_cast<int>(std::floor(scaled * nbins));
+                if (index < 0) index = 0;
+                if (index >= nbins) index = nbins - 1;
+                return index;
+            };
 
-            if (pbc[1]) {
-                by = static_cast<int>(std::floor(sy * nbins_c[1]));
-                by = by % nbins_c[1]; // Safety
-            } else {
-                by = static_cast<int>(std::floor(sy * nbins_c[1]));
-                if (by < 0) by = 0;
-                if (by >= nbins_c[1]) by = nbins_c[1] - 1;
-            }
-
-            if (pbc[2]) {
-                bz = static_cast<int>(std::floor(sz * nbins_c[2]));
-                bz = bz % nbins_c[2]; // Safety
-            } else {
-                bz = static_cast<int>(std::floor(sz * nbins_c[2]));
-                if (bz < 0) bz = 0;
-                if (bz >= nbins_c[2]) bz = nbins_c[2] - 1;
-            }
+            const int bx = bin_of(sx, nbins_c[0]);
+            const int by = bin_of(sy, nbins_c[1]);
+            const int bz = bin_of(sz, nbins_c[2]);
 
             int bin_idx = bx + nbins_c[0] * (by + nbins_c[1] * bz);
             bins[bin_idx].push_back(i);
@@ -304,9 +325,20 @@ public:
                                         double dz_ij = working_positions[3*j+2] + Rz - iz;
                                         
                                         double r2 = dx_ij*dx_ij + dy_ij*dy_ij + dz_ij*dz_ij;
-                                        
+
                                         if (r2 < cutoff_sq) {
-                                            neighbors[i].push_back({j, (int)shift_x, (int)shift_y, (int)shift_z});
+                                            // Back to the caller's coordinates:
+                                            //   r_j^wrap + R = r_j + (W_j + R)
+                                            //   r_i^wrap     = r_i + W_i
+                                            // so the shift against the input
+                                            // positions is R + W_j - W_i. For a
+                                            // structure already inside the cell
+                                            // every W is zero and this is R.
+                                            neighbors[i].push_back({
+                                                j,
+                                                (int)shift_x + wrap_shift[j][0] - wrap_shift[i][0],
+                                                (int)shift_y + wrap_shift[j][1] - wrap_shift[i][1],
+                                                (int)shift_z + wrap_shift[j][2] - wrap_shift[i][2]});
                                         }
                                     }
                                 }

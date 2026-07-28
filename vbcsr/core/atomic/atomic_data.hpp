@@ -1060,14 +1060,23 @@ private:
         std::vector<idx_t> adjncy_t(adjncy.begin(), adjncy.end());
         std::vector<idx_t> part_t(part.begin(), part.end());
         
+        // ParMETIS rejects null array pointers even where the array is empty,
+        // which happens on any rank that owns no vertices -- a cell with fewer
+        // atoms than ranks. Point those at a dummy element instead; the rank
+        // contributes nothing either way, but the call stays collective.
         idx_t* adjncy_ptr = adjncy_t.empty() ? NULL : adjncy_t.data();
         idx_t dummy_adj = 0;
         if (adjncy_t.empty()) adjncy_ptr = &dummy_adj;
 
-        ParMETIS_V3_RefineKway(vtxdist_t.data(), xadj_t.data(), adjncy_ptr, 
-                               NULL, NULL, &wgtflag, &numflag, &ncon, &nparts_t, 
-                               tpwgts.data(), ubvec, options, &edgecut, part_t.data(), &comm_);
-                               
+        idx_t* part_ptr = part_t.data();
+        idx_t dummy_part = 0;
+        if (part_t.empty()) part_ptr = &dummy_part;
+
+        ParMETIS_V3_RefineKway(vtxdist_t.data(), xadj_t.data(), adjncy_ptr,
+                               NULL, NULL, &wgtflag, &numflag, &ncon, &nparts_t,
+                               tpwgts.data(), ubvec, options, &edgecut, part_ptr, &comm_);
+
+                       
         for(size_t i=0; i<part.size(); ++i) part[i] = part_t[i];
 #else
         // Hilbert Curve Fallback Implementation
@@ -1267,8 +1276,13 @@ private:
         double max_r = 0;
         for(double r : r_max_type) max_r = std::max(max_r, r);
         NeighborList nl;
-        nl.build(pos, cell, pbc, max_r * 2.0); 
-        
+        nl.build(pos, cell, pbc, max_r * 2.0);
+
+        // Positions are stored exactly as given -- atom order and coordinates
+        // are the caller's, and are what a Hamiltonian file's own indexing and
+        // R-vector convention refer to. NeighborList reports its shifts against
+        // these same coordinates, so the two agree without anything being moved.
+
         // 1.3 Hilbert Sort
         double min_p[3] = {1e30, 1e30, 1e30};
         double max_p[3] = {-1e30, -1e30, -1e30};

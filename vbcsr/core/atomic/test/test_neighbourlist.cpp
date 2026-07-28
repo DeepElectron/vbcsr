@@ -7,6 +7,8 @@
 #include <cassert>
 #include <algorithm>
 #include <cmath>
+#include <array>
+#include <random>
 
 using namespace vbcsr;
 using namespace vbcsr::atomic;
@@ -294,6 +296,197 @@ void test_robustness() {
     std::cout << "Passed." << std::endl;
 }
 
+// Reference list, by trying every image within reach.
+static std::vector<std::array<int, 4>> brute_force(
+    const std::vector<double>& pos, const std::vector<double>& cell,
+    const std::vector<bool>& pbc, double cutoff, int reach = 6) {
+    const int n = static_cast<int>(pos.size()) / 3;
+    std::vector<std::array<int, 4>> out;
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < n; ++j) {
+            for (int rx = pbc[0] ? -reach : 0; rx <= (pbc[0] ? reach : 0); ++rx) {
+                for (int ry = pbc[1] ? -reach : 0; ry <= (pbc[1] ? reach : 0); ++ry) {
+                    for (int rz = pbc[2] ? -reach : 0; rz <= (pbc[2] ? reach : 0); ++rz) {
+                        if (i == j && rx == 0 && ry == 0 && rz == 0) continue;
+                        double d2 = 0.0;
+                        for (int k = 0; k < 3; ++k) {
+                            const double d = pos[3 * j + k] - pos[3 * i + k] +
+                                             rx * cell[k] + ry * cell[3 + k] + rz * cell[6 + k];
+                            d2 += d * d;
+                        }
+                        if (d2 < cutoff * cutoff) out.push_back({i, j, rx, ry});
+                    }
+                }
+            }
+        }
+    }
+    return out;
+}
+
+static bool has_neighbor(const NeighborList& nl, int i, int j, int rx, int ry) {
+    for (const auto& n : nl.neighbors[i]) {
+        if (n.index == j && n.rx == rx && n.ry == ry) return true;
+    }
+    return false;
+}
+
+// A wrapped fractional coordinate has to land in the bin that contains it.
+//
+// `s - floor(s)` is not guaranteed to be < 1: for an s that is a tiny negative
+// number the subtraction rounds up to exactly 1.0. Binning that by `% nbins`
+// used to put the atom at the BOTTOM of the cell while its wrapped position sat
+// at the TOP, so the fixed-radius bin search looked a whole lattice vector away
+// and silently dropped its bonds.
+//
+// Graphene's conventional basis puts the second carbon at fractional
+// (-1/3, 2/3), which is exactly the case that rounds; a supercell of it lost
+// bonds and |E|max came out below the analytic 3|t|. Every supercell here must
+// give a perfect honeycomb: three neighbours per atom, no more and no fewer.
+void test_wrapped_boundary_coordinates() {
+    std::cout << "Testing atoms on a wrapped cell boundary..." << std::endl;
+    const double a_cc = 1.42;
+    const double a = std::sqrt(3.0) * a_cc;
+
+    // The primitive cell, and the conventional two-atom basis: the second
+    // carbon at fractional (-1/3, 2/3), i.e. outside the cell.
+    const std::vector<double> primitive = {a, 0, 0, 0.5 * a, 1.5 * a_cc, 0, 0, 0, 20.0};
+
+    for (int sc = 1; sc <= 6; ++sc) {
+        std::vector<double> cell = {primitive[0] * sc, primitive[1] * sc, primitive[2] * sc,
+                                    primitive[3] * sc, primitive[4] * sc, primitive[5] * sc,
+                                    primitive[6],      primitive[7],      primitive[8]};
+        std::vector<double> pos;
+        for (int i = 0; i < sc; ++i) {
+            for (int j = 0; j < sc; ++j) {
+                // Offsets accumulated from the cell rows, the way a caller
+                // tiling a cell does; this is what lands a fractional
+                // coordinate on -0 or on a tiny negative number.
+                const double ox = i * primitive[0] + j * primitive[3];
+                const double oy = i * primitive[1] + j * primitive[4];
+                pos.push_back(ox);       pos.push_back(oy);          pos.push_back(10.0);
+                pos.push_back(ox);       pos.push_back(oy + a_cc);   pos.push_back(10.0);
+            }
+        }
+
+        const std::vector<bool> pbc = {true, true, false};
+        NeighborList nl;
+        nl.build(pos, cell, pbc, 1.6);
+
+        const int n = static_cast<int>(pos.size()) / 3;
+        for (int i = 0; i < n; ++i) {
+            assert(nl.neighbors[i].size() == 3 &&
+                   "every carbon has exactly three neighbours at 1.42 A");
+        }
+        for (const auto& e : brute_force(pos, cell, pbc, 1.6)) {
+            assert(has_neighbor(nl, e[0], e[1], e[2], e[3]) &&
+                   "binned search must find every bond brute force finds");
+        }
+    }
+    std::cout << "Passed." << std::endl;
+}
+
+// The regression test for the wrap above, with a deterministic trigger.
+//
+// An atom at a tiny NEGATIVE fractional coordinate is the exact case: floor is
+// -1, and `s - (-1)` rounds to exactly 1.0 because |s| is below the double
+// epsilon. The atom then belongs at the far face of the cell, and `% nbins`
+// used to bin it at the near face instead -- a whole cell away from where its
+// wrapped position sits -- so the fixed-radius bin search never looked where
+// its neighbour actually was.
+//
+// Here atom 0 sits a hair below fractional 0 and atom 1 just inside the far
+// face, 0.5 apart across the periodic boundary. Before the fix atom 0 found no
+// neighbour at all.
+void test_tiny_negative_fractional_coordinate() {
+    std::cout << "Testing a tiny negative fractional coordinate..." << std::endl;
+    const std::vector<double> cell = {6.0, 0, 0, 0, 6.0, 0, 0, 0, 6.0};
+    const std::vector<bool> pbc = {true, true, true};
+    const std::vector<double> pos = {-1e-18, 3.0, 3.0,
+                                      5.5,   3.0, 3.0};
+
+    NeighborList nl;
+    nl.build(pos, cell, pbc, 1.0);
+
+    assert(nl.neighbors[0].size() == 1 && "the bond across the boundary must be found");
+    assert(nl.neighbors[1].size() == 1);
+    assert(has_neighbor(nl, 0, 1, -1, 0));
+    assert(has_neighbor(nl, 1, 0, 1, 0));
+
+    // Same geometry, written with the atom a hair ABOVE zero instead: the
+    // coordinates differ by 2e-18, the bonds must not differ at all.
+    const std::vector<double> mirrored = {1e-18, 3.0, 3.0, 5.5, 3.0, 3.0};
+    NeighborList mirrored_nl;
+    mirrored_nl.build(mirrored, cell, pbc, 1.0);
+    assert(mirrored_nl.neighbors[0].size() == nl.neighbors[0].size() &&
+           "a 2e-18 change in a coordinate must not change the bond list");
+
+    // And with the atom a whole cell out, which wraps by a full lattice vector.
+    const std::vector<double> outside = {-6.0 - 1e-18, 3.0, 3.0, 5.5, 3.0, 3.0};
+    NeighborList outside_nl;
+    outside_nl.build(outside, cell, pbc, 1.0);
+    assert(outside_nl.neighbors[0].size() == 1);
+    assert(has_neighbor(outside_nl, 0, 1, -2, 0) &&
+           "shifts are reported against the coordinates as given");
+    std::cout << "Passed." << std::endl;
+}
+
+// Randomized comparison against brute force.
+//
+// The binned search is an optimization of "try every image", so the two must
+// agree exactly -- no bond found by one and missed by the other. The cases are
+// drawn to cover what tripped the wrap above: strongly skewed cells, atoms
+// exactly on a face, atoms whole cells outside the box, and mixed periodicity.
+void test_matches_brute_force_randomized() {
+    std::cout << "Testing against brute force over randomized cells..." << std::endl;
+    std::mt19937 rng(12345);  // fixed seed: a failure here must be reproducible
+    std::uniform_real_distribution<double> u(0.0, 1.0);
+    int checked = 0;
+
+    for (int trial = 0; trial < 1000; ++trial) {
+        const int n = 1 + static_cast<int>(u(rng) * 8);
+        const double L = 2.0 + 6.0 * u(rng);
+        std::vector<double> cell = {L, 0, 0,
+                                    (u(rng) - 0.5) * 1.6 * L, L * (0.5 + u(rng)), 0,
+                                    (u(rng) - 0.5) * 1.6 * L, (u(rng) - 0.5) * L,
+                                    L * (0.5 + u(rng))};
+        const std::vector<bool> pbc = {u(rng) < 0.85, u(rng) < 0.85, u(rng) < 0.85};
+        const double cutoff = 0.3 + 3.0 * u(rng);
+
+        std::vector<double> pos;
+        for (int i = 0; i < n; ++i) {
+            double s[3];
+            for (int k = 0; k < 3; ++k) {
+                const double pick = u(rng);
+                if (pick < 0.20) s[k] = 0.0;                              // on a face
+                else if (pick < 0.30) s[k] = 1.0;                         // on the far face
+                else if (pick < 0.45) s[k] = std::floor(u(rng) * 5) - 2;  // whole cells out
+                else s[k] = (u(rng) - 0.5) * 3.0;                         // anywhere
+            }
+            for (int k = 0; k < 3; ++k) {
+                pos.push_back(s[0] * cell[k] + s[1] * cell[3 + k] + s[2] * cell[6 + k]);
+            }
+        }
+
+        NeighborList nl;
+        try {
+            nl.build(pos, cell, pbc, cutoff);
+        } catch (const std::invalid_argument&) {
+            continue;  // a degenerate cell is rejected, which is its own contract
+        }
+
+        for (const auto& e : brute_force(pos, cell, pbc, cutoff)) {
+            if (!has_neighbor(nl, e[0], e[1], e[2], e[3])) {
+                std::cerr << "trial " << trial << ": binned search missed bond "
+                          << e[0] << "->" << e[1] << " R=(" << e[2] << "," << e[3]
+                          << ") with cutoff " << cutoff << std::endl;
+                exit(1);
+            }
+        }
+        ++checked;
+    }
+    std::cout << "Passed (" << checked << " random cells)." << std::endl;
+}
+
 int main() {
     test_simple_cubic_pbc();
     test_non_pbc();
@@ -301,5 +494,8 @@ int main() {
     test_mixed_pbc();
     test_exact_indices();
     test_robustness();
+    test_wrapped_boundary_coordinates();
+    test_tiny_negative_fractional_coordinate();
+    test_matches_brute_force_randomized();
     return 0;
 }
