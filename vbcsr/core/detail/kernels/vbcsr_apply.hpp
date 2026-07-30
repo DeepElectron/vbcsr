@@ -23,7 +23,6 @@ struct ShapeBatchKernel {
     using Backend = VBCSRMatrixBackend<T>;
 
     static void mult(DistGraph* graph, const Backend& backend, DistVector<T>& x, DistVector<T>& y) {
-        BLASKernel::configure_native_threading();
         x.bind_to_graph(graph);
         y.bind_to_graph(graph);
         x.sync_ghosts();
@@ -47,7 +46,6 @@ struct ShapeBatchKernel {
     // pad lanes are zero on input and compute to exact zeros on output,
     // so every SIMD chunk stays full and the padding invariant holds.
     static void mult_dense(DistGraph* graph, const Backend& backend, DistMultiVector<T>& X, DistMultiVector<T>& Y) {
-        BLASKernel::configure_native_threading();
         X.bind_to_graph(graph);
         Y.bind_to_graph(graph);
         X.sync_ghosts();
@@ -57,7 +55,6 @@ struct ShapeBatchKernel {
     }
 
     static void mult_adjoint(DistGraph* graph, const Backend& backend, DistVector<T>& x, DistVector<T>& y) {
-        BLASKernel::configure_native_threading();
         x.bind_to_graph(graph);
         y.bind_to_graph(graph);
         // The adjoint plan skips empty columns, so zero the whole buffer up
@@ -68,7 +65,6 @@ struct ShapeBatchKernel {
     }
 
     static void mult_dense_adjoint(DistGraph* graph, const Backend& backend, DistMultiVector<T>& X, DistMultiVector<T>& Y) {
-        BLASKernel::configure_native_threading();
         X.bind_to_graph(graph);
         Y.bind_to_graph(graph);
         // Same whole-buffer parallel zero as the vector adjoint above.

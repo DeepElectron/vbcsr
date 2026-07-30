@@ -304,6 +304,38 @@ struct BLASKernel {
 #endif
     }
 
+    // ---------------------------------------------------------- thread policy
+    //
+    // One knob for the user: OMP_NUM_THREADS. vbcsr translates that budget to
+    // whichever vendor library is linked; nobody sets MKL_NUM_THREADS,
+    // OPENBLAS_NUM_THREADS or a threading layer by hand.
+    //
+    // Every threaded operation in the library is one of three kinds, and each
+    // kind needs exactly one thing:
+    //
+    //  A. Hand-written kernels (CSR/BSR/VBCSR apply, row-major block kernels,
+    //     symbolic SpGEMM). They parallelise their own loops with the linked
+    //     OpenMP and call no vendor BLAS inside. They need NOTHING - no call,
+    //     no guard. Do not add thread configuration to these paths.
+    //
+    //  B. Vendor-threaded kernels invoked from serial code (MKL/AOCL sparse
+    //     handles, standalone dense LAPACK). The vendor pool must hold the
+    //     OpenMP budget: call align_vendor_threads() at the entry point. It is
+    //     idempotent and costs a comparison in the common case.
+    //
+    //  C. Dense BLAS/LAPACK called from INSIDE one of our own OpenMP parallel
+    //     regions (the SpGEMM numeric phase, the batched dense subgraph
+    //     problems of the graph matrix function - currently the only two).
+    //     Each such call must run on one thread or the pools multiply.
+    //     Instantiate ScopedSerialBLAS before the parallel region; it pins the
+    //     vendor pool to one thread and restores the budget when it leaves
+    //     scope.
+    //
+    // The invariant these maintain: the vendor pool always rests at the OpenMP
+    // budget; only a live ScopedSerialBLAS ever has it elsewhere. The process
+    // therefore ends every vbcsr operation in the same thread state it began.
+
+    // The user's thread budget (OMP_NUM_THREADS / omp_set_num_threads).
     static int preferred_parallel_thread_count() {
 #ifdef _OPENMP
         return std::max(1, omp_get_max_threads());
@@ -312,36 +344,69 @@ struct BLASKernel {
 #endif
     }
 
-    // Native sparse kernels may call BLAS inside an outer OpenMP region. Clamp the
-    // inner BLAS runtime to one thread to avoid oversubscription.
-    static void configure_native_threading() {
+    // Current size of the linked vendor pool (the OpenMP budget when the
+    // vendor exposes no such knob).
+    static int vendor_thread_count() {
 #ifdef VBCSR_USE_MKL
-        int one = 1;
-        if (mkl_get_max_threads() != one) {
-            mkl_set_num_threads(one);
-            mkl_set_num_threads_local(one);
-        }
+        return mkl_get_max_threads();
 #elif defined(VBCSR_USE_OPENBLAS)
-        openblas_set_num_threads(1);
+        return openblas_get_num_threads();
 #else
-        // Generic BLAS: Do nothing. 
-        // We do NOT want to call omp_set_num_threads(1) here because it would disable
-        // parallelism for the outer loops (Sparse MVP/MM).
+        return preferred_parallel_thread_count();
 #endif
     }
 
-    // Vendor sparse kernels should own parallelism themselves. For MKL sparse we
-    // align the MKL thread pool with the configured OpenMP thread budget so callers
-    // only need to manage one thread setting.
-    static void configure_vendor_sparse_threading() {
+    static void set_vendor_thread_count(int threads) {
+        if (threads < 1) threads = 1;
 #ifdef VBCSR_USE_MKL
-        int threads = preferred_parallel_thread_count();
         if (mkl_get_max_threads() != threads) {
             mkl_set_num_threads(threads);
             mkl_set_num_threads_local(threads);
         }
+#elif defined(VBCSR_USE_OPENBLAS)
+        if (openblas_get_num_threads() != threads) {
+            openblas_set_num_threads(threads);
+        }
+#else
+        (void)threads;  // generic BLAS: OpenMP's own budget is the only lever
 #endif
     }
+
+    // Kind B: vendor pool := OpenMP budget.
+    static void align_vendor_threads() {
+        set_vendor_thread_count(preferred_parallel_thread_count());
+    }
+
+    // Kind C: single-threaded vendor BLAS for the lifetime of the object.
+    //
+    // Also pins OpenMP's max-active-levels to 1 (once, process-wide): a BLAS
+    // that is threaded through our own OpenMP runtime has no vendor pool to
+    // pin, and the nesting rule is what makes its inner parallel regions run
+    // with a team of one.
+    //
+    // Construct from serial code, before the parallel region.
+    class ScopedSerialBLAS {
+    public:
+        ScopedSerialBLAS() : previous_(vendor_thread_count()) {
+#ifdef _OPENMP
+            if (!omp_in_parallel()) {
+                static const bool once = [] {
+                    omp_set_max_active_levels(1);
+                    return true;
+                }();
+                (void)once;
+            }
+#endif
+            set_vendor_thread_count(1);
+        }
+        ~ScopedSerialBLAS() { set_vendor_thread_count(previous_); }
+
+        ScopedSerialBLAS(const ScopedSerialBLAS&) = delete;
+        ScopedSerialBLAS& operator=(const ScopedSerialBLAS&) = delete;
+
+    private:
+        int previous_;
+    };
 
     static std::string name() {
 #ifdef VBCSR_USE_MKL

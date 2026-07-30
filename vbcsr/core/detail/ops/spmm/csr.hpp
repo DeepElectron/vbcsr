@@ -200,7 +200,7 @@ private:
         // OpenMP thread budget (OMP_NUM_THREADS is the single source of
         // truth). Without this the multiply inherits whatever pool size the
         // previous call left behind.
-        BLASKernel::configure_vendor_sparse_threading();
+        BLASKernel::align_vendor_threads();
 
         MKLSparseHandleOwner a_handle;
         MKLSparseHandleOwner b_handle;
@@ -877,7 +877,7 @@ private:
         const auto t_build = stamp();
 
         if (A.local_block_nnz() > 0 && b_ext_nnz != 0) {
-            BLASKernel::configure_vendor_sparse_threading();
+            BLASKernel::align_vendor_threads();
 
             // A passes verbatim: its column ids already index B_ext's rows by
             // the layout choice above. Same zero-copy wrapper the serial path

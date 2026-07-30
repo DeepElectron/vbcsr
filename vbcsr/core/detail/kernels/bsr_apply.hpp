@@ -387,7 +387,7 @@ void bsr_mult(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistVector<T
     // Vendor path is opt-in (VBCSR_BSR_VENDOR): only then align the MKL pool
     // with the OpenMP budget and build vendor handles.
     if (bsr_vendor_enabled()) {
-        BLASKernel::configure_vendor_sparse_threading();
+        BLASKernel::align_vendor_threads();
         const auto& cache = backend.ensure_vendor_cache(
             graph->adj_ptr,
             graph->adj_ind,
@@ -401,7 +401,6 @@ void bsr_mult(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistVector<T
     }
 #endif
 
-    BLASKernel::configure_native_threading();
     bsr_dispatch_block_size(backend.block_size, [&](auto block_tag) {
         constexpr int kBlockSize = decltype(block_tag)::value;
         bsr_mult_impl<kBlockSize>(graph, backend, x, y);
@@ -495,7 +494,7 @@ void bsr_mult_dense(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistMu
     // Vendor path is opt-in (VBCSR_BSR_VENDOR): only then align the MKL pool
     // with the OpenMP budget and build vendor handles.
     if (bsr_vendor_enabled()) {
-        BLASKernel::configure_vendor_sparse_threading();
+        BLASKernel::align_vendor_threads();
         const auto& cache = backend.ensure_vendor_cache(
             graph->adj_ptr,
             graph->adj_ind,
@@ -514,7 +513,6 @@ void bsr_mult_dense(DistGraph* graph, const BSRMatrixBackend<T>& backend, DistMu
     }
 #endif
 
-    BLASKernel::configure_native_threading();
     bsr_mult_dense_impl(graph, backend, x, y);
 }
 
@@ -617,7 +615,7 @@ void bsr_mult_adjoint(DistGraph* graph, const BSRMatrixBackend<T>& backend, Dist
     // Vendor path is opt-in (VBCSR_BSR_VENDOR): only then align the MKL pool
     // with the OpenMP budget and build vendor handles.
     if (bsr_vendor_enabled()) {
-        BLASKernel::configure_vendor_sparse_threading();
+        BLASKernel::align_vendor_threads();
         const auto& cache = backend.ensure_vendor_cache(
             graph->adj_ptr,
             graph->adj_ind,
@@ -632,7 +630,6 @@ void bsr_mult_adjoint(DistGraph* graph, const BSRMatrixBackend<T>& backend, Dist
     }
 #endif
 
-    BLASKernel::configure_native_threading();
     bsr_dispatch_block_size(backend.block_size, [&](auto block_tag) {
         constexpr int kBlockSize = decltype(block_tag)::value;
         bsr_mult_adjoint_impl<kBlockSize>(graph, backend, x, y);
@@ -761,7 +758,7 @@ void bsr_mult_dense_adjoint(
     // Vendor path is opt-in (VBCSR_BSR_VENDOR): only then align the MKL pool
     // with the OpenMP budget and build vendor handles.
     if (bsr_vendor_enabled()) {
-        BLASKernel::configure_vendor_sparse_threading();
+        BLASKernel::align_vendor_threads();
         const auto& cache = backend.ensure_vendor_cache(
             graph->adj_ptr,
             graph->adj_ind,
@@ -776,7 +773,6 @@ void bsr_mult_dense_adjoint(
     }
 #endif
 
-    BLASKernel::configure_native_threading();
     bsr_mult_dense_adjoint_impl(graph, backend, x, y);
 }
 

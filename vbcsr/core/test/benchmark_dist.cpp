@@ -31,7 +31,6 @@ void bsr_mult_native_benchmark(
     const detail::BSRMatrixBackend<T>& backend,
     DistVector<T>& x,
     DistVector<T>& y) {
-    BLASKernel::configure_native_threading();
     detail::bsr_dispatch_block_size(backend.block_size, [&](auto block_tag) {
         constexpr int kBlockSize = decltype(block_tag)::value;
         detail::bsr_mult_impl<kBlockSize>(graph, backend, x, y);
@@ -44,7 +43,6 @@ void bsr_mult_dense_native_benchmark(
     const detail::BSRMatrixBackend<T>& backend,
     DistMultiVector<T>& x,
     DistMultiVector<T>& y) {
-    BLASKernel::configure_native_threading();
     detail::bsr_mult_dense_impl(graph, backend, x, y);
 }
 
@@ -54,7 +52,6 @@ void bsr_mult_adjoint_native_benchmark(
     const detail::BSRMatrixBackend<T>& backend,
     DistVector<T>& x,
     DistVector<T>& y) {
-    BLASKernel::configure_native_threading();
     detail::bsr_dispatch_block_size(backend.block_size, [&](auto block_tag) {
         constexpr int kBlockSize = decltype(block_tag)::value;
         detail::bsr_mult_adjoint_impl<kBlockSize>(graph, backend, x, y);
@@ -67,7 +64,6 @@ void bsr_mult_dense_adjoint_native_benchmark(
     const detail::BSRMatrixBackend<T>& backend,
     DistMultiVector<T>& x,
     DistMultiVector<T>& y) {
-    BLASKernel::configure_native_threading();
     detail::bsr_mult_dense_adjoint_impl(graph, backend, x, y);
 }
 

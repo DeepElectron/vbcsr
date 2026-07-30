@@ -111,7 +111,7 @@ py::dict threading_diagnostics(bool configure_vendor_sparse) {
     result["mkl_enabled"] = true;
     result["mkl_get_max_threads_before"] = mkl_get_max_threads();
     if (configure_vendor_sparse) {
-        BLASKernel::configure_vendor_sparse_threading();
+        BLASKernel::align_vendor_threads();
     }
     result["mkl_get_max_threads_after"] = mkl_get_max_threads();
 #else

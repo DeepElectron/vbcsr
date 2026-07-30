@@ -69,6 +69,7 @@ inline const char* matrix_kind_name(MatrixKind kind) {
 #include "detail/distributed/block_payload_exchange.hpp"
 #include "detail/distributed/mpi_utils.hpp"
 #include <algorithm>
+#include <cstddef>
 #include <vector>
 #include <omp.h>
 #include <fstream>
@@ -133,11 +134,14 @@ private:
     friend struct detail::VBCSRAxpbyExecutor;
     template <typename>
     friend struct detail::VBCSRSpMMExecutor;
-    template <typename U>
-    friend void graph_matrix_function(
+    // The graph matrix-function driver assembles one dense subgraph per block
+    // row (detail/ops/spmf/graph_function.hpp). graph_matrix_function and
+    // graph_inverse_sqrt go through it, so it is the only one that needs access.
+    template <typename U, typename DenseAction>
+    friend void graph_function_apply(
         BlockSpMat<U>&,
         BlockSpMat<U>*,
-        std::function<U(double)>,
+        DenseAction&&,
         bool);
 
     MatrixKind kind = MatrixKind::CSR;

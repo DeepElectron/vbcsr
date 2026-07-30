@@ -10,6 +10,7 @@ using vbcsr_blas_int = int;
 
 #ifdef VBCSR_USE_OPENBLAS
 extern "C" void openblas_set_num_threads(int num_threads);
+extern "C" int openblas_get_num_threads(void);
 #endif
 
 #ifdef VBCSR_USE_MKL

@@ -330,7 +330,7 @@ private:
             return std::make_unique<Matrix>(make_empty_like_product(A));
         }
 
-        BLASKernel::configure_vendor_sparse_threading();
+        BLASKernel::align_vendor_threads();
 
         BSRMKLSparseHandleOwner a_handle;
         BSRMKLSparseHandleOwner b_handle;

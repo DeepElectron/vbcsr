@@ -7,7 +7,6 @@
 #include <vector>
 #include <cmath>
 #include <complex>
-#include <iostream>
 #include <algorithm>
 #include <functional>
 #include <mpi.h>
@@ -45,11 +44,25 @@ namespace detail {
 } // namespace detail
 
 
-// Helper to compute f(M) for a dense matrix M
+// f(M) for a dense Hermitian matrix M via full diagonalization.
+//
+// On entry M is n x n column-major (one triangle would suffice, but xSYEVD /
+// xHEEVD read the 'U' triangle of the full buffer). On exit M is replaced by
+// the n x k column-major block f(M)[:, col_start : col_start + k].
+//
+// Returns false when the eigensolver fails; M is then the zero n x k block, so
+// a caller that scatters it writes defined (zero) values and can account for
+// the failure instead of consuming garbage.
+//
+// Note for callers holding a row-major view (BlockSpMat::to_dense): reading it
+// as column-major yields conj(M). For Hermitian M and real-valued f,
+// f(conj(M)) = conj(f(M)), and extracting the block ROW of f(M) as the
+// transpose of the computed column block cancels that conjugation exactly -
+// see the scatter step of graph_function_apply.
 template <typename T>
-void dense_matrix_function(int n_in, std::vector<T>& M, std::function<T(double)> func, int k_cols = -1, int col_start_idx = 0) {
+bool dense_matrix_function(int n_in, std::vector<T>& M, std::function<T(double)> func, int k_cols = -1, int col_start_idx = 0) {
     vbcsr_lapack_int n = n_in;
-    if (n == 0) return;
+    if (n == 0) return true;
     
     int k = (k_cols <= 0) ? n : k_cols;
     
@@ -87,26 +100,39 @@ void dense_matrix_function(int n_in, std::vector<T>& M, std::function<T(double)>
     }
     
     if (info != 0) {
-        std::cerr << "Error in LAPACK eigendecomposition (info=" << info << ")" << std::endl;
-        return;
+        // Deliver the contract shape (zeros), report through the return value:
+        // the caller runs inside an OpenMP region and aggregates failures.
+        M.assign(static_cast<size_t>(n) * k, T(0));
+        return false;
     }
     
     // M now contains eigenvectors V. w contains eigenvalues.
     // Result_subset = (V * diag(f(w))) * (V^H)[:, col_start_idx : col_start_idx + k]
-    std::vector<T> V_scaled = M;
+    // Only rows [col_start_idx, col_start_idx + k) of V feed the second gemm
+    // operand, so save that k x n slice (ld = k) and scale V in place instead
+    // of duplicating the full n x n eigenvector matrix. This runs on one
+    // thread per batched subgraph, so the n^2 copy dominated peak RSS.
+    std::vector<T> V_rows(static_cast<size_t>(k) * n);
+    for (int j = 0; j < n; ++j) {
+        for (int i = 0; i < k; ++i) {
+            V_rows[i + static_cast<size_t>(j) * k] = M[(col_start_idx + i) + static_cast<size_t>(j) * n];
+        }
+    }
+
+    // TODO: optimizable? first times diag(f(w)) * V_rows(k*n)^H is faster?
+    // M <- V * diag(f(w))
     for (int j = 0; j < n; ++j) {
         T val = func(w[j]);
         for (int i = 0; i < n; ++i) {
-            V_scaled[i + j * n] *= val;
+            M[i + static_cast<size_t>(j) * n] *= val;
         }
     }
-    
-    std::vector<T> Res(n * k, T(0));
-    // C(n x k) = V_scaled(n x n) * M(k x n)^H
-    // Select rows [col_start_idx, col_start_idx + k) of V (M).
-    // Pointer arithmetic `M.data() + col_start_idx` with stride `n` correctly slices the rows.
-    detail::dense_gemm(n, k, n, T(1.0), V_scaled.data(), n, M.data() + col_start_idx, n, T(0.0), Res.data(), n, false, true);
-    M = Res;
+
+    std::vector<T> Res(static_cast<size_t>(n) * k, T(0));
+    // C(n x k) = (V * diag(f(w)))(n x n) * V_rows(k x n)^H
+    detail::dense_gemm(n, k, n, T(1.0), M.data(), n, V_rows.data(), k, T(0.0), Res.data(), n, false, true);
+    M = std::move(Res);
+    return true;
 }
 
 } // namespace vbcsr

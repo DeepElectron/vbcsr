@@ -164,9 +164,8 @@ private:
         const int n_rows = static_cast<int>(A.row_ptr().size()) - 1;
 
         // Numeric products call BLAS (gemm_batched) from inside the OpenMP
-        // region below: clamp the BLAS runtime to one thread so the pool
-        // state left by a previous vendor call cannot oversubscribe.
-        BLASKernel::configure_native_threading();
+        // region below (thread policy kind C, dense_kernels.hpp).
+        BLASKernel::ScopedSerialBLAS serial_blas;
 
         int max_threads = 1;
         #ifdef _OPENMP
