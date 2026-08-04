@@ -248,11 +248,22 @@ public:
 
         double cutoff_sq = cutoff * cutoff;
 
-        for(int bz = 0; bz < nbins_c[2]; ++bz) {
-            for(int by = 0; by < nbins_c[1]; ++by) {
-                for(int bx = 0; bx < nbins_c[0]; ++bx) {
-                    
-                    int bin_idx = bx + nbins_c[0] * (by + nbins_c[1] * bz);
+        // Parallel over home bins. A bin only ever appends to neighbors[i] for
+        // the atoms it contains, and the bins partition the atoms, so the
+        // destination vectors are disjoint and no synchronization is needed.
+        // Dynamic scheduling because bin occupancy is uneven in any structure
+        // with a surface, a vacuum layer, or a density gradient.
+        const int n_bins_total = nbins_c[0] * nbins_c[1] * nbins_c[2];
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 8)
+#endif
+        for(int bin_linear = 0; bin_linear < n_bins_total; ++bin_linear) {
+            {
+                {
+                    const int bx = bin_linear % nbins_c[0];
+                    const int by = (bin_linear / nbins_c[0]) % nbins_c[1];
+                    const int bz = bin_linear / (nbins_c[0] * nbins_c[1]);
+                    int bin_idx = bin_linear;
                     const auto& atoms_in_current_bin = bins[bin_idx];
                     
                     if (atoms_in_current_bin.empty()) continue;

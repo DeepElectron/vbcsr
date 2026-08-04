@@ -714,10 +714,14 @@ if(VBCSR_ENABLE_TESTS)
     add_vbcsr_mpi_test(test_image_container vbcsr/core/atomic/test/test_image_container.cpp MPI_RANKS 2)
     add_vbcsr_plain_test(test_neighbourlist vbcsr/core/atomic/test/test_neighbourlist.cpp)
     add_vbcsr_gtest(test_neighbourlist_repro vbcsr/core/atomic/test/test_neighbourlist_repro.cpp)
+    add_vbcsr_gtest(test_distributed_build vbcsr/core/atomic/test/test_distributed_build.cpp MPI_RANKS 4)
+    add_vbcsr_gtest(test_from_points_edges vbcsr/core/atomic/test/test_from_points_edges.cpp MPI_RANKS 4)
 
     if(PARMETIS_LIB AND METIS_LIB AND PARMETIS_INCLUDE_DIR AND METIS_INCLUDE_DIR)
         foreach(target
             test_atomic_data
+            test_distributed_build
+            test_from_points_edges
             test_image_container
         )
             target_link_libraries(${target} PRIVATE ${PARMETIS_LIB} ${METIS_LIB})

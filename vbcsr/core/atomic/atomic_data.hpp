@@ -13,6 +13,8 @@
 #include <cstdint>
 #include "neighbourlist.hpp"
 #include "io.hpp"
+#include "distributed_build.hpp"
+#include <memory>
 
 #ifdef VBCSR_HAVE_PARMETIS
 #include <parmetis.h>
@@ -20,7 +22,27 @@
 
 namespace vbcsr {
 namespace atomic {
-    
+
+/// Inverse of a row-major 3x3 cell, so a Cartesian offset can be read in
+/// fractional coordinates.
+///
+/// A free function rather than a method because callers that transform many
+/// vectors -- grid collocation, minimum-image searches -- want the matrix once
+/// and reuse it, where AtomicData::invert_cell recomputes it per vector.
+inline std::array<double, 9> InvertCell3x3(const double* cell) {
+    const double a = cell[0], b = cell[1], c = cell[2];
+    const double d = cell[3], e = cell[4], f = cell[5];
+    const double g = cell[6], h = cell[7], i = cell[8];
+    const double det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    if (!(std::abs(det) > 1e-12)) {
+        throw std::runtime_error("Cell is singular; it has no fractional coordinates.");
+    }
+    const double s = 1.0 / det;
+    return {(e * i - f * h) * s, (c * h - b * i) * s, (b * f - c * e) * s,
+            (f * g - d * i) * s, (a * i - c * g) * s, (c * d - a * f) * s,
+            (d * h - e * g) * s, (b * g - a * h) * s, (a * e - b * d) * s};
+}
+
 class AtomicData {
 public:
     DistGraph* graph = nullptr;
@@ -253,45 +275,36 @@ public:
             size = 1;
         }
 
-        // 1. Rank 0: Process Input & Initial Partition
+        // 1. Spread the atoms and build the edges, both distributed.
+        //
+        // Rank 0 holds the geometry on the way in and nothing else: the atoms
+        // are scattered in blocks, repartitioned by inertial bisection, and each
+        // rank then runs a neighbour search over its own atoms plus a halo. The
+        // alternative -- one neighbour list over every atom on rank 0 -- costs
+        // that rank N * <neighbours>, which at 1e6 atoms is gigabytes and tens
+        // of seconds before any other rank has done anything.
         std::vector<int> type_norb = type_norb_in;
-        std::vector<double> pos_sorted;
-        std::vector<int> z_sorted;
-        std::vector<int> types_sorted;
-        std::vector<int> indices_sorted;
-        std::vector<int> send_counts(size, 0);
-        std::vector<int> send_displs(size + 1, 0);
-        std::vector<std::vector<Edge>> edges_to_send(size);
-        
-        int n_global = 0;
-        if (rank == 0) {
-            n_global = z.size();
-            process_input_rank0(size, pos, z, cell, pbc, r_max_per_type, type_norb,
-                                pos_sorted, z_sorted, types_sorted, indices_sorted,
-                                send_counts, send_displs, edges_to_send);
-        }
-
-        if (initialized) {
-            MPI_Bcast(&n_global, 1, MPI_INT, 0, comm);
-        }
-
-        if (n_global == 0) {
-            return new AtomicData(comm);
-        }
-        
-        // 2. Scatter Atoms and Edges
         std::vector<double> my_pos;
         std::vector<int> my_z;
         std::vector<int> my_types;
         std::vector<int> my_indices;
         std::vector<int> my_edges_flat;
-        int my_n_atom;
-        
-        scatter_initial_data(comm, rank, size, n_global, pos_sorted, z_sorted, types_sorted, indices_sorted,
-                             send_counts, send_displs, edges_to_send, type_norb,
-                             my_n_atom, my_pos, my_z, my_types, my_indices, my_edges_flat);
-        
-        // 3. ParMETIS Partitioning
+        int my_n_atom = 0;
+        int n_global = 0;
+
+        distribute_and_build_edges(comm, rank, size, pos, z, cell, pbc, r_max_per_type,
+                                   type_norb, n_global, my_n_atom, my_pos, my_z, my_types,
+                                   my_indices, my_edges_flat);
+
+        if (n_global == 0) {
+            return new AtomicData(comm);
+        }
+
+        // 2. ParMETIS Partitioning
+        //
+        // Bisection already put neighbours on the same rank; this refines that
+        // for edge cut and balance, and the redistribution below is the same one
+        // it always was.
         std::vector<int> vtxdist;
         std::vector<int> xadj;
         std::vector<int> adjncy;
@@ -305,7 +318,7 @@ public:
         
         partition_graph(vtxdist, xadj, adjncy, size, part, comm, my_pos, n_global);
         
-        // 4. Redistribute Atoms
+        // 3. Redistribute Atoms
         std::vector<double> r_pos;
         std::vector<int> r_z;
         std::vector<int> r_types;
@@ -319,11 +332,11 @@ public:
         redistribute_atoms(comm, rank, size, my_n_atom, part, my_pos, my_z, my_types, my_indices, my_inter_indices,
                            r_pos, r_z, r_types, r_indices, r_inter_indices, total_recv);
         
-        // 5. Redistribute Edges
+        // 4. Redistribute Edges
         std::vector<int> r_edges;
         redistribute_edges(comm, rank, size, my_start, my_edges_flat, part, r_edges);
         
-        // 6. Re-map IDs to be contiguous on each rank
+        // 5. Re-map IDs to be contiguous on each rank
         std::vector<int> all_recv_counts(size);
         if (initialized) {
             MPI_Allgather(&total_recv, 1, MPI_INT, all_recv_counts.data(), 1, MPI_INT, comm);
@@ -351,7 +364,7 @@ public:
             r_edges[5*k+1] = inter_to_final[r_edges[5*k+1]];
         }
                       
-        // 7. Construct AtomicData
+        // 6. Construct AtomicData
         return construct_final_object(
             comm,
             rank,
@@ -445,41 +458,26 @@ public:
             my_input_index, my_z, my_types, my_pos, r_edges, type_norb);
     }
 
-    static AtomicData* from_file(const std::string& filename, const std::vector<double>& r_max_per_type, std::vector<int> type_norb, MPI_Comm comm, const std::string& format="") {
-        int rank;
+    /// Reads a structure file on rank 0 and builds its graph.
+    ///
+    /// Only the parse is serial; from_points spreads the atoms before it does
+    /// any geometry. Per-type tables are indexed by the distinct atomic numbers
+    /// in ascending order -- ReadStructure(...).TypeSymbols() is that list, for
+    /// a caller that needs to see it before choosing them.
+    static AtomicData* from_file(const std::string& filename,
+                                 const std::vector<double>& r_max_per_type,
+                                 const std::vector<int>& type_norb,
+                                 MPI_Comm comm, const std::string& format = "") {
+        int rank = 0;
         int initialized = 0;
         MPI_Initialized(&initialized);
-        if (initialized) {
-            MPI_Comm_rank(comm, &rank);
-        } else {
-            rank = 0;
-        }
-        
-        std::vector<double> pos;
-        std::vector<int> z;
-        std::vector<double> cell;
-        std::vector<bool> pbc;
-        
-        if (rank == 0) {
-            io::StructureData data;
-            std::string fmt = format;
-            if (fmt.empty()) {
-                if (filename.find(".vasp") != std::string::npos || filename.find("POSCAR") != std::string::npos) fmt = "POSCAR";
-                else if (filename.find(".xyz") != std::string::npos) fmt = "XYZ";
-                else throw std::runtime_error("Unknown file format");
-            }
-            
-            if (fmt == "POSCAR") data = io::read_poscar(filename);
-            else if (fmt == "XYZ") data = io::read_xyz(filename);
-            else throw std::runtime_error("Unsupported format: " + fmt);
-            
-            pos = data.pos;
-            z = data.z;
-            cell = data.cell;
-            pbc = data.pbc;
-        }
-        
-        return from_points(pos, z, cell, pbc, r_max_per_type, type_norb, comm);
+        if (initialized) MPI_Comm_rank(comm, &rank);
+
+        Structure data;
+        if (rank == 0) data = ReadStructure(filename, format);
+
+        return from_points(data.pos, data.z, data.cell, data.pbc, r_max_per_type,
+                           type_norb, comm);
     }
 
     ~AtomicData() {
@@ -643,28 +641,21 @@ public:
         *rz += z[j] - z[i];
     }
 
+    // Rewrites a Cartesian vector in fractional coordinates. A degenerate cell
+    // is left alone rather than raised on, which is what the callers here
+    // expect: a cell-less (molecular) system has nothing to reduce.
     void invert_cell(double *x, double *y, double *z) {
-        double det = cell[0]*(cell[4]*cell[8] - cell[5]*cell[7]) -
-                     cell[1]*(cell[3]*cell[8] - cell[5]*cell[6]) +
-                     cell[2]*(cell[3]*cell[7] - cell[4]*cell[6]);
-                     
-        if (std::abs(det) < 1e-9) return;
-        
-        double inv[9];
-        inv[0] = (cell[4]*cell[8] - cell[5]*cell[7]) / det;
-        inv[1] = (cell[2]*cell[7] - cell[1]*cell[8]) / det;
-        inv[2] = (cell[1]*cell[5] - cell[2]*cell[4]) / det;
-        inv[3] = (cell[5]*cell[6] - cell[3]*cell[8]) / det;
-        inv[4] = (cell[0]*cell[8] - cell[2]*cell[6]) / det;
-        inv[5] = (cell[2]*cell[3] - cell[0]*cell[5]) / det;
-        inv[6] = (cell[3]*cell[7] - cell[4]*cell[6]) / det;
-        inv[7] = (cell[1]*cell[6] - cell[0]*cell[7]) / det;
-        inv[8] = (cell[0]*cell[4] - cell[1]*cell[3]) / det;
-        
-        double a = inv[0]*(*x) + inv[1]*(*y) + inv[2]*(*z);
-        double b = inv[3]*(*x) + inv[4]*(*y) + inv[5]*(*z);
-        double c = inv[6]*(*x) + inv[7]*(*y) + inv[8]*(*z);
-        
+        std::array<double, 9> inv;
+        try {
+            inv = InvertCell3x3(cell.data());
+        } catch (const std::runtime_error&) {
+            return;
+        }
+
+        const double a = inv[0]*(*x) + inv[1]*(*y) + inv[2]*(*z);
+        const double b = inv[3]*(*x) + inv[4]*(*y) + inv[5]*(*z);
+        const double c = inv[6]*(*x) + inv[7]*(*y) + inv[8]*(*z);
+
         *x = a;
         *y = b;
         *z = c;
@@ -1235,151 +1226,28 @@ private:
 #endif
     }
 
-    static void process_input_rank0(
-        int size,
+    // Spreads the atoms over the ranks and builds their edges, with no rank
+    // ever holding the whole geometry.
+    //
+    // Rank 0 supplies pos/z; from there the work is distributed throughout:
+    //
+    //   block scatter -> inertial bisection -> halo exchange -> local search
+    //
+    // Bisection is what makes the local search possible: once atoms are grouped
+    // by region, a rank needs only its own atoms plus the shell of foreign ones
+    // within the cutoff, and the search over owned+halo is non-periodic because
+    // the halo arrives as explicit shifted images (distributed_build.hpp).
+    //
+    // Outputs match what the caller's ParMETIS stage expects: `my_indices` is
+    // the atom's position in the input, and edge endpoints are in the
+    // intermediate numbering where rank r owns [exscan_r, exscan_r + n_r).
+    static void distribute_and_build_edges(
+        MPI_Comm comm, int rank, int size,
         const std::vector<double>& pos, const std::vector<int>& z,
         const std::vector<double>& cell, const std::vector<bool>& pbc,
         const std::vector<double>& r_max_per_type,
         std::vector<int>& type_norb,
-        std::vector<double>& pos_sorted,
-        std::vector<int>& z_sorted,
-        std::vector<int>& types_sorted,
-        std::vector<int>& indices_sorted,
-        std::vector<int>& send_counts,
-        std::vector<int>& send_displs,
-        std::vector<std::vector<Edge>>& edges_to_send
-    ) {
-        // this should only be called by rank 0
-        int n_global = z.size();
-        
-        // 1.1 Types
-        std::vector<int> unique_z = z;
-        std::sort(unique_z.begin(), unique_z.end());
-        unique_z.erase(std::unique(unique_z.begin(), unique_z.end()), unique_z.end());
-        int n_types = unique_z.size();
-        std::map<int, int> z_to_type;
-        for(int i=0; i<n_types; ++i) z_to_type[unique_z[i]] = i;
-        
-        std::vector<int> atom_types(n_global);
-        for(int i=0; i<n_global; ++i) atom_types[i] = z_to_type[z[i]];
-        
-        if (type_norb.empty()) type_norb.assign(n_types, 1);
-        else if ((int)type_norb.size() < n_types) type_norb.resize(n_types, type_norb.back());
-
-        // Callers may pass fewer cutoffs than types (e.g. one uniform cutoff);
-        // pad with the last entry so per-type lookups stay in bounds.
-        std::vector<double> r_max_type = r_max_per_type;
-        if (r_max_type.empty()) r_max_type.assign(n_types, 0.0);
-        else if ((int)r_max_type.size() < n_types) r_max_type.resize(n_types, r_max_type.back());
-
-        // 1.2 NeighborList
-        double max_r = 0;
-        for(double r : r_max_type) max_r = std::max(max_r, r);
-        NeighborList nl;
-        nl.build(pos, cell, pbc, max_r * 2.0);
-
-        // Positions are stored exactly as given -- atom order and coordinates
-        // are the caller's, and are what a Hamiltonian file's own indexing and
-        // R-vector convention refer to. NeighborList reports its shifts against
-        // these same coordinates, so the two agree without anything being moved.
-
-        // 1.3 Hilbert Sort
-        double min_p[3] = {1e30, 1e30, 1e30};
-        double max_p[3] = {-1e30, -1e30, -1e30};
-        for(int i=0; i<n_global; ++i) {
-            for(int k=0; k<3; ++k) {
-                min_p[k] = std::min(min_p[k], pos[3*i+k]);
-                max_p[k] = std::max(max_p[k], pos[3*i+k]);
-            }
-        }
-
-        double range[3];
-        for(int k=0; k<3; ++k) range[k] = max_p[k] - min_p[k] + 1e-9;
-        
-        std::vector<std::pair<uint64_t, int>> morton_codes(n_global);
-        for(int i=0; i<n_global; ++i) {
-            uint64_t code = 0;
-            for(int k=0; k<3; ++k) {
-                double n = (pos[3*i+k] - min_p[k]) / range[k];
-                uint64_t u = (uint64_t)(n * 2097152.0); 
-                for(int b=0; b<21; ++b) if ((u >> b) & 1) code |= (1ULL << (3*b + k));
-            }
-            morton_codes[i] = {code, i};
-        }
-        std::sort(morton_codes.begin(), morton_codes.end());
-        
-        // 1.4 Assign Ranks & Sort Data
-        int atoms_per_rank = n_global / size;
-        int remainder = n_global % size;
-        int current_rank = 0;
-        int current_count = 0;
-        int target_count = atoms_per_rank + (0 < remainder ? 1 : 0);
-        
-        pos_sorted.resize(n_global * 3);
-        z_sorted.resize(n_global);
-        types_sorted.resize(n_global);
-        indices_sorted.resize(n_global);
-        std::vector<int> old_to_inter_gid(n_global);
-        std::vector<int> inter_gid_to_rank(n_global);
-        
-        for(int i=0; i<n_global; ++i) {
-            int old_idx = morton_codes[i].second;
-            if (current_count >= target_count) {
-                current_rank++;
-                current_count = 0;
-                target_count = atoms_per_rank + (current_rank < remainder ? 1 : 0);
-            }
-            send_counts[current_rank]++;
-            current_count++;
-            
-            old_to_inter_gid[old_idx] = i;
-            inter_gid_to_rank[i] = current_rank;
-            
-            pos_sorted[3*i] = pos[3*old_idx];
-            pos_sorted[3*i+1] = pos[3*old_idx+1];
-            pos_sorted[3*i+2] = pos[3*old_idx+2];
-            z_sorted[i] = z[old_idx];
-            types_sorted[i] = atom_types[old_idx];
-            indices_sorted[i] = old_idx; 
-        }
-        
-        // 1.5 Process Edges
-        for(int old_i=0; old_i<n_global; ++old_i) {
-            int inter_i = old_to_inter_gid[old_i];
-            int rank_i = inter_gid_to_rank[inter_i];
-            int type_i = atom_types[old_i];
-            
-            const auto& neighbors = nl.get_neighbors(old_i);
-            for(const auto& n : neighbors) {
-                int old_j = n.index;
-                int inter_j = old_to_inter_gid[old_j];
-                int type_j = atom_types[old_j];
-                
-                double r_cut = r_max_type[type_i] + r_max_type[type_j];
-                
-                double dx = pos[3*old_j] - pos[3*old_i] + n.rx*cell[0] + n.ry*cell[3] + n.rz*cell[6];
-                double dy = pos[3*old_j+1] - pos[3*old_i+1] + n.rx*cell[1] + n.ry*cell[4] + n.rz*cell[7];
-                double dz = pos[3*old_j+2] - pos[3*old_i+2] + n.rx*cell[2] + n.ry*cell[5] + n.rz*cell[8];
-                double dist = std::sqrt(dx*dx + dy*dy + dz*dz);
-                
-                if (dist > r_cut + 1e-9) continue;
-                
-                edges_to_send[rank_i].push_back({inter_i, inter_j, n.rx, n.ry, n.rz});
-            }
-        }
-        for(int i=0; i<size; ++i) send_displs[i+1] = send_displs[i] + send_counts[i];
-    }
-
-    static void scatter_initial_data(
-        MPI_Comm comm, int rank, int size, int n_global,
-        const std::vector<double>& pos_sorted,
-        const std::vector<int>& z_sorted,
-        const std::vector<int>& types_sorted,
-        const std::vector<int>& indices_sorted,
-        const std::vector<int>& send_counts,
-        const std::vector<int>& send_displs,
-        const std::vector<std::vector<Edge>>& edges_to_send,
-        std::vector<int>& type_norb,
+        int& n_global,
         int& my_n_atom,
         std::vector<double>& my_pos,
         std::vector<int>& my_z,
@@ -1389,89 +1257,131 @@ private:
     ) {
         int initialized = 0;
         MPI_Initialized(&initialized);
-        
-        if (initialized) {
-            MPI_Bcast(&n_global, 1, MPI_INT, 0, comm);
-        }
-        int n_types = type_norb.size();
-        if (initialized) {
-            MPI_Bcast(&n_types, 1, MPI_INT, 0, comm);
-        }
-        if (rank != 0) type_norb.resize(n_types);
-        if (initialized) {
-            MPI_Bcast(type_norb.data(), n_types, MPI_INT, 0, comm);
-        }
-        
-        if (initialized) {
-            MPI_Scatter(send_counts.data(), 1, MPI_INT, &my_n_atom, 1, MPI_INT, 0, comm);
-        } else {
-            my_n_atom = send_counts[0];
-        }
-        
-        my_pos.resize(my_n_atom * 3);
-        my_z.resize(my_n_atom);
-        my_types.resize(my_n_atom);
-        my_indices.resize(my_n_atom);
-        
-        std::vector<int> send_counts_3(size), send_displs_3(size + 1);
+
+        // Types are the distinct atomic numbers in ascending order; every rank
+        // needs that list to read the per-type tables the same way.
+        std::vector<int> unique_z;
         if (rank == 0) {
-            for(int i=0; i<size; ++i) {
-                send_counts_3[i] = send_counts[i] * 3;
-                send_displs_3[i] = send_displs[i] * 3;
-            }
-            send_displs_3[size] = send_displs[size] * 3;
+            n_global = static_cast<int>(z.size());
+            unique_z = z;
+            std::sort(unique_z.begin(), unique_z.end());
+            unique_z.erase(std::unique(unique_z.begin(), unique_z.end()), unique_z.end());
         }
-        
+        if (initialized) MPI_Bcast(&n_global, 1, MPI_INT, 0, comm);
+        if (n_global == 0) return;
+
+        int n_types = static_cast<int>(unique_z.size());
+        if (initialized) MPI_Bcast(&n_types, 1, MPI_INT, 0, comm);
+        unique_z.resize(n_types);
+        if (initialized) MPI_Bcast(unique_z.data(), n_types, MPI_INT, 0, comm);
+        std::map<int, int> z_to_type;
+        for (int i = 0; i < n_types; ++i) z_to_type[unique_z[i]] = i;
+
+        // Callers may pass fewer entries than types (e.g. one uniform cutoff);
+        // pad with the last so per-type lookups stay in bounds.
+        if (type_norb.empty()) type_norb.assign(n_types, 1);
+        else if ((int)type_norb.size() < n_types) type_norb.resize(n_types, type_norb.back());
+        std::vector<double> r_max_type = r_max_per_type;
+        if (r_max_type.empty()) r_max_type.assign(n_types, 0.0);
+        else if ((int)r_max_type.size() < n_types) r_max_type.resize(n_types, r_max_type.back());
+
+        // Block scatter: contiguous chunks of the input, which bisection is
+        // about to undo anyway, so there is no point sorting first.
+        std::vector<int> counts(size, 0), displs(size + 1, 0);
+        for (int r = 0; r < size; ++r) {
+            counts[r] = n_global / size + (r < n_global % size ? 1 : 0);
+            displs[r + 1] = displs[r] + counts[r];
+        }
+        const int n_block = counts[rank];
+
+        LocalAtoms mine;
+        mine.pos.resize(static_cast<size_t>(n_block) * 3);
+        mine.z.resize(n_block);
         if (initialized) {
-            MPI_Scatterv(pos_sorted.data(), send_counts_3.data(), send_displs_3.data(), MPI_DOUBLE,
-                         my_pos.data(), my_n_atom * 3, MPI_DOUBLE, 0, comm);
-            MPI_Scatterv(z_sorted.data(), send_counts.data(), send_displs.data(), MPI_INT,
-                         my_z.data(), my_n_atom, MPI_INT, 0, comm);
-            MPI_Scatterv(types_sorted.data(), send_counts.data(), send_displs.data(), MPI_INT,
-                         my_types.data(), my_n_atom, MPI_INT, 0, comm);
-            MPI_Scatterv(indices_sorted.data(), send_counts.data(), send_displs.data(), MPI_INT,
-                         my_indices.data(), my_n_atom, MPI_INT, 0, comm);
+            std::vector<int> counts3(size), displs3(size + 1, 0);
+            for (int r = 0; r < size; ++r) {
+                counts3[r] = counts[r] * 3;
+                displs3[r + 1] = displs3[r] + counts3[r];
+            }
+            MPI_Scatterv(pos.data(), counts3.data(), displs3.data(), MPI_DOUBLE,
+                         mine.pos.data(), n_block * 3, MPI_DOUBLE, 0, comm);
+            MPI_Scatterv(z.data(), counts.data(), displs.data(), MPI_INT,
+                         mine.z.data(), n_block, MPI_INT, 0, comm);
         } else {
-            std::copy(pos_sorted.begin(), pos_sorted.begin() + my_n_atom * 3, my_pos.begin());
-            std::copy(z_sorted.begin(), z_sorted.begin() + my_n_atom, my_z.begin());
-            std::copy(types_sorted.begin(), types_sorted.begin() + my_n_atom, my_types.begin());
-            std::copy(indices_sorted.begin(), indices_sorted.begin() + my_n_atom, my_indices.begin());
+            std::copy(pos.begin(), pos.begin() + n_block * 3, mine.pos.begin());
+            std::copy(z.begin(), z.begin() + n_block, mine.z.begin());
+        }
+        mine.type.resize(n_block);
+        mine.global_id.resize(n_block);
+        // Balance on orbital count, not atom count: a rank's share of the matrix
+        // is blocks, and a 9-orbital atom is nine rows where a 1-orbital atom is
+        // one.
+        std::vector<double> weights(n_block);
+        for (int i = 0; i < n_block; ++i) {
+            auto it = z_to_type.find(mine.z[i]);
+            if (it == z_to_type.end()) {
+                throw std::runtime_error("from_points: atom of species Z=" +
+                                         std::to_string(mine.z[i]) + " has no type.");
+            }
+            mine.type[i] = it->second;
+            mine.global_id[i] = displs[rank] + i;
+            weights[i] = static_cast<double>(type_norb[it->second]);
         }
 
-        // Scatter Edges
-        int my_n_edge_tuples;
-        std::vector<int> edge_send_counts(size);
-        if (rank == 0) {
-            for(int i=0; i<size; ++i) edge_send_counts[i] = edges_to_send[i].size() * 5; 
-        }
+        std::unique_ptr<InertialCut> tree;
+        LocalAtoms owned = RedistributeByInertia(mine, weights, comm, &tree);
+        LocalEdges edges = BuildLocalEdges(owned, *tree, cell, pbc, r_max_type, comm);
+
+        my_n_atom = owned.n_local();
+        my_pos = owned.pos;
+        my_z = owned.z;
+        my_types = owned.type;
+        my_indices = owned.global_id;
+
+        // Edges come back in input numbering; the ParMETIS stage wants the
+        // intermediate one, where rank r owns a contiguous block. One allgather
+        // of (input id, intermediate id) pairs resolves both endpoints, halo
+        // atoms included.
+        int my_start = 0;
         if (initialized) {
-            MPI_Scatter(edge_send_counts.data(), 1, MPI_INT, &my_n_edge_tuples, 1, MPI_INT, 0, comm);
-        } else {
-            my_n_edge_tuples = edge_send_counts[0];
+            MPI_Exscan(&my_n_atom, &my_start, 1, MPI_INT, MPI_SUM, comm);
+            if (rank == 0) my_start = 0;
         }
-        
-        my_edges_flat.resize(my_n_edge_tuples);
-        std::vector<int> edge_displs(size + 1, 0);
-        std::vector<int> all_edges_flat;
-        if (rank == 0) {
-            for(int i=0; i<size; ++i) edge_displs[i+1] = edge_displs[i] + edge_send_counts[i];
-            all_edges_flat.resize(edge_displs[size]);
-            int offset = 0;
-            for(int i=0; i<size; ++i) {
-                for(const auto& e : edges_to_send[i]) {
-                    all_edges_flat[offset++] = e.src;
-                    all_edges_flat[offset++] = e.dst;
-                    all_edges_flat[offset++] = e.rx;
-                    all_edges_flat[offset++] = e.ry;
-                    all_edges_flat[offset++] = e.rz;
-                }
+        std::vector<int> input_to_inter(static_cast<size_t>(n_global), -1);
+        {
+            std::vector<int> mine_pairs(static_cast<size_t>(my_n_atom) * 2);
+            for (int i = 0; i < my_n_atom; ++i) {
+                mine_pairs[2 * static_cast<size_t>(i)] = my_indices[i];
+                mine_pairs[2 * static_cast<size_t>(i) + 1] = my_start + i;
             }
+            std::vector<int> pair_counts(size, 2 * my_n_atom), pair_displs(size, 0);
+            if (initialized) {
+                const int mine_n = 2 * my_n_atom;
+                MPI_Allgather(&mine_n, 1, MPI_INT, pair_counts.data(), 1, MPI_INT, comm);
+            }
+            for (int r = 1; r < size; ++r) pair_displs[r] = pair_displs[r - 1] + pair_counts[r - 1];
+            std::vector<int> all(static_cast<size_t>(pair_displs.back() + pair_counts.back()));
+            if (initialized) {
+                MPI_Allgatherv(mine_pairs.data(), 2 * my_n_atom, MPI_INT, all.data(),
+                               pair_counts.data(), pair_displs.data(), MPI_INT, comm);
+            } else {
+                all = mine_pairs;
+            }
+            for (size_t k = 0; k + 1 < all.size(); k += 2) input_to_inter[all[k]] = all[k + 1];
         }
-        if (initialized) {
-            MPI_Scatterv(all_edges_flat.data(), edge_send_counts.data(), edge_displs.data(), MPI_INT,
-                         my_edges_flat.data(), my_n_edge_tuples, MPI_INT, 0, comm);
-        } else {
-            std::copy(all_edges_flat.begin(), all_edges_flat.begin() + my_n_edge_tuples, my_edges_flat.begin());
+
+        my_edges_flat.resize(static_cast<size_t>(edges.n_edge()) * 5);
+        for (int e = 0; e < edges.n_edge(); ++e) {
+            const int src = input_to_inter[edges.index[2 * static_cast<size_t>(e)]];
+            const int dst = input_to_inter[edges.index[2 * static_cast<size_t>(e) + 1]];
+            if (src < 0 || dst < 0) {
+                throw std::runtime_error("from_points: unmapped atom in an edge.");
+            }
+            my_edges_flat[5 * static_cast<size_t>(e)] = src;
+            my_edges_flat[5 * static_cast<size_t>(e) + 1] = dst;
+            my_edges_flat[5 * static_cast<size_t>(e) + 2] = edges.shift[3 * static_cast<size_t>(e)];
+            my_edges_flat[5 * static_cast<size_t>(e) + 3] = edges.shift[3 * static_cast<size_t>(e) + 1];
+            my_edges_flat[5 * static_cast<size_t>(e) + 4] = edges.shift[3 * static_cast<size_t>(e) + 2];
         }
     }
 
