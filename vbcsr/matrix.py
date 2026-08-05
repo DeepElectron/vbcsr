@@ -767,6 +767,34 @@ class VBCSR(LinearOperator):
             shape = (self.shape[0], B.shape[1])
         return self._wrap_core(core_C, self.dtype, self.comm, shape=shape)
 
+    def spmm_hermitian(self, B: 'VBCSR', threshold: float = 0.0, transA: bool = False) -> 'VBCSR':
+        """
+        C = op(A) * B for a product the CALLER knows is Hermitian.
+
+        Only the upper block triangle is computed; the strict lower triangle
+        is its conjugate transpose, and the diagonal blocks are Hermitized,
+        so the result is exactly Hermitian. Silently wrong if the true
+        product is not Hermitian.
+
+        Args:
+            B (VBCSR): The matrix to multiply with.
+            threshold (float): Threshold for dropping small blocks.
+            transA (bool): If True, use A^H.
+
+        Returns:
+            VBCSR: The result matrix C, exactly Hermitian.
+        """
+        if not isinstance(B, VBCSR):
+            raise TypeError("B must be a VBCSR matrix")
+        if self.dtype != B.dtype:
+            raise TypeError("A and B must have the same dtype")
+
+        core_C = self._core.spmm_hermitian(B._core, threshold, transA)
+        shape = None
+        if self.shape[0] is not None and B.shape[1] is not None:
+            shape = (self.shape[0], B.shape[1])
+        return self._wrap_core(core_C, self.dtype, self.comm, shape=shape)
+
     def spmm_self(self, threshold: float = 0.0, transA: bool = False) -> 'VBCSR':
         core_C = self._core.spmm_self(threshold, transA)
         return self._wrap_core(core_C, self.dtype, self.comm, shape=self.shape)

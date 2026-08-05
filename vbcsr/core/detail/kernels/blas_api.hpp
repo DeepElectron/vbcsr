@@ -44,6 +44,26 @@ extern "C" {
                      const void *beta, void *C, const vbcsr_blas_int ldc);
 
 #ifdef VBCSR_BLAS_HAS_BATCH_GEMM
+    // Pointer-array batch GEMM (grouped API): one call over arrays of
+    // same-shape products. Used by the SpGEMM numeric phase, where the
+    // operand blocks of one inner index are scattered, not strided.
+    void cblas_dgemm_batch(const int Order, const int* TransA_Array, const int* TransB_Array,
+                           const vbcsr_blas_int* M_Array, const vbcsr_blas_int* N_Array,
+                           const vbcsr_blas_int* K_Array, const double* alpha_Array,
+                           const double** A_Array, const vbcsr_blas_int* lda_Array,
+                           const double** B_Array, const vbcsr_blas_int* ldb_Array,
+                           const double* beta_Array, double** C_Array,
+                           const vbcsr_blas_int* ldc_Array,
+                           const vbcsr_blas_int group_count, const vbcsr_blas_int* group_size);
+    void cblas_zgemm_batch(const int Order, const int* TransA_Array, const int* TransB_Array,
+                           const vbcsr_blas_int* M_Array, const vbcsr_blas_int* N_Array,
+                           const vbcsr_blas_int* K_Array, const void* alpha_Array,
+                           const void** A_Array, const vbcsr_blas_int* lda_Array,
+                           const void** B_Array, const vbcsr_blas_int* ldb_Array,
+                           const void* beta_Array, void** C_Array,
+                           const vbcsr_blas_int* ldc_Array,
+                           const vbcsr_blas_int group_count, const vbcsr_blas_int* group_size);
+
     void cblas_dgemm_batch_strided(const int Order, const int TransA, const int TransB,
                                    const vbcsr_blas_int M, const vbcsr_blas_int N, const vbcsr_blas_int K,
                                    const double alpha, const double *A, const vbcsr_blas_int lda, const vbcsr_blas_int stridea,

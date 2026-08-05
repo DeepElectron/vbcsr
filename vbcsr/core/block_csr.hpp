@@ -1429,6 +1429,98 @@ public:
         return detail::VBCSRSpMMExecutor<BlockSpMat<T>>::run(*this, B, threshold);
     }
 
+    // C = op(A) B for a product the CALLER knows is Hermitian -- congruences
+    // like Z^H (S Z) with S Hermitian, or X X with X Hermitian. Only block
+    // columns at or above the diagonal are computed (half the block products
+    // and their ghost fetches skipped via the symbolic pattern); the strict
+    // lower triangle is the conjugate transpose of the strict upper, mirrored
+    // through the existing transpose exchange. The result is exactly
+    // Hermitian by construction, which the full product is not once the
+    // threshold has dropped blocks asymmetrically.
+    //
+    // The contract is the caller's to honour: on a product that is not
+    // Hermitian this silently computes the wrong matrix. Hermitian implies
+    // square, so op(A)'s row space and B's column space must be the same
+    // global block space -- there is no cheap runtime check for that here.
+    //
+    // Cost shape (measured, benchmark_spgemm): ~2x over the full product at
+    // dense block density, ~1.6x at 0.29, provided the row loops stay
+    // load-balanced (they are; see the executors). The mirror is one
+    // transpose exchange plus one union axpby -- ~5% of the dense product.
+    // Fusing the mirror into the numeric phase would save most of that and
+    // one metadata round; worthwhile only if profiles ever show it.
+    BlockSpMat spmm_hermitian(const BlockSpMat& B, double threshold, bool transA = false) const {
+        ensure_same_backend_family(*this, B, "spmm_hermitian");
+        if (transA) {
+            BlockSpMat A_T = this->transpose();
+            return A_T.spmm_hermitian(B, threshold, false);
+        }
+        BlockSpMat U = (kind == MatrixKind::CSR && B.kind == MatrixKind::CSR)
+            ? detail::CSRSpMMExecutor<BlockSpMat<T>>::run(*this, B, threshold, /*upper_only=*/true)
+            : (kind == MatrixKind::BSR && B.kind == MatrixKind::BSR)
+                ? detail::BSRSpMMExecutor<BlockSpMat<T>>::run(*this, B, threshold, /*upper_only=*/true)
+                : detail::VBCSRSpMMExecutor<BlockSpMat<T>>::run(*this, B, threshold, /*upper_only=*/true);
+        // Mirror: C = U + strict_lower(U^H). U's transpose carries the
+        // conjugated diagonal too; zero it so the diagonal is not doubled.
+        BlockSpMat L = U.transpose();
+        L.zero_diagonal_blocks();
+        U.axpby(T(1), L, T(1));
+        // The mirrored triangles are exactly conjugate by construction; the
+        // diagonal blocks are as-computed and carry rounding-scale
+        // anti-Hermitian parts. Average them so the promise holds exactly.
+        U.hermitize_diagonal_blocks();
+        return U;
+    }
+
+    // D <- (D + D^H)/2 for every diagonal block, in place.
+    void hermitize_diagonal_blocks() {
+        const int n_rows = static_cast<int>(graph->adj_ptr.size()) - 1;
+        #pragma omp parallel for
+        for (int i = 0; i < n_rows; ++i) {
+            const int global_row = graph->get_global_index(i);
+            for (int k = graph->adj_ptr[i]; k < graph->adj_ptr[i + 1]; ++k) {
+                const int local_col = graph->adj_ind[k];
+                if (graph->get_global_index(local_col) != global_row) continue;
+                const int dim = std::min(graph->block_sizes[i], graph->block_sizes[local_col]);
+                const int c_dim = graph->block_sizes[local_col];
+                T* d = mutable_block_data(k);
+                for (int r = 0; r < dim; ++r) {
+                    d[r * c_dim + r] = ScalarTraits<T>::hermitize(d[r * c_dim + r]);
+                    for (int c = r + 1; c < dim; ++c) {
+                        const T upper = d[r * c_dim + c];
+                        const T lower = d[c * c_dim + r];
+                        const T avg = (upper + ScalarTraits<T>::conjugate(lower)) * T(0.5);
+                        d[r * c_dim + c] = avg;
+                        d[c * c_dim + r] = ScalarTraits<T>::conjugate(avg);
+                    }
+                }
+                break;
+            }
+        }
+        norms_valid = false;
+    }
+
+    // Zeroes every diagonal block's values (the pattern is untouched). Used
+    // by spmm_hermitian's mirror; harmless but pointless elsewhere.
+    void zero_diagonal_blocks() {
+        const int n_rows = static_cast<int>(graph->adj_ptr.size()) - 1;
+        #pragma omp parallel for
+        for (int i = 0; i < n_rows; ++i) {
+            const int global_row = graph->get_global_index(i);
+            for (int k = graph->adj_ptr[i]; k < graph->adj_ptr[i + 1]; ++k) {
+                const int local_col = graph->adj_ind[k];
+                if (graph->get_global_index(local_col) == global_row) {
+                    const int r_dim = graph->block_sizes[i];
+                    const int c_dim = graph->block_sizes[local_col];
+                    T* target = mutable_block_data(k);
+                    std::fill(target, target + static_cast<size_t>(r_dim) * c_dim, T(0));
+                    break;
+                }
+            }
+        }
+        norms_valid = false;
+    }
+
     BlockSpMat spmm_self(double threshold, bool transA = false) {
         return spmm(*this, threshold, transA, false);
     }

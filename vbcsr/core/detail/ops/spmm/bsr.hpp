@@ -2,6 +2,7 @@
 #define VBCSR_DETAIL_OPS_SPMM_BSR_HPP
 
 #include "../../kernels/bsr_apply.hpp"
+#include "../../kernels/dense_kernels.hpp"
 #include "../../distributed/block_payload_exchange.hpp"
 #include "../../distributed/result_graph.hpp"
 #include "common.hpp"
@@ -38,6 +39,78 @@ template <typename Matrix>
 struct BSRSpMMExecutor {
     using T = typename Matrix::value_type;
 
+    // Vendor batch GEMM in the numeric phase, dispatched on block size the
+    // way every kernel choice here is. Measured (benchmark_spgemm, 24
+    // threads, dense): the batch call's fixed per-product overhead loses
+    // badly on small blocks and wins clearly on large ones --
+    //     bs 5: 0.50x    bs 13: 0.95-1.04x    bs 26: 1.30x
+    // -- so it turns on at bs >= 16, where the vendor's throughput advantage
+    // has overtaken the dispatch cost. VBCSR_SPGEMM_BATCH=1/0 forces it
+    // either way (re-read per product so benchmarks can toggle in-process).
+    static bool spgemm_batch_enabled(int block_size) {
+#ifdef VBCSR_BLAS_HAS_BATCH_GEMM
+        const char* env = std::getenv("VBCSR_SPGEMM_BATCH");
+        if (env != nullptr) return std::strcmp(env, "1") == 0;
+        return block_size >= 16;
+#else
+        (void)block_size;
+        return false;
+#endif
+    }
+
+    // All of one inner index's surviving products in one grouped vendor call:
+    // same A block, same shape, distinct destinations -- one group, no races.
+    template <int BlockSize>
+    static void flush_product_batch(
+        int runtime_block_size,
+        const T* a_block,
+        const std::vector<const T*>& b_blocks,
+        const std::vector<T*>& c_blocks) {
+        const int bs = BlockSize == 0 ? runtime_block_size : BlockSize;
+        const size_t n = b_blocks.size();
+#ifdef VBCSR_BLAS_HAS_BATCH_GEMM
+        if constexpr (std::is_same_v<T, double> || std::is_same_v<T, std::complex<double>>) {
+            // Below a handful of products the call setup outweighs the gain.
+            constexpr size_t kMinBatch = 4;
+            if (n >= kMinBatch) {
+                thread_local std::vector<const T*> a_ptrs;
+                a_ptrs.assign(n, a_block);
+                const int trans[1] = {111 /*CblasNoTrans*/};
+                const vbcsr_blas_int dims[1] = {static_cast<vbcsr_blas_int>(bs)};
+                const vbcsr_blas_int group_size[1] = {static_cast<vbcsr_blas_int>(n)};
+                if constexpr (std::is_same_v<T, double>) {
+                    const double alpha[1] = {1.0};
+                    const double beta[1] = {1.0};
+                    cblas_dgemm_batch(101 /*CblasRowMajor*/, trans, trans,
+                                      dims, dims, dims, alpha,
+                                      const_cast<const double**>(a_ptrs.data()), dims,
+                                      const_cast<const double**>(b_blocks.data()), dims,
+                                      beta,
+                                      const_cast<double**>(c_blocks.data()), dims,
+                                      1, group_size);
+                } else {
+                    const T alpha(1.0);
+                    const T beta(1.0);
+                    cblas_zgemm_batch(101 /*CblasRowMajor*/, trans, trans,
+                                      dims, dims, dims, &alpha,
+                                      reinterpret_cast<const void**>(
+                                          const_cast<const T**>(a_ptrs.data())), dims,
+                                      reinterpret_cast<const void**>(
+                                          const_cast<const T**>(b_blocks.data())), dims,
+                                      &beta,
+                                      reinterpret_cast<void**>(
+                                          const_cast<T**>(c_blocks.data())), dims,
+                                      1, group_size);
+                }
+                return;
+            }
+        }
+#endif
+        for (size_t i = 0; i < n; ++i) {
+            accumulate_product<BlockSize>(runtime_block_size, a_block, b_blocks[i], c_blocks[i]);
+        }
+    }
+
     template <int BlockSize>
     static void accumulate_product(
         int runtime_block_size,
@@ -50,15 +123,18 @@ struct BSRSpMMExecutor {
         rowmajor_kernels::rm_gemm<T>(bs, bs, bs, a_block, b_block, bs, dest, bs);
     }
 
-    static Matrix run(const Matrix& A, const Matrix& B, double threshold) {
+    static Matrix run(const Matrix& A, const Matrix& B, double threshold,
+                      bool upper_only = false) {
 #ifdef VBCSR_HAVE_MKL_BSR_SPARSE
-        if (threshold <= 0.0) {
+        // The vendor path computes the full product; the triangular
+        // restriction only exists in the generic executor.
+        if (threshold <= 0.0 && !upper_only) {
             if (auto result = run_mkl_serial(A, B, threshold)) {
                 return std::move(*result);
             }
         }
 #endif
-        return run_generic(A, B, threshold);
+        return run_generic(A, B, threshold, upper_only);
     }
 
 private:
@@ -578,17 +654,23 @@ private:
     }
 #endif
 
-    static Matrix run_generic(const Matrix& A, const Matrix& B, double threshold) {
+    static Matrix run_generic(const Matrix& A, const Matrix& B, double threshold,
+                              bool upper_only = false) {
         const auto& A_backend = A.active_bsr_backend();
         const auto& B_backend = B.active_bsr_backend();
         if (A_backend.block_size != B_backend.block_size) {
             throw std::runtime_error("BSR SpMM requires matching uniform block sizes");
         }
 
+        const bool profile = std::getenv("VBCSR_PROFILE_BSR_SPGEMM") != nullptr;
+        auto stamp = [] { return std::chrono::steady_clock::now(); };
+        const auto t0 = stamp();
         auto metadata = exchange_ghost_metadata(A, B);
-        auto sym = symbolic_multiply_filtered(A, B, metadata, threshold);
+        auto sym = symbolic_multiply_filtered(A, B, metadata, threshold, upper_only);
+        const auto t_symbolic = stamp();
         auto payload_ctx = fetch_required_block_payloads(B, sym.required_blocks);
         auto ghost_blocks = build_spmm_ghost_blocks(metadata, std::move(payload_ctx));
+        const auto t_fetch = stamp();
         auto adjacency = build_spmm_result_adjacency(A, sym);
 
         const auto& A_norms = A.get_block_norms();
@@ -603,97 +685,196 @@ private:
         C.set_page_size(A.configured_page_size());
         const int block_size = A_backend.block_size;
 
+        // One inner index (row, slot) contributes at most once to each
+        // destination, so its surviving products form a batch of same-shape
+        // GEMMs with distinct outputs: exactly what the vendor's grouped
+        // batch API wants. One call per (row, slot) replaces one small GEMM
+        // per block pair, which is where a lone bs x bs product cannot reach
+        // vendor efficiency. Runtime-off with VBCSR_SPGEMM_BATCH=0; tiny
+        // batches fall back to the direct kernel where call overhead would
+        // dominate.
+        const bool batch_active = spgemm_batch_enabled(A_backend.block_size);
+
+        // Hoisted out of the pair loop: B's global column per slot. Resolving
+        // it per block PAIR was measured at a substantial share of the ~1us
+        // per-pair overhead that dominated the numeric phase; per slot it is
+        // one O(nnz(B)) pass.
+        std::vector<int> b_global_cols(B.col_ind().size());
+        #pragma omp parallel for
+        for (long long i = 0; i < static_cast<long long>(b_global_cols.size()); ++i) {
+            b_global_cols[static_cast<size_t>(i)] =
+                B.graph->get_global_index(B.col_ind()[static_cast<size_t>(i)]);
+        }
+
+        // O(1) destination resolution: a per-thread epoch-tagged scatter array
+        // over the global block columns replaces a per-pair binary search into
+        // the symbolic row -- the other large share of the per-pair overhead.
+        // Falls back to the search when the global block count would make the
+        // per-thread arrays unreasonable.
+        const int n_global_blocks =
+            A.graph->block_displs.empty() ? 0 : A.graph->block_displs.back();
+        const bool use_scatter = n_global_blocks > 0 && n_global_blocks <= (1 << 22);
+
+        const auto t_numeric0 = stamp();
+#ifdef VBCSR_BLAS_HAS_BATCH_GEMM
+        // The batch calls run inside the OpenMP row loop: one product batch
+        // per thread at a time, vendor pool pinned to one thread meanwhile.
+        std::unique_ptr<BLASKernel::ScopedSerialBLAS> serial_blas;
+        if (batch_active) serial_blas = std::make_unique<BLASKernel::ScopedSerialBLAS>();
+#endif
+
         bsr_dispatch_block_size(block_size, [&](auto block_tag) {
             constexpr int BlockSize = decltype(block_tag)::value;
 
-            #pragma omp parallel for
-            for (int row = 0; row < n_rows; ++row) {
-                const int c_start = sym.c_row_ptr[row];
-                const int c_end = sym.c_row_ptr[row + 1];
-                if (c_start == c_end) {
-                    continue;
+            #pragma omp parallel
+            {
+                std::vector<const T*> bat_b;
+                std::vector<T*> bat_c;
+                std::vector<int> dest_slot;
+                std::vector<int> dest_tag;
+                if (use_scatter) {
+                    dest_slot.assign(static_cast<size_t>(n_global_blocks), 0);
+                    dest_tag.assign(static_cast<size_t>(n_global_blocks), -1);
                 }
 
-                std::vector<T*> dest_ptrs(c_end - c_start);
-                for (int idx = c_start; idx < c_end; ++idx) {
-                    const int global_col = sym.c_col_ind[idx];
-                    const int local_col = c_graph->global_to_local.at(global_col);
-                    const int dest_start = c_graph->adj_ptr[row];
-                    const int dest_end = c_graph->adj_ptr[row + 1];
-                    auto begin = c_graph->adj_ind.begin() + dest_start;
-                    auto end = c_graph->adj_ind.begin() + dest_end;
-                    auto it = std::lower_bound(begin, end, local_col);
-                    if (it == end || *it != local_col) {
-                        throw std::runtime_error("BSR SpMM could not locate destination block");
+                // Dynamic, not static: with upper_only the work per row falls
+                // linearly across the matrix (row i touches only columns
+                // >= i), and a contiguous static split hands the first thread
+                // about twice the mean -- measured as the halved product
+                // running at two-thirds the per-flop speed of the full one.
+                // Cyclic static (static,4) was tried as a zero-overhead
+                // alternative and measured WORSE for the triangular case
+                // (1.71x vs 1.96x); dynamic's cost on balanced products is
+                // inside run-to-run noise.
+                #pragma omp for schedule(dynamic, 4)
+                for (int row = 0; row < n_rows; ++row) {
+                    const int c_start = sym.c_row_ptr[row];
+                    const int c_end = sym.c_row_ptr[row + 1];
+                    if (c_start == c_end) {
+                        continue;
                     }
-                    const int graph_block_index =
-                        static_cast<int>(std::distance(c_graph->adj_ind.begin(), it));
-                    dest_ptrs[static_cast<size_t>(idx - c_start)] =
-                        C.mutable_block_data(graph_block_index);
-                }
 
-                const int a_start = A.row_ptr()[row];
-                const int a_end = A.row_ptr()[row + 1];
-                const double row_eps = threshold / std::max(1, a_end - a_start);
-                const auto sym_begin = sym.c_col_ind.begin() + c_start;
-                const auto sym_end = sym.c_col_ind.begin() + c_end;
-
-                auto accumulate_entry = [&](int global_col, const T* a_block, double norm_a, const T* b_block, double norm_b) {
-                    if (norm_a * norm_b < row_eps) {
-                        return;
-                    }
-                    auto it = std::lower_bound(sym_begin, sym_end, global_col);
-                    if (it == sym_end || *it != global_col) {
-                        return;
-                    }
-                    accumulate_product<BlockSize>(
-                        block_size,
-                        a_block,
-                        b_block,
-                        dest_ptrs[static_cast<size_t>(std::distance(sym_begin, it))]);
-                };
-
-                for (int slot = a_start; slot < a_end; ++slot) {
-                    const double norm_a = A_norms[slot];
-                    const T* a_value = A.block_data(slot);
-                    const int global_inner = A.graph->get_global_index(A.col_ind()[slot]);
-
-                    if (A.graph->find_owner(global_inner) == A.graph->rank) {
-                        const int local_row_b = B.graph->global_to_local.at(global_inner);
-                        // DistGraph rows are sorted by local IDs, and ghost local IDs are
-                        // owner-grouped, so local traversal order is not guaranteed to be
-                        // globally sorted once ghosts are present. Look up each result
-                        // destination through the symbolic row instead of assuming a
-                        // monotone global-column walk.
-                        for (int b_slot = B.row_ptr()[local_row_b]; b_slot < B.row_ptr()[local_row_b + 1]; ++b_slot) {
-                            const int global_col = B.graph->get_global_index(B.col_ind()[b_slot]);
-                            const double norm_b = B_local_norms[b_slot];
-                            accumulate_entry(
-                                global_col,
-                                a_value,
-                                norm_a,
-                                B.block_data(b_slot),
-                                norm_b);
+                    std::vector<T*> dest_ptrs(c_end - c_start);
+                    for (int idx = c_start; idx < c_end; ++idx) {
+                        const int global_col = sym.c_col_ind[idx];
+                        const int local_col = c_graph->global_to_local.at(global_col);
+                        const int dest_start = c_graph->adj_ptr[row];
+                        const int dest_end = c_graph->adj_ptr[row + 1];
+                        auto begin = c_graph->adj_ind.begin() + dest_start;
+                        auto end = c_graph->adj_ind.begin() + dest_end;
+                        auto it = std::lower_bound(begin, end, local_col);
+                        if (it == end || *it != local_col) {
+                            throw std::runtime_error("BSR SpMM could not locate destination block");
                         }
-                    } else {
-                        auto ghost_it = ghost_blocks.rows.find(global_inner);
-                        if (ghost_it == ghost_blocks.rows.end()) {
-                            continue;
+                        const int graph_block_index =
+                            static_cast<int>(std::distance(c_graph->adj_ind.begin(), it));
+                        dest_ptrs[static_cast<size_t>(idx - c_start)] =
+                            C.mutable_block_data(graph_block_index);
+                    }
+
+                    if (use_scatter) {
+                        for (int idx = c_start; idx < c_end; ++idx) {
+                            dest_slot[static_cast<size_t>(sym.c_col_ind[idx])] = idx - c_start;
+                            dest_tag[static_cast<size_t>(sym.c_col_ind[idx])] = row;
                         }
-                        for (const auto& block : ghost_it->second) {
-                            accumulate_entry(
-                                block.col,
-                                a_value,
-                                norm_a,
-                                block.data,
-                                block.norm);
+                    }
+
+                    const int a_start = A.row_ptr()[row];
+                    const int a_end = A.row_ptr()[row + 1];
+                    const double row_eps = threshold / std::max(1, a_end - a_start);
+                    const auto sym_begin = sym.c_col_ind.begin() + c_start;
+                    const auto sym_end = sym.c_col_ind.begin() + c_end;
+
+                    auto accumulate_entry = [&](int global_col, const T* a_block, double norm_a, const T* b_block, double norm_b) {
+                        if (norm_a * norm_b < row_eps) {
+                            return;
+                        }
+                        T* dest;
+                        if (use_scatter) {
+                            if (dest_tag[static_cast<size_t>(global_col)] != row) {
+                                return;
+                            }
+                            dest = dest_ptrs[static_cast<size_t>(
+                                dest_slot[static_cast<size_t>(global_col)])];
+                        } else {
+                            auto it = std::lower_bound(sym_begin, sym_end, global_col);
+                            if (it == sym_end || *it != global_col) {
+                                return;
+                            }
+                            dest = dest_ptrs[static_cast<size_t>(std::distance(sym_begin, it))];
+                        }
+                        if (batch_active) {
+                            bat_b.push_back(b_block);
+                            bat_c.push_back(dest);
+                            return;
+                        }
+                        accumulate_product<BlockSize>(block_size, a_block, b_block, dest);
+                    };
+
+                    for (int slot = a_start; slot < a_end; ++slot) {
+                        const double norm_a = A_norms[slot];
+                        const T* a_value = A.block_data(slot);
+                        const int global_inner = A.graph->get_global_index(A.col_ind()[slot]);
+
+                        if (A.graph->find_owner(global_inner) == A.graph->rank) {
+                            const int local_row_b = B.graph->global_to_local.at(global_inner);
+                            // DistGraph rows are sorted by local IDs, and ghost local IDs are
+                            // owner-grouped, so local traversal order is not guaranteed to be
+                            // globally sorted once ghosts are present. Look up each result
+                            // destination through the symbolic row instead of assuming a
+                            // monotone global-column walk.
+                            for (int b_slot = B.row_ptr()[local_row_b]; b_slot < B.row_ptr()[local_row_b + 1]; ++b_slot) {
+                                const int global_col = b_global_cols[static_cast<size_t>(b_slot)];
+                                const double norm_b = B_local_norms[b_slot];
+                                accumulate_entry(
+                                    global_col,
+                                    a_value,
+                                    norm_a,
+                                    B.block_data(b_slot),
+                                    norm_b);
+                            }
+                        } else {
+                            auto ghost_it = ghost_blocks.rows.find(global_inner);
+                            if (ghost_it == ghost_blocks.rows.end()) {
+                                continue;  // batch is empty here: flushed at the last slot
+                            }
+                            for (const auto& block : ghost_it->second) {
+                                accumulate_entry(
+                                    block.col,
+                                    a_value,
+                                    norm_a,
+                                    block.data,
+                                    block.norm);
+                            }
+                        }
+
+                        if (batch_active && !bat_b.empty()) {
+                            flush_product_batch<BlockSize>(
+                                block_size, a_value, bat_b, bat_c);
+                            bat_b.clear();
+                            bat_c.clear();
                         }
                     }
                 }
             }
         });
 
+        const auto t_numeric = stamp();
         C.filter_blocks(threshold);
+
+        if (profile) {
+            auto seconds = [](auto a, auto b) {
+                return std::chrono::duration<double>(b - a).count();
+            };
+            std::cerr << "VBCSR_PROFILE_BSR_SPGEMM"
+                      << " symbolic=" << seconds(t0, t_symbolic)
+                      << " fetch=" << seconds(t_symbolic, t_fetch)
+                      << " numeric=" << seconds(t_numeric0, t_numeric)
+                      << " filter=" << seconds(t_numeric, stamp())
+                      << " batch=" << (batch_active ? 1 : 0)
+                      << " upper_only=" << (upper_only ? 1 : 0)
+                      << std::endl;
+        }
         return C;
     }
 };

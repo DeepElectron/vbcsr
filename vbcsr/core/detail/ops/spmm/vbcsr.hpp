@@ -63,11 +63,12 @@ private:
     };
 
 public:
-    static Matrix run(const Matrix& A, const Matrix& B, double threshold) {
+    static Matrix run(const Matrix& A, const Matrix& B, double threshold,
+                      bool upper_only = false) {
         const bool profile = std::getenv("VBCSR_PROFILE_VBCSR_SPGEMM") != nullptr;
         const auto t0 = std::chrono::steady_clock::now();
         auto metadata = exchange_ghost_metadata(A, B);
-        auto sym = symbolic_multiply_filtered(A, B, metadata, threshold);
+        auto sym = symbolic_multiply_filtered(A, B, metadata, threshold, upper_only);
         const auto t_symbolic = std::chrono::steady_clock::now();
         auto payload_ctx = fetch_required_block_payloads(B, sym.required_blocks);
         auto ghost_blocks = build_spmm_ghost_blocks(metadata, std::move(payload_ctx));
@@ -216,7 +217,11 @@ private:
                         product_batches[key].push_back(task);
                     };
 
-                #pragma omp for
+                // Dynamic, not static: under upper_only the per-row work falls
+                // linearly across the matrix, and a static split roughly
+                // doubles the first thread's share (measured on the BSR
+                // executor as the halved product losing a third of its speed).
+                #pragma omp for schedule(dynamic, 4)
                 for (int row = 0; row < n_rows; ++row) {
                     ++tag;
                     if (tag == 0) {

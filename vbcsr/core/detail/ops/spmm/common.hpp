@@ -197,12 +197,18 @@ GhostMetadata exchange_ghost_metadata(const MatrixA& A, const MatrixB& B) {
     return metadata;
 }
 
+// upper_only restricts the result to global block columns >= the row's
+// global block index. The numeric phases resolve every product's destination
+// through this symbolic pattern, so restricting it here is what skips the
+// lower-triangle products' flops and their ghost fetches -- the caller
+// (spmm_hermitian) reconstructs the lower triangle by conjugate transposition.
 template <typename MatrixA, typename MatrixB>
 SymbolicMultiplyResult symbolic_multiply_filtered(
     const MatrixA& A,
     const MatrixB& B,
     const GhostMetadata& meta,
-    double threshold) {
+    double threshold,
+    bool upper_only = false) {
     SymbolicMultiplyResult res;
     const int n_rows = static_cast<int>(A.row_ptr().size()) - 1;
     res.c_row_ptr.resize(n_rows + 1);
@@ -243,6 +249,7 @@ SymbolicMultiplyResult symbolic_multiply_filtered(
         for (int row = 0; row < n_rows; ++row) {
             const int start = A.row_ptr()[row];
             const int end = A.row_ptr()[row + 1];
+            const int global_row = A.graph->get_global_index(row);
 
             // Upper bound on this row's distinct result columns.
             size_t row_width_bound = 0;
@@ -288,6 +295,9 @@ SymbolicMultiplyResult symbolic_multiply_filtered(
                 const double norm_A = A_norms[a_slot];
 
                 auto process_block = [&](int global_col_B, double norm_B) {
+                    if (upper_only && global_col_B < global_row) {
+                        return;
+                    }
                     size_t h = static_cast<size_t>(global_col_B) & hash_mask;
                     size_t count = 0;
                     while (table[h].tag == tag) {

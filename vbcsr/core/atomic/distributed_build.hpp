@@ -31,8 +31,8 @@
 // cutoffs and a part count in, a distributed graph out. What the cutoffs mean
 // is the caller's business.
 
-#include "vbcsr/core/atomic/inertial_partition.hpp"
-#include "vbcsr/core/atomic/neighbourlist.hpp"
+#include "inertial_partition.hpp"
+#include "neighbourlist.hpp"
 
 #include <algorithm>
 #include <cmath>

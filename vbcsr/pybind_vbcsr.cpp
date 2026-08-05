@@ -274,6 +274,11 @@ void bind_block_spmat(py::module& m, const std::string& name) {
         .def("save_matrix_market", &BlockSpMat<T>::save_matrix_market)
         .def("spmm", &BlockSpMat<T>::spmm, py::arg("B"), py::arg("threshold"), py::arg("transA") = false, py::arg("transB") = false)
         .def("spmm_self", &BlockSpMat<T>::spmm_self, py::arg("threshold"), py::arg("transA") = false)
+        .def("spmm_hermitian", &BlockSpMat<T>::spmm_hermitian,
+             py::arg("B"), py::arg("threshold"), py::arg("transA") = false,
+             "C = op(A) B for a product the caller KNOWS is Hermitian: only the\n"
+             "upper block triangle is computed, the lower is its conjugate\n"
+             "transpose. Wrong silently if the true product is not Hermitian.")
         .def("add", &BlockSpMat<T>::add, py::arg("B"), py::arg("alpha") = 1.0, py::arg("beta") = 1.0)
         .def("transpose", &BlockSpMat<T>::transpose)
         .def("extract_submatrix", &BlockSpMat<T>::extract_submatrix, py::arg("global_indices"))

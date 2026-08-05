@@ -41,13 +41,18 @@ template <typename Matrix>
 struct CSRSpMMExecutor {
     using T = typename Matrix::value_type;
 
-    static Matrix run(const Matrix& A, const Matrix& B, double threshold) {
+    static Matrix run(const Matrix& A, const Matrix& B, double threshold,
+                      bool upper_only = false) {
 #ifdef VBCSR_HAVE_MKL_SPARSE
-        if (auto result = run_mkl_serial(A, B, threshold)) {
-            return std::move(*result);
+        // The vendor shortcut computes the full product; the triangular
+        // restriction exists only in the native path.
+        if (!upper_only) {
+            if (auto result = run_mkl_serial(A, B, threshold)) {
+                return std::move(*result);
+            }
         }
 #endif
-        return run_generic(A, B, threshold);
+        return run_generic(A, B, threshold, upper_only);
     }
 
 private:
@@ -1175,7 +1180,8 @@ private:
     // eligible runs (thresholded or not) take run_fused_distributed above,
     // whose thresholding matches the serial MKL path (exact product, then
     // drop |value| < threshold), so results agree across rank counts.
-    static Matrix run_generic(const Matrix& A, const Matrix& B, double threshold) {
+    static Matrix run_generic(const Matrix& A, const Matrix& B, double threshold,
+                              bool upper_only = false) {
         const bool profile = std::getenv("VBCSR_PROFILE_CSR_DIST_SPGEMM") != nullptr;
         auto stamp = [] { return std::chrono::steady_clock::now(); };
         const auto t0 = stamp();
@@ -1198,6 +1204,7 @@ private:
         {
             const int b_rows = static_cast<int>(B.row_ptr().size()) - 1;
             int local_ok =
+                !upper_only &&
                 fused_distributed_enabled() &&
                 !spgemm_sorted_output_enabled() &&
                 is_mkl_supported_scalar_type() &&
@@ -1253,7 +1260,10 @@ private:
             std::vector<int> touched;
             uint32_t tag = 0;
 
-            #pragma omp for schedule(static)
+            // Dynamic for the same reason as the block executors: upper_only
+            // makes the per-row work triangular, and static scheduling then
+            // stalls the whole product on the thread holding the early rows.
+            #pragma omp for schedule(dynamic, 16)
             for (int row = 0; row < n_rows; ++row) {
                 ++tag;
                 if (tag == 0) {
@@ -1267,8 +1277,12 @@ private:
                 const int a_start = A.row_ptr()[row];
                 const int a_end = A.row_ptr()[row + 1];
                 const double row_eps = threshold / std::max(1, a_end - a_start);
+                const int global_row = A.graph->get_global_index(row);
 
                 auto accumulate = [&](int global_col, const T& value) {
+                    if (upper_only && global_col < global_row) {
+                        return;
+                    }
                     size_t h = static_cast<size_t>(global_col) & kHashMask;
                     size_t probes = 0;
                     while (table[h].tag == tag) {

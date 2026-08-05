@@ -24,7 +24,7 @@
 // volume marginally better but needs the graph itself -- which for a large
 // system is exactly the object we are trying to avoid materializing.
 
-#include "vbcsr/core/detail/kernels/lapack_api.hpp"
+#include "../detail/kernels/lapack_api.hpp"
 
 #include <algorithm>
 #include <cmath>
