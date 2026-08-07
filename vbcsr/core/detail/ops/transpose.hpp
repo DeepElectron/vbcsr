@@ -83,29 +83,50 @@ TransposeExchangeResult<typename Matrix::value_type> exchange_transpose_blocks(c
 
     std::vector<int> send_meta(sdispls[size]);
     std::vector<T> send_values(sdispls_data[size]);
-    std::vector<size_t> current_counts(size, 0);
-    std::vector<size_t> current_data_counts(size, 0);
 
+    // Two-pass pack. The first pass records each block's destination offsets
+    // (meta only, cheap); the second does the copies in parallel. The old
+    // single loop moved the whole matrix through one thread's memcpy -- at
+    // large scale that turned every distributed transpose (and with it the
+    // mirror of every spmm_hermitian and the transA congruence of the
+    // Newton-Schulz loop) into an hour-scale serial stall with every other
+    // rank idle in the following collective.
+    const size_t total_blocks = static_cast<size_t>(matrix.row_ptr()[n_rows]);
+    std::vector<size_t> block_meta_off(total_blocks);
+    std::vector<size_t> block_data_off(total_blocks);
+    {
+        std::vector<size_t> current_counts(size, 0);
+        std::vector<size_t> current_data_counts(size, 0);
+        for (int i = 0; i < n_rows; ++i) {
+            const int r_dim = matrix.graph->block_sizes[i];
+            for (int k = matrix.row_ptr()[i]; k < matrix.row_ptr()[i + 1]; ++k) {
+                const int g_col = matrix.graph->get_global_index(matrix.col_ind()[k]);
+                const int owner = matrix.graph->find_owner(g_col);
+                const int c_dim = matrix.graph->block_sizes[matrix.col_ind()[k]];
+                block_meta_off[k] = sdispls[owner] + current_counts[owner];
+                block_data_off[k] = sdispls_data[owner] + current_data_counts[owner];
+                current_counts[owner] += 4;
+                current_data_counts[owner] += static_cast<size_t>(r_dim) * c_dim;
+            }
+        }
+    }
+    #pragma omp parallel for schedule(dynamic, 64)
     for (int i = 0; i < n_rows; ++i) {
         const int g_row = matrix.graph->owned_global_indices[i];
         const int r_dim = matrix.graph->block_sizes[i];
         for (int k = matrix.row_ptr()[i]; k < matrix.row_ptr()[i + 1]; ++k) {
             const int g_col = matrix.graph->get_global_index(matrix.col_ind()[k]);
-            const int owner = matrix.graph->find_owner(g_col);
             const int c_dim = matrix.graph->block_sizes[matrix.col_ind()[k]];
 
-            int* meta_ptr = send_meta.data() + sdispls[owner] + current_counts[owner];
+            int* meta_ptr = send_meta.data() + block_meta_off[k];
             meta_ptr[0] = g_col;
             meta_ptr[1] = g_row;
             meta_ptr[2] = c_dim;
             meta_ptr[3] = r_dim;
-            current_counts[owner] += 4;
 
-            const size_t n_elem = static_cast<size_t>(r_dim) * c_dim;
-            std::memcpy(send_values.data() + sdispls_data[owner] + current_data_counts[owner],
+            std::memcpy(send_values.data() + block_data_off[k],
                         matrix.block_data(k),
-                        n_elem * sizeof(T));
-            current_data_counts[owner] += n_elem;
+                        static_cast<size_t>(r_dim) * c_dim * sizeof(T));
         }
     }
 
@@ -148,12 +169,35 @@ TransposeExchangeResult<typename Matrix::value_type> exchange_transpose_blocks(c
         }
     }
 
-    for (auto& neighbors : result.adjacency) {
+    const int n_adj = static_cast<int>(result.adjacency.size());
+    #pragma omp parallel for schedule(dynamic, 64)
+    for (int i = 0; i < n_adj; ++i) {
+        auto& neighbors = result.adjacency[i];
         std::sort(neighbors.begin(), neighbors.end());
         neighbors.erase(std::unique(neighbors.begin(), neighbors.end()), neighbors.end());
     }
 
     return result;
+}
+
+// Precomputed location of one received transposed block: where its 4-int
+// meta record and its value payload start. Indexing the stream first (a
+// meta-only walk) lets the heavy unpack -- lookups plus a block transpose
+// per received block, ~the whole matrix in bytes -- run in parallel.
+struct ReceivedBlockLoc {
+    size_t meta_off;
+    size_t value_off;
+};
+
+inline std::vector<ReceivedBlockLoc> index_received_blocks(const std::vector<int>& meta) {
+    std::vector<ReceivedBlockLoc> locs;
+    locs.reserve(meta.size() / 4);
+    size_t value_off = 0;
+    for (size_t p = 0; p + 3 < meta.size(); p += 4) {
+        locs.push_back({p, value_off});
+        value_off += static_cast<size_t>(meta[p + 2]) * static_cast<size_t>(meta[p + 3]);
+    }
+    return locs;
 }
 
 template <typename Matrix>
@@ -246,32 +290,47 @@ struct CSRTransposeExecutor {
         result.owns_graph = true;
         result.graph->enable_matrix_lifetime_management();
         result.set_page_size(matrix.configured_page_size());
-        const int* meta_ptr = exchange.recv_meta.data();
-        const int* meta_end = exchange.recv_meta.data() + exchange.recv_meta.size();
-        const T* value_ptr = exchange.recv_values.data();
-        while (meta_ptr < meta_end) {
-            const int global_row = *meta_ptr++;
-            const int global_col = *meta_ptr++;
-            const int row_dim = *meta_ptr++;
-            const int col_dim = *meta_ptr++;
-            if (row_dim != 1 || col_dim != 1) {
-                throw std::logic_error("Distributed CSR transpose expects scalar blocks");
+        const auto locs = index_received_blocks(exchange.recv_meta);
+        const int n_recv = static_cast<int>(locs.size());
+        int any_bad_payload = 0;
+        int any_missing_dest = 0;
+        #pragma omp parallel for schedule(dynamic, 256) reduction(|:any_bad_payload) reduction(|:any_missing_dest)
+        for (int b = 0; b < n_recv; ++b) {
+            const int* meta_ptr = exchange.recv_meta.data() + locs[b].meta_off;
+            const int global_row = meta_ptr[0];
+            const int global_col = meta_ptr[1];
+            if (meta_ptr[2] != 1 || meta_ptr[3] != 1) {
+                any_bad_payload = 1;
+                continue;
             }
-
-            const int local_row = graph_C->global_to_local.at(global_row);
-            const int local_col = graph_C->global_to_local.at(global_col);
-            const int dest_start = graph_C->adj_ptr[local_row];
-            const int dest_end = graph_C->adj_ptr[local_row + 1];
-            auto begin = graph_C->adj_ind.begin() + dest_start;
-            auto end = graph_C->adj_ind.begin() + dest_end;
+            // find(), not at(): a throw inside the OpenMP region would
+            // terminate instead of propagating.
+            auto row_it = graph_C->global_to_local.find(global_row);
+            auto col_it = graph_C->global_to_local.find(global_col);
+            if (row_it == graph_C->global_to_local.end() ||
+                col_it == graph_C->global_to_local.end()) {
+                any_missing_dest = 1;
+                continue;
+            }
+            const int local_row = row_it->second;
+            const int local_col = col_it->second;
+            auto begin = graph_C->adj_ind.begin() + graph_C->adj_ptr[local_row];
+            auto end = graph_C->adj_ind.begin() + graph_C->adj_ptr[local_row + 1];
             auto it = std::lower_bound(begin, end, local_col);
             if (it == end || *it != local_col) {
-                throw std::runtime_error("Distributed CSR transpose could not locate destination block");
+                any_missing_dest = 1;
+                continue;
             }
             const int graph_block_index =
                 static_cast<int>(std::distance(graph_C->adj_ind.begin(), it));
             *result.mutable_block_data(graph_block_index) =
-                ScalarTraits<T>::conjugate(*value_ptr++);
+                ScalarTraits<T>::conjugate(exchange.recv_values[locs[b].value_off]);
+        }
+        if (any_bad_payload) {
+            throw std::logic_error("Distributed CSR transpose expects scalar blocks");
+        }
+        if (any_missing_dest) {
+            throw std::runtime_error("Distributed CSR transpose could not locate destination block");
         }
 
         return result;
@@ -354,33 +413,44 @@ struct BSRTransposeExecutor {
         result.owns_graph = true;
         result.graph->enable_matrix_lifetime_management();
         result.set_page_size(matrix.configured_page_size());
-        const int* meta_ptr = exchange.recv_meta.data();
-        const int* meta_end = exchange.recv_meta.data() + exchange.recv_meta.size();
-        const T* value_ptr = exchange.recv_values.data();
-        while (meta_ptr < meta_end) {
-            const int global_row = *meta_ptr++;
-            const int global_col = *meta_ptr++;
-            const int row_dim = *meta_ptr++;
-            const int col_dim = *meta_ptr++;
-
-            const int local_row = graph_C->global_to_local.at(global_row);
-            const int local_col = graph_C->global_to_local.at(global_col);
-            const int dest_start = graph_C->adj_ptr[local_row];
-            const int dest_end = graph_C->adj_ptr[local_row + 1];
-            auto begin = graph_C->adj_ind.begin() + dest_start;
-            auto end = graph_C->adj_ind.begin() + dest_end;
+        const auto locs = index_received_blocks(exchange.recv_meta);
+        const int n_recv = static_cast<int>(locs.size());
+        int any_missing_dest = 0;
+        #pragma omp parallel for schedule(dynamic, 256) reduction(|:any_missing_dest)
+        for (int b = 0; b < n_recv; ++b) {
+            const int* mp = exchange.recv_meta.data() + locs[b].meta_off;
+            const int global_row = mp[0];
+            const int global_col = mp[1];
+            const int row_dim = mp[2];
+            const int col_dim = mp[3];
+            // find(), not at(): a throw inside the OpenMP region would
+            // terminate instead of propagating.
+            auto row_it = graph_C->global_to_local.find(global_row);
+            auto col_it = graph_C->global_to_local.find(global_col);
+            if (row_it == graph_C->global_to_local.end() ||
+                col_it == graph_C->global_to_local.end()) {
+                any_missing_dest = 1;
+                continue;
+            }
+            const int local_row = row_it->second;
+            const int local_col = col_it->second;
+            auto begin = graph_C->adj_ind.begin() + graph_C->adj_ptr[local_row];
+            auto end = graph_C->adj_ind.begin() + graph_C->adj_ptr[local_row + 1];
             auto it = std::lower_bound(begin, end, local_col);
             if (it == end || *it != local_col) {
-                throw std::runtime_error("Distributed BSR transpose could not locate destination block");
+                any_missing_dest = 1;
+                continue;
             }
             const int graph_block_index =
                 static_cast<int>(std::distance(graph_C->adj_ind.begin(), it));
             write_transposed_conjugate_block(
                 result.mutable_block_data(graph_block_index),
-                value_ptr,
+                exchange.recv_values.data() + locs[b].value_off,
                 col_dim,
                 row_dim);
-            value_ptr += static_cast<size_t>(row_dim) * col_dim;
+        }
+        if (any_missing_dest) {
+            throw std::runtime_error("Distributed BSR transpose could not locate destination block");
         }
 
         return result;
@@ -471,32 +541,44 @@ private:
         result.owns_graph = true;
         result.graph->enable_matrix_lifetime_management();
         result.set_page_size(matrix.configured_page_size());
-        const int* meta_ptr = exchange.recv_meta.data();
-        const int* meta_end = exchange.recv_meta.data() + exchange.recv_meta.size();
-        const T* value_ptr = exchange.recv_values.data();
-        while (meta_ptr < meta_end) {
-            const int global_row = *meta_ptr++;
-            const int global_col = *meta_ptr++;
-            const int row_dim = *meta_ptr++;
-            const int col_dim = *meta_ptr++;
-            const int local_row = graph_C->global_to_local.at(global_row);
-            const int local_col = graph_C->global_to_local.at(global_col);
-            const int dest_start = graph_C->adj_ptr[local_row];
-            const int dest_end = graph_C->adj_ptr[local_row + 1];
-            auto begin = graph_C->adj_ind.begin() + dest_start;
-            auto end = graph_C->adj_ind.begin() + dest_end;
+        const auto locs = index_received_blocks(exchange.recv_meta);
+        const int n_recv = static_cast<int>(locs.size());
+        int any_missing_dest = 0;
+        #pragma omp parallel for schedule(dynamic, 256) reduction(|:any_missing_dest)
+        for (int b = 0; b < n_recv; ++b) {
+            const int* mp = exchange.recv_meta.data() + locs[b].meta_off;
+            const int global_row = mp[0];
+            const int global_col = mp[1];
+            const int row_dim = mp[2];
+            const int col_dim = mp[3];
+            // find(), not at(): a throw inside the OpenMP region would
+            // terminate instead of propagating.
+            auto row_it = graph_C->global_to_local.find(global_row);
+            auto col_it = graph_C->global_to_local.find(global_col);
+            if (row_it == graph_C->global_to_local.end() ||
+                col_it == graph_C->global_to_local.end()) {
+                any_missing_dest = 1;
+                continue;
+            }
+            const int local_row = row_it->second;
+            const int local_col = col_it->second;
+            auto begin = graph_C->adj_ind.begin() + graph_C->adj_ptr[local_row];
+            auto end = graph_C->adj_ind.begin() + graph_C->adj_ptr[local_row + 1];
             auto it = std::lower_bound(begin, end, local_col);
             if (it == end || *it != local_col) {
-                throw std::runtime_error("Distributed VBCSR transpose could not locate destination block");
+                any_missing_dest = 1;
+                continue;
             }
             const int graph_block_index =
                 static_cast<int>(std::distance(graph_C->adj_ind.begin(), it));
             write_transposed_conjugate_block(
                 result.mutable_block_data(graph_block_index),
-                value_ptr,
+                exchange.recv_values.data() + locs[b].value_off,
                 col_dim,
                 row_dim);
-            value_ptr += static_cast<size_t>(row_dim) * col_dim;
+        }
+        if (any_missing_dest) {
+            throw std::runtime_error("Distributed VBCSR transpose could not locate destination block");
         }
         return result;
     }

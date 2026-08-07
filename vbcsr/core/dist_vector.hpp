@@ -161,13 +161,20 @@ public:
         return new_vec;
     }
 
-    // Copy from another vector
+    // Copy from another vector. The owned data is the vector's value; ghosts
+    // are halo scratch that mult refreshes before it reads them. So a source
+    // bound to a different owned-structure-compatible graph (mult rebinds
+    // vectors to its matrix's graph, and e.g. an S^{-1/2} factor's graph is
+    // denser than S's) copies its owned data only; matching bindings copy
+    // everything, keeping warm ghosts warm.
     void copy_from(const DistVector<T>& other) {
-        if (data.size() != other.data.size()) {
-            throw std::runtime_error("Vector size mismatch in copy_from");
+        if (local_size != other.local_size) {
+            throw std::runtime_error("Vector owned-size mismatch in copy_from");
         }
-        // Copy data (including ghosts)
-        std::copy(other.data.begin(), other.data.end(), data.begin());
+        const size_t n = (data.size() == other.data.size())
+                             ? data.size()
+                             : static_cast<size_t>(local_size);
+        std::copy(other.data.begin(), other.data.begin() + n, data.begin());
     }
 
     void swap(DistVector<T>& other) {

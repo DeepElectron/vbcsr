@@ -136,27 +136,36 @@ public:
         for (size_t i = 0; i < data.size(); ++i) data[i] *= alpha;
     }
 
+    // Binary ops run over the OWNED rows only, like DistVector's. Ghost rows
+    // are halo scratch that mult refreshes before reading, and the operands
+    // may legitimately be bound to different owned-structure-compatible
+    // graphs (mult rebinds vectors to its matrix's graph; a recursion mixing
+    // S with a denser S^{-1/2} factor sees both bindings), where the ghost
+    // regions have different sizes and no common meaning.
     void axpy(T alpha, const DistMultiVector<T>& x) {
         assert(x.num_vectors == num_vectors);
-        assert(x.data.size() == data.size());
+        assert(x.local_rows == local_rows);
+        const size_t n = static_cast<size_t>(local_rows) * ld;
         #pragma omp parallel for
-        for (size_t i = 0; i < data.size(); ++i) data[i] += alpha * x.data[i];
+        for (size_t i = 0; i < n; ++i) data[i] += alpha * x.data[i];
     }
 
     void axpby(T alpha, const DistMultiVector<T>& x, T beta) {
         assert(x.num_vectors == num_vectors);
-        assert(x.data.size() == data.size());
+        assert(x.local_rows == local_rows);
+        const size_t n = static_cast<size_t>(local_rows) * ld;
         #pragma omp parallel for
-        for (size_t i = 0; i < data.size(); ++i) {
+        for (size_t i = 0; i < n; ++i) {
             data[i] = alpha * x.data[i] + beta * data[i];
         }
     }
 
     void pointwise_mult(const DistMultiVector<T>& other) {
         assert(other.num_vectors == num_vectors);
-        assert(other.data.size() == data.size());
+        assert(other.local_rows == local_rows);
+        const size_t n = static_cast<size_t>(local_rows) * ld;
         #pragma omp parallel for
-        for (size_t i = 0; i < data.size(); ++i) {
+        for (size_t i = 0; i < n; ++i) {
             data[i] *= other.data[i];
         }
     }
@@ -195,11 +204,18 @@ public:
         }
     }
 
+    // Same owned-only contract as DistVector::copy_from: matching bindings
+    // copy everything, a source with a different ghost structure copies its
+    // owned rows only. The previous full-buffer copy overran the destination
+    // whenever the source's graph carried more ghosts.
     void copy_from(const DistMultiVector<T>& other) {
         if (local_rows != other.local_rows || num_vectors != other.num_vectors) {
             throw std::runtime_error("DistMultiVector::copy_from: size mismatch");
         }
-        std::copy(other.data.begin(), other.data.end(), data.begin());
+        const size_t n = (data.size() == other.data.size())
+                             ? data.size()
+                             : static_cast<size_t>(local_rows) * ld;
+        std::copy(other.data.begin(), other.data.begin() + n, data.begin());
     }
 
     DistMultiVector<T> duplicate() const {
