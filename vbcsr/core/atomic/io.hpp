@@ -10,8 +10,10 @@
 
 #include "periodic_table.hpp"
 
+#include <array>
 #include <cctype>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -51,10 +53,85 @@ struct Structure {
     std::vector<double> cell;  // 9, row-major lattice vectors
     std::vector<bool> pbc;     // 3
     int n_atom = 0;
+    std::array<int, 3> supercell{{1, 1, 1}};
 
     /// Returns the distinct species in the order AtomicData assigns type indices.
     std::vector<std::string> TypeSymbols() const {
         return UniqueSymbolsFromAtomicNumbers(z);
+    }
+
+    /// Returns the geometry obtained by repeating this cell along its three
+    /// lattice vectors. The input coordinates and atom order are preserved:
+    /// atoms are ordered by image (a1, then a2, then a3), with the original
+    /// atom order inside every image.
+    Structure BuildSupercell() const {
+        if (pos.size() != z.size() * 3 || n_atom != static_cast<int>(z.size())) {
+            throw std::runtime_error(
+                "Structure supercell expansion requires n_atom, z and pos to agree.");
+        }
+        if (cell.size() != 9) {
+            throw std::runtime_error(
+                "Structure supercell expansion requires a 3x3 row-major cell.");
+        }
+        if (pbc.size() != 3) {
+            throw std::runtime_error(
+                "Structure supercell expansion requires three pbc flags.");
+        }
+
+        size_t n_image = 1;
+        for (int axis = 0; axis < 3; ++axis) {
+            if (supercell[axis] < 1) {
+                throw std::runtime_error(
+                    "Structure supercell factors must be positive integers.");
+            }
+            if (supercell[axis] > 1) {
+                const double x = cell[3 * axis];
+                const double y = cell[3 * axis + 1];
+                const double zc = cell[3 * axis + 2];
+                if (x * x + y * y + zc * zc <= 1e-24) {
+                    throw std::runtime_error(
+                        "Structure cannot be repeated along a zero-length cell vector.");
+                }
+            }
+            const size_t factor = static_cast<size_t>(supercell[axis]);
+            if (n_image > std::numeric_limits<size_t>::max() / factor) {
+                throw std::runtime_error("Structure supercell image count overflows size_t.");
+            }
+            n_image *= factor;
+        }
+        if (!z.empty() && n_image > static_cast<size_t>(std::numeric_limits<int>::max()) / z.size()) {
+            throw std::runtime_error("Structure supercell atom count exceeds INT_MAX.");
+        }
+
+        Structure result;
+        result.n_atom = static_cast<int>(z.size() * n_image);
+        result.pos.reserve(static_cast<size_t>(result.n_atom) * 3);
+        result.z.reserve(static_cast<size_t>(result.n_atom));
+        result.cell = cell;
+        result.pbc = pbc;
+
+        for (int ix = 0; ix < supercell[0]; ++ix) {
+            for (int iy = 0; iy < supercell[1]; ++iy) {
+                for (int iz = 0; iz < supercell[2]; ++iz) {
+                    const double offset[3] = {
+                        ix * cell[0] + iy * cell[3] + iz * cell[6],
+                        ix * cell[1] + iy * cell[4] + iz * cell[7],
+                        ix * cell[2] + iy * cell[5] + iz * cell[8]};
+                    for (size_t atom = 0; atom < z.size(); ++atom) {
+                        result.pos.push_back(pos[3 * atom] + offset[0]);
+                        result.pos.push_back(pos[3 * atom + 1] + offset[1]);
+                        result.pos.push_back(pos[3 * atom + 2] + offset[2]);
+                        result.z.push_back(z[atom]);
+                    }
+                }
+            }
+        }
+        for (int axis = 0; axis < 3; ++axis) {
+            for (int component = 0; component < 3; ++component) {
+                result.cell[3 * axis + component] *= supercell[axis];
+            }
+        }
+        return result;
     }
 };
 

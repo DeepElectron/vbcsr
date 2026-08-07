@@ -171,7 +171,12 @@ void graph_function_apply(
         auto batch_blocks = detail::fetch_batched_block_payloads(A, batch_indices);
         t_fetch += omp_get_wtime() - t0;
 
-        if (rank == 0 && verbose) {
+        // Bounded progress: at most ~16 lines however many batches there
+        // are. A large graph reaches hundreds of batches, and one line per
+        // batch buries every other message in the log (a 11k-row system
+        // printed 175 of these).
+        const int report_stride = std::max(1, nbatch / 16);
+        if (rank == 0 && verbose && (b % report_stride == 0 || b + 1 == nbatch)) {
             std::cout << "graph_function_apply: batch " << (b + 1) << "/" << nbatch
                       << " (rows " << b * batch_size << ".."
                       << std::min(n_owned_max, (b + 1) * batch_size) - 1 << ")" << std::endl;

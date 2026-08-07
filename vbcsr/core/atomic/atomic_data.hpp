@@ -78,6 +78,13 @@ public:
     int N_atom=0;
     int n_edge=0;
     int N_edge=0;
+
+    // Provenance of a Structure-expanded graph. File-backed real-space
+    // operators use it to map supercell atom/image keys back to the primitive
+    // (i,j,R) convention. Ordinary and caller-partitioned graphs keep the
+    // identity defaults.
+    int primitive_n_atom=0;
+    std::array<int, 3> structure_supercell{{1, 1, 1}};
     
     // Offsets for block-sparse matrix
     std::vector<int> local_offsets={}; // Local offset of each atom's block
