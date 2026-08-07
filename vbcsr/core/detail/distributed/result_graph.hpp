@@ -19,7 +19,11 @@ void backfill_ghost_block_sizes(DistGraph& graph, const GhostSizeMap& ghost_size
         graph.block_sizes.resize(n_cols, 0);
     }
 
-    #pragma omp parallel for
+    // A throw inside an OpenMP region calls terminate() instead of
+    // propagating, which would turn a diagnosable missing-ghost error into a
+    // bare abort. Flag it and throw after the region.
+    int any_missing_size = 0;
+    #pragma omp parallel for reduction(|:any_missing_size)
     for (int i = 0; i < n_cols; ++i) {
         if (graph.block_sizes[i] > 0) {
             continue;
@@ -28,9 +32,13 @@ void backfill_ghost_block_sizes(DistGraph& graph, const GhostSizeMap& ghost_size
         const int global_col = graph.get_global_index(i);
         auto it = ghost_sizes.find(global_col);
         if (it == ghost_sizes.end()) {
-            throw std::runtime_error(std::string("Missing block size while building ") + context + " result graph");
+            any_missing_size = 1;
+            continue;
         }
         graph.block_sizes[i] = it->second;
+    }
+    if (any_missing_size) {
+        throw std::runtime_error(std::string("Missing block size while building ") + context + " result graph");
     }
 
     graph.block_offsets.resize(n_cols + 1);

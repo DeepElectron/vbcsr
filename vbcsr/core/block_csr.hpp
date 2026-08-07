@@ -1445,10 +1445,13 @@ public:
     //
     // Cost shape (measured, benchmark_spgemm): ~2x over the full product at
     // dense block density, ~1.6x at 0.29, provided the row loops stay
-    // load-balanced (they are; see the executors). The mirror is one
-    // transpose exchange plus one union axpby -- ~5% of the dense product.
-    // Fusing the mirror into the numeric phase would save most of that and
-    // one metadata round; worthwhile only if profiles ever show it.
+    // load-balanced (they are; see the executors). The mirror completes the
+    // upper triangle in one pass (detail::conjugate_transpose with
+    // mirror=true): it builds the Hermitian result directly instead of
+    // materializing a full transpose, zeroing its diagonal and union-axpbying
+    // the two -- three matrices and two result graphs where one of each will
+    // do, which at multi-million-orbital scale was the difference between
+    // fitting in memory and not.
     BlockSpMat spmm_hermitian(const BlockSpMat& B, double threshold, bool transA = false) const {
         ensure_same_backend_family(*this, B, "spmm_hermitian");
         if (transA) {
@@ -1460,16 +1463,14 @@ public:
             : (kind == MatrixKind::BSR && B.kind == MatrixKind::BSR)
                 ? detail::BSRSpMMExecutor<BlockSpMat<T>>::run(*this, B, threshold, /*upper_only=*/true)
                 : detail::VBCSRSpMMExecutor<BlockSpMat<T>>::run(*this, B, threshold, /*upper_only=*/true);
-        // Mirror: C = U + strict_lower(U^H). U's transpose carries the
-        // conjugated diagonal too; zero it so the diagonal is not doubled.
-        BlockSpMat L = U.transpose();
-        L.zero_diagonal_blocks();
-        U.axpby(T(1), L, T(1));
+        // Mirror: C = U + strict_lower(U^H), built in one pass. The diagonal
+        // is carried over from U untouched, so it is never doubled.
+        BlockSpMat C = detail::conjugate_transpose(U, /*mirror=*/true);
         // The mirrored triangles are exactly conjugate by construction; the
         // diagonal blocks are as-computed and carry rounding-scale
         // anti-Hermitian parts. Average them so the promise holds exactly.
-        U.hermitize_diagonal_blocks();
-        return U;
+        C.hermitize_diagonal_blocks();
+        return C;
     }
 
     // D <- (D + D^H)/2 for every diagonal block, in place.

@@ -4,11 +4,16 @@
 #include "../../scalar_traits.hpp"
 #include "../distributed/mpi_utils.hpp"
 #include "../distributed/result_graph.hpp"
+#include "../storage/index_map.hpp"
+
+#include <omp.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
-#include <map>
+#include <limits>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace vbcsr::detail {
@@ -30,558 +35,555 @@ void write_transposed_conjugate_block(
     }
 }
 
-template <typename T>
-struct TransposeExchangeResult {
-    std::vector<int> recv_meta;
-    std::vector<T> recv_values;
-    std::vector<std::vector<int>> adjacency;
-    std::map<int, int> ghost_dims;
-};
-
-template <typename Matrix>
-TransposeExchangeResult<typename Matrix::value_type> exchange_transpose_blocks(const Matrix& matrix) {
-    using T = typename Matrix::value_type;
-
-    TransposeExchangeResult<T> result;
-    if (matrix.graph->size == 1) {
-        return result;
-    }
-
-    const int size = matrix.graph->size;
-    const int n_rows = static_cast<int>(matrix.row_ptr().size()) - 1;
-
-    std::vector<size_t> send_counts(size, 0);
-    std::vector<size_t> send_data_counts(size, 0);
-    for (int i = 0; i < n_rows; ++i) {
-        const int r_dim = matrix.graph->block_sizes[i];
-        for (int k = matrix.row_ptr()[i]; k < matrix.row_ptr()[i + 1]; ++k) {
-            const int g_col = matrix.graph->get_global_index(matrix.col_ind()[k]);
-            const int owner = matrix.graph->find_owner(g_col);
-            const int c_dim = matrix.graph->block_sizes[matrix.col_ind()[k]];
-            send_counts[owner] += 4;
-            send_data_counts[owner] += static_cast<size_t>(r_dim) * c_dim;
-        }
-    }
-
-    std::vector<size_t> recv_counts(size);
-    std::vector<size_t> recv_data_counts(size);
-    MPI_Alltoall(send_counts.data(), sizeof(size_t), MPI_BYTE,
-                 recv_counts.data(), sizeof(size_t), MPI_BYTE, matrix.graph->comm);
-    MPI_Alltoall(send_data_counts.data(), sizeof(size_t), MPI_BYTE,
-                 recv_data_counts.data(), sizeof(size_t), MPI_BYTE, matrix.graph->comm);
-
-    std::vector<size_t> sdispls(size + 1, 0);
-    std::vector<size_t> rdispls(size + 1, 0);
-    std::vector<size_t> sdispls_data(size + 1, 0);
-    std::vector<size_t> rdispls_data(size + 1, 0);
-    for (int i = 0; i < size; ++i) {
-        sdispls[i + 1] = sdispls[i] + send_counts[i];
-        rdispls[i + 1] = rdispls[i] + recv_counts[i];
-        sdispls_data[i + 1] = sdispls_data[i] + send_data_counts[i];
-        rdispls_data[i + 1] = rdispls_data[i] + recv_data_counts[i];
-    }
-
-    std::vector<int> send_meta(sdispls[size]);
-    std::vector<T> send_values(sdispls_data[size]);
-
-    // Two-pass pack. The first pass records each block's destination offsets
-    // (meta only, cheap); the second does the copies in parallel. The old
-    // single loop moved the whole matrix through one thread's memcpy -- at
-    // large scale that turned every distributed transpose (and with it the
-    // mirror of every spmm_hermitian and the transA congruence of the
-    // Newton-Schulz loop) into an hour-scale serial stall with every other
-    // rank idle in the following collective.
-    const size_t total_blocks = static_cast<size_t>(matrix.row_ptr()[n_rows]);
-    std::vector<size_t> block_meta_off(total_blocks);
-    std::vector<size_t> block_data_off(total_blocks);
-    {
-        std::vector<size_t> current_counts(size, 0);
-        std::vector<size_t> current_data_counts(size, 0);
-        for (int i = 0; i < n_rows; ++i) {
-            const int r_dim = matrix.graph->block_sizes[i];
-            for (int k = matrix.row_ptr()[i]; k < matrix.row_ptr()[i + 1]; ++k) {
-                const int g_col = matrix.graph->get_global_index(matrix.col_ind()[k]);
-                const int owner = matrix.graph->find_owner(g_col);
-                const int c_dim = matrix.graph->block_sizes[matrix.col_ind()[k]];
-                block_meta_off[k] = sdispls[owner] + current_counts[owner];
-                block_data_off[k] = sdispls_data[owner] + current_data_counts[owner];
-                current_counts[owner] += 4;
-                current_data_counts[owner] += static_cast<size_t>(r_dim) * c_dim;
-            }
-        }
-    }
-    #pragma omp parallel for schedule(dynamic, 64)
-    for (int i = 0; i < n_rows; ++i) {
-        const int g_row = matrix.graph->owned_global_indices[i];
-        const int r_dim = matrix.graph->block_sizes[i];
-        for (int k = matrix.row_ptr()[i]; k < matrix.row_ptr()[i + 1]; ++k) {
-            const int g_col = matrix.graph->get_global_index(matrix.col_ind()[k]);
-            const int c_dim = matrix.graph->block_sizes[matrix.col_ind()[k]];
-
-            int* meta_ptr = send_meta.data() + block_meta_off[k];
-            meta_ptr[0] = g_col;
-            meta_ptr[1] = g_row;
-            meta_ptr[2] = c_dim;
-            meta_ptr[3] = r_dim;
-
-            std::memcpy(send_values.data() + block_data_off[k],
-                        matrix.block_data(k),
-                        static_cast<size_t>(r_dim) * c_dim * sizeof(T));
-        }
-    }
-
-    result.recv_meta.resize(rdispls[size]);
-    safe_alltoallv(send_meta.data(), send_counts, sdispls, MPI_INT,
-                   result.recv_meta.data(), recv_counts, rdispls, MPI_INT, matrix.graph->comm);
-
-    result.recv_values.resize(rdispls_data[size]);
-    std::vector<size_t> send_data_bytes(size);
-    std::vector<size_t> recv_data_bytes(size);
-    std::vector<size_t> sdispls_data_bytes(size + 1);
-    std::vector<size_t> rdispls_data_bytes(size + 1);
-    for (int i = 0; i < size; ++i) {
-        send_data_bytes[i] = send_data_counts[i] * sizeof(T);
-        recv_data_bytes[i] = recv_data_counts[i] * sizeof(T);
-        sdispls_data_bytes[i] = sdispls_data[i] * sizeof(T);
-        rdispls_data_bytes[i] = rdispls_data[i] * sizeof(T);
-    }
-    sdispls_data_bytes[size] = sdispls_data[size] * sizeof(T);
-    rdispls_data_bytes[size] = rdispls_data[size] * sizeof(T);
-
-    safe_alltoallv(send_values.data(), send_data_bytes, sdispls_data_bytes, MPI_BYTE,
-                   result.recv_values.data(), recv_data_bytes, rdispls_data_bytes, MPI_BYTE, matrix.graph->comm);
-
-    result.adjacency.resize(matrix.graph->owned_global_indices.size());
-    const int* meta_ptr = result.recv_meta.data();
-    for (int i = 0; i < size; ++i) {
-        const int* meta_end = meta_ptr + recv_counts[i];
-        while (meta_ptr < meta_end) {
-            const int g_row = *meta_ptr++;
-            const int g_col = *meta_ptr++;
-            meta_ptr++;
-            const int c_dim = *meta_ptr++;
-
-            auto row_it = matrix.graph->global_to_local.find(g_row);
-            if (row_it != matrix.graph->global_to_local.end()) {
-                result.adjacency[row_it->second].push_back(g_col);
-                result.ghost_dims[g_col] = c_dim;
-            }
-        }
-    }
-
-    const int n_adj = static_cast<int>(result.adjacency.size());
-    #pragma omp parallel for schedule(dynamic, 64)
-    for (int i = 0; i < n_adj; ++i) {
-        auto& neighbors = result.adjacency[i];
-        std::sort(neighbors.begin(), neighbors.end());
-        neighbors.erase(std::unique(neighbors.begin(), neighbors.end()), neighbors.end());
-    }
-
-    return result;
+// Bytes of block payload one rank packs into a single value-exchange round.
+// The exchange is chunked to this budget so peak memory is the matrix plus a
+// bounded buffer rather than three full copies of it (which is what a single
+// pack-everything/alltoallv/unpack-everything pass costs, and what put a
+// multi-million-orbital transpose out of reach).
+inline size_t transpose_chunk_bytes() {
+    const char* env = std::getenv("VBCSR_TRANSPOSE_CHUNK_MB");
+    const long long mb = env ? std::atoll(env) : 0;
+    return static_cast<size_t>(mb > 0 ? mb : 256) << 20;
 }
 
-// Precomputed location of one received transposed block: where its 4-int
-// meta record and its value payload start. Indexing the stream first (a
-// meta-only walk) lets the heavy unpack -- lookups plus a block transpose
-// per received block, ~the whole matrix in bytes -- run in parallel.
-struct ReceivedBlockLoc {
-    size_t meta_off;
-    size_t value_off;
+// Per-destination layout of the source blocks in one row range, computed in
+// parallel. Rows are cut into `chunks` contiguous pieces; each piece counts
+// privately, a serial prefix over (piece, destination) fixes the bases, and
+// the pack pass then writes with a private cursor per piece. The result is
+// byte-identical to a single-threaded row-order pack -- which matters, because
+// the receiver relies on that order to match values against metadata.
+//
+// This replaces the old serial offset pass, which walked every block on one
+// thread and measured as the single largest non-MPI phase of the transpose.
+struct GroupLayout {
+    int chunks = 0;
+    std::vector<int> row_begin;       // chunks + 1 row boundaries
+    std::vector<size_t> base_blocks;  // chunks * nranks: first block index in group
+    std::vector<size_t> base_elems;   // chunks * nranks: first element offset in group
+    std::vector<size_t> group_blocks; // nranks
+    std::vector<size_t> group_elems;  // nranks
 };
 
-inline std::vector<ReceivedBlockLoc> index_received_blocks(const std::vector<int>& meta) {
-    std::vector<ReceivedBlockLoc> locs;
-    locs.reserve(meta.size() / 4);
-    size_t value_off = 0;
-    for (size_t p = 0; p + 3 < meta.size(); p += 4) {
-        locs.push_back({p, value_off});
-        value_off += static_cast<size_t>(meta[p + 2]) * static_cast<size_t>(meta[p + 3]);
+// `dest[k]` is the rank that owns slot k's transposed image, or kTransposeSkip
+// for slots the caller excludes. Slots destined for `my_rank` are left out of
+// the layout entirely: they never enter the exchange.
+inline constexpr int kTransposeSkip = -1;
+
+template <typename Matrix>
+GroupLayout plan_remote_groups(
+    const Matrix& matrix,
+    const std::vector<int>& dest,
+    int row_lo,
+    int row_hi,
+    int my_rank,
+    int nranks,
+    int max_chunks) {
+    const DistGraph& graph = *matrix.graph;
+    const std::vector<int>& adj_ptr = graph.adj_ptr;
+
+    GroupLayout layout;
+    const int n_rows = row_hi - row_lo;
+    layout.chunks = std::max(1, std::min(max_chunks, n_rows));
+    layout.row_begin.resize(static_cast<size_t>(layout.chunks) + 1);
+    for (int c = 0; c <= layout.chunks; ++c) {
+        layout.row_begin[static_cast<size_t>(c)] =
+            row_lo + static_cast<int>(static_cast<long long>(n_rows) * c / layout.chunks);
     }
-    return locs;
+
+    const size_t table = static_cast<size_t>(layout.chunks) * nranks;
+    layout.base_blocks.assign(table, 0);
+    layout.base_elems.assign(table, 0);
+    layout.group_blocks.assign(nranks, 0);
+    layout.group_elems.assign(nranks, 0);
+
+    #pragma omp parallel for schedule(static)
+    for (int c = 0; c < layout.chunks; ++c) {
+        size_t* blocks = layout.base_blocks.data() + static_cast<size_t>(c) * nranks;
+        size_t* elems = layout.base_elems.data() + static_cast<size_t>(c) * nranks;
+        for (int i = layout.row_begin[static_cast<size_t>(c)];
+             i < layout.row_begin[static_cast<size_t>(c) + 1]; ++i) {
+            const int r_dim = graph.block_sizes[i];
+            for (int k = adj_ptr[i]; k < adj_ptr[i + 1]; ++k) {
+                const int owner = dest[static_cast<size_t>(k)];
+                if (owner == kTransposeSkip || owner == my_rank) continue;
+                blocks[owner] += 1;
+                elems[owner] += static_cast<size_t>(r_dim) * graph.block_sizes[graph.adj_ind[k]];
+            }
+        }
+    }
+
+    // Serial prefix over (destination, chunk): tiny (chunks * nranks), and it
+    // is what makes the parallel pack reproduce row order exactly.
+    for (int q = 0; q < nranks; ++q) {
+        size_t run_blocks = 0;
+        size_t run_elems = 0;
+        for (int c = 0; c < layout.chunks; ++c) {
+            const size_t idx = static_cast<size_t>(c) * nranks + q;
+            const size_t nb = layout.base_blocks[idx];
+            const size_t ne = layout.base_elems[idx];
+            layout.base_blocks[idx] = run_blocks;
+            layout.base_elems[idx] = run_elems;
+            run_blocks += nb;
+            run_elems += ne;
+        }
+        layout.group_blocks[static_cast<size_t>(q)] = run_blocks;
+        layout.group_elems[static_cast<size_t>(q)] = run_elems;
+    }
+    return layout;
+}
+
+// C = A^H, or -- when `mirror` -- the Hermitian completion C = A +
+// strict_lower(A^H) of an upper-triangle-only A.
+//
+// Three things this does that a pack-everything transpose does not:
+//
+//  - Blocks whose column this rank already owns never enter the exchange.
+//    They are conjugate-transposed straight from A's storage into C's. On a
+//    locality-preserving partition that is the overwhelming majority of the
+//    matrix, and the old code round-tripped all of it through a self-send.
+//
+//  - The value exchange runs in bounded rounds (transpose_chunk_bytes), so
+//    peak memory is A + C + one chunk instead of A + C + two full copies.
+//    Metadata is exchanged whole up front -- it is 16 bytes per block against
+//    a block payload, so chunking it would buy nothing -- which also lets the
+//    receiver resolve every destination slot before any value arrives.
+//
+//  - The result graph is built with construct_from_local_csr, so the ghost
+//    set, ghost block sizes and partition all come from data already in hand.
+//    construct_distributed would have re-derived the ghosts by scanning the
+//    adjacency, re-sorted every row, fetched ghost sizes over MPI and
+//    allgathered the partition.
+//
+// `mirror` additionally fuses what spmm_hermitian used to do in three steps
+// (full transpose into a second matrix, zero its diagonal, union-axpby into a
+// third): A's own blocks are copied in place and only the strict upper
+// triangle is mirrored, so no intermediate matrix or union graph is built. A
+// is required to be upper-triangle-only; anything in its strict lower triangle
+// is ignored rather than mirrored on top of an existing block.
+template <typename Matrix>
+Matrix conjugate_transpose(const Matrix& matrix, bool mirror) {
+    using T = typename Matrix::value_type;
+
+    DistGraph& ga = *matrix.graph;
+    const int my_rank = ga.rank;
+    const int nranks = ga.size;
+    const int n_owned = static_cast<int>(ga.owned_global_indices.size());
+    const std::vector<int>& adj_ptr = ga.adj_ptr;
+    const size_t nnz = static_cast<size_t>(adj_ptr[n_owned]);
+
+    // ---- 1. Classify every source block by who owns its transposed image.
+    std::vector<int> dest(nnz, kTransposeSkip);
+    size_t remote_elems = 0;
+    #pragma omp parallel for schedule(dynamic, 256) reduction(+:remote_elems)
+    for (int i = 0; i < n_owned; ++i) {
+        const int g_row = ga.owned_global_indices[i];
+        const int r_dim = ga.block_sizes[i];
+        for (int k = adj_ptr[i]; k < adj_ptr[i + 1]; ++k) {
+            const int local_col = ga.adj_ind[k];
+            const int g_col = ga.get_global_index(local_col);
+            if (mirror && g_col <= g_row) continue;  // diagonal stays, lower is not ours
+            const int owner = (nranks == 1) ? my_rank : ga.find_owner(g_col);
+            dest[static_cast<size_t>(k)] = owner;
+            if (owner != my_rank) {
+                remote_elems += static_cast<size_t>(r_dim) * ga.block_sizes[local_col];
+            }
+        }
+    }
+
+    // ---- 2. Exchange the metadata of the remote blocks, whole.
+    // Meta record is the DESTINATION block's (global row, global col, row dim,
+    // col dim); the payload sent later is already conjugate-transposed, so the
+    // receiver only ever memcpys.
+    const int max_chunks = std::max(1, omp_get_max_threads() * 4);
+    std::vector<int> recv_meta;
+    std::vector<size_t> recv_blocks_from(static_cast<size_t>(nranks), 0);
+    if (nranks > 1) {
+        const GroupLayout meta_layout =
+            plan_remote_groups(matrix, dest, 0, n_owned, my_rank, nranks, max_chunks);
+
+        std::vector<size_t> send_meta_counts(nranks), send_meta_displs(nranks + 1, 0);
+        for (int q = 0; q < nranks; ++q) {
+            send_meta_counts[static_cast<size_t>(q)] = meta_layout.group_blocks[static_cast<size_t>(q)] * 4;
+            send_meta_displs[static_cast<size_t>(q) + 1] =
+                send_meta_displs[static_cast<size_t>(q)] + send_meta_counts[static_cast<size_t>(q)];
+        }
+        std::vector<int> send_meta(send_meta_displs[static_cast<size_t>(nranks)]);
+
+        #pragma omp parallel for schedule(static)
+        for (int c = 0; c < meta_layout.chunks; ++c) {
+            std::vector<size_t> cursor(static_cast<size_t>(nranks));
+            for (int q = 0; q < nranks; ++q) {
+                cursor[static_cast<size_t>(q)] =
+                    send_meta_displs[static_cast<size_t>(q)] +
+                    meta_layout.base_blocks[static_cast<size_t>(c) * nranks + q] * 4;
+            }
+            for (int i = meta_layout.row_begin[static_cast<size_t>(c)];
+                 i < meta_layout.row_begin[static_cast<size_t>(c) + 1]; ++i) {
+                const int g_row = ga.owned_global_indices[i];
+                const int r_dim = ga.block_sizes[i];
+                for (int k = adj_ptr[i]; k < adj_ptr[i + 1]; ++k) {
+                    const int owner = dest[static_cast<size_t>(k)];
+                    if (owner == kTransposeSkip || owner == my_rank) continue;
+                    const int local_col = ga.adj_ind[k];
+                    int* meta = send_meta.data() + cursor[static_cast<size_t>(owner)];
+                    meta[0] = ga.get_global_index(local_col);  // destination row
+                    meta[1] = g_row;                           // destination column
+                    meta[2] = ga.block_sizes[local_col];       // destination row dim
+                    meta[3] = r_dim;                           // destination col dim
+                    cursor[static_cast<size_t>(owner)] += 4;
+                }
+            }
+        }
+
+        std::vector<size_t> recv_meta_counts(nranks), recv_meta_displs(nranks + 1, 0);
+        MPI_Alltoall(send_meta_counts.data(), sizeof(size_t), MPI_BYTE,
+                     recv_meta_counts.data(), sizeof(size_t), MPI_BYTE, ga.comm);
+        for (int q = 0; q < nranks; ++q) {
+            recv_blocks_from[static_cast<size_t>(q)] = recv_meta_counts[static_cast<size_t>(q)] / 4;
+            recv_meta_displs[static_cast<size_t>(q) + 1] =
+                recv_meta_displs[static_cast<size_t>(q)] + recv_meta_counts[static_cast<size_t>(q)];
+        }
+        recv_meta.resize(recv_meta_displs[static_cast<size_t>(nranks)]);
+        safe_alltoallv(send_meta.data(), send_meta_counts, send_meta_displs, MPI_INT,
+                       recv_meta.data(), recv_meta_counts, recv_meta_displs, MPI_INT, ga.comm);
+    }
+    const size_t n_recv = recv_meta.size() / 4;
+
+    // ---- 3. Result ghosts: the remote rows that sent to us, plus -- in
+    // mirror mode -- A's own ghost columns, which the kept blocks still name.
+    // Every ghost's block size is already in hand, so no fetch is needed.
+    std::vector<int> ghosts;
+    std::vector<int> ghost_sizes;
+    {
+        std::vector<std::pair<int, int>> candidates;  // (global id, block size)
+        candidates.reserve(n_recv + (mirror ? ga.ghost_global_indices.size() : 0));
+        for (size_t b = 0; b < n_recv; ++b) {
+            candidates.emplace_back(recv_meta[b * 4 + 1], recv_meta[b * 4 + 3]);
+        }
+        if (mirror) {
+            for (size_t g = 0; g < ga.ghost_global_indices.size(); ++g) {
+                candidates.emplace_back(ga.ghost_global_indices[g],
+                                        ga.block_sizes[static_cast<size_t>(n_owned) + g]);
+            }
+        }
+        // construct_from_local_csr requires ghosts ordered by (owner, gid).
+        std::sort(candidates.begin(), candidates.end(),
+                  [&](const std::pair<int, int>& a, const std::pair<int, int>& b) {
+                      const int oa = ga.find_owner(a.first, ga.block_displs);
+                      const int ob = ga.find_owner(b.first, ga.block_displs);
+                      if (oa != ob) return oa < ob;
+                      return a.first < b.first;
+                  });
+        candidates.erase(std::unique(candidates.begin(), candidates.end(),
+                                     [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
+                                         return a.first == b.first;
+                                     }),
+                         candidates.end());
+        ghosts.reserve(candidates.size());
+        ghost_sizes.reserve(candidates.size());
+        for (const auto& c : candidates) {
+            ghosts.push_back(c.first);
+            ghost_sizes.push_back(c.second);
+        }
+    }
+
+    // Global -> result-local for every column the result can name. Owned
+    // blocks keep their source-local index; ghosts are renumbered.
+    IndexMap to_local;
+    to_local.reserve(static_cast<size_t>(n_owned) + ghosts.size());
+    for (int i = 0; i < n_owned; ++i) {
+        to_local[ga.owned_global_indices[i]] = i;
+    }
+    for (size_t g = 0; g < ghosts.size(); ++g) {
+        to_local[ghosts[g]] = n_owned + static_cast<int>(g);
+    }
+
+    // ---- 4. Result adjacency, in result-local column ids.
+    std::vector<int> c_adj_ptr(static_cast<size_t>(n_owned) + 1, 0);
+    {
+        std::vector<int> counts(static_cast<size_t>(n_owned), 0);
+        if (mirror) {
+            #pragma omp parallel for schedule(static)
+            for (int i = 0; i < n_owned; ++i) {
+                counts[static_cast<size_t>(i)] += adj_ptr[i + 1] - adj_ptr[i];
+            }
+        }
+        #pragma omp parallel for schedule(dynamic, 256)
+        for (int i = 0; i < n_owned; ++i) {
+            for (int k = adj_ptr[i]; k < adj_ptr[i + 1]; ++k) {
+                if (dest[static_cast<size_t>(k)] != my_rank) continue;
+                const int local_row = to_local.at(ga.get_global_index(ga.adj_ind[k]));
+                #pragma omp atomic
+                counts[static_cast<size_t>(local_row)] += 1;
+            }
+        }
+        #pragma omp parallel for schedule(static)
+        for (size_t b = 0; b < n_recv; ++b) {
+            const int local_row = to_local.at(recv_meta[b * 4]);
+            #pragma omp atomic
+            counts[static_cast<size_t>(local_row)] += 1;
+        }
+        size_t running = 0;
+        for (int i = 0; i < n_owned; ++i) {
+            running += static_cast<size_t>(counts[static_cast<size_t>(i)]);
+            if (running > static_cast<size_t>(std::numeric_limits<int>::max())) {
+                throw std::overflow_error(
+                    "transpose adjacency exceeds 2^31 blocks on this rank; distribute over more ranks");
+            }
+            c_adj_ptr[static_cast<size_t>(i) + 1] = static_cast<int>(running);
+        }
+    }
+
+    std::vector<int> c_adj_ind(static_cast<size_t>(c_adj_ptr[static_cast<size_t>(n_owned)]));
+    {
+        std::vector<int> cursor(c_adj_ptr.begin(), c_adj_ptr.end() - 1);
+        if (mirror) {
+            #pragma omp parallel for schedule(dynamic, 256)
+            for (int i = 0; i < n_owned; ++i) {
+                int at = cursor[static_cast<size_t>(i)];
+                for (int k = adj_ptr[i]; k < adj_ptr[i + 1]; ++k) {
+                    c_adj_ind[static_cast<size_t>(at++)] =
+                        to_local.at(ga.get_global_index(ga.adj_ind[k]));
+                }
+                cursor[static_cast<size_t>(i)] = at;
+            }
+        }
+        #pragma omp parallel for schedule(dynamic, 256)
+        for (int i = 0; i < n_owned; ++i) {
+            for (int k = adj_ptr[i]; k < adj_ptr[i + 1]; ++k) {
+                if (dest[static_cast<size_t>(k)] != my_rank) continue;
+                const int local_row = to_local.at(ga.get_global_index(ga.adj_ind[k]));
+                int at;
+                #pragma omp atomic capture
+                at = cursor[static_cast<size_t>(local_row)]++;
+                c_adj_ind[static_cast<size_t>(at)] = i;
+            }
+        }
+        #pragma omp parallel for schedule(static)
+        for (size_t b = 0; b < n_recv; ++b) {
+            const int local_row = to_local.at(recv_meta[b * 4]);
+            int at;
+            #pragma omp atomic capture
+            at = cursor[static_cast<size_t>(local_row)]++;
+            c_adj_ind[static_cast<size_t>(at)] = to_local.at(recv_meta[b * 4 + 1]);
+        }
+        #pragma omp parallel for schedule(dynamic, 64)
+        for (int i = 0; i < n_owned; ++i) {
+            std::sort(c_adj_ind.begin() + c_adj_ptr[static_cast<size_t>(i)],
+                      c_adj_ind.begin() + c_adj_ptr[static_cast<size_t>(i) + 1]);
+        }
+    }
+
+    // ---- 5. Result graph and storage.
+    DistGraph* graph_c = new DistGraph(ga.comm);
+    {
+        NumaVector<int> adj_ind_c;
+        adj_ind_c.assign(c_adj_ind.data(), c_adj_ind.size());
+        graph_c->construct_from_local_csr(
+            ga.owned_global_indices,
+            std::vector<int>(ga.block_sizes.begin(), ga.block_sizes.begin() + n_owned),
+            ghosts,
+            ghost_sizes,
+            ga.block_displs,
+            std::move(c_adj_ptr),
+            std::move(adj_ind_c));
+    }
+    Matrix result(graph_c);
+    result.owns_graph = true;
+    result.graph->enable_matrix_lifetime_management();
+    result.set_page_size(matrix.configured_page_size());
+
+    // Position of column `local_col` in result row `local_row`.
+    const std::vector<int>& cp = graph_c->adj_ptr;
+    const NumaVector<int>& ci = graph_c->adj_ind;
+    auto slot_of = [&](int local_row, int local_col) {
+        const auto begin = ci.begin() + cp[static_cast<size_t>(local_row)];
+        const auto end = ci.begin() + cp[static_cast<size_t>(local_row) + 1];
+        const auto it = std::lower_bound(begin, end, local_col);
+        return (it == end || *it != local_col)
+                   ? -1
+                   : static_cast<int>(std::distance(ci.begin(), it));
+    };
+
+    int any_missing_dest = 0;
+
+    // ---- 6a. A's own blocks (mirror only) and every block whose transposed
+    // image this rank owns: straight from A's storage to C's, no buffers.
+    if (mirror) {
+        #pragma omp parallel for schedule(dynamic, 256) reduction(|:any_missing_dest)
+        for (int i = 0; i < n_owned; ++i) {
+            for (int k = adj_ptr[i]; k < adj_ptr[i + 1]; ++k) {
+                const int slot = slot_of(i, to_local.at(ga.get_global_index(ga.adj_ind[k])));
+                if (slot < 0) { any_missing_dest = 1; continue; }
+                std::memcpy(result.mutable_block_data(slot), matrix.block_data(k),
+                            matrix.block_size_elements(k) * sizeof(T));
+            }
+        }
+    }
+    #pragma omp parallel for schedule(dynamic, 256) reduction(|:any_missing_dest)
+    for (int i = 0; i < n_owned; ++i) {
+        const int r_dim = ga.block_sizes[i];
+        for (int k = adj_ptr[i]; k < adj_ptr[i + 1]; ++k) {
+            if (dest[static_cast<size_t>(k)] != my_rank) continue;
+            const int local_col = ga.adj_ind[k];
+            const int slot = slot_of(to_local.at(ga.get_global_index(local_col)), i);
+            if (slot < 0) { any_missing_dest = 1; continue; }
+            write_transposed_conjugate_block(result.mutable_block_data(slot),
+                                             matrix.block_data(k),
+                                             r_dim, ga.block_sizes[local_col]);
+        }
+    }
+
+    // ---- 6b. Remote blocks, in bounded rounds.
+    if (nranks > 1) {
+        // Destination slot and payload size of every incoming block, resolved
+        // once from the metadata so a value round is a pure memcpy.
+        std::vector<int> recv_slot(n_recv);
+        std::vector<size_t> recv_elems(n_recv);
+        #pragma omp parallel for schedule(static) reduction(|:any_missing_dest)
+        for (size_t b = 0; b < n_recv; ++b) {
+            const int* meta = recv_meta.data() + b * 4;
+            const int slot = slot_of(to_local.at(meta[0]), to_local.at(meta[1]));
+            if (slot < 0) any_missing_dest = 1;
+            recv_slot[b] = slot;
+            recv_elems[b] = static_cast<size_t>(meta[2]) * static_cast<size_t>(meta[3]);
+        }
+
+        long long my_rounds = 1;
+        {
+            const size_t budget = transpose_chunk_bytes();
+            const size_t bytes = remote_elems * sizeof(T);
+            my_rounds = static_cast<long long>((bytes + budget - 1) / budget);
+            if (my_rounds < 1) my_rounds = 1;
+        }
+        long long rounds = my_rounds;
+        MPI_Allreduce(&my_rounds, &rounds, 1, MPI_LONG_LONG, MPI_MAX, ga.comm);
+
+        // Start of each source's metadata segment, so a round can address its
+        // slice without rescanning the counts.
+        std::vector<size_t> recv_base(static_cast<size_t>(nranks) + 1, 0);
+        for (int q = 0; q < nranks; ++q) {
+            recv_base[static_cast<size_t>(q) + 1] =
+                recv_base[static_cast<size_t>(q)] + recv_blocks_from[static_cast<size_t>(q)];
+        }
+
+        std::vector<size_t> cursor(static_cast<size_t>(nranks), 0);
+        std::vector<T> send_values;
+        std::vector<T> recv_values;
+        std::vector<size_t> round_offset;
+        std::vector<size_t> round_block;
+        for (long long r = 0; r < rounds; ++r) {
+            const int row_lo = static_cast<int>(static_cast<long long>(n_owned) * r / rounds);
+            const int row_hi = static_cast<int>(static_cast<long long>(n_owned) * (r + 1) / rounds);
+            const GroupLayout layout =
+                plan_remote_groups(matrix, dest, row_lo, row_hi, my_rank, nranks, max_chunks);
+
+            std::vector<size_t> send_counts(nranks), send_displs(nranks + 1, 0);
+            for (int q = 0; q < nranks; ++q) {
+                send_counts[static_cast<size_t>(q)] = layout.group_elems[static_cast<size_t>(q)];
+                send_displs[static_cast<size_t>(q) + 1] =
+                    send_displs[static_cast<size_t>(q)] + send_counts[static_cast<size_t>(q)];
+            }
+            send_values.resize(send_displs[static_cast<size_t>(nranks)]);
+
+            #pragma omp parallel for schedule(static)
+            for (int c = 0; c < layout.chunks; ++c) {
+                std::vector<size_t> at(static_cast<size_t>(nranks));
+                for (int q = 0; q < nranks; ++q) {
+                    at[static_cast<size_t>(q)] =
+                        send_displs[static_cast<size_t>(q)] +
+                        layout.base_elems[static_cast<size_t>(c) * nranks + q];
+                }
+                for (int i = layout.row_begin[static_cast<size_t>(c)];
+                     i < layout.row_begin[static_cast<size_t>(c) + 1]; ++i) {
+                    const int r_dim = ga.block_sizes[i];
+                    for (int k = adj_ptr[i]; k < adj_ptr[i + 1]; ++k) {
+                        const int owner = dest[static_cast<size_t>(k)];
+                        if (owner == kTransposeSkip || owner == my_rank) continue;
+                        const int c_dim = ga.block_sizes[ga.adj_ind[k]];
+                        write_transposed_conjugate_block(
+                            send_values.data() + at[static_cast<size_t>(owner)],
+                            matrix.block_data(k), r_dim, c_dim);
+                        at[static_cast<size_t>(owner)] += static_cast<size_t>(r_dim) * c_dim;
+                    }
+                }
+            }
+
+            // How many blocks each source contributes this round; the receiver
+            // cannot derive it, because the slabs follow the sender's rows.
+            std::vector<size_t> send_blocks(layout.group_blocks);
+            std::vector<size_t> recv_blocks(static_cast<size_t>(nranks));
+            MPI_Alltoall(send_blocks.data(), sizeof(size_t), MPI_BYTE,
+                         recv_blocks.data(), sizeof(size_t), MPI_BYTE, ga.comm);
+
+            // Values arrive per source in the same row order as the metadata,
+            // so this round's blocks from source q are the next recv_blocks[q]
+            // entries of q's metadata segment.
+            std::vector<size_t> recv_counts(nranks), recv_displs(nranks + 1, 0);
+            round_block.clear();
+            round_offset.clear();
+            for (int q = 0; q < nranks; ++q) {
+                size_t group = 0;
+                for (size_t j = 0; j < recv_blocks[static_cast<size_t>(q)]; ++j) {
+                    const size_t b = recv_base[static_cast<size_t>(q)] + cursor[static_cast<size_t>(q)] + j;
+                    round_block.push_back(b);
+                    round_offset.push_back(recv_displs[static_cast<size_t>(q)] + group);
+                    group += recv_elems[b];
+                }
+                recv_counts[static_cast<size_t>(q)] = group;
+                recv_displs[static_cast<size_t>(q) + 1] = recv_displs[static_cast<size_t>(q)] + group;
+            }
+            recv_values.resize(recv_displs[static_cast<size_t>(nranks)]);
+
+            std::vector<size_t> send_bytes(nranks), recv_bytes(nranks);
+            std::vector<size_t> send_bdispls(nranks + 1), recv_bdispls(nranks + 1);
+            for (int q = 0; q <= nranks; ++q) {
+                send_bdispls[static_cast<size_t>(q)] = send_displs[static_cast<size_t>(q)] * sizeof(T);
+                recv_bdispls[static_cast<size_t>(q)] = recv_displs[static_cast<size_t>(q)] * sizeof(T);
+                if (q < nranks) {
+                    send_bytes[static_cast<size_t>(q)] = send_counts[static_cast<size_t>(q)] * sizeof(T);
+                    recv_bytes[static_cast<size_t>(q)] = recv_counts[static_cast<size_t>(q)] * sizeof(T);
+                }
+            }
+            safe_alltoallv(send_values.data(), send_bytes, send_bdispls, MPI_BYTE,
+                           recv_values.data(), recv_bytes, recv_bdispls, MPI_BYTE, ga.comm);
+
+            // Unpack: the payload is already conjugate-transposed.
+            const long long n_round = static_cast<long long>(round_block.size());
+            #pragma omp parallel for schedule(static)
+            for (long long j = 0; j < n_round; ++j) {
+                const size_t b = round_block[static_cast<size_t>(j)];
+                if (recv_slot[b] < 0) continue;
+                std::memcpy(result.mutable_block_data(recv_slot[b]),
+                            recv_values.data() + round_offset[static_cast<size_t>(j)],
+                            recv_elems[b] * sizeof(T));
+            }
+
+            for (int q = 0; q < nranks; ++q) {
+                cursor[static_cast<size_t>(q)] += recv_blocks[static_cast<size_t>(q)];
+            }
+        }
+    }
+
+    if (any_missing_dest) {
+        throw std::runtime_error("transpose could not locate destination block");
+    }
+    return result;
 }
 
 template <typename Matrix>
 struct CSRTransposeExecutor {
-    using T = typename Matrix::value_type;
-
-    static Matrix serial(const Matrix& matrix) {
-        const int n_rows = static_cast<int>(matrix.row_ptr().size()) - 1;
-        const int n_cols = static_cast<int>(matrix.graph->block_sizes.size());
-
-        std::vector<std::vector<int>> c_adj(n_cols);
-        for (int row = 0; row < n_rows; ++row) {
-            const int global_row = matrix.graph->get_global_index(row);
-            for (int slot = matrix.row_ptr()[row]; slot < matrix.row_ptr()[row + 1]; ++slot) {
-                c_adj[matrix.col_ind()[slot]].push_back(global_row);
-            }
-        }
-
-        std::vector<int> c_owned_globals(n_cols);
-        std::vector<int> c_block_sizes(n_cols);
-        for (int row = 0; row < n_cols; ++row) {
-            c_owned_globals[row] = matrix.graph->get_global_index(row);
-            c_block_sizes[row] = matrix.graph->block_sizes[row];
-        }
-
-        DistGraph* graph_C = new DistGraph(matrix.graph->comm);
-        graph_C->construct_distributed(c_owned_globals, c_block_sizes, c_adj);
-        Matrix result(graph_C);
-        result.owns_graph = true;
-        result.graph->enable_matrix_lifetime_management();
-        result.set_page_size(matrix.configured_page_size());
-
-        // Every source entry lands in a distinct destination slot, so rows
-        // parallelize freely (matches the BSR/VBCSR serial executors).
-        // Failures are flagged and thrown after the region — throwing inside
-        // an OpenMP loop would terminate instead of propagating.
-        int any_bad_payload = 0;
-        int any_missing_dest = 0;
-        #pragma omp parallel for schedule(static) reduction(|:any_bad_payload) reduction(|:any_missing_dest)
-        for (int row = 0; row < n_rows; ++row) {
-            const int global_row = matrix.graph->get_global_index(row);
-            for (int slot = matrix.row_ptr()[row]; slot < matrix.row_ptr()[row + 1]; ++slot) {
-                if (matrix.block_size_elements(slot) != 1) {
-                    any_bad_payload = 1;
-                    continue;
-                }
-                const int dest_row = matrix.col_ind()[slot];
-                // find(), not at(): a throw inside the OpenMP region would
-                // terminate instead of propagating.
-                auto dest_col_it = graph_C->global_to_local.find(global_row);
-                if (dest_col_it == graph_C->global_to_local.end()) {
-                    any_missing_dest = 1;
-                    continue;
-                }
-                const int dest_col = dest_col_it->second;
-                const int dest_start = graph_C->adj_ptr[dest_row];
-                const int dest_end = graph_C->adj_ptr[dest_row + 1];
-                auto begin = graph_C->adj_ind.begin() + dest_start;
-                auto end = graph_C->adj_ind.begin() + dest_end;
-                auto it = std::lower_bound(begin, end, dest_col);
-                if (it == end || *it != dest_col) {
-                    any_missing_dest = 1;
-                    continue;
-                }
-                const int dest_graph_block =
-                    static_cast<int>(std::distance(graph_C->adj_ind.begin(), it));
-                *result.mutable_block_data(dest_graph_block) =
-                    ScalarTraits<T>::conjugate(*matrix.block_data(slot));
-            }
-        }
-        if (any_bad_payload) {
-            throw std::logic_error("CSR transpose expects scalar slot payloads");
-        }
-        if (any_missing_dest) {
-            throw std::runtime_error("CSR transpose could not locate destination block");
-        }
-
-        return result;
-    }
-
-    static Matrix distributed(const Matrix& matrix) {
-        auto exchange = exchange_transpose_blocks(matrix);
-        DistGraph* graph_C = construct_result_graph(
-            matrix,
-            exchange.adjacency,
-            exchange.ghost_dims,
-            "transpose");
-
-        Matrix result(graph_C);
-        result.owns_graph = true;
-        result.graph->enable_matrix_lifetime_management();
-        result.set_page_size(matrix.configured_page_size());
-        const auto locs = index_received_blocks(exchange.recv_meta);
-        const int n_recv = static_cast<int>(locs.size());
-        int any_bad_payload = 0;
-        int any_missing_dest = 0;
-        #pragma omp parallel for schedule(dynamic, 256) reduction(|:any_bad_payload) reduction(|:any_missing_dest)
-        for (int b = 0; b < n_recv; ++b) {
-            const int* meta_ptr = exchange.recv_meta.data() + locs[b].meta_off;
-            const int global_row = meta_ptr[0];
-            const int global_col = meta_ptr[1];
-            if (meta_ptr[2] != 1 || meta_ptr[3] != 1) {
-                any_bad_payload = 1;
-                continue;
-            }
-            // find(), not at(): a throw inside the OpenMP region would
-            // terminate instead of propagating.
-            auto row_it = graph_C->global_to_local.find(global_row);
-            auto col_it = graph_C->global_to_local.find(global_col);
-            if (row_it == graph_C->global_to_local.end() ||
-                col_it == graph_C->global_to_local.end()) {
-                any_missing_dest = 1;
-                continue;
-            }
-            const int local_row = row_it->second;
-            const int local_col = col_it->second;
-            auto begin = graph_C->adj_ind.begin() + graph_C->adj_ptr[local_row];
-            auto end = graph_C->adj_ind.begin() + graph_C->adj_ptr[local_row + 1];
-            auto it = std::lower_bound(begin, end, local_col);
-            if (it == end || *it != local_col) {
-                any_missing_dest = 1;
-                continue;
-            }
-            const int graph_block_index =
-                static_cast<int>(std::distance(graph_C->adj_ind.begin(), it));
-            *result.mutable_block_data(graph_block_index) =
-                ScalarTraits<T>::conjugate(exchange.recv_values[locs[b].value_off]);
-        }
-        if (any_bad_payload) {
-            throw std::logic_error("Distributed CSR transpose expects scalar blocks");
-        }
-        if (any_missing_dest) {
-            throw std::runtime_error("Distributed CSR transpose could not locate destination block");
-        }
-
-        return result;
-    }
-
-    static Matrix run(const Matrix& matrix) {
-        if (matrix.graph->size == 1) {
-            return serial(matrix);
-        }
-        return distributed(matrix);
-    }
+    static Matrix run(const Matrix& matrix) { return conjugate_transpose(matrix, false); }
 };
 
 template <typename Matrix>
 struct BSRTransposeExecutor {
-    using T = typename Matrix::value_type;
-
-    static Matrix serial(const Matrix& matrix) {
-        const int n_rows = static_cast<int>(matrix.row_ptr().size()) - 1;
-        const int n_cols = static_cast<int>(matrix.graph->block_sizes.size());
-
-        std::vector<std::vector<int>> c_adj(n_cols);
-        for (int row = 0; row < n_rows; ++row) {
-            const int global_row = matrix.graph->get_global_index(row);
-            for (int slot = matrix.row_ptr()[row]; slot < matrix.row_ptr()[row + 1]; ++slot) {
-                c_adj[matrix.col_ind()[slot]].push_back(global_row);
-            }
-        }
-
-        std::vector<int> c_owned_globals(n_cols);
-        std::vector<int> c_block_sizes(n_cols);
-        for (int row = 0; row < n_cols; ++row) {
-            c_owned_globals[row] = matrix.graph->get_global_index(row);
-            c_block_sizes[row] = matrix.graph->block_sizes[row];
-        }
-
-        DistGraph* graph_C = new DistGraph(matrix.graph->comm);
-        graph_C->construct_distributed(c_owned_globals, c_block_sizes, c_adj);
-        Matrix result(graph_C);
-        result.owns_graph = true;
-        result.graph->enable_matrix_lifetime_management();
-        result.set_page_size(matrix.configured_page_size());
-
-        #pragma omp parallel for
-        for (int row = 0; row < n_rows; ++row) {
-                const int global_row = matrix.graph->get_global_index(row);
-                for (int slot = matrix.row_ptr()[row]; slot < matrix.row_ptr()[row + 1]; ++slot) {
-                const int dest_row = matrix.col_ind()[slot];
-                const int dest_col = graph_C->global_to_local.at(global_row);
-                const int dest_start = graph_C->adj_ptr[dest_row];
-                const int dest_end = graph_C->adj_ptr[dest_row + 1];
-                auto begin = graph_C->adj_ind.begin() + dest_start;
-                auto end = graph_C->adj_ind.begin() + dest_end;
-                auto it = std::lower_bound(begin, end, dest_col);
-                if (it == end || *it != dest_col) {
-                    throw std::runtime_error("BSR transpose could not locate destination block");
-                }
-                const int dest_graph_block =
-                    static_cast<int>(std::distance(graph_C->adj_ind.begin(), it));
-                write_transposed_conjugate_block(
-                    result.mutable_block_data(dest_graph_block),
-                    matrix.block_data(slot),
-                    matrix.graph->block_sizes[row],
-                    matrix.graph->block_sizes[matrix.col_ind()[slot]]);
-            }
-        }
-
-        return result;
-    }
-
-    static Matrix distributed(const Matrix& matrix) {
-        auto exchange = exchange_transpose_blocks(matrix);
-        DistGraph* graph_C = construct_result_graph(
-            matrix,
-            exchange.adjacency,
-            exchange.ghost_dims,
-            "transpose");
-
-        Matrix result(graph_C);
-        result.owns_graph = true;
-        result.graph->enable_matrix_lifetime_management();
-        result.set_page_size(matrix.configured_page_size());
-        const auto locs = index_received_blocks(exchange.recv_meta);
-        const int n_recv = static_cast<int>(locs.size());
-        int any_missing_dest = 0;
-        #pragma omp parallel for schedule(dynamic, 256) reduction(|:any_missing_dest)
-        for (int b = 0; b < n_recv; ++b) {
-            const int* mp = exchange.recv_meta.data() + locs[b].meta_off;
-            const int global_row = mp[0];
-            const int global_col = mp[1];
-            const int row_dim = mp[2];
-            const int col_dim = mp[3];
-            // find(), not at(): a throw inside the OpenMP region would
-            // terminate instead of propagating.
-            auto row_it = graph_C->global_to_local.find(global_row);
-            auto col_it = graph_C->global_to_local.find(global_col);
-            if (row_it == graph_C->global_to_local.end() ||
-                col_it == graph_C->global_to_local.end()) {
-                any_missing_dest = 1;
-                continue;
-            }
-            const int local_row = row_it->second;
-            const int local_col = col_it->second;
-            auto begin = graph_C->adj_ind.begin() + graph_C->adj_ptr[local_row];
-            auto end = graph_C->adj_ind.begin() + graph_C->adj_ptr[local_row + 1];
-            auto it = std::lower_bound(begin, end, local_col);
-            if (it == end || *it != local_col) {
-                any_missing_dest = 1;
-                continue;
-            }
-            const int graph_block_index =
-                static_cast<int>(std::distance(graph_C->adj_ind.begin(), it));
-            write_transposed_conjugate_block(
-                result.mutable_block_data(graph_block_index),
-                exchange.recv_values.data() + locs[b].value_off,
-                col_dim,
-                row_dim);
-        }
-        if (any_missing_dest) {
-            throw std::runtime_error("Distributed BSR transpose could not locate destination block");
-        }
-
-        return result;
-    }
-
-    static Matrix run(const Matrix& matrix) {
-        if (matrix.graph->size == 1) {
-            return serial(matrix);
-        }
-        return distributed(matrix);
-    }
+    static Matrix run(const Matrix& matrix) { return conjugate_transpose(matrix, false); }
 };
 
 template <typename Matrix>
 struct VBCSRTransposeExecutor {
-    using T = typename Matrix::value_type;
-
-    static Matrix run(const Matrix& matrix) {
-        if (matrix.graph->size == 1) {
-            return serial(matrix);
-        }
-        return distributed(matrix);
-    }
-
-private:
-    static Matrix serial(const Matrix& matrix) {
-        const int n_rows = static_cast<int>(matrix.row_ptr().size()) - 1;
-        const int n_cols = static_cast<int>(matrix.graph->block_offsets.size()) - 1;
-
-        std::vector<std::vector<int>> c_adj(n_cols);
-        for (int row = 0; row < n_rows; ++row) {
-            const int global_row = matrix.graph->get_global_index(row);
-            for (int slot = matrix.row_ptr()[row]; slot < matrix.row_ptr()[row + 1]; ++slot) {
-                const int col = matrix.col_ind()[slot];
-                c_adj[col].push_back(global_row);
-            }
-        }
-
-        std::vector<int> c_owned_globals(n_cols);
-        std::vector<int> c_block_sizes(n_cols);
-        for (int row = 0; row < n_cols; ++row) {
-            c_owned_globals[row] = matrix.graph->get_global_index(row);
-            c_block_sizes[row] = matrix.graph->block_sizes[row];
-        }
-
-        DistGraph* graph_C = new DistGraph(matrix.graph->comm);
-        graph_C->construct_distributed(c_owned_globals, c_block_sizes, c_adj);
-
-        Matrix result(graph_C);
-        result.owns_graph = true;
-        result.graph->enable_matrix_lifetime_management();
-        result.set_page_size(matrix.configured_page_size());
-        #pragma omp parallel for
-        for (int row = 0; row < n_rows; ++row) {
-            const int global_row = matrix.graph->get_global_index(row);
-            for (int slot = matrix.row_ptr()[row]; slot < matrix.row_ptr()[row + 1]; ++slot) {
-                const int dest_row = matrix.col_ind()[slot];
-                const int dest_col = graph_C->global_to_local.at(global_row);
-                const int dest_start = graph_C->adj_ptr[dest_row];
-                const int dest_end = graph_C->adj_ptr[dest_row + 1];
-                auto begin = graph_C->adj_ind.begin() + dest_start;
-                auto end = graph_C->adj_ind.begin() + dest_end;
-                auto it = std::lower_bound(begin, end, dest_col);
-                if (it == end || *it != dest_col) {
-                    throw std::runtime_error("VBCSR transpose could not locate destination block");
-                }
-                const int dest_graph_block =
-                    static_cast<int>(std::distance(graph_C->adj_ind.begin(), it));
-                write_transposed_conjugate_block(
-                    result.mutable_block_data(dest_graph_block),
-                    matrix.block_data(slot),
-                    matrix.graph->block_sizes[row],
-                    matrix.graph->block_sizes[matrix.col_ind()[slot]]);
-            }
-        }
-        return result;
-    }
-
-    static Matrix distributed(const Matrix& matrix) {
-        auto exchange = exchange_transpose_blocks(matrix);
-        DistGraph* graph_C = construct_result_graph(
-            matrix,
-            exchange.adjacency,
-            exchange.ghost_dims,
-            "transpose");
-
-        Matrix result(graph_C);
-        result.owns_graph = true;
-        result.graph->enable_matrix_lifetime_management();
-        result.set_page_size(matrix.configured_page_size());
-        const auto locs = index_received_blocks(exchange.recv_meta);
-        const int n_recv = static_cast<int>(locs.size());
-        int any_missing_dest = 0;
-        #pragma omp parallel for schedule(dynamic, 256) reduction(|:any_missing_dest)
-        for (int b = 0; b < n_recv; ++b) {
-            const int* mp = exchange.recv_meta.data() + locs[b].meta_off;
-            const int global_row = mp[0];
-            const int global_col = mp[1];
-            const int row_dim = mp[2];
-            const int col_dim = mp[3];
-            // find(), not at(): a throw inside the OpenMP region would
-            // terminate instead of propagating.
-            auto row_it = graph_C->global_to_local.find(global_row);
-            auto col_it = graph_C->global_to_local.find(global_col);
-            if (row_it == graph_C->global_to_local.end() ||
-                col_it == graph_C->global_to_local.end()) {
-                any_missing_dest = 1;
-                continue;
-            }
-            const int local_row = row_it->second;
-            const int local_col = col_it->second;
-            auto begin = graph_C->adj_ind.begin() + graph_C->adj_ptr[local_row];
-            auto end = graph_C->adj_ind.begin() + graph_C->adj_ptr[local_row + 1];
-            auto it = std::lower_bound(begin, end, local_col);
-            if (it == end || *it != local_col) {
-                any_missing_dest = 1;
-                continue;
-            }
-            const int graph_block_index =
-                static_cast<int>(std::distance(graph_C->adj_ind.begin(), it));
-            write_transposed_conjugate_block(
-                result.mutable_block_data(graph_block_index),
-                exchange.recv_values.data() + locs[b].value_off,
-                col_dim,
-                row_dim);
-        }
-        if (any_missing_dest) {
-            throw std::runtime_error("Distributed VBCSR transpose could not locate destination block");
-        }
-        return result;
-    }
+    static Matrix run(const Matrix& matrix) { return conjugate_transpose(matrix, false); }
 };
 
 } // namespace vbcsr::detail
