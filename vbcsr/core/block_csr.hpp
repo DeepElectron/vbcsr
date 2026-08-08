@@ -161,7 +161,8 @@ private:
 
 public:
     // Public facade state and view types.
-    DistGraph* graph;
+    // Null in the empty state -- see the default constructor and reset().
+    DistGraph* graph = nullptr;
     using value_type = T;
 
     struct ConstLocalBlockView {
@@ -476,6 +477,39 @@ public:
               false,
               ConstructionToken{}) {
         allocate_from_graph();
+    }
+
+    /// An empty matrix: no graph, no storage, and nothing but assignment is
+    /// legal on it. This is exactly the state a moved-from matrix is already
+    /// left in, so it introduces no new invariant.
+    ///
+    /// It exists so that a variable declared ahead of the loop that fills it
+    /// does not have to allocate a whole graph-shaped matrix first. Writing
+    /// `BlockSpMat<T> a(graph);` and then `a = something.spmm(...)` allocates
+    /// the entire local sparsity pattern only to free it at the assignment --
+    /// on a large problem that is gigabytes held for no reason.
+    BlockSpMat() = default;
+
+    /// Release this matrix's storage and its graph reference now, returning it
+    /// to the empty state.
+    ///
+    /// The library cannot know that a matrix the caller still holds is dead;
+    /// only the caller knows. This is how they say so. It matters wherever a
+    /// result is about to replace an operand, because a plain
+    /// `a = b.spmm(c, tol)` keeps a's old contents alive for the whole product
+    /// -- the assignment that frees them does not run until the result is
+    /// complete. `a.reset()` first, and the peak drops by a whole matrix.
+    void reset() {
+        clear_remote_assembly_state(this);
+        release_graph_reference();
+        graph = nullptr;
+        owns_graph = false;
+        backend_handle_ = std::monostate{};
+        kind = MatrixKind::CSR;
+        configured_page_size_ = 0;
+        block_norms.clear();
+        block_norms.shrink_to_fit();
+        norms_valid = false;
     }
 
     ~BlockSpMat() {
@@ -1452,20 +1486,48 @@ public:
     // the two -- three matrices and two result graphs where one of each will
     // do, which at multi-million-orbital scale was the difference between
     // fitting in memory and not.
+    // The two halves are also available separately, because the peak memory of
+    // this operation is not set by the answer but by what is alive while it is
+    // built: the upper triangle U and the completion C exist together, and C's
+    // pattern is U's plus its mirror, so U + C costs about 1.5x the answer on
+    // top of both operands. A caller whose operand dies with U -- a congruence
+    // chain, an iteration that overwrites its own input -- can free it between
+    // the two calls and never pay for the overlap:
+    //
+    //     BlockSpMat U = a.spmm_hermitian_upper(b, tol);
+    //     a.reset();                       // a is dead now; b may be too
+    //     a = U.complete_hermitian();
+    //
+    // Fusing the mirror into the numeric phase instead -- writing both slots
+    // of each computed block straight into a pre-sized C -- was considered and
+    // is worse: it removes U (saving 0.5x the answer) but leaves both operands
+    // alive for the whole product, where splitting frees a whole operand.
     BlockSpMat spmm_hermitian(const BlockSpMat& B, double threshold, bool transA = false) const {
-        ensure_same_backend_family(*this, B, "spmm_hermitian");
+        return spmm_hermitian_upper(B, threshold, transA).complete_hermitian();
+    }
+
+    // Phase 1: only the block columns at or above the diagonal. Half the block
+    // products, and their ghost fetches skipped via the symbolic pattern.
+    BlockSpMat spmm_hermitian_upper(const BlockSpMat& B, double threshold,
+                                    bool transA = false) const {
+        ensure_same_backend_family(*this, B, "spmm_hermitian_upper");
         if (transA) {
             BlockSpMat A_T = this->transpose();
-            return A_T.spmm_hermitian(B, threshold, false);
+            return A_T.spmm_hermitian_upper(B, threshold, false);
         }
-        BlockSpMat U = (kind == MatrixKind::CSR && B.kind == MatrixKind::CSR)
+        return (kind == MatrixKind::CSR && B.kind == MatrixKind::CSR)
             ? detail::CSRSpMMExecutor<BlockSpMat<T>>::run(*this, B, threshold, /*upper_only=*/true)
             : (kind == MatrixKind::BSR && B.kind == MatrixKind::BSR)
                 ? detail::BSRSpMMExecutor<BlockSpMat<T>>::run(*this, B, threshold, /*upper_only=*/true)
                 : detail::VBCSRSpMMExecutor<BlockSpMat<T>>::run(*this, B, threshold, /*upper_only=*/true);
-        // Mirror: C = U + strict_lower(U^H), built in one pass. The diagonal
-        // is carried over from U untouched, so it is never doubled.
-        BlockSpMat C = detail::conjugate_transpose(U, /*mirror=*/true);
+    }
+
+    // Phase 2: C = U + strict_lower(U^H) for an upper-triangle-only U, built
+    // in one pass. The diagonal is carried over untouched, so it is never
+    // doubled. Contract: *this holds only blocks at or above the diagonal --
+    // anything below is ignored rather than added to its mirror.
+    BlockSpMat complete_hermitian() const {
+        BlockSpMat C = detail::conjugate_transpose(*this, /*mirror=*/true);
         // The mirrored triangles are exactly conjugate by construction; the
         // diagonal blocks are as-computed and carry rounding-scale
         // anti-Hermitian parts. Average them so the promise holds exactly.
