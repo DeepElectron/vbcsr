@@ -1418,15 +1418,15 @@ public:
         // chunk is done its source blocks are dead; the destination is only
         // ever smaller than the source, so the peak becomes about the size of
         // the unfiltered matrix instead of the sum of both.
-        // 16 chunks, kept after measuring the alternative. Fewer chunks make
-        // the placing touch below cheaper (it is domain-aligned, and a chunk
-        // spans only a few domains, so it runs on few threads): 1.21s at 16
-        // chunks against 0.81s at 4, on a 6.2 GB filter. But chunk count is what
-        // bounds how much of the SOURCE is still alive while the destination
-        // fills, and this is a memory-driven design -- the extra ~0.4s is
-        // nothing against a run measured in thousands of seconds, while the
-        // retained source is gigabytes at 4096 atoms.
-        const int copy_chunk_rows = std::max(1, (n_rows + 15) / 16);
+        // 4 chunks, matching bsr.hpp's consuming path and for the same reason:
+        // the placing touch below is domain-aligned, so the fraction of threads
+        // active during it is 1/chunks regardless of how many threads there are.
+        // Deriving the count from the thread count (tried, reverted) collapses
+        // to one chunk on small machines and stops releasing the source at all.
+        // Measured at 48 threads on a 6.2 GB filter: 1.21s at 16 chunks against
+        // 0.81s at 4.
+        constexpr int kCopyChunks = 4;
+        const int copy_chunk_rows = std::max(1, (n_rows + kCopyChunks - 1) / kCopyChunks);
         const auto copy_kept_blocks = [&](auto& result) {
             // This copy is the result's deferred FIRST TOUCH, so the thread that
             // runs a row decides which NUMA node its pages live on, and the

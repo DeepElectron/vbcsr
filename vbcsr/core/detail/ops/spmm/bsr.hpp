@@ -724,21 +724,34 @@ private:
         // thread its own domain to stream and release (a range release rather
         // than a prefix release), so every thread is busy and the release is
         // finer than any chunk count. That is a larger change than a constant.
-        // DERIVED from the thread count, not fitted to one machine. What broke
-        // at 16 chunks was not the number 16 -- it was that a chunk spanned
-        // domains/chunks domains, so the domain-aligned zeroing ran on a
-        // fraction of the threads. That ratio is what has to be held, and on a
-        // machine with a different core count a fixed chunk count gives a
-        // different ratio: 16 chunks starves an 8-thread host completely (half a
-        // domain per chunk) and wastes release granularity on a 128-thread one.
-        const int domain_count = std::max(1, C.bsr_thread_domains().thread_count);
-        constexpr int kMinDomainsPerChunk = 12;   // 4 chunks on the 48-thread host measured
-        constexpr int kMaxChunks = 16;            // memory granularity ceiling
-        const int n_chunks =
-            std::min(kMaxChunks, std::max(1, domain_count / kMinDomainsPerChunk));
+        // 4 chunks, and the count is machine-INDEPENDENT for a reason worth
+        // stating, because the first attempt at this got it wrong.
+        //
+        // The domain-aligned touch runs on the domains a chunk spans, so the
+        // fraction of threads active during it is (domains/chunks)/domains =
+        // 1/chunks. That ratio does not depend on the thread count at all. An
+        // earlier version derived the count from threads (min(16, threads/12)),
+        // which looked like it removed a fitted constant but silently collapsed
+        // to a SINGLE chunk at 12 threads or fewer -- no page release at all,
+        // which is the entire point of the consuming path. Measured across 2-48
+        // threads it was never slower, because it had stopped doing the work.
+        //
+        // 4 chunks: a quarter of the threads on the touch, three quarters of the
+        // operand released progressively. Measured at 48 threads, spmm against
+        // spmm_inplace: 16 chunks 0.317/0.417 (in-place 1.32x SLOWER), 8 chunks
+        // 0.324/0.386, 4 chunks 0.326/0.315, 2 chunks 0.313/0.289.
+        //
+        // It is NOT free at low thread counts, and that is the honest trade:
+        // 48 threads 0.311/0.313, 12 threads 0.770/0.799, 4 threads
+        // 2.036/2.118 -- so about 4% on a small machine, where a quarter of
+        // four threads is one thread doing the touch and the per-chunk barriers
+        // have less to hide behind. Paid deliberately: this is a memory-driven
+        // path, and the alternative rule that avoided the 4% did so by dropping
+        // to a single chunk and releasing nothing.
+        constexpr int kConsumeChunks = 4;
         const int chunk_rows = consume_A == nullptr
                                    ? std::max(1, n_rows)
-                                   : std::max(1, (n_rows + n_chunks - 1) / n_chunks);
+                                   : std::max(1, (n_rows + kConsumeChunks - 1) / kConsumeChunks);
 
         const double rss_alloc = profile ? profile_rss_gb() : 0.0;
         const auto t_numeric0 = stamp();
