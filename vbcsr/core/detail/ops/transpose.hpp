@@ -14,6 +14,7 @@
 #include <limits>
 #include <stdexcept>
 #include <utility>
+#include <unordered_set>
 #include <vector>
 
 namespace vbcsr::detail {
@@ -255,14 +256,35 @@ Matrix conjugate_transpose(const Matrix& matrix, bool mirror) {
     std::vector<int> ghosts;
     std::vector<int> ghost_sizes;
     {
+        // A ghost is a column this rank does NOT own, and that has to be
+        // enforced here rather than assumed.
+        //
+        // to_local below maps owned globals to [0, n_owned) and then ghosts to
+        // n_owned + g. If an id reaches both loops the ghost pass OVERWRITES its
+        // owned index with an out-of-range one, and every consumer that sizes an
+        // array by n_owned -- `counts` immediately below is the first -- writes
+        // past the end. That is a heap-buffer-overflow, and it surfaced as
+        // `free(): invalid next size` several phases later in a 4-rank
+        // Newton-Schulz run, far from here.
+        //
+        // The received metadata is the source: a block arrives carrying the
+        // sender's row as its destination COLUMN, and nothing guaranteed that
+        // column was remote to us. Verified directly -- rank 0 saw g_col=0 with
+        // in_owned=1 mapped to local_row=128 against n_owned=128.
+        std::unordered_set<int> owned_ids(ga.owned_global_indices.begin(),
+                                          ga.owned_global_indices.end());
         std::vector<std::pair<int, int>> candidates;  // (global id, block size)
         candidates.reserve(n_recv + (mirror ? ga.ghost_global_indices.size() : 0));
         for (size_t b = 0; b < n_recv; ++b) {
-            candidates.emplace_back(recv_meta[b * 4 + 1], recv_meta[b * 4 + 3]);
+            const int gid = recv_meta[b * 4 + 1];
+            if (owned_ids.count(gid) != 0) continue;  // owned: already in to_local
+            candidates.emplace_back(gid, recv_meta[b * 4 + 3]);
         }
         if (mirror) {
             for (size_t g = 0; g < ga.ghost_global_indices.size(); ++g) {
-                candidates.emplace_back(ga.ghost_global_indices[g],
+                const int gid = ga.ghost_global_indices[g];
+                if (owned_ids.count(gid) != 0) continue;
+                candidates.emplace_back(gid,
                                         ga.block_sizes[static_cast<size_t>(n_owned) + g]);
             }
         }
