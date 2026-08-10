@@ -65,6 +65,8 @@ inline const char* matrix_kind_name(MatrixKind kind) {
 #include "detail/ops/spmm/bsr.hpp"
 #include "detail/ops/spmm/csr.hpp"
 #include "detail/ops/spmm/vbcsr.hpp"
+#include "detail/ops/spmm/rarh.hpp"
+#include "detail/ops/spmm/square_polynomial.hpp"
 #include "detail/ops/transpose.hpp"
 #include "detail/distributed/block_payload_exchange.hpp"
 #include "detail/distributed/mpi_utils.hpp"
@@ -1407,30 +1409,95 @@ public:
         new_graph->construct_distributed(graph->owned_global_indices, owned_block_sizes, new_adj_global);
 
         std::vector<double> new_norms(new_graph->adj_ind.size(), 0.0);
+        // Copied in row chunks, handing this matrix's pages back as they are
+        // consumed. A filter is the one operation that unavoidably holds a
+        // source and a destination of the same order at once, and it lands on
+        // the result of every SpGEMM -- on a 4096-atom Newton-Schulz step that
+        // is another ~23 GB alive on top of a product that already holds four
+        // matrices. Rows are independent and are copied in order, so once a
+        // chunk is done its source blocks are dead; the destination is only
+        // ever smaller than the source, so the peak becomes about the size of
+        // the unfiltered matrix instead of the sum of both.
+        // 16 chunks, kept after measuring the alternative. Fewer chunks make
+        // the placing touch below cheaper (it is domain-aligned, and a chunk
+        // spans only a few domains, so it runs on few threads): 1.21s at 16
+        // chunks against 0.81s at 4, on a 6.2 GB filter. But chunk count is what
+        // bounds how much of the SOURCE is still alive while the destination
+        // fills, and this is a memory-driven design -- the extra ~0.4s is
+        // nothing against a run measured in thousands of seconds, while the
+        // retained source is gigabytes at 4096 atoms.
+        const int copy_chunk_rows = std::max(1, (n_rows + 15) / 16);
         const auto copy_kept_blocks = [&](auto& result) {
-            #pragma omp parallel for
-            for (int row = 0; row < n_rows; ++row) {
-                int dest_graph_block = new_graph->adj_ptr[row];
-                for (int slot = graph->adj_ptr[row]; slot < graph->adj_ptr[row + 1]; ++slot) {
-                    if (block_norms[slot] < threshold) {
-                        continue;
+            // This copy is the result's deferred FIRST TOUCH, so the thread that
+            // runs a row decides which NUMA node its pages live on, and the
+            // forward apply later splits that matrix along thread_domains. Walk
+            // each chunk by domain rather than by row on a dynamic schedule --
+            // the intersection of the two, exactly as bsr.hpp's SpGEMM does --
+            // otherwise removing the eager zero pass also silently removed the
+            // placement it used to establish.
+            const auto& domains = result.thread_domain_partition();
+            const bool aligned = domains.thread_count > 0 &&
+                                 static_cast<int>(domains.row_bounds.size()) ==
+                                     domains.thread_count + 1;
+            for (int chunk_begin = 0; chunk_begin < n_rows; chunk_begin += copy_chunk_rows) {
+                const int chunk_end = std::min(n_rows, chunk_begin + copy_chunk_rows);
+                // Placement and parallelism, in that order.
+                //
+                // Doing the COPY itself domain-by-domain gets placement right
+                // but collapses parallelism: a chunk spans only a few domains
+                // (16 chunks against one domain per thread), so most threads sit
+                // idle and the copy measured 1.55x slower. So the placing touch
+                // is separated from the copy -- the touch runs domain-aligned
+                // (correct node), the copy then runs dynamic over the whole
+                // chunk (all threads), writing into pages that are already
+                // placed. This is the shape bsr.hpp's SpGEMM uses.
+                if (aligned) {
+                    #pragma omp parallel for schedule(static)
+                    for (int d = 0; d < domains.thread_count; ++d) {
+                        const int lo = std::max(domains.domain_begin(d), chunk_begin);
+                        const int hi = std::min(domains.domain_end(d), chunk_end);
+                        if (lo < hi) result.touch_row_range(lo, hi);
                     }
-
-                    const size_t size = block_size_elements(slot);
-                    std::memcpy(
-                        result.mutable_block_data(dest_graph_block),
-                        block_data(slot),
-                        size * sizeof(T));
-                    new_norms[dest_graph_block] = block_norms[slot];
-                    ++dest_graph_block;
                 }
+                #pragma omp parallel for schedule(dynamic, 4)
+                for (int row = chunk_begin; row < chunk_end; ++row) {
+                {
+                    int dest_graph_block = new_graph->adj_ptr[row];
+                    for (int slot = graph->adj_ptr[row]; slot < graph->adj_ptr[row + 1]; ++slot) {
+                        if (block_norms[slot] < threshold) {
+                            continue;
+                        }
+
+                        const size_t size = block_size_elements(slot);
+                        std::memcpy(
+                            result.mutable_block_data(dest_graph_block),
+                            block_data(slot),
+                            size * sizeof(T));
+                        new_norms[dest_graph_block] = block_norms[slot];
+                        ++dest_graph_block;
+                    }
+                }
+                }
+                // Outside the parallel region, so every row below the boundary
+                // is copied on every thread before its storage goes away.
+                release_value_blocks_before(graph->adj_ptr[chunk_end]);
             }
         };
 
-        BlockSpMat result(new_graph);
-        result.owns_graph = true;
-        result.graph->enable_matrix_lifetime_management();
-        result.set_page_size(configured_page_size_);
+        // Allocated WITHOUT the constructor's first-touch zero pass, because
+        // copy_kept_blocks below memcpy's every block of it: the pass would
+        // write the whole matrix once only to have it immediately overwritten,
+        // and -- far worse -- it makes the filtered copy fully resident the
+        // instant it is constructed, before a single row has been copied or the
+        // source has released anything.
+        //
+        // Measured on a 4096-atom Newton-Schulz step: this one allocation was
+        // the run's peak. The product it filters ended its numeric phase at
+        // 78.1 GB and finished at 67.8, yet the phase peaked at 101.4 -- the
+        // difference was this copy, resident in full alongside its own source.
+        // The memcpy is the first touch, and it runs on the same row partition
+        // the pass would have used, so nothing about NUMA placement changes.
+        BlockSpMat result = make_overwritten_result(new_graph, configured_page_size_);
         copy_kept_blocks(result);
         *this = std::move(result);
 
@@ -1520,6 +1587,247 @@ public:
             : (kind == MatrixKind::BSR && B.kind == MatrixKind::BSR)
                 ? detail::BSRSpMMExecutor<BlockSpMat<T>>::run(*this, B, threshold, /*upper_only=*/true)
                 : detail::VBCSRSpMMExecutor<BlockSpMat<T>>::run(*this, B, threshold, /*upper_only=*/true);
+    }
+
+    // *this <- (*this) B, overwriting the left operand instead of returning a
+    // new matrix.
+    //
+    // A separate entry point rather than a flag on spmm, as every library that
+    // offers this does it: BLAS splits gemm (C <- A B) from trmm (B <- A B),
+    // PyTorch splits mul from mul_, NumPy takes an explicit out=. The reason is
+    // that the overwriting form carries PRECONDITIONS the out-of-place form
+    // does not -- B must not alias *this, and there is no transA -- and a
+    // positional bool at the call site both hides them and reads as noise.
+    //
+    // Why it saves anything: the numeric phase consumes A one row block at a
+    // time and row i of the product touches only row i of A, so A's storage can
+    // be handed back as the product walks it instead of being held whole until
+    // the assignment. Peak goes from |A| + |result| to about max(|A|, |result|).
+    // The saving is real memory, not bookkeeping: pages are independent
+    // mmap allocations, so releasing one returns it to the OS.
+    //
+    // Currently only the BSR backend releases as it goes; the others compute
+    // the same answer through the ordinary product, correct but without the
+    // memory benefit.
+    void spmm_inplace(const BlockSpMat& B, double threshold) {
+        ensure_product_operands_compatible(*this, B, "spmm_inplace");
+        if (this == &B) {
+            // A <- A A would release the rows another row still has to read,
+            // and distributed it would release rows other ranks fetch.
+            throw std::runtime_error(
+                "spmm_inplace: the operand must not alias the matrix being overwritten");
+        }
+        if (kind == MatrixKind::BSR && B.kind == MatrixKind::BSR) {
+            *this = detail::BSRSpMMExecutor<BlockSpMat<T>>::run_consuming(*this, B, threshold);
+            return;
+        }
+        if (kind == MatrixKind::CSR && B.kind == MatrixKind::CSR) {
+            *this = detail::CSRSpMMExecutor<BlockSpMat<T>>::run_consuming(*this, B, threshold);
+            return;
+        }
+        // VBCSR falls through to the plain product: releasing a prefix of its
+        // values needs release_value_blocks_before, which its shape-packed store
+        // does not support (see there). Correct, just without the page release.
+        *this = spmm(B, threshold);
+    }
+
+    // Hands back the value storage under every block below `block_index`.
+    // Only meaningful mid-product, and only to a caller that has proved those
+    // blocks are dead -- see spmm_inplace, whose BSR and CSR paths both consume
+    // their operand this way. A no-op on backends that do not page their
+    // values, which costs correctness nothing.
+    // A matrix whose every block the caller promises to overwrite, allocated
+    // without the first-touch zero pass that would otherwise make it resident
+    // before it holds anything.
+    //
+    // All three kinds, because the eager pass is in all three
+    // (csr_backend/bsr_backend initialize_structure_first_touch,
+    // vbcsr_backend build_first_touch_structure) and so is the cost: on a
+    // 4096-atom Newton-Schulz step this single allocation inside filter_blocks
+    // was the run's peak, 20+ GB resident before a row had been copied. The
+    // copy that follows is the first touch, on the same row partition the pass
+    // would have used, so NUMA placement is unchanged.
+    //
+    // VBCSR defers the pass rather than skipping it: its shape-packed store has
+    // no single row-ordered buffer to overwrite blindly, so the ranges are kept
+    // and zeroed per domain by whoever writes them.
+    static BlockSpMat make_overwritten_result(DistGraph* new_graph, uint32_t page_size) {
+        const MatrixKind kind = detect_matrix_kind(new_graph);
+        if (new_graph->block_sizes.empty()) {
+            BlockSpMat result(new_graph);
+            result.owns_graph = true;
+            result.graph->enable_matrix_lifetime_management();
+            result.set_page_size(page_size);
+            return result;
+        }
+        std::unique_ptr<DistGraph> guard(new_graph);
+        BlockSpMat result(guard.get(), kind, true, ConstructionToken{});
+        guard.release();
+        result.owns_graph = true;
+        result.graph->enable_matrix_lifetime_management();
+        result.set_page_size(page_size);
+
+        const uint32_t normalized = normalize_page_size(kind, result.graph, page_size);
+        switch (kind) {
+        case MatrixKind::CSR: {
+            CSRBackendStorage backend;
+            backend.initialize_structure_deferred_touch(result.graph->adj_ptr, normalized);
+            result.attach_backend(std::move(backend));
+            break;
+        }
+        case MatrixKind::BSR: {
+            BSRBackendStorage backend;
+            backend.initialize_structure_deferred_touch(
+                result.graph->adj_ptr, result.graph->block_sizes[0], normalized);
+            result.attach_backend(std::move(backend));
+            break;
+        }
+        case MatrixKind::VBCSR: {
+            VBCSRBackendStorage backend(normalized);
+            backend.build_first_touch_structure(
+                result.graph->adj_ptr, result.graph->adj_ind, result.graph->block_sizes,
+                static_cast<int>(result.graph->owned_global_indices.size()),
+                /*defer_zero=*/true);
+            result.attach_backend(std::move(backend));
+            break;
+        }
+        }
+        return result;
+    }
+
+    // The BSR apply partition, and a row-range zero that runs against it.
+    // Exposed for the SpGEMM numeric phase, which now does the first touch of
+    // its own result as it walks it (see make_result_matrix_deferred_touch).
+    const detail::ThreadDomainPartition& bsr_thread_domains() const {
+        return active_bsr_backend().thread_domains;
+    }
+
+    // Zero every block of rows [row_begin, row_end), whatever the backend. Used
+    // as a PLACING first touch: called from inside a parallel region with each
+    // thread passed its own thread-domain range, so the pages land on the node
+    // that will later read them. Kind-agnostic on purpose -- it goes through
+    // mutable_block_data, so it needs no per-backend row-range support (VBCSR
+    // has none, its store being shape-packed).
+    void touch_row_range(int row_begin, int row_end) {
+        for (int row = row_begin; row < row_end; ++row) {
+            for (int slot = graph->adj_ptr[row]; slot < graph->adj_ptr[row + 1]; ++slot) {
+                std::memset(mutable_block_data(slot), 0,
+                            block_size_elements(slot) * sizeof(T));
+            }
+        }
+    }
+
+    void bsr_zero_row_range(int row_begin, int row_end) {
+        active_bsr_backend().zero_row_range(graph->adj_ptr, row_begin, row_end);
+    }
+
+    void release_value_blocks_before(long long block_index) {
+        if (block_index <= 0) return;
+        const uint64_t boundary = static_cast<uint64_t>(block_index);
+        if (kind == MatrixKind::BSR) {
+            active_bsr_backend().release_blocks_before(boundary);
+        } else if (kind == MatrixKind::CSR) {
+            active_csr_backend().release_blocks_before(boundary);
+        }
+        // VBCSR is not covered YET, and the obstacle is smaller than it looks.
+        // Its store packs values by SHAPE, so "the blocks below row R" is a
+        // prefix of each shape's buffer rather than of one buffer. Those
+        // prefixes do exist: build_first_touch_structure fills shape_blocks by
+        // walking domains in order and rows ascending within each, and the
+        // thread domains are contiguous ascending row ranges, so every shape's
+        // buffer comes out ROW-ORDERED. What is missing is only the per-shape
+        // count below R, which shape_domain_offsets already gives exactly when R
+        // is a domain edge.
+        //
+        // So closing this is: a release_blocks_before(row) on the VBCSR backend
+        // that releases offsets[domain] in each shape, plus a consuming SpGEMM
+        // path whose chunks land on domain edges rather than even row splits.
+        // Correct as is -- it simply keeps the memory.
+    }
+
+    // C = c2 (*this)^2 + c1 (*this) + c0 I, upper triangle only, WITHOUT ever
+    // forming the square. See detail/ops/spmm/square_polynomial.hpp: for a
+    // contracting polynomial the square is denser than the answer, so the
+    // two-call route pays for a matrix the drop threshold then removes -- and
+    // truncates twice where this truncates once.
+    //
+    // *this must be Hermitian (so the result is); complete the result with
+    // complete_hermitian().
+    BlockSpMat square_polynomial_upper(T c2, T c1, T c0, double threshold) const {
+        return detail::SquarePolynomialExecutor<BlockSpMat<T>>::run(
+            *this, c2, c1, c0, threshold);
+    }
+
+    // C = A B A^H with A == *this, upper triangle only, WITHOUT ever forming
+    // A B. Named as the same triple product is elsewhere in sparse linear
+    // algebra -- PETSc's MatRARt, hypre's RAP -- with the outer factor being
+    // the matrix called on. See detail/ops/spmm/rarh.hpp for why the fusion
+    // matters and not just the flop count: the
+    // intermediate is denser than the answer, so the two-call route pays for a
+    // matrix that the drop threshold would have removed had it been applied at
+    // the end instead of at the link.
+    //
+    // Both operands must be Hermitian -- A because the kernel reaches its
+    // second contraction through A[j,l]^H == A[l,j] and would otherwise need a
+    // transpose, B so that C is Hermitian and half of it can be skipped. The
+    // contract is unchecked, as in spmm_hermitian; a non-Hermitian A is caught
+    // only when it happens to expose a column that is not a row.
+    //
+    // Complete the result with complete_hermitian().
+    BlockSpMat rarh_upper(const BlockSpMat& B, double threshold) const {
+        ensure_product_operands_compatible(*this, B, "rarh_upper");
+        return detail::RARhExecutor<BlockSpMat<T>>::run(*this, B, threshold);
+    }
+
+    // Preconditions shared by the binary products whose implementations index
+    // one operand's GLOBAL block space with indices taken from the other.
+    //
+    // ensure_same_backend_family alone is not enough for those. The row
+    // directory is sized from one operand's global block count and written at
+    // positions taken from the other's global indices, so a mismatched global
+    // space is an out-of-bounds WRITE rather than a wrong answer; and the two
+    // exchange rounds are collective over one operand's communicator while
+    // addressing owners derived from the other. Every in-tree caller happens to
+    // satisfy all of this, which is exactly why it was never noticed -- but
+    // these are public entry points.
+    static void ensure_product_operands_compatible(const BlockSpMat& lhs,
+                                                   const BlockSpMat& rhs,
+                                                   const char* what) {
+        ensure_same_backend_family(lhs, rhs, what);
+        DistGraph* lg = require_live_graph(lhs.graph, what);
+        DistGraph* rg = require_live_graph(rhs.graph, what);
+
+        if (lg->comm != MPI_COMM_NULL && rg->comm != MPI_COMM_NULL) {
+            int relation = MPI_UNEQUAL;
+            MPI_Comm_compare(lg->comm, rg->comm, &relation);
+            if (relation != MPI_IDENT && relation != MPI_CONGRUENT) {
+                throw std::runtime_error(
+                    std::string(what) +
+                    ": operands must share a communicator (identical or congruent)");
+            }
+        } else if ((lg->comm == MPI_COMM_NULL) != (rg->comm == MPI_COMM_NULL)) {
+            throw std::runtime_error(std::string(what) +
+                                     ": one operand has a null communicator");
+        }
+
+        if (lg->size != rg->size || lg->rank != rg->rank) {
+            throw std::runtime_error(std::string(what) +
+                                     ": operands must share rank ordering");
+        }
+
+        const auto global_blocks = [](const DistGraph* g) {
+            return g->block_displs.empty()
+                       ? static_cast<int>(g->adj_ptr.size()) - 1
+                       : g->block_displs.back();
+        };
+        if (global_blocks(lg) != global_blocks(rg)) {
+            throw std::runtime_error(
+                std::string(what) + ": operands must span the same global block space");
+        }
+        if (lg->owned_global_indices != rg->owned_global_indices) {
+            throw std::runtime_error(std::string(what) +
+                                     ": operands must share the owned row distribution");
+        }
     }
 
     // Phase 2: C = U + strict_lower(U^H) for an upper-triangle-only U, built

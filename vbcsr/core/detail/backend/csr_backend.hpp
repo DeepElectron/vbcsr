@@ -150,6 +150,50 @@ struct CSRMatrixBackend {
         }
     }
 
+    // Structure and thread domains exactly as initialize_structure_first_touch
+    // builds them, WITHOUT its zero pass over the whole buffer.
+    //
+    // That pass is for first-touch NUMA placement, not for correctness of the
+    // allocation, and it faults in every page of the result before a value
+    // exists -- which on an SpGEMM result or a filtered copy is the whole
+    // answer resident before it has been computed, and was the measured peak of
+    // a Newton-Schulz run. The caller takes on the obligation it discharged:
+    // zero each row range before accumulating into it, through zero_row_range,
+    // from the same domain thread so the placement is unchanged.
+    void initialize_structure_deferred_touch(
+        const std::vector<int>& row_ptr,
+        uint32_t page_size) {
+        const uint64_t logical_nnz =
+            row_ptr.empty() ? 0 : static_cast<uint64_t>(row_ptr.back());
+        configured_page_size_ = normalize_page_size(page_size);
+        const uint32_t active_page_size = logical_nnz == 0
+            ? configured_page_size_
+            : static_cast<uint32_t>(std::min<uint64_t>(logical_nnz, configured_page_size_));
+        values = PagedBuffer<T>(active_page_size);
+        invalidate_vendor_cache();
+        values.resize_uninitialized(logical_nnz);
+
+        const int n_rows = row_ptr.empty() ? 0 : static_cast<int>(row_ptr.size()) - 1;
+        thread_domains = build_thread_domain_partition(
+            n_rows,
+            thread_domain_max_threads(),
+            [&](int row) { return row_ptr[row + 1] - row_ptr[row]; });
+    }
+
+    /// Zeroes the values of rows [row_begin, row_end). Call from the thread that
+    /// will write them, so first touch lands where the apply partition expects.
+    void zero_row_range(const std::vector<int>& row_ptr, int row_begin, int row_end) {
+        if (row_begin >= row_end || row_ptr.empty()) return;
+        values.zero_fill_range(static_cast<uint64_t>(row_ptr[row_begin]),
+                               static_cast<uint64_t>(row_ptr[row_end]));
+    }
+
+    /// Hands back the storage under every nonzero below `nnz_index`. One value
+    /// per block here, so the block index IS the element index.
+    uint64_t release_blocks_before(uint64_t nnz_index) {
+        return values.release_pages_before(nnz_index);
+    }
+
     void initialize_structure(uint64_t logical_nnz, uint32_t page_size) {
         configured_page_size_ = normalize_page_size(page_size);
         initialize_structure(logical_nnz);

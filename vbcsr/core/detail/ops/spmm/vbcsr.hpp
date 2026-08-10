@@ -144,6 +144,22 @@ private:
         // Shared first-touch structure build: the numeric fill below then
         // overwrites pages already placed on the threads that later apply
         // this result (numa_locality_plan.md — operation results).
+        //
+        // NOT deferred, unlike the CSR and BSR results, and the difference is
+        // deliberate. The pass is redundant for CORRECTNESS here -- the numeric
+        // loop std::fills every destination block before accumulating into it --
+        // so it looks like pure waste, and it does cost a fully resident result
+        // before any value exists. What it buys is DETERMINISTIC placement: this
+        // pass walks the thread-domain partition that the forward apply plan
+        // later reuses, while the numeric loop below is schedule(dynamic, 4), so
+        // deferring would hand each page to whichever thread happened to win that
+        // row and leave the apply reading across nodes.
+        //
+        // Closing this properly means giving the numeric loop a domain-aligned
+        // static schedule (then its fill IS the placing touch and the pass can go
+        // via build_first_touch_structure(defer_zero=true) + zero_domain), which
+        // trades the load balance dynamic scheduling was chosen for. That is a
+        // measurement, not a cleanup, so it is left alone rather than guessed at.
         backend.build_first_touch_structure(
             C.graph->adj_ptr,
             C.graph->adj_ind,

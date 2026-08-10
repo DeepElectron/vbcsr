@@ -207,6 +207,17 @@ struct BSRMatrixBackend {
             : static_cast<size_t>(values.size()) / values_in_block;
     }
 
+    // Hands back the storage under every block below `block_index`. For an
+    // in-place product consuming its own left operand row by row: those blocks
+    // will never be read again, and on the mmap path this is a munmap, so the
+    // memory leaves the process rather than sitting in a free list. Blocks at
+    // or above the boundary keep their addresses. Returns bytes released.
+    uint64_t release_blocks_before(uint64_t block_index) {
+        const size_t per_block = values_per_block();
+        if (per_block == 0) return 0;
+        return values.release_pages_before(block_index * static_cast<uint64_t>(per_block));
+    }
+
     void initialize_structure(uint64_t logical_blocks, int uniform_block_size) {
         block_size = uniform_block_size;
         configured_blocks_per_page_ =
@@ -280,6 +291,57 @@ struct BSRMatrixBackend {
                 static_cast<uint64_t>(row_ptr[thread_domains.domain_begin(domain)]) * block_values,
                 static_cast<uint64_t>(row_ptr[thread_domains.domain_end(domain)]) * block_values);
         }
+    }
+
+    // Structure and thread domains exactly as initialize_structure_first_touch
+    // builds them, but WITHOUT its zero pass over the whole buffer.
+    //
+    // That pass exists for first-touch NUMA placement, not for correctness of
+    // the allocation itself, and it has a cost the paged store was designed to
+    // avoid: it faults in every page of the result before a single value is
+    // computed. On an SpGEMM result that is the entire answer resident up front,
+    // which makes any attempt to release the INPUT as it is consumed pointless
+    // -- the peak has already happened.
+    //
+    // The caller takes on the obligation the pass used to discharge: zero each
+    // row range before accumulating into it, through zero_row_range below, and
+    // do it from the same domain thread so the placement is unchanged.
+    void initialize_structure_deferred_touch(
+        const std::vector<int>& row_ptr,
+        int uniform_block_size,
+        uint32_t blocks_per_page) {
+        block_size = uniform_block_size;
+        configured_blocks_per_page_ =
+            normalize_blocks_per_page(blocks_per_page, uniform_block_size);
+        const uint64_t logical_blocks =
+            row_ptr.empty() ? 0 : static_cast<uint64_t>(row_ptr.back());
+        const uint32_t page_blocks = logical_blocks == 0
+            ? configured_blocks_per_page_
+            : static_cast<uint32_t>(
+                  std::min<uint64_t>(logical_blocks, configured_blocks_per_page_));
+        values = PagedBuffer<T>(std::max<uint32_t>(
+            page_blocks * static_cast<uint32_t>(values_per_block()),
+            1u));
+        invalidate_apply_plan();
+        values.resize_uninitialized(
+            logical_blocks * static_cast<uint64_t>(values_per_block()));
+
+        const int n_rows = row_ptr.empty() ? 0 : static_cast<int>(row_ptr.size()) - 1;
+        thread_domains = build_thread_domain_partition(
+            n_rows,
+            thread_domain_max_threads(),
+            [&](int row) { return row_ptr[row + 1] - row_ptr[row]; });
+    }
+
+    // Zeroes the values of rows [row_begin, row_end). Call from the thread that
+    // will write them, so first touch still lands where the apply partition
+    // expects it.
+    void zero_row_range(const std::vector<int>& row_ptr, int row_begin, int row_end) {
+        if (row_begin >= row_end || row_ptr.empty()) return;
+        const uint64_t block_values = static_cast<uint64_t>(values_per_block());
+        values.zero_fill_range(
+            static_cast<uint64_t>(row_ptr[row_begin]) * block_values,
+            static_cast<uint64_t>(row_ptr[row_end]) * block_values);
     }
 
     void initialize_structure_for_complete_overwrite(

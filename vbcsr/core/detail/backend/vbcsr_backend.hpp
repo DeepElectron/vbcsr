@@ -148,10 +148,12 @@ struct VBCSRMatrixBackend {
     VBCSRMatrixBackend(const VBCSRMatrixBackend&) = delete;
     VBCSRMatrixBackend& operator=(const VBCSRMatrixBackend&) = delete;
 
+    // Member-init order follows declaration order (thread_domains is declared
+    // above the private block) so the compiler does not silently reorder.
     VBCSRMatrixBackend(VBCSRMatrixBackend&& other) noexcept
-        : graph_block_handles_(std::move(other.graph_block_handles_)),
-          storage(std::move(other.storage)),
-          thread_domains(std::move(other.thread_domains)) {}
+        : thread_domains(std::move(other.thread_domains)),
+          graph_block_handles_(std::move(other.graph_block_handles_)),
+          storage(std::move(other.storage)) {}
 
     VBCSRMatrixBackend& operator=(VBCSRMatrixBackend&& other) noexcept {
         if (this != &other) {
@@ -188,11 +190,26 @@ struct VBCSRMatrixBackend {
     // pages land on that thread's NUMA node. Stores the partition so the
     // forward apply plan splits along the same boundaries. Every block is in
     // exactly one (shape, domain) range, so the fill covers all payload.
+    // `defer_zero` SKIPS the final zero pass outright, exactly as the CSR and
+    // BSR backends do, and carries the same contract: the caller must write
+    // every block. The pass is for first-touch NUMA placement, not correctness,
+    // and running it up front faults in the whole result before a value exists
+    // -- on a filtered copy or an SpGEMM result that was the measured peak of a
+    // Newton-Schulz run. Placement is preserved because the writer walks the
+    // same thread-domain partition (see copy_kept_blocks and the fused kernels'
+    // assemble); it is not preserved by anything here.
+    //
+    // An earlier version kept the per-shape, per-domain ranges so a caller could
+    // run the pass later through zero_domain(). Nothing ever called it -- every
+    // user of defer_zero writes every block -- so the state and its two
+    // accessors were dead weight, and the comment describing a "deferred pass
+    // that runs later" described something that never ran.
     void build_first_touch_structure(
         const std::vector<int>& adj_ptr,
         IndexSpan adj_ind,
         const std::vector<int>& block_sizes,
-        int n_rows) {
+        int n_rows,
+        bool defer_zero = false) {
         initialize_graph_block_handles(adj_ind.size());
 
         std::map<std::pair<int, int>, size_t> shape_counts;
@@ -254,14 +271,16 @@ struct VBCSRMatrixBackend {
             append_blocks_for_shape_uninitialized(
                 shape_id, shape_blocks[static_cast<size_t>(shape_id)]);
         }
-        #pragma omp parallel for schedule(static)
-        for (int domain = 0; domain < domains.thread_count; ++domain) {
-            for (int shape_id = 0; shape_id < shape_count; ++shape_id) {
-                const auto& offsets = shape_domain_offsets[static_cast<size_t>(shape_id)];
-                zero_fill_blocks_for_shape(
-                    shape_id,
-                    offsets[static_cast<size_t>(domain)],
-                    offsets[static_cast<size_t>(domain) + 1]);
+        if (!defer_zero) {
+            #pragma omp parallel for schedule(static)
+            for (int domain = 0; domain < domains.thread_count; ++domain) {
+                for (int shape_id = 0; shape_id < shape_count; ++shape_id) {
+                    const auto& offsets = shape_domain_offsets[static_cast<size_t>(shape_id)];
+                    zero_fill_blocks_for_shape(
+                        shape_id,
+                        offsets[static_cast<size_t>(domain)],
+                        offsets[static_cast<size_t>(domain) + 1]);
+                }
             }
         }
         set_thread_domains(std::move(domains));

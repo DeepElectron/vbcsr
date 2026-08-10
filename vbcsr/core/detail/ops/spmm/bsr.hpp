@@ -39,23 +39,13 @@ template <typename Matrix>
 struct BSRSpMMExecutor {
     using T = typename Matrix::value_type;
 
-    // Vendor batch GEMM in the numeric phase, dispatched on block size the
-    // way every kernel choice here is. Measured (benchmark_spgemm, 24
-    // threads, dense): the batch call's fixed per-product overhead loses
-    // badly on small blocks and wins clearly on large ones --
-    //     bs 5: 0.50x    bs 13: 0.95-1.04x    bs 26: 1.30x
-    // -- so it turns on at bs >= 16, where the vendor's throughput advantage
-    // has overtaken the dispatch cost. VBCSR_SPGEMM_BATCH=1/0 forces it
-    // either way (re-read per product so benchmarks can toggle in-process).
+    // Vendor batch GEMM in the numeric phase, dispatched on block size the way
+    // every kernel choice here is. The policy and the measurements behind it
+    // live in common.hpp's vendor_batch_profitable, shared with the fused
+    // triple product, because the crossover is a property of the machine and
+    // the block size and two copies of it would drift.
     static bool spgemm_batch_enabled(int block_size) {
-#ifdef VBCSR_BLAS_HAS_BATCH_GEMM
-        const char* env = std::getenv("VBCSR_SPGEMM_BATCH");
-        if (env != nullptr) return std::strcmp(env, "1") == 0;
-        return block_size >= 16;
-#else
-        (void)block_size;
-        return false;
-#endif
+        return vendor_batch_profitable(block_size);
     }
 
     // All of one inner index's surviving products in one grouped vendor call:
@@ -67,46 +57,8 @@ struct BSRSpMMExecutor {
         const std::vector<const T*>& b_blocks,
         const std::vector<T*>& c_blocks) {
         const int bs = BlockSize == 0 ? runtime_block_size : BlockSize;
-        const size_t n = b_blocks.size();
-#ifdef VBCSR_BLAS_HAS_BATCH_GEMM
-        if constexpr (std::is_same_v<T, double> || std::is_same_v<T, std::complex<double>>) {
-            // Below a handful of products the call setup outweighs the gain.
-            constexpr size_t kMinBatch = 4;
-            if (n >= kMinBatch) {
-                thread_local std::vector<const T*> a_ptrs;
-                a_ptrs.assign(n, a_block);
-                const int trans[1] = {111 /*CblasNoTrans*/};
-                const vbcsr_blas_int dims[1] = {static_cast<vbcsr_blas_int>(bs)};
-                const vbcsr_blas_int group_size[1] = {static_cast<vbcsr_blas_int>(n)};
-                if constexpr (std::is_same_v<T, double>) {
-                    const double alpha[1] = {1.0};
-                    const double beta[1] = {1.0};
-                    cblas_dgemm_batch(101 /*CblasRowMajor*/, trans, trans,
-                                      dims, dims, dims, alpha,
-                                      const_cast<const double**>(a_ptrs.data()), dims,
-                                      const_cast<const double**>(b_blocks.data()), dims,
-                                      beta,
-                                      const_cast<double**>(c_blocks.data()), dims,
-                                      1, group_size);
-                } else {
-                    const T alpha(1.0);
-                    const T beta(1.0);
-                    cblas_zgemm_batch(101 /*CblasRowMajor*/, trans, trans,
-                                      dims, dims, dims, &alpha,
-                                      reinterpret_cast<const void**>(
-                                          const_cast<const T**>(a_ptrs.data())), dims,
-                                      reinterpret_cast<const void**>(
-                                          const_cast<const T**>(b_blocks.data())), dims,
-                                      &beta,
-                                      reinterpret_cast<void**>(
-                                          const_cast<T**>(c_blocks.data())), dims,
-                                      1, group_size);
-                }
-                return;
-            }
-        }
-#endif
-        for (size_t i = 0; i < n; ++i) {
+        if (grouped_block_gemm_batch<T>(bs, a_block, b_blocks, c_blocks)) return;
+        for (size_t i = 0; i < b_blocks.size(); ++i) {
             accumulate_product<BlockSize>(runtime_block_size, a_block, b_blocks[i], c_blocks[i]);
         }
     }
@@ -137,7 +89,36 @@ struct BSRSpMMExecutor {
         return run_generic(A, B, threshold, upper_only);
     }
 
+    // A <- A B, releasing A's value pages as the numeric phase consumes them.
+    // Always the generic path: the vendor route computes the whole product from
+    // a handle over A's storage, so there is no point at which a prefix of it
+    // is provably dead.
+    static Matrix run_consuming(Matrix& A, const Matrix& B, double threshold) {
+        return run_generic(A, B, threshold, /*upper_only=*/false, /*consume_A=*/&A);
+    }
+
 private:
+    // A result whose pages are mapped but not yet touched. The numeric loop
+    // zeroes each row range as it reaches it (see the chunk loop), so the
+    // first-touch placement the ordinary constructor would have done up front
+    // still happens, just spread across the phase that writes the values --
+    // and the answer is never resident before it has been computed.
+    static Matrix make_result_matrix_deferred_touch(const Matrix& A, DistGraph* c_graph,
+                                                    int block_size) {
+        std::unique_ptr<DistGraph> graph_guard(c_graph);
+        Matrix C(graph_guard.get(), MatrixKind::BSR, true, typename Matrix::ConstructionToken{});
+        graph_guard.release();
+        C.owns_graph = true;
+        C.graph->enable_matrix_lifetime_management();
+        C.set_page_size(A.configured_page_size());
+
+        typename Matrix::BSRBackendStorage backend;
+        backend.initialize_structure_deferred_touch(
+            C.graph->adj_ptr, block_size, A.configured_page_size());
+        C.attach_backend(std::move(backend));
+        return C;
+    }
+
     static Matrix make_empty_like_product(const Matrix& A) {
         const int n_rows = static_cast<int>(A.row_ptr().size()) - 1;
         std::vector<std::vector<int>> adjacency(static_cast<size_t>(n_rows));
@@ -363,7 +344,6 @@ private:
     }
 
     static std::unique_ptr<Matrix> make_result_matrix_uninitialized(
-        const Matrix& A,
         DistGraph* c_graph,
         size_t block_count,
         int block_size) {
@@ -564,7 +544,6 @@ private:
 
         DistGraph* c_graph = construct_serial_result_graph(A, c_row_ptr, c_cols_local);
         auto C = make_result_matrix_uninitialized(
-            A,
             c_graph,
             exported_nnz,
             block_size);
@@ -654,8 +633,17 @@ private:
     }
 #endif
 
+    // `consume_A`, when set, must alias A: the caller is doing A <- A B and has
+    // no further use for A's values, so the numeric phase runs in row chunks
+    // and hands each chunk's input pages back as it passes them. Row i of the
+    // result reads row i of A and rows of B only -- never another row of A --
+    // and A is the LEFT operand, so no other rank fetches its blocks either.
+    // Those two facts are the whole licence for releasing early.
+    //
+    // With consume_A null the chunk loop runs exactly once and this is the
+    // original single `omp for`: no extra barrier, no dispatch change.
     static Matrix run_generic(const Matrix& A, const Matrix& B, double threshold,
-                              bool upper_only = false) {
+                              bool upper_only = false, Matrix* consume_A = nullptr) {
         const auto& A_backend = A.active_bsr_backend();
         const auto& B_backend = B.active_bsr_backend();
         if (A_backend.block_size != B_backend.block_size) {
@@ -665,12 +653,15 @@ private:
         const bool profile = std::getenv("VBCSR_PROFILE_BSR_SPGEMM") != nullptr;
         auto stamp = [] { return std::chrono::steady_clock::now(); };
         const auto t0 = stamp();
+        const double rss0 = profile ? profile_rss_gb() : 0.0;
         auto metadata = exchange_ghost_metadata(A, B);
         auto sym = symbolic_multiply_filtered(A, B, metadata, threshold, upper_only);
         const auto t_symbolic = stamp();
+        const double rss_symbolic = profile ? profile_rss_gb() : 0.0;
         auto payload_ctx = fetch_required_block_payloads(B, sym.required_blocks);
         auto ghost_blocks = build_spmm_ghost_blocks(metadata, std::move(payload_ctx));
         const auto t_fetch = stamp();
+        const double rss_fetch = profile ? profile_rss_gb() : 0.0;
         auto adjacency = build_spmm_result_adjacency(A, sym);
 
         const auto& A_norms = A.get_block_norms();
@@ -679,11 +670,8 @@ private:
         const int n_rows = static_cast<int>(A.row_ptr().size()) - 1;
         DistGraph* c_graph = construct_result_graph(A, adjacency, ghost_blocks.sizes, "spmm");
 
-        Matrix C(c_graph);
-        C.owns_graph = true;
-        C.graph->enable_matrix_lifetime_management();
-        C.set_page_size(A.configured_page_size());
         const int block_size = A_backend.block_size;
+        Matrix C = make_result_matrix_deferred_touch(A, c_graph, block_size);
 
         // One inner index (row, slot) contributes at most once to each
         // destination, so its surviving products form a batch of same-shape
@@ -715,6 +703,44 @@ private:
             A.graph->block_displs.empty() ? 0 : A.graph->block_displs.back();
         const bool use_scatter = n_global_blocks > 0 && n_global_blocks <= (1 << 22);
 
+        // 4 chunks, and the count matters more than it looks.
+        //
+        // Chunking is what turns the peak from |A| + |C| into max(|A|, |C|) plus
+        // the unreleased remainder, so more chunks release more. But the zeroing
+        // pass below is domain-aligned -- it has to be, it is the placing first
+        // touch -- and a chunk spans only (domains / chunks) domains, so at 16
+        // chunks it ran on about 3 of 48 threads. That made the CONSUMING path
+        // slower than the ordinary one, which is backwards: it does strictly
+        // less allocation work.
+        //
+        // Measured, 2048 rows x bs 13, spmm against spmm_inplace:
+        //   16 chunks  0.317 / 0.417   (in-place 1.32x SLOWER)
+        //    8 chunks  0.324 / 0.386
+        //    4 chunks  0.326 / 0.315   (parity, and 3/4 of A still released)
+        //    2 chunks  0.313 / 0.289   (in-place faster, but only half released)
+        // 4 is where in-place stops paying for its own memory saving.
+        //
+        // The real fix is to stop coupling the two granularities: give each
+        // thread its own domain to stream and release (a range release rather
+        // than a prefix release), so every thread is busy and the release is
+        // finer than any chunk count. That is a larger change than a constant.
+        // DERIVED from the thread count, not fitted to one machine. What broke
+        // at 16 chunks was not the number 16 -- it was that a chunk spanned
+        // domains/chunks domains, so the domain-aligned zeroing ran on a
+        // fraction of the threads. That ratio is what has to be held, and on a
+        // machine with a different core count a fixed chunk count gives a
+        // different ratio: 16 chunks starves an 8-thread host completely (half a
+        // domain per chunk) and wastes release granularity on a 128-thread one.
+        const int domain_count = std::max(1, C.bsr_thread_domains().thread_count);
+        constexpr int kMinDomainsPerChunk = 12;   // 4 chunks on the 48-thread host measured
+        constexpr int kMaxChunks = 16;            // memory granularity ceiling
+        const int n_chunks =
+            std::min(kMaxChunks, std::max(1, domain_count / kMinDomainsPerChunk));
+        const int chunk_rows = consume_A == nullptr
+                                   ? std::max(1, n_rows)
+                                   : std::max(1, (n_rows + n_chunks - 1) / n_chunks);
+
+        const double rss_alloc = profile ? profile_rss_gb() : 0.0;
         const auto t_numeric0 = stamp();
 #ifdef VBCSR_BLAS_HAS_BATCH_GEMM
         // The batch calls run inside the OpenMP row loop: one product batch
@@ -746,8 +772,30 @@ private:
                 // alternative and measured WORSE for the triangular case
                 // (1.71x vs 1.96x); dynamic's cost on balanced products is
                 // inside run-to-run noise.
+                // One pass when nothing is being consumed; otherwise enough
+                // chunks that the unreleased tail of A stays small, traded
+                // against the barrier at each chunk edge confining dynamic
+                // balancing to that chunk's rows.
+                for (int chunk_begin = 0; chunk_begin < n_rows; chunk_begin += chunk_rows) {
+                const int chunk_end = std::min(n_rows, chunk_begin + chunk_rows);
+                // The first touch the constructor no longer does. Each domain
+                // clears its own share of this chunk, so the page still lands on
+                // the node whose thread will later apply that row -- the whole
+                // point of the pass this replaces -- while pages beyond the
+                // chunk stay unmapped-in.
+                {
+                    const auto& domains = C.bsr_thread_domains();
+                    #pragma omp for schedule(static)
+                    for (int domain = 0; domain < domains.thread_count; ++domain) {
+                        const int begin = std::max(domains.domain_begin(domain), chunk_begin);
+                        const int end = std::min(domains.domain_end(domain), chunk_end);
+                        if (end > begin) {
+                            C.bsr_zero_row_range(begin, end);
+                        }
+                    }
+                }
                 #pragma omp for schedule(dynamic, 4)
-                for (int row = 0; row < n_rows; ++row) {
+                for (int row = chunk_begin; row < chunk_end; ++row) {
                     const int c_start = sym.c_row_ptr[row];
                     const int c_end = sym.c_row_ptr[row + 1];
                     if (c_start == c_end) {
@@ -856,10 +904,20 @@ private:
                         }
                     }
                 }
+                // Implicit barrier above: every row below chunk_end is done on
+                // every thread, so A's blocks below its row pointer are dead.
+                if (consume_A != nullptr) {
+                    #pragma omp single
+                    {
+                        consume_A->release_value_blocks_before(A.row_ptr()[chunk_end]);
+                    }
+                }
+                }
             }
         });
 
         const auto t_numeric = stamp();
+        const double rss_numeric = profile ? profile_rss_gb() : 0.0;
         C.filter_blocks(threshold);
 
         if (profile) {
@@ -873,6 +931,12 @@ private:
                       << " filter=" << seconds(t_numeric, stamp())
                       << " batch=" << (batch_active ? 1 : 0)
                       << " upper_only=" << (upper_only ? 1 : 0)
+                      << " | rssGB in=" << rss0
+                      << " symbolic=" << rss_symbolic
+                      << " fetch=" << rss_fetch
+                      << " alloc=" << rss_alloc
+                      << " numeric=" << rss_numeric
+                      << " filter=" << profile_rss_gb()
                       << std::endl;
         }
         return C;

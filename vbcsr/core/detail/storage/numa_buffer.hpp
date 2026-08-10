@@ -23,10 +23,22 @@ namespace detail {
 // Heap-recycled memory keeps whatever NUMA placement its previous owner's
 // writes gave it, which silently defeats first-touch placement (caught by
 // test_numa_locality). Anonymous mmap pages are guaranteed untouched, so the
-// thread that zero-fills a range is always the first toucher. Non-trivial T
-// (std::complex: array-new zero-writes on the allocating thread) and
-// non-Linux keep plain new[]; buffers below kFreshMmapMinBytes stay on the
-// heap (cache-resident anyway; the mmap round-trip would not pay off).
+// thread that zero-fills a range is always the first toucher. Non-Linux keeps
+// plain new[]; buffers below kFreshMmapMinBytes stay on the heap
+// (cache-resident anyway; the mmap round-trip would not pay off).
+//
+// The trait is trivially COPYABLE, not trivially default-constructible, and the
+// difference decides whether std::complex gets these pages at all: complex has
+// a user-provided default constructor, so it fails the stricter trait and used
+// to land on new[] -- where array-new runs that constructor over every element
+// and touches the whole buffer on the allocating thread. On a complex SpGEMM
+// result that is a full pass over tens of GB, resident before a single value is
+// computed, which is exactly what a paged store exists to avoid. Anonymous
+// mmap is kernel-zeroed, and all-zero bytes ARE complex's default-constructed
+// value, so nothing observes a difference except the page that never faults in.
+//
+// Trivially destructible is still required: these buffers are freed wholesale
+// without running element destructors.
 inline constexpr size_t kFreshMmapMinBytes = 256u * 1024u;
 
 template <typename T>
@@ -55,7 +67,7 @@ inline FreshBufferOwner<T> allocate_fresh_buffer(size_t count) {
         return FreshBufferOwner<T>(nullptr, FreshBufferDeleter<T>{});
     }
 #ifdef __linux__
-    if constexpr (std::is_trivially_default_constructible_v<T> &&
+    if constexpr (std::is_trivially_copyable_v<T> &&
                   std::is_trivially_destructible_v<T>) {
         const size_t bytes = count * sizeof(T);
         if (bytes >= kFreshMmapMinBytes) {

@@ -22,6 +22,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <algorithm>
 #include <cstdio>
 #include <set>
 #include <vector>
@@ -193,6 +194,20 @@ bool check_locality(const char* label, BlockSpMat<double>& mat, bool adjacency =
 
 } // namespace
 
+
+// Drop the smallest quarter of the blocks, whatever the random fill produced.
+// A fixed threshold cannot be used here: it either drops nothing (and
+// filter_blocks early-returns without copying, so the path under test never
+// runs) or drops so much that the result is too small to sample.
+template <typename M>
+void filter_lowest_quartile(M& m) {
+    std::vector<double> norms = m.get_block_norms();
+    if (norms.size() < 8) return;
+    std::vector<double> sorted(norms);
+    std::sort(sorted.begin(), sorted.end());
+    m.filter_blocks(sorted[sorted.size() / 4]);
+}
+
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
     int exercised = 0;
@@ -254,6 +269,12 @@ int main(int argc, char** argv) {
                 mat.fill_random();
                 BlockSpMat<double> product = mat.spmm(mat, 0.0);
                 exercised += check_locality("csr spgemm result", product);
+                // filter_blocks builds its result through
+                // make_overwritten_result and first-touches it in
+                // copy_kept_blocks -- a separate path from the SpGEMM above,
+                // and the one measured as the peak of a Newton-Schulz step.
+                filter_lowest_quartile(product);
+                exercised += check_locality("csr filtered result", product);
                 exercised += check_locality("csr spgemm result adj_ind", product, /*adjacency=*/true);
             }
             {
@@ -265,6 +286,12 @@ int main(int argc, char** argv) {
                 mat.fill_random();
                 BlockSpMat<double> product = mat.spmm(mat, 0.0);
                 exercised += check_locality("bsr spgemm result", product);
+                // filter_blocks builds its result through
+                // make_overwritten_result and first-touches it in
+                // copy_kept_blocks -- a separate path from the SpGEMM above,
+                // and the one measured as the peak of a Newton-Schulz step.
+                filter_lowest_quartile(product);
+                exercised += check_locality("bsr filtered result", product);
             }
             {
                 const int n_rows = 3000;  // vbcsr mixed: C ~ 150 MiB
@@ -278,6 +305,12 @@ int main(int argc, char** argv) {
                 mat.fill_random();
                 BlockSpMat<double> product = mat.spmm(mat, 0.0);
                 exercised += check_locality("vbcsr spgemm result", product);
+                // filter_blocks builds its result through
+                // make_overwritten_result and first-touches it in
+                // copy_kept_blocks -- a separate path from the SpGEMM above,
+                // and the one measured as the peak of a Newton-Schulz step.
+                filter_lowest_quartile(product);
+                exercised += check_locality("vbcsr filtered result", product);
             }
         }
     }

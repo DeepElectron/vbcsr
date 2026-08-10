@@ -10,6 +10,11 @@
 #include <type_traits>
 #include <vector>
 
+#ifdef __linux__
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 #include "numa_buffer.hpp"
 
 namespace vbcsr::detail {
@@ -75,21 +80,37 @@ public:
     void clear() {
         pages_.clear();
         size_ = 0;
+        released_prefix_ = false;
+        released_through_ = 0;
     }
 
     // Standard reserve semantics: capacity beyond size() is not observable,
     // so the new pages are not zero-filled (resize() zero-fills the live
     // range on growth itself).
     void reserve(uint64_t element_capacity) {
+        assert_growable("reserve");
         ensure_capacity_uninitialized(element_capacity);
     }
 
     void resize(uint64_t element_count) {
+        assert_growable("resize");
+        const uint64_t old_capacity = capacity();
         if (element_count > capacity()) {
             ensure_capacity(element_count);
         }
         if (element_count > size_) {
-            zero_fill_range(size_, element_count);
+            // Only the part of the new range that lands in pages which ALREADY
+            // existed can hold stale values. Pages appended just now are zero
+            // on arrival -- anonymous mmap is kernel-zeroed, and the heap path
+            // fills on append -- so clearing them again is a second full pass
+            // over the whole buffer, and worse, it faults in every page of an
+            // allocation whose entire point was to stay untouched until
+            // written. On a matrix grown from empty this was zeroing tens of
+            // GB twice before a single value existed.
+            const uint64_t stale_end = std::min(element_count, old_capacity);
+            if (stale_end > size_) {
+                zero_fill_range(size_, stale_end);
+            }
         }
         size_ = element_count;
         refresh_page_usage();
@@ -181,9 +202,99 @@ public:
     }
 
 private:
+    // Frees every page lying entirely below `element_index`, and returns the
+    // bytes handed back. The page SLOTS stay, so every element index above the
+    // boundary keeps its address; only the storage under the released prefix
+    // goes away. Reading a released element is a programming error, not a
+    // resize -- there is no way to detect it cheaply, so this is private and
+    // reachable only from a backend that owns the traversal order.
+    //
+    // This is what lets an in-place product shrink its input as it consumes it:
+    // pages are independent allocations, and on the mmap path the release is a
+    // munmap, so resident memory actually drops instead of returning to an
+    // allocator free list where it would still count against the job.
+    uint64_t release_pages_before(uint64_t element_index) {
+        if (element_index > size_) {
+            element_index = size_;
+        }
+        if (element_index == 0) {
+            return 0;
+        }
+        uint64_t freed_bytes = 0;
+#ifdef __linux__
+        // MADV_DONTNEED, not munmap, and it works on the OS page rather than
+        // this buffer's page. That distinction is the whole reason this
+        // function does anything: a store sizes its pages to hold the entire
+        // matrix where it can -- BSR's cap is UINT32_MAX/block_values, some 25
+        // million 13x13 blocks -- so "free the pages lying entirely below the
+        // boundary" frees nothing at all until the last one, which is too late
+        // to be worth doing. Advising the aligned prefix hands back physical
+        // memory at 4 KB granularity while the mapping and every pointer into
+        // it stay exactly as they were.
+        //
+        // Only anonymous mmap pages qualify. On the heap path there is no way
+        // to return part of an allocation, so nothing happens and the caller
+        // simply keeps the memory -- correct, just not smaller.
+        const long os_page = ::sysconf(_SC_PAGESIZE);
+        if (os_page <= 0) return 0;
+        const uintptr_t mask = static_cast<uintptr_t>(os_page) - 1;
+        // Only the NEWLY dead range. A consuming product calls this once per
+        // chunk with a growing boundary, and starting from page 0 every time
+        // re-advised every previously released page -- quadratic syscall work
+        // over memory that was already gone, and it reported those bytes as
+        // freed again.
+        if (element_index <= released_through_) return 0;
+        uint64_t consumed = 0;
+        for (uint32_t page = 0; page < pages_.size() && consumed < element_index; ++page) {
+            const uint64_t page_begin = consumed;
+            const uint64_t page_end = consumed + elements_per_page_;
+            consumed = page_end;
+            const uint64_t lo = std::max<uint64_t>(released_through_, page_begin);
+            const uint64_t hi = std::min<uint64_t>(element_index, page_end);
+            if (lo >= hi) continue;
+            Page& storage_page = pages_[page];
+            if (storage_page.data && storage_page.data.get_deleter().mmap_bytes != 0) {
+                const uintptr_t base =
+                    reinterpret_cast<uintptr_t>(storage_page.data.get());
+                const uintptr_t begin = base + static_cast<size_t>(lo - page_begin) * sizeof(T);
+                const uintptr_t end = base + static_cast<size_t>(hi - page_begin) * sizeof(T);
+                const uintptr_t aligned_begin = (begin + mask) & ~mask;
+                const uintptr_t aligned_end = end & ~mask;
+                if (aligned_end > aligned_begin) {
+                    ::madvise(reinterpret_cast<void*>(aligned_begin),
+                              static_cast<size_t>(aligned_end - aligned_begin),
+                              MADV_DONTNEED);
+                    freed_bytes += aligned_end - aligned_begin;
+                }
+            }
+        }
+        released_through_ = element_index;
+#else
+        (void)element_index;
+#endif
+        released_prefix_ = true;
+        return freed_bytes;
+    }
+
+    // A buffer with released pages still REPORTS the capacity of the slots it
+    // kept, and the mapping is still there (MADV_DONTNEED keeps it; only the
+    // physical pages go), so a later grow would write into memory whose
+    // contents have silently reverted to zero-fill
+    // somewhere unrelated. Growing one is always a bug -- release is for
+    // storage about to be dropped -- so say that here rather than let it
+    // become a crash in whatever touched it next.
+    void assert_growable(const char* what) const {
+        if (released_prefix_) {
+            throw std::logic_error(
+                std::string("PagedBuffer::") + what +
+                ": pages were released from this buffer; it can only be cleared or destroyed");
+        }
+    }
+
     // Deliberately private: this is only for backend code paths that prove every
     // element is overwritten before the buffer can be observed by matrix code.
     void resize_uninitialized(uint64_t element_count) {
+        assert_growable("resize_uninitialized");
         if (element_count > capacity()) {
             ensure_capacity_uninitialized(element_count);
         }
@@ -250,10 +361,20 @@ private:
         }
     }
 
+    // Guarantees a zeroed page, and skips the write when the allocator already
+    // guaranteed it. An anonymous mmap is kernel-zeroed by definition, so the
+    // fill would only serve to fault in every page of a buffer that may never
+    // be fully written. The heap path still needs it: `new T[n]` DEFAULT-
+    // initializes, which leaves arithmetic types indeterminate (class types
+    // like std::complex do run their constructor, but this has to be right for
+    // both).
     void append_page() {
         Page storage_page;
         storage_page.data = allocate_fresh_buffer<T>(elements_per_page_);
-        std::fill(storage_page.data.get(), storage_page.data.get() + elements_per_page_, T(0));
+        if (storage_page.data.get_deleter().mmap_bytes == 0) {
+            std::fill(storage_page.data.get(),
+                      storage_page.data.get() + elements_per_page_, T(0));
+        }
         pages_.push_back(std::move(storage_page));
     }
 
@@ -334,6 +455,14 @@ private:
 
     uint64_t size_ = 0;
     uint32_t elements_per_page_ = 1;
+    // Set once any page has been handed back: capacity() still counts the slot,
+    // so growing afterwards would write into a range whose contents were
+    // silently discarded. The mapping survives -- MADV_DONTNEED, not munmap --
+    // which is exactly why the guard is needed: nothing faults to announce it.
+    bool released_prefix_ = false;
+    // Elements already handed back, so a repeated call advises only what is
+    // newly dead rather than the whole prefix again.
+    uint64_t released_through_ = 0;
     std::vector<Page> pages_;
 };
 

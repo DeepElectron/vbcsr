@@ -55,6 +55,14 @@ struct CSRSpMMExecutor {
         return run_generic(A, B, threshold, upper_only);
     }
 
+    // A <- A B, releasing A's value pages as the numeric phase consumes them.
+    // Always the generic path: the vendor route computes the whole product from
+    // a handle over A's storage, so there is no point at which a prefix of it
+    // is provably dead.
+    static Matrix run_consuming(Matrix& A, const Matrix& B, double threshold) {
+        return run_generic(A, B, threshold, /*upper_only=*/false, /*consume_A=*/&A);
+    }
+
 private:
     static Matrix make_empty_like_product(const Matrix& A) {
         const int n_rows = static_cast<int>(A.row_ptr().size()) - 1;
@@ -1180,8 +1188,17 @@ private:
     // eligible runs (thresholded or not) take run_fused_distributed above,
     // whose thresholding matches the serial MKL path (exact product, then
     // drop |value| < threshold), so results agree across rank counts.
+    // `consume_A`, when set, must alias A: the caller is doing A <- A B and has
+    // given up A, so each chunk of A's value pages is handed back as soon as the
+    // rows that read them are accumulated. Row i of A is read only while
+    // accumulating result row i (the loop below walks A.row_ptr()[row] to
+    // [row+1] and reaches B for everything else), so once a chunk of rows is
+    // done, A's blocks below that row boundary are dead. The ghost exchange has
+    // already completed by then, so nothing another rank still needs is
+    // released. With consume_A null the chunk loop runs once and this is the
+    // non-consuming path unchanged.
     static Matrix run_generic(const Matrix& A, const Matrix& B, double threshold,
-                              bool upper_only = false) {
+                              bool upper_only = false, Matrix* consume_A = nullptr) {
         const bool profile = std::getenv("VBCSR_PROFILE_CSR_DIST_SPGEMM") != nullptr;
         auto stamp = [] { return std::chrono::steady_clock::now(); };
         const auto t0 = stamp();
@@ -1260,11 +1277,21 @@ private:
             std::vector<int> touched;
             uint32_t tag = 0;
 
+            // One chunk unless A is being consumed, in which case the row range
+            // is split so pages can be handed back as the loop passes them.
+            const int n_chunks = (consume_A == nullptr || n_rows <= 0) ? 1
+                               : std::min(16, n_rows);
+            for (int chunk = 0; chunk < n_chunks; ++chunk) {
+            const int chunk_begin = static_cast<int>(
+                static_cast<long long>(n_rows) * chunk / n_chunks);
+            const int chunk_end = static_cast<int>(
+                static_cast<long long>(n_rows) * (chunk + 1) / n_chunks);
+
             // Dynamic for the same reason as the block executors: upper_only
             // makes the per-row work triangular, and static scheduling then
             // stalls the whole product on the thread holding the early rows.
             #pragma omp for schedule(dynamic, 16)
-            for (int row = 0; row < n_rows; ++row) {
+            for (int row = chunk_begin; row < chunk_end; ++row) {
                 ++tag;
                 if (tag == 0) {
                     for (auto& entry : table) {
@@ -1348,6 +1375,18 @@ private:
                                          table[static_cast<size_t>(slot)].value);
                 }
             }
+            // The omp for above ends on an implicit barrier, so every row of
+            // this chunk is accumulated before anything is handed back. single
+            // carries its own barrier, so no thread enters the next chunk while
+            // the release is in flight. CSR stores one value per block, so the
+            // block boundary IS the element boundary release_blocks_before wants.
+            if (consume_A != nullptr) {
+                #pragma omp single
+                {
+                    consume_A->release_value_blocks_before(A.row_ptr()[chunk_end]);
+                }
+            }
+            }  // chunk
         }
 
         const auto t_accum = stamp();
@@ -1365,10 +1404,14 @@ private:
 
         DistGraph* c_graph = construct_result_graph(A, adjacency, ghost_blocks.sizes, "spmm");
         const auto t_graph = stamp();
-        Matrix C(c_graph);
-        C.owns_graph = true;
-        C.graph->enable_matrix_lifetime_management();
-        C.set_page_size(A.configured_page_size());
+        // Allocated without the first-touch zero pass: the copy-out below writes
+        // EVERY block of every row (it builds this graph's adjacency from
+        // row_entries, so a row with no entries has no slots, and it throws on
+        // any row whose widths disagree), so the pass would only make the whole
+        // result resident before a value existed. Its schedule(static) row split
+        // is what does the first touch instead, which is the same contiguous
+        // partition the pass would have used.
+        Matrix C = Matrix::make_overwritten_result(c_graph, A.configured_page_size());
         const auto t_alloc = stamp();
 
         // Place the accumulated values into the result's blocks. The mapping is
