@@ -152,6 +152,44 @@ struct RARhExecutor {
 
     // Every block of the rows named in `patterns`, as the payload exchange
     // wants them.
+    // Per-rank ceiling on halo PAYLOAD residency, which sets the tile count in
+    // run_distributed. Deliberately a byte budget rather than a row or tile
+    // count: what has to be bounded is memory, and a fixed row count bounds it
+    // only for one particular sparsity and one particular partition -- the
+    // pathological case this exists for is precisely the one where a few rows
+    // reach a large part of the matrix.
+    //
+    // 2 GiB default: small enough that a rank cannot accumulate a copy of the
+    // operands, large enough that ordinary problems stay single-tile and pay
+    // nothing. VBCSR_RARH_HALO_BUDGET_BYTES overrides it -- a deployment knob, not
+    // a benchmark one, since the right ceiling is a property of the machine the
+    // job lands on. Read per call (once per distributed triple product, which
+    // is two collective rounds and a numeric phase) so it is also settable from
+    // a test: the tiled and untiled paths must agree exactly, and without this
+    // no unit-sized problem would ever take the tiled path.
+    static size_t halo_budget_bytes() {
+        // Bytes, not megabytes, so a test can set a budget below any
+        // unit-sized problem's halo and actually reach the tiled path.
+        const char* env = std::getenv("VBCSR_RARH_HALO_BUDGET_BYTES");
+        if (env != nullptr) {
+            const long long bytes = std::atoll(env);
+            if (bytes > 0) return static_cast<size_t>(bytes);
+        }
+        return size_t(2) << 30;
+    }
+
+    // The subset of `meta` for the given rows. Patterns are held globally (they
+    // are metadata and cheap); this is what narrows a tile's payload request.
+    static GhostMetadata restrict_metadata(const GhostMetadata& meta,
+                                           const std::set<int>& rows) {
+        GhostMetadata subset;
+        for (int row : rows) {
+            auto it = meta.find(row);
+            if (it != meta.end()) subset.emplace(it->first, it->second);
+        }
+        return subset;
+    }
+
     static std::vector<BlockID> blocks_of(const GhostMetadata& patterns) {
         std::vector<BlockID> blocks;
         for (const auto& row : patterns) {
@@ -174,7 +212,8 @@ struct RARhExecutor {
                            double a_max_norm,
                            std::vector<std::vector<int>>& row_columns,
                            std::vector<std::vector<T>>& row_values,
-                           int& bad_operand) {
+                           int& bad_operand,
+                           int row_begin = 0, int row_end = -1) {
         const DistGraph& ga = *A.graph;
         const DistGraph& gb = *B.graph;
         const int n_rows = static_cast<int>(ga.adj_ptr.size()) - 1;
@@ -245,7 +284,7 @@ struct RARhExecutor {
             };
 
             #pragma omp for schedule(dynamic, 8)
-            for (int i = 0; i < n_rows; ++i) {
+            for (int i = row_begin; i < (row_end < 0 ? n_rows : row_end); ++i) {
                 const int g_row = ga.get_global_index(i);
                 const int r_dim = ga.block_sizes[i];
                 inner.clear();
@@ -573,24 +612,113 @@ struct RARhExecutor {
         }
         GhostMetadata meta_a = fetch_row_patterns(A, need_a, ga.comm, ga.size, rank);
 
-        // ---- Payloads for both rounds.
-        auto ghosts_b = build_spmm_ghost_blocks<T>(
-            meta_b, fetch_required_block_payloads(B, blocks_of(meta_b)));
-        auto ghosts_a = build_spmm_ghost_blocks<T>(
-            meta_a, fetch_required_block_payloads(A, blocks_of(meta_a)));
+        // ---- Payloads, in TILES of local rows.
+        //
+        // The two rounds above stay global because they move PATTERNS, which
+        // are metadata: a column index, two dims and a norm, against a block of
+        // r*c scalars. At LCAO sizes that is ~16 bytes versus ~2704, so the
+        // pattern of the whole halo costs a fraction of one tile's payload and
+        // is worth having in hand.
+        //
+        // The PAYLOADS are the scalability problem this tiling exists for.
+        // Fetched for every locally owned row at once, a rank holds the union
+        // of every remote row its rows reach -- and with an unfavourable
+        // partition or wide support that approaches a full copy of A and B on
+        // every rank, which is the largest single obstacle to 700k atoms.
+        // Fetched a tile at a time, residency is bounded by the tile instead,
+        // and the metadata already in hand gives the exact byte cost of a tile
+        // before anything is transferred.
+        //
+        // Tile count is agreed across ranks: these fetches are collective, so
+        // every rank must make the same number of calls even where its own
+        // share of rows ran out and its request is empty.
+        // Metadata carries a column and a norm, not dimensions, so this is an
+        // UPPER bound: block count times the largest block dimension squared.
+        // Exact for BSR (one block size), conservative for VBCSR -- which errs
+        // toward more tiles, the safe direction for a memory ceiling.
+        int max_dim = 1;
+        for (int d : ga.block_sizes) max_dim = std::max(max_dim, d);
+        for (int d : gb.block_sizes) max_dim = std::max(max_dim, d);
+        const size_t bytes_per_block =
+            static_cast<size_t>(max_dim) * static_cast<size_t>(max_dim) * sizeof(T);
+        auto payload_bytes_of = [&](const GhostMetadata& meta) {
+            size_t blocks = 0;
+            for (const auto& row : meta) blocks += row.second.size();
+            return blocks * bytes_per_block;
+        };
+        const size_t halo_bytes = payload_bytes_of(meta_a) + payload_bytes_of(meta_b);
+        int local_tiles = 1;
+        const size_t budget = halo_budget_bytes();
+        if (halo_bytes > budget && n_rows > 1) {
+            const size_t want = (halo_bytes + budget - 1) / budget;
+            local_tiles = static_cast<int>(std::min<size_t>(want, static_cast<size_t>(n_rows)));
+        }
+        int n_tiles = local_tiles;
+        MPI_Allreduce(&local_tiles, &n_tiles, 1, MPI_INT, MPI_MAX, ga.comm);
+        const int tile_rows = std::max(1, (n_rows + n_tiles - 1) / std::max(1, n_tiles));
 
-        RemoteRows remote_b, remote_a;
-        remote_b.build(ghosts_b, meta_b, n_global);
-        remote_a.build(ghosts_a, meta_a, n_global);
-
-        const double rss_ghosts = profile ? profile_rss_gb() : 0.0;
         std::vector<std::vector<int>> row_columns(n_rows);
         std::vector<std::vector<T>> row_values(n_rows);
         int bad_operand = 0;
-        fused_rows(A, B, threshold, remote_a, remote_b,
-                   row_of_global(A, n_global), row_of_global(B, n_global),
-                   n_global, A.get_block_norms(), B.get_block_norms(),
-                   global_max_norm(A), row_columns, row_values, bad_operand);
+        GhostSizes ghost_sizes;
+        double rss_ghosts = rss_in;
+
+        const std::vector<int> a_row_map = row_of_global(A, n_global);
+        const std::vector<int> b_row_map = row_of_global(B, n_global);
+
+        for (int tile = 0; tile < n_tiles; ++tile) {
+            const int lo = std::min(n_rows, tile * tile_rows);
+            const int hi = std::min(n_rows, lo + tile_rows);
+
+            // Which remote rows THIS tile reaches -- the same derivation as the
+            // rounds above, restricted to the tile's rows.
+            std::set<int> tile_b, tile_support;
+            for (int i = lo; i < hi; ++i) {
+                for (int k = ga.adj_ptr[i]; k < ga.adj_ptr[i + 1]; ++k) {
+                    const int g_mid = ga.get_global_index(ga.adj_ind[k]);
+                    if (gb.find_owner(g_mid) != rank) tile_b.insert(g_mid);
+                    auto local = gb.global_to_local.find(g_mid);
+                    if (local != gb.global_to_local.end() &&
+                        local->second < static_cast<int>(gb.adj_ptr.size()) - 1) {
+                        const int lb = local->second;
+                        for (int e = gb.adj_ptr[lb]; e < gb.adj_ptr[lb + 1]; ++e) {
+                            tile_support.insert(gb.get_global_index(gb.adj_ind[e]));
+                        }
+                        continue;
+                    }
+                    auto pattern = meta_b.find(g_mid);
+                    if (pattern == meta_b.end()) continue;
+                    for (const auto& m : pattern->second) tile_support.insert(m.col);
+                }
+            }
+            std::set<int> tile_a;
+            for (int g : tile_support) {
+                if (ga.find_owner(g) != rank) tile_a.insert(g);
+            }
+
+            const GhostMetadata sub_b = restrict_metadata(meta_b, tile_b);
+            const GhostMetadata sub_a = restrict_metadata(meta_a, tile_a);
+
+            auto ghosts_b = build_spmm_ghost_blocks<T>(
+                sub_b, fetch_required_block_payloads(B, blocks_of(sub_b)));
+            auto ghosts_a = build_spmm_ghost_blocks<T>(
+                sub_a, fetch_required_block_payloads(A, blocks_of(sub_a)));
+
+            RemoteRows remote_b, remote_a;
+            remote_b.build(ghosts_b, sub_b, n_global);
+            remote_a.build(ghosts_a, sub_a, n_global);
+            if (profile) rss_ghosts = std::max(rss_ghosts, profile_rss_gb());
+
+            fused_rows(A, B, threshold, remote_a, remote_b, a_row_map, b_row_map,
+                       n_global, A.get_block_norms(), B.get_block_norms(),
+                       global_max_norm(A), row_columns, row_values, bad_operand,
+                       lo, hi);
+
+            // Result column dims come from A's rows, so they accumulate across
+            // tiles even though the payloads do not.
+            for (const auto& entry : ghosts_a.sizes) ghost_sizes.insert(entry);
+        }
+
         int any_bad = bad_operand;
         MPI_Allreduce(&bad_operand, &any_bad, 1, MPI_INT, MPI_MAX, ga.comm);
         if (any_bad) {
@@ -602,7 +730,6 @@ struct RARhExecutor {
         // Result columns come from A's rows: those of the fetched rows are in
         // ghosts_a.sizes, those of A's own rows are its graph's ghosts.
         const double rss_numeric = profile ? profile_rss_gb() : 0.0;
-        GhostSizes ghost_sizes = ghosts_a.sizes;
         const int n_owned = static_cast<int>(ga.owned_global_indices.size());
         for (size_t g = 0; g < ga.ghost_global_indices.size(); ++g) {
             ghost_sizes[ga.ghost_global_indices[g]] =
