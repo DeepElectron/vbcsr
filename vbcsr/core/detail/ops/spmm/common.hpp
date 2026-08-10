@@ -52,29 +52,51 @@ inline double profile_rss_gb() {
 // ---------------------------------------------------------------------------
 // Block-product dispatch, shared by every SpGEMM-shaped kernel here.
 //
-// ONE policy, in one place, because the choice is a property of the machine and
-// the block size rather than of any executor: below the crossover the vendor's
-// fixed per-call cost is not amortised by a bs^3 product and the row-major
-// intrinsic kernel wins; above it the vendor's throughput takes over.
-// Measured (benchmark_spgemm, complex, dense):
+// ONE policy, in one place, because the choice is a property of the machine,
+// the scalar type and the block size rather than of any executor: below the
+// crossover the vendor's fixed per-call cost is not amortised by the flops in
+// the call and the row-major intrinsic kernel wins; above it the vendor's
+// throughput takes over.
 //
-//     bs  5   0.50x        bs 13   0.76-1.04x        bs 26   1.22-1.30x
+// The threshold is PER SCALAR TYPE, which is what that amortisation argument
+// predicts -- a complex block product carries about four times the flops of a
+// real one at the same block size, so the two cross over in different places.
+// End-to-end spmm on identical operands, batch forced off vs on, min of 9 runs,
+// ratio = vendor / intrinsic, so below 1 the vendor wins:
 //
-// so the switch sits at bs >= 16. VBCSR_SPGEMM_BATCH=1/0 forces it either way,
-// re-read per call so a benchmark can toggle it in-process.
+//   complex<double>   bs 13  1.11   16  1.02   18  1.005  19  0.99   20  1.01
+//                     bs 21  0.92   22  0.93   24  0.94   26  0.90   32  0.84
+//   double            bs 13  1.89   16  1.57   20  1.23   22  1.13   26  1.00
+//                     bs 32  1.13   40  1.10   48  1.00   64  1.08   96  1.05
+//
+// Complex crosses at bs 21 and the win grows with the block. Real NEVER crosses
+// -- out to bs 96 the vendor batch is at best a wash -- so it stays off, and
+// that is a measurement rather than an omission.
+//
+// Err HIGH when re-deriving this elsewhere: the two directions are not
+// symmetric. Below the crossover the penalty runs to 2.2x, above it the gain
+// tops out near 1.2x, so a threshold set too low costs far more than one set
+// too high. VBCSR_SPGEMM_BATCH=1/0 forces it either way, which is how the
+// table above is reproduced on a new machine.
+template <typename T>
 inline bool vendor_batch_profitable(int block_size) {
 #ifdef VBCSR_BLAS_HAS_BATCH_GEMM
     // Resolved ONCE. This sits under grouped_block_gemm_batch, which runs per
     // group flush in the innermost contraction of every fused kernel, and a
     // getenv there is a locked lookup through the whole environment on every
-    // block group.
+    // block group. The cost of that is a process-lifetime override: a benchmark
+    // toggles it by re-running, not in-process.
     static const int override_value = [] {
         const char* env = std::getenv("VBCSR_SPGEMM_BATCH");
         if (env == nullptr) return -1;
         return std::strcmp(env, "1") == 0 ? 1 : 0;
     }();
     if (override_value >= 0) return override_value == 1;
-    return block_size >= 16;
+    if constexpr (std::is_same_v<T, std::complex<double>>) {
+        return block_size >= 21;
+    }
+    (void)block_size;
+    return false;
 #else
     (void)block_size;
     return false;
@@ -101,7 +123,7 @@ bool grouped_block_gemm_batch(int bs, const T* a_block,
         const size_t n = b_blocks.size();
         // Below a handful of products the call setup outweighs the gain.
         constexpr size_t kMinBatch = 4;
-        if (n < kMinBatch || !vendor_batch_profitable(bs)) return false;
+        if (n < kMinBatch || !vendor_batch_profitable<T>(bs)) return false;
         thread_local std::vector<const T*> a_ptrs;
         a_ptrs.assign(n, a_block);
         const int trans[1] = {111 /*CblasNoTrans*/};

@@ -39,13 +39,14 @@ template <typename Matrix>
 struct BSRSpMMExecutor {
     using T = typename Matrix::value_type;
 
-    // Vendor batch GEMM in the numeric phase, dispatched on block size the way
-    // every kernel choice here is. The policy and the measurements behind it
-    // live in common.hpp's vendor_batch_profitable, shared with the fused
-    // triple product, because the crossover is a property of the machine and
-    // the block size and two copies of it would drift.
+    // Vendor batch GEMM in the numeric phase, dispatched on scalar type and
+    // block size the way every kernel choice here is. The policy and the
+    // measurements behind it live in common.hpp's vendor_batch_profitable,
+    // shared with the fused triple product, because the crossover is a property
+    // of the machine, the scalar type and the block size, and two copies of it
+    // would drift.
     static bool spgemm_batch_enabled(int block_size) {
-        return vendor_batch_profitable(block_size);
+        return vendor_batch_profitable<T>(block_size);
     }
 
     // All of one inner index's surviving products in one grouped vendor call:

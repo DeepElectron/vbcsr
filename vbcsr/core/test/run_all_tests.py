@@ -15,6 +15,7 @@ MAINTAINED_TESTS = [
     "test_migration_contract.cpp",
     "test_numeric_reference.cpp",
     "test_pb_csr.cpp",
+    "test_vendor_batch_gemm.cpp",
 ]
 
 LEGACY_TESTS = [
