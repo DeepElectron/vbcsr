@@ -24,6 +24,10 @@
 //     or more exercise run_distributed, where the columns a row reaches come
 //     back from two rounds of exchange and the order they arrive in has nothing
 //     to do with the order the result needs.
+//   * Every check run TWICE above one rank: once over a balanced partition, and
+//     once over one that leaves half the ranks owning no rows at all. The
+//     starved shape is what any run with more ranks than block rows produces,
+//     and it used to hang the job outright.
 //
 // Operand values come from a hash of (block, entry) rather than from a
 // generator, so every rank derives the same matrix for the blocks it owns
@@ -133,56 +137,75 @@ double max_abs_diff(const std::vector<T>& x, const std::vector<T>& y) {
     return worst;
 }
 
-}  // namespace
+// Block sizes chosen so no two neighbours are equal: a block written to the
+// wrong column is then also the wrong shape.
+const std::vector<int>& block_sizes() {
+    static const std::vector<int> sizes = {2, 3, 1, 4, 2, 3, 1, 2, 3};
+    return sizes;
+}
 
-int main(int argc, char** argv) {
-    MPI_Init(&argc, &argv);
-    int rank = 0, nranks = 1;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &nranks);
+// Symmetric pattern, since both operands must be Hermitian. Each row's columns
+// are listed DESCENDING, so anything relying on the input happening to be
+// sorted fails here.
+const std::vector<std::vector<int>>& adjacency() {
+    static const std::vector<std::vector<int>> adj = [] {
+        std::vector<std::vector<int>> a(kBlocks);
+        auto link = [&](int i, int j) {
+            a[static_cast<size_t>(i)].push_back(j);
+            if (i != j) a[static_cast<size_t>(j)].push_back(i);
+        };
+        for (int i = 0; i < kBlocks; ++i) link(i, i);
+        link(0, 1); link(1, 2); link(2, 3); link(3, 4); link(4, 5);
+        link(5, 6); link(6, 7); link(7, 8); link(0, 4); link(2, 6); link(1, 7);
+        for (auto& row : a) {
+            std::sort(row.begin(), row.end(), std::greater<int>());
+            row.erase(std::unique(row.begin(), row.end()), row.end());
+        }
+        return a;
+    }();
+    return adj;
+}
 
-    // Block sizes chosen so no two neighbours are equal: a block written to the
-    // wrong column is then also the wrong shape.
-    const std::vector<int> sizes = {2, 3, 1, 4, 2, 3, 1, 2, 3};
+// The rows this rank owns, as a contiguous ascending slice.
+//
+// `workers` is how many of the ranks get any rows at all, counted from rank 0;
+// the rest own nothing. workers == nranks spreads the remainder rather than
+// piling it on the low ranks, so no rank is starved by accident. workers <
+// nranks starves the top ranks ON PURPOSE -- see the empty-rank case in main.
+std::vector<int> my_rows(int rank, int nranks, int workers) {
+    if (workers > nranks) workers = nranks;
+    if (workers < 1) workers = 1;
+    if (rank >= workers) return {};
+    const int base = kBlocks / workers;
+    const int extra = kBlocks % workers;
+    const int begin = rank * base + std::min(rank, extra);
+    const int end = begin + base + (rank < extra ? 1 : 0);
+    std::vector<int> rows;
+    for (int i = begin; i < end; ++i) rows.push_back(i);
+    return rows;
+}
+
+// One full pass of the checks over a given partition. Returns the failure count,
+// already agreed across ranks.
+int run_case(const char* label, const std::vector<int>& rows, int rank) {
+    const std::vector<int>& sizes = block_sizes();
+    const std::vector<std::vector<int>>& full_adj = adjacency();
     std::vector<int> offsets(kBlocks + 1, 0);
     for (int i = 0; i < kBlocks; ++i) offsets[i + 1] = offsets[i] + sizes[static_cast<size_t>(i)];
     const int n = offsets[kBlocks];
 
-    // Symmetric pattern, since both operands must be Hermitian.
-    std::vector<std::vector<int>> full_adj(kBlocks);
-    auto link = [&](int i, int j) {
-        full_adj[static_cast<size_t>(i)].push_back(j);
-        if (i != j) full_adj[static_cast<size_t>(j)].push_back(i);
-    };
-    for (int i = 0; i < kBlocks; ++i) link(i, i);
-    link(0, 1); link(1, 2); link(2, 3); link(3, 4); link(4, 5);
-    link(5, 6); link(6, 7); link(7, 8); link(0, 4); link(2, 6); link(1, 7);
-    // DESCENDING, so anything relying on the input happening to be sorted fails.
-    for (auto& row : full_adj) {
-        std::sort(row.begin(), row.end(), std::greater<int>());
-        row.erase(std::unique(row.begin(), row.end()), row.end());
-    }
-
-    // A contiguous slice of the rows per rank, with the remainder spread rather
-    // than piled on the first ranks, so that no rank is left owning nothing at
-    // the rank counts this is usually run at.
-    const int base = kBlocks / nranks;
-    const int extra = kBlocks % nranks;
-    const int begin = rank * base + std::min(rank, extra);
-    const int end = begin + base + (rank < extra ? 1 : 0);
-    std::vector<int> owned, owned_sizes;
+    std::vector<int> owned_sizes;
     std::vector<std::vector<int>> adj;
-    for (int i = begin; i < end; ++i) {
-        owned.push_back(i);
+    for (int i : rows) {
         owned_sizes.push_back(sizes[static_cast<size_t>(i)]);
         adj.push_back(full_adj[static_cast<size_t>(i)]);
     }
 
     DistGraph graph(MPI_COMM_WORLD);
-    graph.construct_distributed(owned, owned_sizes, adj);
+    graph.construct_distributed(rows, owned_sizes, adj);
 
     auto build = [&](BlockSpMat<T>& m, int which) {
-        for (int i = begin; i < end; ++i) {
+        for (int i : rows) {
             for (int j : full_adj[static_cast<size_t>(i)]) {
                 const int r = sizes[static_cast<size_t>(i)];
                 const int c = sizes[static_cast<size_t>(j)];
@@ -210,12 +233,13 @@ int main(int argc, char** argv) {
     int failures = 0;
     const double tol = 1e-11;
     auto report = [&](const char* what, double worst) {
-        if (rank == 0) std::printf("%s: max |diff| = %.3e\n", what, worst);
+        if (rank == 0) std::printf("  %-52s max |diff| = %.3e\n", what, worst);
         if (!(worst < tol)) {
-            if (rank == 0) std::printf("  FAILED\n");
+            if (rank == 0) std::printf("    FAILED\n");
             ++failures;
         }
     };
+    (void)label;
 
     // C = A B A^H, at threshold 0 so every block the pattern allows survives
     // and the comparison is exact rather than up-to-dropped-blocks.
@@ -283,13 +307,52 @@ int main(int argc, char** argv) {
         }
         MPI_Allreduce(MPI_IN_PLACE, &worst, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
         MPI_Allreduce(MPI_IN_PLACE, &kept, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
-        if (rank == 0) std::printf("rarh_upper at threshold %g: %lld blocks kept\n",
-                                   threshold, kept);
         report("rarh_upper at threshold, kept blocks vs dense", worst);
-        if (kept == 0) {
-            if (rank == 0) std::printf("  FAILED: threshold dropped everything\n");
+        // The same blocks must survive however the rows are spread: the
+        // threshold is applied to finished blocks, which no partition changes.
+        if (kept != 43) {
+            if (rank == 0) {
+                std::printf("    FAILED: %lld blocks kept, expected 43\n", kept);
+            }
             ++failures;
         }
+    }
+
+    int any = failures;
+    MPI_Allreduce(MPI_IN_PLACE, &any, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    return any;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
+    int rank = 0, nranks = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &nranks);
+
+    int failures = 0;
+
+    if (rank == 0) std::printf("balanced partition, %d rank(s):\n", nranks);
+    failures += run_case("balanced", my_rows(rank, nranks, nranks), rank);
+
+    // A partition that leaves the top ranks owning NOTHING.
+    //
+    // Not a contrived shape: any run with more ranks than block rows produces
+    // it, and so does an unlucky ParMETIS split. It used to hang the job with
+    // no output and no error -- make_overwritten_result reached
+    // BlockSpMat(DistGraph*) only on a rank whose graph came out empty, and
+    // that constructor settles the matrix kind by MPI_Allreduce, so the starved
+    // rank entered two collectives nobody else did and blocked there forever.
+    //
+    // Half the ranks are starved rather than one, so block_displs carries a run
+    // of repeated entries and find_owner has to resolve an owner across them.
+    if (nranks > 1) {
+        const int workers = std::max(1, nranks / 2);
+        if (rank == 0) {
+            std::printf("starved partition, %d rank(s), %d owning rows:\n", nranks, workers);
+        }
+        failures += run_case("starved", my_rows(rank, nranks, workers), rank);
     }
 
     int any = failures;

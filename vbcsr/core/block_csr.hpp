@@ -472,6 +472,16 @@ public:
     // Every BlockSpMat registers with its graph, even when the graph remains
     // user-owned. Matrix-owned result graphs are promoted to delete-on-last
     // release; externally owned graphs are only reference-counted.
+    //
+    // COLLECTIVE on the graph's communicator: it settles the matrix kind by
+    // detect_matrix_kind, which Allreduces the block-size extremes because a
+    // rank cannot decide CSR/BSR/VBCSR from its own slice -- and a rank owning
+    // nothing has no evidence at all. So this constructor must be reached by
+    // every rank of the graph the same number of times. Constructing INSIDE a
+    // branch that depends on local structure is therefore a deadlock, not a
+    // style question; where the kind is already known, use the private
+    // (graph, kind, owns, ConstructionToken) constructor instead, which
+    // communicates nothing. make_overwritten_result has the worked example.
     BlockSpMat(DistGraph* g)
         : BlockSpMat(
               require_live_graph(g, "BlockSpMat"),
@@ -1654,9 +1664,22 @@ public:
     static BlockSpMat make_overwritten_result(DistGraph* new_graph, uint32_t page_size) {
         const MatrixKind kind = detect_matrix_kind(new_graph);
         if (new_graph->block_sizes.empty()) {
-            BlockSpMat result(new_graph);
-            result.owns_graph = true;
-            result.graph->enable_matrix_lifetime_management();
+            // The SAME constructor the populated path below uses, and not
+            // `BlockSpMat(new_graph)`, because that one calls
+            // detect_matrix_kind itself -- and detect_matrix_kind is
+            // COLLECTIVE.
+            //
+            // A rank whose graph has no blocks is exactly the rank that takes
+            // this branch and nobody else does, so calling it here entered two
+            // more MPI_Allreduce than every other rank made. That rank then
+            // blocked in an Allreduce the others had already left, and the job
+            // hung with no output and no error. Reached whenever a partition
+            // leaves a rank with no rows -- more ranks than blocks always does
+            // it, and so does any unlucky ParMETIS split.
+            std::unique_ptr<DistGraph> guard(new_graph);
+            BlockSpMat result(guard.get(), kind, true, ConstructionToken{});
+            guard.release();
+            result.allocate_from_graph();
             result.set_page_size(page_size);
             return result;
         }
@@ -2663,6 +2686,11 @@ void BlockSpMat<T>::rebuild_backend_for_page_size(const char* op_name) {
     }
 }
 
+// COLLECTIVE on g->comm. The kind is a property of the WHOLE matrix -- one
+// rank's rows being uniformly sized says nothing about anybody else's, and a
+// rank owning no rows has nothing to go on -- so the extremes are reduced and
+// every rank must reach this the same number of times. Callers that already
+// know the kind must not call it again; see the note on BlockSpMat(DistGraph*).
 template <typename T>
 MatrixKind BlockSpMat<T>::detect_matrix_kind(const DistGraph* g) {
     g = require_live_graph(g, "detect_matrix_kind");

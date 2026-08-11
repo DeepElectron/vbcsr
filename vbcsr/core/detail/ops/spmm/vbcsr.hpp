@@ -124,11 +124,18 @@ private:
         std::unique_ptr<DistGraph> graph_guard(c_graph);
         const MatrixKind result_kind = Matrix::detect_matrix_kind(graph_guard.get());
         if (result_kind != MatrixKind::VBCSR) {
-            Matrix C(graph_guard.get());
-            C.owns_graph = true;
-            C.graph->enable_matrix_lifetime_management();
-            C.set_page_size(A.configured_page_size());
+            // Construct with the kind in hand, not `Matrix C(graph)`: that
+            // constructor runs detect_matrix_kind itself, which is COLLECTIVE,
+            // and repeating it here costs every rank two more Allreduce for an
+            // answer already on the line above. Safe as it stood -- the branch
+            // is on the globally reduced kind, so no rank takes it alone -- but
+            // the same shape inside make_overwritten_result, where the branch
+            // WAS local, hung the job. Not a pattern to leave lying around.
+            Matrix C(graph_guard.get(), result_kind, true,
+                     typename Matrix::ConstructionToken{});
             graph_guard.release();
+            C.allocate_from_graph();
+            C.set_page_size(A.configured_page_size());
             return C;
         }
 
