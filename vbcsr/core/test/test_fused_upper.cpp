@@ -45,6 +45,9 @@ using namespace vbcsr;
 namespace {
 
 constexpr int kBlocks = 9;
+// Surviving blocks of the thresholded rhar case, pinned like rarh's 43: the
+// threshold is applied to finished blocks, which no partition changes.
+constexpr int kRharKept = 40;
 using T = std::complex<double>;
 
 uint64_t mix(uint64_t x) {
@@ -341,9 +344,221 @@ int run_case(const char* label, const std::vector<int>& rows, int rank) {
         }
     }
 
+    // C = G^H B G from a NON-HERMITIAN G on an ASYMMETRIC pattern -- the
+    // contract rarh cannot carry (it reaches its second contraction through
+    // G[j,l]^H == G[l,j], silently wrong values on this operand) and the one
+    // the Newton-Schulz reform actually presents: Z is a thresholded
+    // polynomial of S, Hermitian in neither values nor, after per-block drops,
+    // pattern. The asymmetric drops below make column i's row set differ from
+    // row i's column set, so the kernel's transpose index and pushed boundary
+    // are exercised on a pattern where no symmetry could hide a wrong fetch.
+    {
+        std::vector<std::vector<int>> adj_g_full(kBlocks);
+        for (int i = 0; i < kBlocks; ++i) {
+            for (int j : full_adj[static_cast<size_t>(i)]) {
+                // Drop (i,j) but keep (j,i): pattern asymmetry, not just value
+                // asymmetry. Diagonals stay so no row is empty.
+                if (i != j && ((i * 7 + j) % 3 == 0)) continue;
+                adj_g_full[static_cast<size_t>(i)].push_back(j);
+            }
+        }
+        std::vector<std::vector<int>> adj_g;
+        for (int i : rows) adj_g.push_back(adj_g_full[static_cast<size_t>(i)]);
+        DistGraph graph_g(MPI_COMM_WORLD);
+        graph_g.construct_distributed(rows, owned_sizes, adj_g);
+        BlockSpMat<T> G(&graph_g);
+        for (int i : rows) {
+            for (int j : adj_g_full[static_cast<size_t>(i)]) {
+                const int r = sizes[static_cast<size_t>(i)];
+                const int c = sizes[static_cast<size_t>(j)];
+                std::vector<T> block(static_cast<size_t>(r) * c);
+                for (int a = 0; a < r; ++a) {
+                    for (int b = 0; b < c; ++b) {
+                        block[static_cast<size_t>(a) * c + b] = raw(2, i, j, a, b);
+                    }
+                }
+                G.add_block(i, j, block.data(), r, c, AssemblyMode::INSERT);
+            }
+        }
+        std::vector<T> g_dense = densify(G, sizes, offsets, n);
+        sum_over_ranks(g_dense);
+        const std::vector<T> rhar_want =
+            dense_mul(dense_mul(dense_adjoint(g_dense, n), b_dense, n), g_dense, n);
+
+        {
+            BlockSpMat<T> C = G.rhar_upper(B, 0.0);
+            C.complete_hermitian_inplace();
+            std::vector<T> got = densify(C, sizes, offsets, n);
+            sum_over_ranks(got);
+            report("rhar_upper vs dense G^H B G (G non-Hermitian)",
+                   max_abs_diff(got, rhar_want));
+        }
+
+        // Kept blocks under a threshold: exact values, none below the
+        // diagonal, and the same survivors whatever the partition.
+        {
+            const double threshold = 1e-2;
+            const BlockSpMat<T> C = G.rhar_upper(B, threshold);
+            const DistGraph& g = *C.graph;
+            const int c_rows = static_cast<int>(g.adj_ptr.size()) - 1;
+            double worst = 0.0;
+            long long kept = 0;
+            for (int i = 0; i < c_rows; ++i) {
+                const int g_row = g.get_global_index(i);
+                for (int k = g.adj_ptr[i]; k < g.adj_ptr[i + 1]; ++k) {
+                    const int g_col = g.get_global_index(g.adj_ind[k]);
+                    if (g_col < g_row) {
+                        std::printf("[rank %d] FAILED: lower-triangle block (%d,%d) kept\n",
+                                    rank, g_row, g_col);
+                        ++failures;
+                    }
+                    const T* block = C.block_data(k);
+                    const int r_dim = sizes[static_cast<size_t>(g_row)];
+                    const int c_dim = sizes[static_cast<size_t>(g_col)];
+                    for (int r = 0; r < r_dim; ++r) {
+                        for (int c = 0; c < c_dim; ++c) {
+                            worst = std::max(
+                                worst,
+                                std::abs(block[static_cast<size_t>(r) * c_dim + c] -
+                                         rhar_want[static_cast<size_t>(offsets[g_row] + r) * n +
+                                                   offsets[g_col] + c]));
+                        }
+                    }
+                    ++kept;
+                }
+            }
+            MPI_Allreduce(MPI_IN_PLACE, &worst, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+            MPI_Allreduce(MPI_IN_PLACE, &kept, 1, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+            report("rhar_upper at threshold, kept blocks vs dense", worst);
+            if (kept != kRharKept) {
+                if (rank == 0) {
+                    std::printf("    FAILED: %lld blocks kept, expected %d\n", kept,
+                                kRharKept);
+                }
+                ++failures;
+            }
+        }
+    }
+
     int any = failures;
     MPI_Allreduce(MPI_IN_PLACE, &any, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
     return any;
+}
+
+// A 96-block chain with skip links, rhar only. The 9-block cases above are
+// small enough that a boundary exchange packs a handful of bytes per
+// destination -- rhar's push had a 3x displacement error that read past its
+// send buffer there and STILL passed on heap-garbage luck at every rank
+// count. Here each rank pushes to several destinations at real buffer
+// distances, so a displacement in the wrong unit lands in another
+// destination's segment (or a segfault), never back on the right bytes.
+int run_chain_case(int rank, int nranks) {
+    constexpr int kChain = 96;
+    std::vector<int> sizes(kChain);
+    for (int i = 0; i < kChain; ++i) {
+        sizes[static_cast<size_t>(i)] = block_sizes()[static_cast<size_t>(i % kBlocks)];
+    }
+    std::vector<int> offsets(kChain + 1, 0);
+    for (int i = 0; i < kChain; ++i) offsets[i + 1] = offsets[i] + sizes[static_cast<size_t>(i)];
+    const int n = offsets[kChain];
+
+    // Asymmetric pattern: chain plus one-directional skips of 7 and 13.
+    std::vector<std::vector<int>> adj_full(kChain);
+    for (int i = 0; i < kChain; ++i) {
+        auto& row = adj_full[static_cast<size_t>(i)];
+        row.push_back(i);
+        if (i > 0) row.push_back(i - 1);
+        if (i + 1 < kChain) row.push_back(i + 1);
+        if (i + 7 < kChain) row.push_back(i + 7);
+        if (i >= 13) row.push_back(i - 13);
+        std::sort(row.begin(), row.end(), std::greater<int>());
+    }
+    // Hermitian B on the symmetrised pattern, so the contract holds.
+    std::vector<std::vector<int>> adj_b(kChain);
+    for (int i = 0; i < kChain; ++i) {
+        std::vector<int> row = adj_full[static_cast<size_t>(i)];
+        for (int j = 0; j < kChain; ++j) {
+            const auto& other = adj_full[static_cast<size_t>(j)];
+            if (j != i && std::find(other.begin(), other.end(), i) != other.end()) {
+                row.push_back(j);
+            }
+        }
+        std::sort(row.begin(), row.end(), std::greater<int>());
+        row.erase(std::unique(row.begin(), row.end()), row.end());
+        adj_b[static_cast<size_t>(i)] = row;
+    }
+
+    std::vector<int> rows;
+    {
+        const int base = kChain / nranks;
+        const int extra = kChain % nranks;
+        const int begin = rank * base + std::min(rank, extra);
+        const int end = begin + base + (rank < extra ? 1 : 0);
+        for (int i = begin; i < end; ++i) rows.push_back(i);
+    }
+    std::vector<int> owned_sizes;
+    std::vector<std::vector<int>> my_adj_g, my_adj_b;
+    for (int i : rows) {
+        owned_sizes.push_back(sizes[static_cast<size_t>(i)]);
+        my_adj_g.push_back(adj_full[static_cast<size_t>(i)]);
+        my_adj_b.push_back(adj_b[static_cast<size_t>(i)]);
+    }
+    DistGraph graph_g(MPI_COMM_WORLD);
+    graph_g.construct_distributed(rows, owned_sizes, my_adj_g);
+    DistGraph graph_b(MPI_COMM_WORLD);
+    graph_b.construct_distributed(rows, owned_sizes, my_adj_b);
+
+    BlockSpMat<T> G(&graph_g);
+    BlockSpMat<T> B(&graph_b);
+    for (size_t r = 0; r < rows.size(); ++r) {
+        const int i = rows[r];
+        const int rd = sizes[static_cast<size_t>(i)];
+        for (int j : my_adj_g[r]) {
+            const int cd = sizes[static_cast<size_t>(j)];
+            std::vector<T> block(static_cast<size_t>(rd) * cd);
+            for (int a = 0; a < rd; ++a) {
+                for (int b = 0; b < cd; ++b) {
+                    block[static_cast<size_t>(a) * cd + b] = raw(3, i, j, a, b);
+                }
+            }
+            G.add_block(i, j, block.data(), rd, cd, AssemblyMode::INSERT);
+        }
+        for (int j : my_adj_b[r]) {
+            const int cd = sizes[static_cast<size_t>(j)];
+            std::vector<T> block(static_cast<size_t>(rd) * cd);
+            for (int a = 0; a < rd; ++a) {
+                for (int b = 0; b < cd; ++b) {
+                    block[static_cast<size_t>(a) * cd + b] = hermitian_entry(4, i, j, a, b);
+                }
+            }
+            B.add_block(i, j, block.data(), rd, cd, AssemblyMode::INSERT);
+        }
+    }
+
+    std::vector<T> g_dense = densify(G, sizes, offsets, n);
+    std::vector<T> b_dense = densify(B, sizes, offsets, n);
+    sum_over_ranks(g_dense);
+    sum_over_ranks(b_dense);
+    const std::vector<T> want =
+        dense_mul(dense_mul(dense_adjoint(g_dense, n), b_dense, n), g_dense, n);
+
+    BlockSpMat<T> C = G.rhar_upper(B, 0.0);
+    C.complete_hermitian_inplace();
+    std::vector<T> got = densify(C, sizes, offsets, n);
+    sum_over_ranks(got);
+    const double worst = max_abs_diff(got, want);
+
+    int failures = 0;
+    if (rank == 0) {
+        std::printf("  %-52s max |diff| = %.3e\n",
+                    "rhar_upper on the 96-block chain vs dense", worst);
+    }
+    if (!(worst < 1e-10)) {
+        if (rank == 0) std::printf("    FAILED\n");
+        ++failures;
+    }
+    MPI_Allreduce(MPI_IN_PLACE, &failures, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    return failures;
 }
 
 }  // namespace
@@ -377,6 +592,9 @@ int main(int argc, char** argv) {
         }
         failures += run_case("starved", my_rows(rank, nranks, workers), rank);
     }
+
+    if (rank == 0) std::printf("chain case, %d rank(s):\n", nranks);
+    failures += run_chain_case(rank, nranks);
 
     int any = failures;
     MPI_Allreduce(MPI_IN_PLACE, &any, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);

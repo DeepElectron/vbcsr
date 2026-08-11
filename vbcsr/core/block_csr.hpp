@@ -66,6 +66,7 @@ inline const char* matrix_kind_name(MatrixKind kind) {
 #include "detail/ops/spmm/csr.hpp"
 #include "detail/ops/spmm/vbcsr.hpp"
 #include "detail/ops/spmm/rarh.hpp"
+#include "detail/ops/spmm/rhar.hpp"
 #include "detail/ops/spmm/square_polynomial.hpp"
 #include "detail/ops/transpose.hpp"
 #include "detail/distributed/block_payload_exchange.hpp"
@@ -1812,6 +1813,30 @@ public:
     BlockSpMat rarh_upper(const BlockSpMat& B, double threshold) const {
         ensure_product_operands_compatible(*this, B, "rarh_upper");
         return detail::RARhExecutor<BlockSpMat<T>>::run(*this, B, threshold);
+    }
+
+    // C = A^H B A with A == *this, upper triangle only, WITHOUT ever forming
+    // A^H or A^H B. The sibling of rarh_upper, as PETSc pairs MatRARt with
+    // MatPtAP -- and a separate kernel rather than a transA flag, because the
+    // two rest on different contracts: rarh reaches its second contraction
+    // through A[j,l]^H == A[l,j] and so REQUIRES A Hermitian, while this
+    // kernel requires nothing of A. That is exactly what a Newton-Schulz
+    // reform X = Z^H S Z needs -- Z is a thresholded polynomial of S, only
+    // approximately Hermitian -- and what the route this replaces paid two
+    // Z-sized matrices for: spmm's transA path materialises a full A^H, and
+    // the two-product form materialises the intermediate as well. Here row i
+    // of C is (column i of A)^H B A: local blocks of A are read in place
+    // through a transpose index, boundary blocks arrive pushed and already
+    // conjugate-transposed, and one result row is held per thread. See
+    // detail/ops/spmm/rhar.hpp.
+    //
+    // B must be Hermitian, so that C is; that contract is unchecked, as in
+    // rarh_upper. A may be anything with the same distribution.
+    //
+    // Complete the result with complete_hermitian_inplace().
+    BlockSpMat rhar_upper(const BlockSpMat& B, double threshold) const {
+        ensure_product_operands_compatible(*this, B, "rhar_upper");
+        return detail::RhARExecutor<BlockSpMat<T>>::run(*this, B, threshold);
     }
 
     // Preconditions shared by the binary products whose implementations index
