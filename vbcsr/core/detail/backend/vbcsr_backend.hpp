@@ -222,7 +222,18 @@ struct VBCSRMatrixBackend {
         uint64_t released = 0;
         for (size_t shape_id = 0; shape_id < shape_domain_offsets.size(); ++shape_id) {
             const auto& offsets = shape_domain_offsets[shape_id];
-            if (static_cast<size_t>(full_domains) >= offsets.size()) continue;
+            // Impossible in a consistent state: the offsets are sized
+            // (domain_count + 1) by the same build that stored the partition,
+            // and full_domains never exceeds domain_count. Reaching here means
+            // the offsets belong to a DIFFERENT partition than thread_domains
+            // -- exactly the corruption invalidate_structural_caches exists to
+            // rule out -- and skipping the shape would silently release the
+            // wrong amount for it.
+            if (static_cast<size_t>(full_domains) >= offsets.size()) {
+                throw std::logic_error(
+                    "VBCSR release: shape_domain_offsets does not cover the thread "
+                    "partition; they were built for different structures");
+            }
             released += storage.release_shape_blocks_before(
                 static_cast<int>(shape_id), offsets[static_cast<size_t>(full_domains)]);
         }
@@ -636,9 +647,19 @@ private:
     // its weights and first-touch placement belong to the old structure.
     // (The first-touch construction path calls set_thread_domains LAST, after
     // its appends have gone through invalidate_structural_caches.)
+    //
+    // thread_domains and shape_domain_offsets are only meaningful as a PAIR --
+    // release_blocks_below_row indexes one by the other -- so both go
+    // together. Clearing only thread_domains left the disarm resting on the
+    // thread_count <= 0 check alone: correct today, but nothing stopped a
+    // later caller from assigning a fresh partition (the sibling backends
+    // already get theirs written from executor code) against stale offsets,
+    // and release would then free the WRONG BLOCKS with no error. Clearing
+    // both makes the invariant mechanical instead of social.
     void invalidate_structural_caches() {
         invalidate_apply_plan();
         thread_domains = ThreadDomainPartition{};
+        shape_domain_offsets.clear();
     }
 
     T* block_ptr_from_handle(uint64_t handle) {

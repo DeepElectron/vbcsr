@@ -710,6 +710,13 @@ if(VBCSR_ENABLE_TESTS)
     add_vbcsr_mpi_test(test_vendor_batch_gemm vbcsr/core/test/test_vendor_batch_gemm.cpp)
     add_vbcsr_mpi_test(test_fused_upper vbcsr/core/test/test_fused_upper.cpp)
     add_vbcsr_mpi_test(test_release_below_row vbcsr/core/test/test_release_below_row.cpp)
+    # The VBCSR release rounds down to a thread-domain edge, and the partition
+    # is built from omp_get_max_threads(): at 1 thread the single domain spans
+    # every row, "below the halfway row" rounds down to nothing, and the case
+    # fails spuriously. Pin the thread count so the test measures the release,
+    # not the machine ctest happened to run on.
+    set_tests_properties(test_release_below_row PROPERTIES
+        ENVIRONMENT "OMP_NUM_THREADS=4")
     add_vbcsr_gtest(test_block_csr_export vbcsr/core/test/test_block_csr_export.cpp MPI_RANKS 2)
     add_vbcsr_plain_test(test_shape_paged_storage vbcsr/core/test/test_shape_paged_storage.cpp)
 

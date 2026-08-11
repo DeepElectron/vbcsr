@@ -206,8 +206,9 @@ private:
     // bytes handed back. The page SLOTS stay, so every element index above the
     // boundary keeps its address; only the storage under the released prefix
     // goes away. Reading a released element is a programming error, not a
-    // resize -- there is no way to detect it cheaply, so this is private and
-    // reachable only from a backend that owns the traversal order.
+    // resize -- release builds cannot afford to detect it, so this is private
+    // and reachable only from a backend that owns the traversal order, and
+    // debug builds trip assert_not_released on the read paths.
     //
     // This is what lets an in-place product shrink its input as it consumes it:
     // pages are independent allocations, and on the mmap path the release is a
@@ -408,16 +409,36 @@ private:
         }
     }
 
+    // Debug-only use-after-release tripwire. An element below the watermark
+    // has a valid address (MADV_DONTNEED keeps the mapping) whose contents
+    // have silently reverted to zero, so nothing downstream ever announces
+    // the bug -- a consuming kernel that reads behind its own release just
+    // computes with zeros. The watermark is already maintained for the
+    // advise-once bookkeeping; checking it costs one compare, and only in
+    // builds that ask for checking.
+    void assert_not_released(uint64_t index) const {
+#ifndef NDEBUG
+        if (index < released_through_) {
+            throw std::logic_error(
+                "PagedBuffer: element read below the release watermark (use-after-release)");
+        }
+#else
+        (void)index;
+#endif
+    }
+
     std::pair<uint32_t, uint32_t> locate(uint64_t index) const {
         if (index >= size_) {
             throw std::out_of_range("PagedBuffer element index out of bounds");
         }
+        assert_not_released(index);
         return {
             static_cast<uint32_t>(index / elements_per_page_),
             static_cast<uint32_t>(index % elements_per_page_)};
     }
 
     PageSlice<T> trimmed_page(uint64_t begin, uint64_t end) {
+        assert_not_released(begin);
         auto slice = page(static_cast<uint32_t>(begin / elements_per_page_));
         const uint32_t offset = static_cast<uint32_t>(begin % elements_per_page_);
         const uint32_t available = slice.count - offset;
@@ -429,6 +450,7 @@ private:
     }
 
     PageSlice<const T> trimmed_page(uint64_t begin, uint64_t end) const {
+        assert_not_released(begin);
         auto slice = page(static_cast<uint32_t>(begin / elements_per_page_));
         const uint32_t offset = static_cast<uint32_t>(begin % elements_per_page_);
         const uint32_t available = slice.count - offset;
