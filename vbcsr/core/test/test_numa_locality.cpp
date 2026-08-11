@@ -101,7 +101,8 @@ std::vector<std::vector<int>> make_adjacency(int n_rows) {
 // coincides with the nnz-weighted domain partition when the partition weight
 // IS the per-row entry count — true for csr and bsr, not for vbcsr (work-
 // weighted), so adjacency checks run on csr/bsr only.
-bool check_locality(const char* label, BlockSpMat<double>& mat, bool adjacency = false) {
+bool check_locality(const char* label, BlockSpMat<double>& mat, bool adjacency = false,
+                    double floor_fraction = 0.9) {
     const auto& domains = mat.thread_domain_partition();
     const auto& adj_ptr = mat.graph->adj_ptr;
     const int max_threads = omp_get_max_threads();
@@ -186,7 +187,12 @@ bool check_locality(const char* label, BlockSpMat<double>& mat, bool adjacency =
     std::fflush(stdout);
     // 90%: tolerate stray pages (THP coalescing, OS balancing), catch the
     // defect mode (everything on node 0 => remote domains match ~0%).
-    assert(match_fraction >= 0.9 && "sampled pages are not domain-local");
+    //
+    // One path passes 0.0 on purpose rather than by accident -- see the
+    // completion case in main, where placement is uncorrelated with the domain
+    // partition and the number is reported rather than asserted.
+    assert(match_fraction >= floor_fraction && "sampled pages are not domain-local");
+    (void)floor_fraction;
     return true;
 }
 
@@ -292,6 +298,53 @@ int main(int argc, char** argv) {
                 // and the one measured as the peak of a Newton-Schulz step.
                 filter_lowest_quartile(product);
                 exercised += check_locality("bsr filtered result", product);
+            }
+            {
+                // The Hermitian completion, both forms.
+                //
+                // The copying form holds the invariant. The in-place one does
+                // NOT, and is reported rather than asserted because on this
+                // path the measurement cannot distinguish success from chance:
+                // placement follows whichever thread wins each dynamically
+                // scheduled row, and across runs the node-local fraction came
+                // out 27.3 / 44.0 / 66.8 / 72.7 / 72.7% -- mean ~53% on a
+                // two-node machine, where chance IS 50%. It is uncorrelated
+                // with the domain partition, not partially aligned. Any floor
+                // under 50% passes by luck and any floor over it fails by luck.
+                //
+                // Why it cannot be fixed here, so it is not re-attempted:
+                // complete_hermitian_inplace cannot run the first-touch zero
+                // pass, because that would make the result fully resident
+                // before a single source row was released -- the peak the whole
+                // operation exists to remove. Nor does a per-chunk placing
+                // touch work: the local writes are a SCATTER (source row i
+                // lands in result row j > i), so a chunk's rows may already
+                // hold values written from earlier chunks, and zeroing them to
+                // place them would destroy those. Touching in DESCENDING chunk
+                // order would be safe -- the only writers into a chunk's rows
+                // are chunks at or below it -- but then the dead rows are a
+                // suffix and the release takes a prefix. The two orders are
+                // incompatible, and the release is worth more.
+                //
+                // Measured cost of losing it: none. Nothing downstream reads
+                // this matrix by domain -- both fused kernels take their
+                // operands with schedule(dynamic, 8), so the reading thread is
+                // whoever picks up the row -- and timing the next product on
+                // the completed matrix showed no penalty. If a domain-split
+                // reader of X or P ever appears, this is where it will bite.
+                const int n_rows = 4000;
+                std::vector<int> block_sizes(n_rows, 8);
+                DistGraph graph(MPI_COMM_SELF);
+                graph.construct_serial(n_rows, block_sizes, make_adjacency(n_rows));
+                BlockSpMat<double> mat(&graph);
+                mat.fill_random();
+                BlockSpMat<double> upper =
+                    mat.square_polynomial_upper(0.375, -1.25, 1.875, 0.0);
+                BlockSpMat<double> copied = upper.complete_hermitian();
+                exercised += check_locality("bsr completion (copying)", copied);
+                upper.complete_hermitian_inplace();
+                check_locality("bsr completion (in place, reported only)", upper,
+                               /*adjacency=*/false, /*floor_fraction=*/0.0);
             }
             {
                 const int n_rows = 3000;  // vbcsr mixed: C ~ 150 MiB
