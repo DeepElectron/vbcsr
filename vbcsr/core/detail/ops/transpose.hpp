@@ -40,7 +40,10 @@ void write_transposed_conjugate_block(
 // The exchange is chunked to this budget so peak memory is the matrix plus a
 // bounded buffer rather than three full copies of it (which is what a single
 // pack-everything/alltoallv/unpack-everything pass costs, and what put a
-// multi-million-orbital transpose out of reach).
+// multi-million-orbital transpose out of reach). The budget bounds BOTH sides
+// of a round: what one rank packs to send, and -- through the per-source
+// allowances each receiver grants before the rounds start -- what one rank
+// takes in.
 inline size_t transpose_chunk_bytes() {
     const char* env = std::getenv("VBCSR_TRANSPOSE_CHUNK_MB");
     const long long mb = env ? std::atoll(env) : 0;
@@ -145,9 +148,14 @@ GroupLayout plan_remote_groups(
 //
 //  - The value exchange runs in bounded rounds (transpose_chunk_bytes), so
 //    peak memory is A + C + one chunk instead of A + C + two full copies.
+//    The bound holds on both ends: each receiver grants its sources per-round
+//    allowances before the rounds start, so a rank fed by many senders at
+//    once still sees one budget's worth per round, not one per sender.
 //    Metadata is exchanged whole up front -- it is 16 bytes per block against
-//    a block payload, so chunking it would buy nothing -- which also lets the
-//    receiver resolve every destination slot before any value arrives.
+//    a block payload, so chunking it would buy nothing -- which lets the
+//    receiver resolve every destination slot before any value arrives, and is
+//    also what tells it how much each source holds for it, which is what the
+//    allowances are cut from.
 //
 //  - The result graph is built with construct_from_local_csr, so the ghost
 //    set, ghost block sizes and partition all come from data already in hand.
@@ -181,27 +189,15 @@ Matrix conjugate_transpose(const Matrix& matrix, bool mirror,
 
     // ---- 1. Classify every source block by who owns its transposed image.
     std::vector<int> dest(nnz, kTransposeSkip);
-    size_t remote_elems = 0;
-    // Kept per row, not just summed: the value rounds below are bounded by
-    // BYTES, and a bound needs to know where the bytes are.
-    std::vector<size_t> row_remote_elems(static_cast<size_t>(n_owned), 0);
-    #pragma omp parallel for schedule(dynamic, 256) reduction(+:remote_elems)
+    #pragma omp parallel for schedule(dynamic, 256)
     for (int i = 0; i < n_owned; ++i) {
         const int g_row = ga.owned_global_indices[i];
-        const int r_dim = ga.block_sizes[i];
-        size_t row_elems = 0;
         for (int k = adj_ptr[i]; k < adj_ptr[i + 1]; ++k) {
             const int local_col = ga.adj_ind[k];
             const int g_col = ga.get_global_index(local_col);
             if (mirror && g_col <= g_row) continue;  // diagonal stays, lower is not ours
-            const int owner = (nranks == 1) ? my_rank : ga.find_owner(g_col);
-            dest[static_cast<size_t>(k)] = owner;
-            if (owner != my_rank) {
-                row_elems += static_cast<size_t>(r_dim) * ga.block_sizes[local_col];
-            }
+            dest[static_cast<size_t>(k)] = (nranks == 1) ? my_rank : ga.find_owner(g_col);
         }
-        row_remote_elems[static_cast<size_t>(i)] = row_elems;
-        remote_elems += row_elems;
     }
 
     // ---- 2. Exchange the metadata of the remote blocks, whole.
@@ -524,28 +520,116 @@ Matrix conjugate_transpose(const Matrix& matrix, bool mirror,
             recv_elems[b] = static_cast<size_t>(meta[2]) * static_cast<size_t>(meta[3]);
         }
 
-        // Round boundaries by BYTE PREFIX, not by row count.
+        // Start of each source's metadata segment, so a round can address its
+        // slice without rescanning the counts.
+        std::vector<size_t> recv_base(static_cast<size_t>(nranks) + 1, 0);
+        for (int q = 0; q < nranks; ++q) {
+            recv_base[static_cast<size_t>(q) + 1] =
+                recv_base[static_cast<size_t>(q)] + recv_blocks_from[static_cast<size_t>(q)];
+        }
+
+        // Per-source allowances, granted by the RECEIVER.
         //
-        // The count of rounds was derived from the total bytes, but the rows
-        // were then split evenly by INDEX -- so the budget bounded nothing on
-        // a matrix with uneven rows. One saturated row lands in one round and
-        // carries whatever it carries; the "budget" was an average, not a cap.
-        // Walking a prefix sum closes a round when the next row would exceed
-        // it, which makes it a real bound except for a single row that alone
-        // is over budget (irreducible without splitting inside a row).
+        // The budget below bounds what one rank packs per round, but a rank is
+        // fed by every other rank at once: with P senders each shipping a full
+        // budget to the same destination in the same round, the receive buffer
+        // is P x the budget -- unbounded in the rank count, and tens of GB on
+        // a hot receiver at cluster scale. The metadata exchange already told
+        // each receiver exactly how much every source holds for it, so it cuts
+        // its budget into per-source shares proportional to those holdings and
+        // grants them up front, one Alltoall of 8 bytes per rank. Proportional
+        // shares mean every source drains its holding in the same number of
+        // rounds, so the exchange still finishes in
+        // max over receivers of (incoming / budget) rounds -- the minimum any
+        // receive-bounded exchange needs -- rather than being throttled by an
+        // arbitrary split.
+        //
+        // The floor keeps a source with a sliver from being granted next to
+        // nothing and stretching the exchange into thousands of rounds. All P
+        // sources hitting the floor at once overshoots the budget by P x 64 KB
+        // -- noise against the budget at any plausible rank count.
+        const size_t budget = transpose_chunk_bytes();
+        std::vector<size_t> allowance(static_cast<size_t>(nranks), 0);
+        {
+            std::vector<size_t> grant(static_cast<size_t>(nranks), 0);
+            size_t total_in = 0;
+            for (int q = 0; q < nranks; ++q) {
+                size_t bytes = 0;
+                for (size_t b = recv_base[static_cast<size_t>(q)];
+                     b < recv_base[static_cast<size_t>(q) + 1]; ++b) {
+                    bytes += recv_elems[b] * sizeof(T);
+                }
+                grant[static_cast<size_t>(q)] = bytes;
+                total_in += bytes;
+            }
+            constexpr size_t kGrantFloor = size_t(1) << 16;
+            for (int q = 0; q < nranks; ++q) {
+                size_t share = grant[static_cast<size_t>(q)];
+                if (total_in > budget) {
+                    share = static_cast<size_t>(
+                        static_cast<long double>(share) * budget / total_in);
+                }
+                grant[static_cast<size_t>(q)] = std::max(share, kGrantFloor);
+            }
+            MPI_Alltoall(grant.data(), sizeof(size_t), MPI_BYTE,
+                         allowance.data(), sizeof(size_t), MPI_BYTE, ga.comm);
+        }
+
+        // Round boundaries by byte prefix, against BOTH bounds: the sender's
+        // own budget and every destination's allowance.
+        //
+        // Rows are priced at segment granularity -- plan_remote_groups'
+        // prefix table gives, per (segment, destination), the bytes this rank
+        // would send -- and a serial walk over the segments closes a round
+        // when the next one would push the total over the budget or any
+        // destination over its allowance. Boundaries stay a row prefix, which
+        // is what the consuming release in stage 6a relies on. A round always
+        // takes at least one segment, so a single segment that alone exceeds
+        // an allowance ships anyway instead of deadlocking the exchange --
+        // irreducible without splitting inside it, and the same caveat the
+        // send-side bound always had for a single oversized row.
+        //
+        // Segment count: fine enough that one segment's overshoot is noise,
+        // capped so the prefix table (16 B x segments x nranks) stays small
+        // against the buffers it exists to bound.
         std::vector<int> round_bound;
         {
-            const size_t budget = transpose_chunk_bytes();
+            const int by_table = static_cast<int>(std::max<size_t>(
+                1, (size_t(32) << 20) / (2 * sizeof(size_t) * static_cast<size_t>(nranks))));
+            const int segments = std::max(max_chunks, std::min(4096, by_table));
+            const GroupLayout plan =
+                plan_remote_groups(matrix, dest, 0, n_owned, my_rank, nranks, segments);
+            auto segment_bytes = [&](int c, int q) {
+                const size_t lo =
+                    plan.base_elems[static_cast<size_t>(c) * nranks + q];
+                const size_t hi =
+                    c + 1 < plan.chunks
+                        ? plan.base_elems[(static_cast<size_t>(c) + 1) * nranks + q]
+                        : plan.group_elems[static_cast<size_t>(q)];
+                return (hi - lo) * sizeof(T);
+            };
+            std::vector<size_t> acc(static_cast<size_t>(nranks), 0);
+            std::vector<size_t> seg(static_cast<size_t>(nranks), 0);
+            size_t acc_total = 0;
             round_bound.push_back(0);
-            size_t acc = 0;
-            for (int i = 0; i < n_owned; ++i) {
-                const size_t row_bytes =
-                    row_remote_elems[static_cast<size_t>(i)] * sizeof(T);
-                if (acc > 0 && acc + row_bytes > budget) {
-                    round_bound.push_back(i);
-                    acc = 0;
+            for (int c = 0; c < plan.chunks; ++c) {
+                size_t seg_total = 0;
+                bool over = false;
+                for (int q = 0; q < nranks; ++q) {
+                    seg[static_cast<size_t>(q)] = segment_bytes(c, q);
+                    seg_total += seg[static_cast<size_t>(q)];
+                    over |= acc[static_cast<size_t>(q)] + seg[static_cast<size_t>(q)] >
+                            allowance[static_cast<size_t>(q)];
                 }
-                acc += row_bytes;
+                if (acc_total > 0 && (over || acc_total + seg_total > budget)) {
+                    round_bound.push_back(plan.row_begin[static_cast<size_t>(c)]);
+                    std::fill(acc.begin(), acc.end(), 0);
+                    acc_total = 0;
+                }
+                for (int q = 0; q < nranks; ++q) {
+                    acc[static_cast<size_t>(q)] += seg[static_cast<size_t>(q)];
+                }
+                acc_total += seg_total;
             }
             round_bound.push_back(n_owned);
         }
@@ -557,14 +641,6 @@ Matrix conjugate_transpose(const Matrix& matrix, bool mirror,
         // ones rather than dropping out of the exchange.
         while (static_cast<long long>(round_bound.size()) - 1 < rounds) {
             round_bound.push_back(n_owned);
-        }
-
-        // Start of each source's metadata segment, so a round can address its
-        // slice without rescanning the counts.
-        std::vector<size_t> recv_base(static_cast<size_t>(nranks) + 1, 0);
-        for (int q = 0; q < nranks; ++q) {
-            recv_base[static_cast<size_t>(q) + 1] =
-                recv_base[static_cast<size_t>(q)] + recv_blocks_from[static_cast<size_t>(q)];
         }
 
         std::vector<size_t> cursor(static_cast<size_t>(nranks), 0);
