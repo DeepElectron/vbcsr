@@ -125,6 +125,9 @@ struct SquarePolynomialExecutor {
             RowAccumulator acc;
             ProductGroup group;
             acc.resize(n_global);
+            // Surviving accumulator slots, in column order. Per thread and
+            // reused across rows so the ordering pass allocates once.
+            std::vector<int> keep_order;
 
             auto visit = [&](int g_row, auto&& fn) {
                 const int local = a_row[static_cast<size_t>(g_row)];
@@ -229,16 +232,37 @@ struct SquarePolynomialExecutor {
                 }
 
                 // The one drop, on finished values.
+                //
+                // Staged BY COLUMN and EXACTLY SIZED, which is what lets
+                // assemble copy straight out of these rows; see the note there
+                // and the matching one in rarh.hpp for what the alternative
+                // -- reordering afterwards, into a second buffer per row --
+                // cost in peak memory.
                 std::vector<int>& keep_columns = row_columns[i];
                 std::vector<T>& keep_values = row_values[i];
+                keep_order.clear();
+                size_t keep_elems = 0;
                 for (size_t s = 0; s < acc.touched.size(); ++s) {
                     const size_t count = static_cast<size_t>(r_dim) * acc.col_dim[s];
-                    const T* block = acc.values.data() + acc.value_offset[s];
                     if (threshold > 0.0) {
+                        const T* block = acc.values.data() + acc.value_offset[s];
                         double sq = 0.0;
                         for (size_t e = 0; e < count; ++e) sq += block_squared_magnitude<T>(block[e]);
                         if (std::sqrt(sq) < threshold) continue;
                     }
+                    keep_order.push_back(static_cast<int>(s));
+                    keep_elems += count;
+                }
+                std::sort(keep_order.begin(), keep_order.end(), [&](int x, int y) {
+                    return acc.touched[static_cast<size_t>(x)] <
+                           acc.touched[static_cast<size_t>(y)];
+                });
+                keep_columns.reserve(keep_order.size());
+                keep_values.reserve(keep_elems);
+                for (int idx : keep_order) {
+                    const size_t s = static_cast<size_t>(idx);
+                    const size_t count = static_cast<size_t>(r_dim) * acc.col_dim[s];
+                    const T* block = acc.values.data() + acc.value_offset[s];
                     keep_columns.push_back(acc.touched[s]);
                     keep_values.insert(keep_values.end(), block, block + count);
                 }
@@ -252,48 +276,18 @@ struct SquarePolynomialExecutor {
         const DistGraph& ga = *A.graph;
         const int n_rows = static_cast<int>(ga.adj_ptr.size()) - 1;
 
-        // NOT the optional output ordering that spgemm_sorted_output_enabled
-        // governs in the other executors -- this sort is load-bearing and must
-        // stay unconditional. construct_result_graph sorts every row's columns
+        // Column order is load-bearing here, and NOT the optional output
+        // ordering that spgemm_sorted_output_enabled governs in the other
+        // executors: construct_result_graph sorts every row's columns
         // (result_graph.hpp), while the copy-out below walks row_columns[i] and
         // writes consecutive slots from graph_c->adj_ptr[i]. The two orders have
-        // to agree; putting this behind the flag silently transposes values onto
-        // the wrong columns, which reaches the caller as a diverged iteration
-        // rather than as anything the kernel itself can detect.
-        #pragma omp parallel for schedule(dynamic, 8)
-        for (int i = 0; i < n_rows; ++i) {
-            std::vector<int>& columns = row_columns[i];
-            if (columns.size() < 2) continue;
-            std::vector<int> order(columns.size());
-            for (size_t s = 0; s < order.size(); ++s) order[s] = static_cast<int>(s);
-            std::sort(order.begin(), order.end(),
-                      [&](int x, int y) { return columns[x] < columns[y]; });
-            const int r_dim = ga.block_sizes[i];
-            auto dim_of = [&](int g_col) {
-                auto it = ga.global_to_local.find(g_col);
-                if (it != ga.global_to_local.end()) return ga.block_sizes[it->second];
-                return ghost_sizes.at(g_col);
-            };
-            std::vector<size_t> offset(columns.size());
-            size_t running = 0;
-            for (size_t s = 0; s < columns.size(); ++s) {
-                offset[s] = running;
-                running += static_cast<size_t>(r_dim) * dim_of(columns[s]);
-            }
-            std::vector<int> sorted_columns(columns.size());
-            std::vector<T> sorted_values;
-            sorted_values.reserve(row_values[i].size());
-            for (size_t s = 0; s < order.size(); ++s) {
-                const int from = order[s];
-                sorted_columns[s] = columns[from];
-                const size_t count = static_cast<size_t>(r_dim) * dim_of(columns[from]);
-                sorted_values.insert(sorted_values.end(),
-                                     row_values[i].begin() + offset[from],
-                                     row_values[i].begin() + offset[from] + count);
-            }
-            columns.swap(sorted_columns);
-            row_values[i].swap(sorted_values);
-        }
+        // to agree; disagreeing silently transposes values onto the wrong
+        // columns, which reaches the caller as a diverged iteration rather than
+        // as anything the kernel itself can detect.
+        //
+        // It is established where the rows are staged rather than by a pass
+        // here, because a pass here has to build a second buffer per row and so
+        // holds a duplicate of the whole answer; see the note at the drop loop.
 
         DistGraph* graph_c =
             construct_result_graph(A, row_columns, ghost_sizes, "square_polynomial");
@@ -305,8 +299,10 @@ struct SquarePolynomialExecutor {
         // left unwritten by skipping the zero pass.
         Matrix C = Matrix::make_overwritten_result(graph_c, A.configured_page_size());
 
-        // Each row's staging buffer is freed as soon as it is copied, so the
-        // two only overlap by the rows not yet reached.
+        // Each row's staging buffer is released as soon as it is copied, so the
+        // two only overlap by the rows not yet reached. Released to the KERNEL,
+        // not just to malloc -- see release_and_drop in common.hpp for why the
+        // difference is most of this kernel's peak.
         //
         // Walked by THREAD DOMAIN, not by row with a dynamic schedule. This copy
         // is the deferred first touch, so whichever thread runs a row is the
@@ -332,7 +328,7 @@ struct SquarePolynomialExecutor {
                             count * sizeof(T));
                 at += count;
             }
-            std::vector<T>().swap(row_values[i]);
+            release_and_drop(row_values[i]);
         }
         }
         return C;

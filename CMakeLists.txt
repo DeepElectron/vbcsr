@@ -708,6 +708,7 @@ if(VBCSR_ENABLE_TESTS)
     add_vbcsr_mpi_test(test_numeric_reference vbcsr/core/test/test_numeric_reference.cpp)
     add_vbcsr_mpi_test(test_migration_contract vbcsr/core/test/test_migration_contract.cpp)
     add_vbcsr_mpi_test(test_vendor_batch_gemm vbcsr/core/test/test_vendor_batch_gemm.cpp)
+    add_vbcsr_mpi_test(test_fused_upper vbcsr/core/test/test_fused_upper.cpp)
     add_vbcsr_gtest(test_block_csr_export vbcsr/core/test/test_block_csr_export.cpp MPI_RANKS 2)
     add_vbcsr_plain_test(test_shape_paged_storage vbcsr/core/test/test_shape_paged_storage.cpp)
 

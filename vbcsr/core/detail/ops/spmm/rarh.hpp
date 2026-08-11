@@ -190,6 +190,9 @@ struct RARhExecutor {
             inner.resize(n_global);
             outer.resize(n_global);
             ProductGroup group;
+            // Surviving accumulator slots, in column order. Per thread and
+            // reused across rows so the ordering pass allocates once.
+            std::vector<int> keep_order;
 
             // One block of a row of A, wherever that row lives. `fn` receives
             // the block's Frobenius norm alongside it, because both gates below
@@ -364,18 +367,59 @@ struct RARhExecutor {
                 }
 
                 // The one drop, on finished values.
+                //
+                // Two passes over the touched slots rather than one, and the
+                // reason is memory rather than clarity. The row is staged
+                // BY COLUMN and EXACTLY SIZED here, which is what lets assemble
+                // copy straight out of it:
+                //
+                //   * By column, because the accumulator hands slots back in
+                //     first-touch order and the result graph is ordered. That
+                //     reordering used to be a separate pass in assemble which
+                //     built a second buffer per row and swapped -- an extra copy
+                //     of the whole answer, and, since the discarded buffers are
+                //     over the allocator's dynamic mmap threshold at these row
+                //     sizes, one glibc keeps rather than returns. Measured at
+                //     4096 blocks x 200 neighbours: the pass raised the high
+                //     water mark by 2.20 GB against a 5.72 GB result, and left
+                //     1.90 GB of it resident, to permute and nothing else.
+                //     Sorting the ~500 surviving INDICES costs nothing beside it.
+                //   * Exactly sized, because push_back/insert growth left the
+                //     staged rows at 9.70 GB of capacity for 5.72 GB of answer.
+                //     The slack is untouched pages so it is not resident, but
+                //     every doubling frees a buffer that the allocator then
+                //     holds, and that retention is resident.
+                //
+                // The norms the first pass computes are not re-derived: the
+                // second pass copies only what the first kept.
                 std::vector<int>& keep_columns = row_columns[i];
                 std::vector<T>& keep_values = row_values[i];
+                keep_order.clear();
+                size_t keep_elems = 0;
                 for (size_t sIdx = 0; sIdx < outer.touched.size(); ++sIdx) {
                     const size_t count =
                         static_cast<size_t>(r_dim) * outer.col_dim[sIdx];
-                    const T* block = outer.values.data() + outer.value_offset[sIdx];
                     if (threshold > 0.0) {
+                        const T* block = outer.values.data() + outer.value_offset[sIdx];
                         double sq = 0.0;
                         for (size_t e = 0; e < count; ++e) sq += squared_magnitude(block[e]);
                         if (std::sqrt(sq) < threshold) continue;
                     }
-                    keep_columns.push_back(outer.touched[sIdx]);
+                    keep_order.push_back(static_cast<int>(sIdx));
+                    keep_elems += count;
+                }
+                std::sort(keep_order.begin(), keep_order.end(), [&](int x, int y) {
+                    return outer.touched[static_cast<size_t>(x)] <
+                           outer.touched[static_cast<size_t>(y)];
+                });
+                keep_columns.reserve(keep_order.size());
+                keep_values.reserve(keep_elems);
+                for (int sIdx : keep_order) {
+                    const size_t slot = static_cast<size_t>(sIdx);
+                    const size_t count =
+                        static_cast<size_t>(r_dim) * outer.col_dim[slot];
+                    const T* block = outer.values.data() + outer.value_offset[slot];
+                    keep_columns.push_back(outer.touched[slot]);
                     keep_values.insert(keep_values.end(), block, block + count);
                 }
             }
@@ -393,44 +437,11 @@ struct RARhExecutor {
         const DistGraph& ga = *A.graph;
         const int n_rows = static_cast<int>(ga.adj_ptr.size()) - 1;
 
-        // Sort each row's columns, carrying the values with them, so the
-        // result graph and the staged values agree on order.
-        #pragma omp parallel for schedule(dynamic, 8)
-        for (int i = 0; i < n_rows; ++i) {
-            std::vector<int>& columns = row_columns[i];
-            if (columns.size() < 2) continue;
-            std::vector<int> order(columns.size());
-            for (size_t s = 0; s < order.size(); ++s) order[s] = static_cast<int>(s);
-            std::sort(order.begin(), order.end(),
-                      [&](int x, int y) { return columns[x] < columns[y]; });
-            const int r_dim = ga.block_sizes[i];
-            auto dim_of = [&](int g_col) {
-                auto it = ga.global_to_local.find(g_col);
-                if (it != ga.global_to_local.end()) return ga.block_sizes[it->second];
-                return ghost_sizes.at(g_col);
-            };
-            std::vector<int> sorted_columns(columns.size());
-            std::vector<T> sorted_values;
-            sorted_values.reserve(row_values[i].size());
-            // Offsets in the staged buffer, in the pre-sort order.
-            std::vector<size_t> offset(columns.size());
-            size_t running = 0;
-            for (size_t s = 0; s < columns.size(); ++s) {
-                offset[s] = running;
-                running += static_cast<size_t>(r_dim) * dim_of(columns[s]);
-            }
-            for (size_t s = 0; s < order.size(); ++s) {
-                const int from = order[s];
-                sorted_columns[s] = columns[from];
-                const size_t count = static_cast<size_t>(r_dim) * dim_of(columns[from]);
-                sorted_values.insert(sorted_values.end(),
-                                     row_values[i].begin() + offset[from],
-                                     row_values[i].begin() + offset[from] + count);
-            }
-            columns.swap(sorted_columns);
-            row_values[i].swap(sorted_values);
-        }
-
+        // Rows arrive from fused_rows already ordered by global column, which
+        // is both what the result graph is built from and what makes the copy
+        // below positional. Reordering HERE -- the shape this had -- had to
+        // build a second buffer per row and swap; see the note at the drop loop
+        // for what that cost and why the ordering moved rather than stayed.
         DistGraph* graph_c = construct_result_graph(A, row_columns, ghost_sizes, "rarh");
         // Deferred first touch, as square_polynomial's assemble already does.
         // The plain `Matrix C(graph_c)` here ran the zero pass over the whole
@@ -472,7 +483,7 @@ struct RARhExecutor {
                             row_values[i].data() + at, count * sizeof(T));
                 at += count;
             }
-            std::vector<T>().swap(row_values[i]);
+            release_and_drop(row_values[i]);
         }
         }
         return C;
