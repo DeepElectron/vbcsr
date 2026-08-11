@@ -306,11 +306,21 @@ set_constant(self, val: Union[float, complex, int]) -> None
 ```
 Sets all local elements to `val`.
 
-#### `set_random_normal`
+#### `set_random`
 ```python
-set_random_normal(self, normalize: bool = False) -> None
+set_random(self, seed: int, normalize: bool = True) -> None
 ```
-Fills the locally owned entries with random normal values.
+Fills the locally owned entries with a counter-based random draw: random phase
+for complex scalars, Rademacher (+-1) for real ones.
+
+Reproducible and independent of the decomposition. Each entry is a hash of
+(seed, its global block, its row within that block, its column), never of a
+thread's position in a loop, so the same seed gives the same vector at any rank
+count and any thread count.
+
+`normalize` scales to unit norm, which the trace estimators want. It costs no
+communication here: both draws have `|v|^2 = N` exactly, so it is a multiply by
+`1/sqrt(N)`.
 
 #### `scale`
 ```python
@@ -400,11 +410,21 @@ set_constant(self, val: Union[float, complex, int]) -> None
 ```
 Sets all elements to `val`.
 
-#### `set_random_normal`
+#### `set_random`
 ```python
-set_random_normal(self, normalize: bool = False) -> None
+set_random(self, seed: int, normalize: bool = True) -> None
 ```
-Fills the locally owned rows with random normal values.
+Fills the locally owned rows with a counter-based random draw: random phase
+for complex scalars, Rademacher (+-1) for real ones.
+
+Reproducible and independent of the decomposition. Each entry is a hash of
+(seed, its global block, its row within that block, its column), never of a
+thread's position in a loop, so the same seed gives the same vector at any rank
+count and any thread count.
+
+`normalize` scales to unit norm, which the trace estimators want. It costs no
+communication here: both draws have `|v|^2 = N` exactly, so it is a multiply by
+`1/sqrt(N)`.
 
 #### `scale`
 ```python

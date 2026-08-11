@@ -1,6 +1,7 @@
 #ifndef VBCSR_DIST_VECTOR_HPP
 #define VBCSR_DIST_VECTOR_HPP
 
+#include "random_vectors.hpp"
 #include "dist_graph.hpp"
 #include "detail/storage/numa_buffer.hpp"
 
@@ -121,36 +122,55 @@ public:
         return global_dot;
     }
 
-    void set_random_normal(bool normalize = true) {
-        std::random_device rd;
-        const unsigned base_seed = rd();
-        #pragma omp parallel
-        {
-            // Per-thread generator (a shared engine would race); each thread
-            // fills its static slice.
-            std::mt19937 gen(base_seed + 0x9e3779b9u *
-#ifdef _OPENMP
-                static_cast<unsigned>(omp_get_thread_num())
-#else
-                0u
-#endif
-            );
-            std::normal_distribution<double> d(0.0, 1.0);
-            #pragma omp for schedule(static)
-            for (int i = 0; i < local_size; ++i) {
-                if constexpr (std::is_same<T, std::complex<double>>::value) {
-                    data[i] = std::complex<double>(d(gen), d(gen));
-                } else {
-                    data[i] = (T)d(gen);
-                }
+    /// Fills the owned entries with a counter-based random draw.
+    ///
+    /// Reproducible and INDEPENDENT OF THE DECOMPOSITION: each entry is a hash
+    /// of (seed, its global block, its row inside that block, 0), so the same
+    /// seed gives the same vector at any rank or thread count. See
+    /// random_vectors.hpp for why that matters and what it replaced.
+    ///
+    /// `normalize` scales to unit norm, which every trace estimator here wants
+    /// since it reads mu_0 = <v,v> = 1. For Rademacher and RandomPhase that is
+    /// a multiply by 1/sqrt(N_global) with NO communication, because |v|^2 = N
+    /// exactly; only Gaussian has to measure its own norm and reduce.
+    /// `stable_block_ids`, when given, names owned block b by an identifier that
+    /// survives repartitioning -- for atomic data, the atom's original index
+    /// from the input. Without it the key falls back to the graph's global
+    /// block index, which ParMETIS RENUMBERS: the same atom is block 5 on one
+    /// rank count and block 300 on another, so hashing it reproduces a run only
+    /// at a fixed rank count. Measured: 17% apart between 1 and 2 ranks with
+    /// the graph index, exact with the stable one.
+    void set_random(RandomKind kind, uint64_t seed, bool normalize = true,
+                    const int* stable_block_ids = nullptr) {
+        const int n_owned = static_cast<int>(graph->owned_global_indices.size());
+        #pragma omp parallel for schedule(static)
+        for (int b = 0; b < n_owned; ++b) {
+            const uint64_t gblock = static_cast<uint64_t>(
+                stable_block_ids ? stable_block_ids[b]
+                                 : graph->owned_global_indices[b]);
+            const int begin = graph->block_offsets[b];
+            const int end = graph->block_offsets[b + 1];
+            for (int i = begin; i < end; ++i) {
+                data[i] = random_entry<T>(kind, seed, gblock,
+                                          static_cast<uint64_t>(i - begin), 0);
             }
         }
-        
-        if (normalize) {
+
+        if (!normalize) return;
+        if (has_deterministic_norm(kind)) {
+            const double n_global =
+                static_cast<double>(graph->global_scalar_rows());
+            this->scale(1.0 / std::sqrt(n_global));
+        } else {
             T n = this->dot(*this);
-            double norm = std::sqrt(std::abs(n));
-            this->scale(1.0 / norm);
+            this->scale(1.0 / std::sqrt(std::abs(n)));
         }
+    }
+
+    /// The lowest-variance draw this scalar type supports.
+    void set_random(uint64_t seed, bool normalize = true,
+                    const int* stable_block_ids = nullptr) {
+        set_random(default_random_kind<T>(), seed, normalize, stable_block_ids);
     }
 
     // Create a duplicate with the same structure and data

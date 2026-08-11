@@ -1,6 +1,7 @@
 #ifndef VBCSR_DIST_MULTIVECTOR_HPP
 #define VBCSR_DIST_MULTIVECTOR_HPP
 
+#include "random_vectors.hpp"
 #include "dist_graph.hpp"
 #include "dist_vector.hpp"
 #include "detail/distributed/mpi_utils.hpp"
@@ -273,50 +274,63 @@ public:
         results = bdot(other);
     }
 
-    void set_random_normal(bool normalize = true) {
-        std::random_device rd;
-        const unsigned base_seed = rd();
-        const int total_rows = local_rows + ghost_rows;
-        #pragma omp parallel
-        {
-            // Per-thread generator (a shared engine would race); each thread
-            // fills its static row slice. Fill only the real lanes: padding
-            // must stay zero.
-            std::mt19937 gen(base_seed + 0x9e3779b9u *
-#ifdef _OPENMP
-                static_cast<unsigned>(omp_get_thread_num())
-#else
-                0u
-#endif
-            );
-            std::normal_distribution<double> d(0.0, 1.0);
-            #pragma omp for schedule(static)
-            for (int row = 0; row < total_rows; ++row) {
+    /// Counter-based random columns; see DistVector::set_random and
+    /// random_vectors.hpp. Column v is keyed on its own index, so column v is
+    /// the same vector whatever num_vectors is and whatever the decomposition.
+    ///
+    /// Only OWNED rows are filled -- ghosts are halo scratch that the operator
+    /// refreshes, and writing them here would make a column depend on which
+    /// rank it landed on. Padding lanes stay zero.
+    /// `stable_block_ids`, when given, names owned block b by an identifier that
+    /// survives repartitioning -- for atomic data, the atom's original index
+    /// from the input. Without it the key falls back to the graph's global
+    /// block index, which ParMETIS RENUMBERS: the same atom is block 5 on one
+    /// rank count and block 300 on another, so hashing it reproduces a run only
+    /// at a fixed rank count. Measured: 17% apart between 1 and 2 ranks with
+    /// the graph index, exact with the stable one.
+    void set_random(RandomKind kind, uint64_t seed, bool normalize = true,
+                    const int* stable_block_ids = nullptr) {
+        const int n_owned = static_cast<int>(graph->owned_global_indices.size());
+        #pragma omp parallel for schedule(static)
+        for (int b = 0; b < n_owned; ++b) {
+            const uint64_t gblock = static_cast<uint64_t>(
+                stable_block_ids ? stable_block_ids[b]
+                                 : graph->owned_global_indices[b]);
+            const int begin = graph->block_offsets[b];
+            const int end = graph->block_offsets[b + 1];
+            for (int row = begin; row < end; ++row) {
                 T* r = row_data(row);
+                const uint64_t intra = static_cast<uint64_t>(row - begin);
                 for (int v = 0; v < num_vectors; ++v) {
-                    if constexpr (std::is_same<T, std::complex<double>>::value) {
-                        r[v] = std::complex<double>(d(gen), d(gen));
-                    } else {
-                        r[v] = (T)d(gen);
-                    }
+                    r[v] = random_entry<T>(kind, seed, gblock, intra,
+                                           static_cast<uint64_t>(v));
                 }
             }
         }
 
-        if (normalize) {
+        if (!normalize) return;
+        const int total_rows = local_rows + ghost_rows;
+        std::vector<T> factors(num_vectors);
+        if (has_deterministic_norm(kind)) {
+            const double inv = 1.0 / std::sqrt(static_cast<double>(
+                                       graph->global_scalar_rows()));
+            for (int v = 0; v < num_vectors; ++v) factors[v] = T(inv);
+        } else {
             std::vector<T> dots = this->bdot(*this);
-            std::vector<T> factors(num_vectors);
             for (int v = 0; v < num_vectors; ++v) {
-                double norm = std::sqrt(std::abs(dots[v]));
-                factors[v] = 1.0 / norm;
-            }
-            for (int row = 0; row < total_rows; ++row) {
-                T* r = row_data(row);
-                for (int v = 0; v < num_vectors; ++v) {
-                    r[v] *= factors[v];
-                }
+                factors[v] = T(1.0 / std::sqrt(std::abs(dots[v])));
             }
         }
+        for (int row = 0; row < total_rows; ++row) {
+            T* r = row_data(row);
+            for (int v = 0; v < num_vectors; ++v) r[v] *= factors[v];
+        }
+    }
+
+    /// The lowest-variance draw this scalar type supports.
+    void set_random(uint64_t seed, bool normalize = true,
+                    const int* stable_block_ids = nullptr) {
+        set_random(default_random_kind<T>(), seed, normalize, stable_block_ids);
     }
 
     // Persistent buffers

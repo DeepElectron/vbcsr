@@ -136,7 +136,9 @@ void bind_dist_vector(py::module& m, const std::string& name) {
         .def("dot", &DistVector<T>::dot)
         .def("duplicate", &DistVector<T>::duplicate)
         .def("copy_from", &DistVector<T>::copy_from)
-        .def("set_random_normal", &DistVector<T>::set_random_normal)
+        .def("set_random", [](DistVector<T>& v, uint64_t seed, bool normalize) {
+            v.set_random(seed, normalize);
+        }, py::arg("seed"), py::arg("normalize") = true)
         .def("reset_comm_stats", &DistVector<T>::reset_comm_stats)
         .def_property_readonly("comm_seconds", [](const DistVector<T>& v) { return v.comm_seconds; })
         .def_property_readonly("comm_calls", [](const DistVector<T>& v) { return v.comm_calls; })
@@ -171,7 +173,9 @@ void bind_dist_multivector(py::module& m, const std::string& name) {
         .def("bdot", &DistMultiVector<T>::bdot)
         .def("duplicate", &DistMultiVector<T>::duplicate)
         .def("copy_from", &DistMultiVector<T>::copy_from)
-        .def("set_random_normal", &DistMultiVector<T>::set_random_normal)
+        .def("set_random", [](DistMultiVector<T>& v, uint64_t seed, bool normalize) {
+            v.set_random(seed, normalize);
+        }, py::arg("seed"), py::arg("normalize") = true)
         .def("reset_comm_stats", &DistMultiVector<T>::reset_comm_stats)
         .def_property_readonly("comm_seconds", [](const DistMultiVector<T>& v) { return v.comm_seconds; })
         .def_property_readonly("comm_calls", [](const DistMultiVector<T>& v) { return v.comm_calls; })
