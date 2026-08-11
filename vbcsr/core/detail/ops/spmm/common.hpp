@@ -3,6 +3,7 @@
 
 #include "../../distributed/block_payload_types.hpp"
 #include "../../distributed/mpi_utils.hpp"
+#include "../../distributed/result_graph.hpp"
 #include "../../kernels/dense_kernels.hpp"
 #include "../../kernels/rowmajor_kernels.hpp"
 
@@ -786,6 +787,203 @@ SpMMGhostBlocks<T> build_spmm_ghost_blocks(
     }
 
     return ghost_blocks;
+}
+
+// ---------------------------------------------------------------------------
+// Shared pieces of the row-at-a-time fused executors (rarh, square_polynomial,
+// rhar). Each of these used to be a verbatim per-executor copy; a divergence in
+// any of them is a SILENT value-transposition or wrong-fetch bug, not a compile
+// error, so they are shared by construction rather than by review.
+
+/// Rows fetched from other ranks, indexed by global row for O(1) reach in the
+/// numeric loop. A map probe per block pair was not affordable: the inner
+/// contraction runs over thousands of pairs per row.
+///
+/// `first` is -1 only for a row nobody answered. Payloads carry only NONEMPTY
+/// rows, but the pattern reply names every row whose owner answered --
+/// including rows that exist and hold zero blocks. Those must read as
+/// found-with-nothing, not as missing: an empty row's contribution to a
+/// contraction is zero, and treating it as absent turned it into a spurious
+/// "not Hermitian" throw on a valid operand.
+template <typename T>
+struct FusedRemoteRows {
+    std::vector<int> first;   // global row -> first entry; -1 means UNANSWERED
+    std::vector<int> count;   // global row -> number of entries
+    std::vector<int> cols;    // global column of each entry
+    std::vector<int> dims;    // its block column dimension
+    std::vector<double> norms;  // Frobenius, from the pattern exchange
+    std::vector<const T*> data;
+
+    void build(const SpMMGhostBlocks<T>& ghosts, const GhostMetadata& patterns,
+               int n_global) {
+        first.assign(static_cast<size_t>(n_global), -1);
+        count.assign(static_cast<size_t>(n_global), 0);
+        for (const auto& row : patterns) {
+            first[static_cast<size_t>(row.first)] = 0;
+        }
+        for (const auto& entry : ghosts.rows) {
+            first[static_cast<size_t>(entry.first)] = static_cast<int>(cols.size());
+            count[static_cast<size_t>(entry.first)] = static_cast<int>(entry.second.size());
+            for (const auto& block : entry.second) {
+                cols.push_back(block.col);
+                dims.push_back(block.c_dim);
+                norms.push_back(block.norm);
+                data.push_back(block.data);
+            }
+        }
+    }
+};
+
+/// Every block of the rows named in `patterns`, as the payload exchange wants
+/// them.
+inline std::vector<BlockID> fused_blocks_of(const GhostMetadata& patterns) {
+    std::vector<BlockID> blocks;
+    for (const auto& row : patterns) {
+        for (const auto& meta : row.second) {
+            blocks.push_back(BlockID{row.first, meta.col});
+        }
+    }
+    return blocks;
+}
+
+/// Global block index -> local row, or -1 where the matrix does not own it.
+template <typename Matrix>
+std::vector<int> fused_row_of_global(const Matrix& m, int n_global_blocks) {
+    std::vector<int> map(static_cast<size_t>(n_global_blocks), -1);
+    const int n_rows = static_cast<int>(m.graph->adj_ptr.size()) - 1;
+    for (int i = 0; i < n_rows; ++i) {
+        map[static_cast<size_t>(m.graph->get_global_index(i))] = i;
+    }
+    return map;
+}
+
+/// Largest block norm over the whole team. Global rather than per row because
+/// a stage-one neglect is later multiplied by a block belonging to a row this
+/// rank may not own, so only a global bound is sound.
+template <typename Matrix>
+double fused_global_max_norm(const Matrix& A) {
+    const auto& norms = A.get_block_norms();
+    double local = 0.0;
+    for (double n : norms) local = std::max(local, n);
+    if (A.graph->size <= 1) return local;
+    double global = local;
+    MPI_Allreduce(&local, &global, 1, MPI_DOUBLE, MPI_MAX, A.graph->comm);
+    return global;
+}
+
+/// The one drop, on finished values, staging the survivors BY COLUMN and
+/// EXACTLY SIZED -- which is what lets fused_assemble copy straight out of the
+/// staged rows. Two passes rather than one, and the reason is memory rather
+/// than clarity:
+///
+///   * By column, because the accumulator hands slots back in first-touch
+///     order and the result graph is ordered. Reordering in assemble had to
+///     build a second buffer per row and swap -- an extra copy of the whole
+///     answer, and, since the discarded buffers are over the allocator's
+///     dynamic mmap threshold at these row sizes, one glibc keeps rather than
+///     returns. Measured at 4096 blocks x 200 neighbours: +2.20 GB high water
+///     against a 5.72 GB result, 1.90 GB of it left resident, to permute and
+///     nothing else. Sorting the surviving INDICES costs nothing beside it.
+///   * Exactly sized, because push_back growth left the staged rows at
+///     9.70 GB of capacity for 5.72 GB of answer, and every doubling frees a
+///     buffer the allocator then holds.
+///
+/// ORDER INVARIANT, stated because nothing asserts it: the sort below is by
+/// GLOBAL column, while construct_result_graph orders each row's adjacency by
+/// LOCAL id -- owned columns (ascending global) first, then ghosts (by owner,
+/// then global). The two agree only because (a) ownership is
+/// contiguous-ascending in global id (find_owner binary-searches
+/// block_displs), and (b) the output is UPPER-ONLY: an owned row's columns
+/// are all >= its own global id, so every ghost column in the row is above
+/// the owned range and sorts after every owned column in BOTH orders. A
+/// full-pattern kernel reusing this staging would break (b) -- its ghost
+/// columns below the owned range sort first globally but after the owned
+/// locals -- and the positional copy in fused_assemble would silently
+/// transpose values onto wrong columns in distributed runs.
+template <typename T>
+inline void stage_row_in_column_order(const FusedRowAccumulator<T>& acc, int r_dim,
+                                      double threshold, std::vector<int>& keep_order,
+                                      std::vector<int>& keep_columns,
+                                      std::vector<T>& keep_values) {
+    keep_order.clear();
+    size_t keep_elems = 0;
+    for (size_t s = 0; s < acc.touched.size(); ++s) {
+        const size_t count = static_cast<size_t>(r_dim) * acc.col_dim[s];
+        if (threshold > 0.0) {
+            const T* block = acc.values.data() + acc.value_offset[s];
+            double sq = 0.0;
+            for (size_t e = 0; e < count; ++e) sq += block_squared_magnitude<T>(block[e]);
+            if (std::sqrt(sq) < threshold) continue;
+        }
+        keep_order.push_back(static_cast<int>(s));
+        keep_elems += count;
+    }
+    std::sort(keep_order.begin(), keep_order.end(), [&](int x, int y) {
+        return acc.touched[static_cast<size_t>(x)] <
+               acc.touched[static_cast<size_t>(y)];
+    });
+    keep_columns.reserve(keep_order.size());
+    keep_values.reserve(keep_elems);
+    for (int idx : keep_order) {
+        const size_t s = static_cast<size_t>(idx);
+        const size_t count = static_cast<size_t>(r_dim) * acc.col_dim[s];
+        const T* block = acc.values.data() + acc.value_offset[s];
+        keep_columns.push_back(acc.touched[s]);
+        keep_values.insert(keep_values.end(), block, block + count);
+    }
+}
+
+/// Everything after a fused kernel's numeric pass: build the graph the
+/// surviving pattern defines and copy the staged values in, positionally.
+///
+/// The staged pattern IS the result pattern (stage_row_in_column_order's
+/// invariant above), so the copy is positional. Deferred first touch: the
+/// plain `Matrix C(graph_c)` ran the zero pass over the whole result --
+/// making it fully resident -- at the one moment the staged rows still hold
+/// the entire answer too. Every block is written by the copy, so there is
+/// nothing for the pass to initialise that the copy does not.
+///
+/// Each row's staging buffer is released the instant it has been copied --
+/// to the KERNEL, not just to malloc; see release_and_drop above for why the
+/// difference is most of the peak.
+///
+/// Walked by THREAD DOMAIN, not a dynamic row schedule: this copy is the
+/// deferred first touch, so the thread that runs a row decides which node its
+/// pages live on, and the forward apply splits this matrix along
+/// thread_domains.
+template <typename Matrix>
+Matrix fused_assemble(const Matrix& A,
+                      std::vector<std::vector<int>>& row_columns,
+                      std::vector<std::vector<typename Matrix::value_type>>& row_values,
+                      const GhostSizes& ghost_sizes, const char* what) {
+    using T = typename Matrix::value_type;
+    const DistGraph& ga = *A.graph;
+    const int n_rows = static_cast<int>(ga.adj_ptr.size()) - 1;
+
+    DistGraph* graph_c = construct_result_graph(A, row_columns, ghost_sizes, what);
+    Matrix C = Matrix::make_overwritten_result(graph_c, A.configured_page_size());
+
+    const auto& domains = C.thread_domain_partition();
+    const bool aligned = domains.thread_count > 0 &&
+                         static_cast<int>(domains.row_bounds.size()) ==
+                             domains.thread_count + 1;
+    #pragma omp parallel for schedule(static) if (aligned)
+    for (int d = 0; d < (aligned ? domains.thread_count : 1); ++d) {
+        const int row_lo = aligned ? domains.domain_begin(d) : 0;
+        const int row_hi = aligned ? domains.domain_end(d) : n_rows;
+        for (int i = row_lo; i < row_hi; ++i) {
+            int slot = graph_c->adj_ptr[i];
+            size_t at = 0;
+            for (size_t s = 0; s < row_columns[i].size(); ++s, ++slot) {
+                const size_t count = C.block_size_elements(slot);
+                std::memcpy(C.mutable_block_data(slot),
+                            row_values[i].data() + at, count * sizeof(T));
+                at += count;
+            }
+            release_and_drop(row_values[i]);
+        }
+    }
+    return C;
 }
 
 } // namespace detail

@@ -59,55 +59,10 @@ struct SquarePolynomialExecutor {
     using RowAccumulator = FusedRowAccumulator<T>;
     using ProductGroup = FusedProductGroup<T>;
 
-    // Rows fetched from other ranks, indexed by global row for O(1) reach in the
-    // numeric loop. `first` is -1 only for a row nobody answered; a row that
-    // exists and holds no blocks answers with zero entries, which must read as
-    // found-with-nothing.
-    struct RemoteRows {
-        std::vector<int> first;
-        std::vector<int> count;
-        std::vector<int> cols;
-        std::vector<int> dims;
-        std::vector<double> norms;
-        std::vector<const T*> data;
-
-        void build(const SpMMGhostBlocks<T>& ghosts, const GhostMetadata& patterns,
-                   int n_global) {
-            first.assign(static_cast<size_t>(n_global), -1);
-            count.assign(static_cast<size_t>(n_global), 0);
-            for (const auto& row : patterns) first[static_cast<size_t>(row.first)] = 0;
-            for (const auto& entry : ghosts.rows) {
-                first[static_cast<size_t>(entry.first)] = static_cast<int>(cols.size());
-                count[static_cast<size_t>(entry.first)] =
-                    static_cast<int>(entry.second.size());
-                for (const auto& block : entry.second) {
-                    cols.push_back(block.col);
-                    dims.push_back(block.c_dim);
-                    norms.push_back(block.norm);
-                    data.push_back(block.data);
-                }
-            }
-        }
-    };
-
-    static std::vector<BlockID> blocks_of(const GhostMetadata& patterns) {
-        std::vector<BlockID> blocks;
-        for (const auto& row : patterns) {
-            for (const auto& meta : row.second) {
-                blocks.push_back(BlockID{row.first, meta.col});
-            }
-        }
-        return blocks;
-    }
-
-    static std::vector<int> row_of_global(const Matrix& m, int n_global_blocks) {
-        std::vector<int> map(static_cast<size_t>(n_global_blocks), -1);
-        const int n_rows = static_cast<int>(m.graph->adj_ptr.size()) - 1;
-        for (int i = 0; i < n_rows; ++i) {
-            map[static_cast<size_t>(m.graph->get_global_index(i))] = i;
-        }
-        return map;
-    }
+    // Shared with rarh and rhar; see common.hpp. A drift between per-executor
+    // copies of these was a silent wrong-fetch bug, so they are shared by
+    // construction.
+    using RemoteRows = FusedRemoteRows<T>;
 
     static void fused_rows(const Matrix& A, T c2, T c1, T c0, double threshold,
                            const RemoteRows& remote, const std::vector<int>& a_row,
@@ -231,107 +186,14 @@ struct SquarePolynomialExecutor {
                     for (int d = 0; d < r_dim; ++d) dest[d * r_dim + d] += c0;
                 }
 
-                // The one drop, on finished values.
-                //
-                // Staged BY COLUMN and EXACTLY SIZED, which is what lets
-                // assemble copy straight out of these rows; see the note there
-                // and the matching one in rarh.hpp for what the alternative
-                // -- reordering afterwards, into a second buffer per row --
-                // cost in peak memory.
-                std::vector<int>& keep_columns = row_columns[i];
-                std::vector<T>& keep_values = row_values[i];
-                keep_order.clear();
-                size_t keep_elems = 0;
-                for (size_t s = 0; s < acc.touched.size(); ++s) {
-                    const size_t count = static_cast<size_t>(r_dim) * acc.col_dim[s];
-                    if (threshold > 0.0) {
-                        const T* block = acc.values.data() + acc.value_offset[s];
-                        double sq = 0.0;
-                        for (size_t e = 0; e < count; ++e) sq += block_squared_magnitude<T>(block[e]);
-                        if (std::sqrt(sq) < threshold) continue;
-                    }
-                    keep_order.push_back(static_cast<int>(s));
-                    keep_elems += count;
-                }
-                std::sort(keep_order.begin(), keep_order.end(), [&](int x, int y) {
-                    return acc.touched[static_cast<size_t>(x)] <
-                           acc.touched[static_cast<size_t>(y)];
-                });
-                keep_columns.reserve(keep_order.size());
-                keep_values.reserve(keep_elems);
-                for (int idx : keep_order) {
-                    const size_t s = static_cast<size_t>(idx);
-                    const size_t count = static_cast<size_t>(r_dim) * acc.col_dim[s];
-                    const T* block = acc.values.data() + acc.value_offset[s];
-                    keep_columns.push_back(acc.touched[s]);
-                    keep_values.insert(keep_values.end(), block, block + count);
-                }
+                // The one drop, on finished values; the staging order, its
+                // exact sizing and the ORDER INVARIANT the positional copy
+                // rests on are recorded at stage_row_in_column_order in
+                // common.hpp.
+                stage_row_in_column_order(acc, r_dim, threshold, keep_order,
+                                          row_columns[i], row_values[i]);
             }
         }
-    }
-
-    static Matrix assemble(const Matrix& A, std::vector<std::vector<int>>& row_columns,
-                           std::vector<std::vector<T>>& row_values,
-                           const GhostSizes& ghost_sizes) {
-        const DistGraph& ga = *A.graph;
-        const int n_rows = static_cast<int>(ga.adj_ptr.size()) - 1;
-
-        // Column order is load-bearing here, and NOT the optional output
-        // ordering that spgemm_sorted_output_enabled governs in the other
-        // executors: construct_result_graph sorts every row's columns
-        // (result_graph.hpp), while the copy-out below walks row_columns[i] and
-        // writes consecutive slots from graph_c->adj_ptr[i]. The two orders have
-        // to agree; disagreeing silently transposes values onto the wrong
-        // columns, which reaches the caller as a diverged iteration rather than
-        // as anything the kernel itself can detect.
-        //
-        // It is established where the rows are staged rather than by a pass
-        // here, because a pass here has to build a second buffer per row and so
-        // holds a duplicate of the whole answer; see the note at the drop loop.
-
-        DistGraph* graph_c =
-            construct_result_graph(A, row_columns, ghost_sizes, "square_polynomial");
-        // Deferred first touch, and built at A's page size rather than allocated
-        // at the default and then rebuilt by set_page_size. The plain
-        // `Matrix C(graph_c)` here faulted in the whole answer -- while the
-        // staging buffers below still held all of it -- before a single block
-        // had been written. Every block of C is memcpy'd below, so nothing is
-        // left unwritten by skipping the zero pass.
-        Matrix C = Matrix::make_overwritten_result(graph_c, A.configured_page_size());
-
-        // Each row's staging buffer is released as soon as it is copied, so the
-        // two only overlap by the rows not yet reached. Released to the KERNEL,
-        // not just to malloc -- see release_and_drop in common.hpp for why the
-        // difference is most of this kernel's peak.
-        //
-        // Walked by THREAD DOMAIN, not by row with a dynamic schedule. This copy
-        // is the deferred first touch, so whichever thread runs a row is the
-        // node its pages land on -- and the forward apply later splits this
-        // matrix along thread_domains. A dynamic schedule placed them wherever
-        // the race fell out, which silently undid the NUMA locality the removed
-        // zero pass used to establish. bsr.hpp's SpGEMM has the same structure
-        // and already did this correctly; these assembles did not.
-        const auto& domains = C.thread_domain_partition();
-        const bool aligned = domains.thread_count > 0 &&
-                             static_cast<int>(domains.row_bounds.size()) ==
-                                 domains.thread_count + 1;
-        #pragma omp parallel for schedule(static) if (aligned)
-        for (int d = 0; d < (aligned ? domains.thread_count : 1); ++d) {
-        const int row_lo = aligned ? domains.domain_begin(d) : 0;
-        const int row_hi = aligned ? domains.domain_end(d) : n_rows;
-        for (int i = row_lo; i < row_hi; ++i) {
-            int slot = graph_c->adj_ptr[i];
-            size_t at = 0;
-            for (size_t s = 0; s < row_columns[i].size(); ++s, ++slot) {
-                const size_t count = C.block_size_elements(slot);
-                std::memcpy(C.mutable_block_data(slot), row_values[i].data() + at,
-                            count * sizeof(T));
-                at += count;
-            }
-            release_and_drop(row_values[i]);
-        }
-        }
-        return C;
     }
 
     // Whether this rank holds any nonzero block at all.
@@ -376,7 +238,7 @@ struct SquarePolynomialExecutor {
             }
             const GhostMetadata meta = fetch_row_patterns(A, needed, ga.comm, ga.size, rank);
             ghosts = build_spmm_ghost_blocks<T>(
-                meta, fetch_required_block_payloads(A, blocks_of(meta)));
+                meta, fetch_required_block_payloads(A, fused_blocks_of(meta)));
             remote.build(ghosts, meta, n_global);
             ghost_sizes = ghosts.sizes;
         }
@@ -386,9 +248,9 @@ struct SquarePolynomialExecutor {
                 ga.block_sizes[static_cast<size_t>(n_owned) + g];
         }
 
-        fused_rows(A, c2, c1, c0, threshold, remote, row_of_global(A, n_global), n_global,
+        fused_rows(A, c2, c1, c0, threshold, remote, fused_row_of_global(A, n_global), n_global,
                    A.get_block_norms(), has_nonzero_block(A), row_columns, row_values);
-        return assemble(A, row_columns, row_values, ghost_sizes);
+        return fused_assemble(A, row_columns, row_values, ghost_sizes, "square_polynomial");
     }
 };
 
