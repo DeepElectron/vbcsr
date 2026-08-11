@@ -175,10 +175,14 @@ Matrix conjugate_transpose(const Matrix& matrix, bool mirror) {
     // ---- 1. Classify every source block by who owns its transposed image.
     std::vector<int> dest(nnz, kTransposeSkip);
     size_t remote_elems = 0;
+    // Kept per row, not just summed: the value rounds below are bounded by
+    // BYTES, and a bound needs to know where the bytes are.
+    std::vector<size_t> row_remote_elems(static_cast<size_t>(n_owned), 0);
     #pragma omp parallel for schedule(dynamic, 256) reduction(+:remote_elems)
     for (int i = 0; i < n_owned; ++i) {
         const int g_row = ga.owned_global_indices[i];
         const int r_dim = ga.block_sizes[i];
+        size_t row_elems = 0;
         for (int k = adj_ptr[i]; k < adj_ptr[i + 1]; ++k) {
             const int local_col = ga.adj_ind[k];
             const int g_col = ga.get_global_index(local_col);
@@ -186,9 +190,11 @@ Matrix conjugate_transpose(const Matrix& matrix, bool mirror) {
             const int owner = (nranks == 1) ? my_rank : ga.find_owner(g_col);
             dest[static_cast<size_t>(k)] = owner;
             if (owner != my_rank) {
-                remote_elems += static_cast<size_t>(r_dim) * ga.block_sizes[local_col];
+                row_elems += static_cast<size_t>(r_dim) * ga.block_sizes[local_col];
             }
         }
+        row_remote_elems[static_cast<size_t>(i)] = row_elems;
+        remote_elems += row_elems;
     }
 
     // ---- 2. Exchange the metadata of the remote blocks, whole.
@@ -471,15 +477,40 @@ Matrix conjugate_transpose(const Matrix& matrix, bool mirror) {
             recv_elems[b] = static_cast<size_t>(meta[2]) * static_cast<size_t>(meta[3]);
         }
 
-        long long my_rounds = 1;
+        // Round boundaries by BYTE PREFIX, not by row count.
+        //
+        // The count of rounds was derived from the total bytes, but the rows
+        // were then split evenly by INDEX -- so the budget bounded nothing on
+        // a matrix with uneven rows. One saturated row lands in one round and
+        // carries whatever it carries; the "budget" was an average, not a cap.
+        // Walking a prefix sum closes a round when the next row would exceed
+        // it, which makes it a real bound except for a single row that alone
+        // is over budget (irreducible without splitting inside a row).
+        std::vector<int> round_bound;
         {
             const size_t budget = transpose_chunk_bytes();
-            const size_t bytes = remote_elems * sizeof(T);
-            my_rounds = static_cast<long long>((bytes + budget - 1) / budget);
-            if (my_rounds < 1) my_rounds = 1;
+            round_bound.push_back(0);
+            size_t acc = 0;
+            for (int i = 0; i < n_owned; ++i) {
+                const size_t row_bytes =
+                    row_remote_elems[static_cast<size_t>(i)] * sizeof(T);
+                if (acc > 0 && acc + row_bytes > budget) {
+                    round_bound.push_back(i);
+                    acc = 0;
+                }
+                acc += row_bytes;
+            }
+            round_bound.push_back(n_owned);
         }
+        long long my_rounds =
+            std::max<long long>(1, static_cast<long long>(round_bound.size()) - 1);
         long long rounds = my_rounds;
         MPI_Allreduce(&my_rounds, &rounds, 1, MPI_LONG_LONG, MPI_MAX, ga.comm);
+        // The rounds are collective, so a rank that needed fewer runs empty
+        // ones rather than dropping out of the exchange.
+        while (static_cast<long long>(round_bound.size()) - 1 < rounds) {
+            round_bound.push_back(n_owned);
+        }
 
         // Start of each source's metadata segment, so a round can address its
         // slice without rescanning the counts.
@@ -495,8 +526,8 @@ Matrix conjugate_transpose(const Matrix& matrix, bool mirror) {
         std::vector<size_t> round_offset;
         std::vector<size_t> round_block;
         for (long long r = 0; r < rounds; ++r) {
-            const int row_lo = static_cast<int>(static_cast<long long>(n_owned) * r / rounds);
-            const int row_hi = static_cast<int>(static_cast<long long>(n_owned) * (r + 1) / rounds);
+            const int row_lo = round_bound[static_cast<size_t>(r)];
+            const int row_hi = round_bound[static_cast<size_t>(r) + 1];
             const GroupLayout layout =
                 plan_remote_groups(matrix, dest, row_lo, row_hi, my_rank, nranks, max_chunks);
 
