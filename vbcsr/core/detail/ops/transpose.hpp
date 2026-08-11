@@ -161,8 +161,15 @@ GroupLayout plan_remote_groups(
 // triangle is mirrored, so no intermediate matrix or union graph is built. A
 // is required to be upper-triangle-only; anything in its strict lower triangle
 // is ignored rather than mirrored on top of an existing block.
+// `consume_source`, when set, must be `&matrix`: the caller is handing this
+// function its source to destroy, and each row's storage is released as soon as
+// the last pass that reads it is done with it. See the note at stage 6 for the
+// ordering that makes "the last pass" a row prefix, and
+// BlockSpMat::complete_hermitian_inplace for why the entry point that does this
+// is the mutating one -- a const method cannot honestly free its own object.
 template <typename Matrix>
-Matrix conjugate_transpose(const Matrix& matrix, bool mirror) {
+Matrix conjugate_transpose(const Matrix& matrix, bool mirror,
+                           Matrix* consume_source = nullptr) {
     using T = typename Matrix::value_type;
 
     DistGraph& ga = *matrix.graph;
@@ -416,10 +423,30 @@ Matrix conjugate_transpose(const Matrix& matrix, bool mirror) {
             std::move(c_adj_ptr),
             std::move(adj_ind_c));
     }
-    Matrix result(graph_c);
-    result.owns_graph = true;
-    result.graph->enable_matrix_lifetime_management();
-    result.set_page_size(matrix.configured_page_size());
+    // Consuming skips the first-touch zero pass; the plain path keeps it. That
+    // is a real trade, not an oversight either way.
+    //
+    // The pass is redundant for correctness in both -- stage 6 writes every
+    // block the result graph has, because that graph was built in stage 4 from
+    // exactly those blocks -- and what it buys is domain-aligned NUMA
+    // placement, which stage 6 cannot reproduce: its local writes are a SCATTER
+    // (source row i lands in result row j > i), so no ordering of them places
+    // result rows by domain.
+    //
+    // But when consuming, the pass defeats the whole point: it makes the result
+    // fully resident before a single row of the source has been released, so
+    // the source and the finished result are both whole at the same moment --
+    // which is exactly the peak the caller asked to avoid. Placement is worth
+    // less than 5.7 GB of peak on the path that asks for this.
+    Matrix result = consume_source != nullptr
+                        ? Matrix::make_overwritten_result(graph_c,
+                                                          matrix.configured_page_size())
+                        : Matrix(graph_c);
+    if (consume_source == nullptr) {
+        result.owns_graph = true;
+        result.graph->enable_matrix_lifetime_management();
+        result.set_page_size(matrix.configured_page_size());
+    }
 
     // Position of column `local_col` in result row `local_row`.
     const std::vector<int>& cp = graph_c->adj_ptr;
@@ -435,32 +462,52 @@ Matrix conjugate_transpose(const Matrix& matrix, bool mirror) {
 
     int any_missing_dest = 0;
 
-    // ---- 6a. A's own blocks (mirror only) and every block whose transposed
-    // image this rank owns: straight from A's storage to C's, no buffers.
-    if (mirror) {
-        #pragma omp parallel for schedule(dynamic, 256) reduction(|:any_missing_dest)
-        for (int i = 0; i < n_owned; ++i) {
-            for (int k = adj_ptr[i]; k < adj_ptr[i + 1]; ++k) {
-                const int slot = slot_of(i, to_local.at(ga.get_global_index(ga.adj_ind[k])));
-                if (slot < 0) { any_missing_dest = 1; continue; }
-                std::memcpy(result.mutable_block_data(slot), matrix.block_data(k),
-                            matrix.block_size_elements(k) * sizeof(T));
+    // ---- 6. The values, remote first and local second.
+    //
+    // THE ORDER MATTERS ONLY WHEN CONSUMING, and then it is what makes the
+    // release possible at all. The source is read by two passes -- the remote
+    // pack (6b) and the local writes (6a) -- so a row is dead only once BOTH
+    // have seen it. 6b walks rows in byte-bounded rounds whose boundaries are a
+    // row prefix, and 6a walks every row; running 6b to completion first leaves
+    // "already read by everything" equal to "below the row 6a has reached",
+    // which is a prefix and so is exactly what release_values_below_row takes.
+    //
+    // Interleaving them per round would release earlier and hold less, but it
+    // would also weave two exchange-bound loops together for a fraction of one
+    // chunk. Not worth the tangle: the chunk is the unit of overshoot either
+    // way.
+    //
+    // For the plain path the order is immaterial -- the two write disjoint
+    // slots of a result whose pages are already placed by the zero pass above
+    // -- so there is one ordering here rather than two.
+
+    // ---- 6b. Remote blocks, in bounded rounds.
+    const auto write_local_rows = [&](int row_lo, int row_hi) {
+        if (mirror) {
+            #pragma omp parallel for schedule(dynamic, 256) reduction(|:any_missing_dest)
+            for (int i = row_lo; i < row_hi; ++i) {
+                for (int k = adj_ptr[i]; k < adj_ptr[i + 1]; ++k) {
+                    const int slot = slot_of(i, to_local.at(ga.get_global_index(ga.adj_ind[k])));
+                    if (slot < 0) { any_missing_dest = 1; continue; }
+                    std::memcpy(result.mutable_block_data(slot), matrix.block_data(k),
+                                matrix.block_size_elements(k) * sizeof(T));
+                }
             }
         }
-    }
-    #pragma omp parallel for schedule(dynamic, 256) reduction(|:any_missing_dest)
-    for (int i = 0; i < n_owned; ++i) {
-        const int r_dim = ga.block_sizes[i];
-        for (int k = adj_ptr[i]; k < adj_ptr[i + 1]; ++k) {
-            if (dest[static_cast<size_t>(k)] != my_rank) continue;
-            const int local_col = ga.adj_ind[k];
-            const int slot = slot_of(to_local.at(ga.get_global_index(local_col)), i);
-            if (slot < 0) { any_missing_dest = 1; continue; }
-            write_transposed_conjugate_block(result.mutable_block_data(slot),
-                                             matrix.block_data(k),
-                                             r_dim, ga.block_sizes[local_col]);
+        #pragma omp parallel for schedule(dynamic, 256) reduction(|:any_missing_dest)
+        for (int i = row_lo; i < row_hi; ++i) {
+            const int r_dim = ga.block_sizes[i];
+            for (int k = adj_ptr[i]; k < adj_ptr[i + 1]; ++k) {
+                if (dest[static_cast<size_t>(k)] != my_rank) continue;
+                const int local_col = ga.adj_ind[k];
+                const int slot = slot_of(to_local.at(ga.get_global_index(local_col)), i);
+                if (slot < 0) { any_missing_dest = 1; continue; }
+                write_transposed_conjugate_block(result.mutable_block_data(slot),
+                                                 matrix.block_data(k),
+                                                 r_dim, ga.block_sizes[local_col]);
+            }
         }
-    }
+    };
 
     // ---- 6b. Remote blocks, in bounded rounds.
     if (nranks > 1) {
@@ -617,6 +664,31 @@ Matrix conjugate_transpose(const Matrix& matrix, bool mirror) {
             }
         }
     }
+
+    // ---- 6a. A's own blocks (mirror only) and every block whose transposed
+    // image this rank owns: straight from A's storage to C's, no buffers.
+    //
+    // In chunks when consuming, so the source can be handed back as it is
+    // finished with. 4 chunks, the same count filter_blocks and bsr.hpp's
+    // consuming path use, and for the reason recorded there: a chunk count
+    // derived from the thread count collapses to one on a small machine and
+    // stops releasing anything, while a large one costs more in barriers than
+    // it saves in overshoot.
+    constexpr int kLocalChunks = 4;
+    const int chunk_rows = consume_source != nullptr
+                               ? std::max(1, (n_owned + kLocalChunks - 1) / kLocalChunks)
+                               : n_owned;
+    for (int chunk_begin = 0; chunk_begin < n_owned; chunk_begin += chunk_rows) {
+        const int chunk_end = std::min(n_owned, chunk_begin + chunk_rows);
+        write_local_rows(chunk_begin, chunk_end);
+        if (consume_source != nullptr) {
+            // Both passes are done with every row below chunk_end: 6b finished
+            // above, and the loops in write_local_rows carry their own implicit
+            // barrier, so no thread is still reading the range being released.
+            consume_source->release_values_below_row(chunk_end);
+        }
+    }
+    if (n_owned == 0) write_local_rows(0, 0);
 
     if (any_missing_dest) {
         throw std::runtime_error("transpose could not locate destination block");

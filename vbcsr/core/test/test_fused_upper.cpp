@@ -243,13 +243,36 @@ int run_case(const char* label, const std::vector<int>& rows, int rank) {
 
     // C = A B A^H, at threshold 0 so every block the pattern allows survives
     // and the comparison is exact rather than up-to-dropped-blocks.
+    const std::vector<T> rarh_want =
+        dense_mul(dense_mul(a_dense, b_dense, n), dense_adjoint(a_dense, n), n);
     {
         const BlockSpMat<T> C = A.rarh_upper(B, 0.0).complete_hermitian();
         std::vector<T> got = densify(C, sizes, offsets, n);
         sum_over_ranks(got);
-        const std::vector<T> want =
-            dense_mul(dense_mul(a_dense, b_dense, n), dense_adjoint(a_dense, n), n);
-        report("rarh_upper vs dense A B A^H", max_abs_diff(got, want));
+        report("rarh_upper vs dense A B A^H", max_abs_diff(got, rarh_want));
+    }
+
+    // The in-place completion must land on the SAME matrix, not merely a
+    // correct one: it releases the upper triangle's pages as it mirrors them,
+    // and a release that ran even slightly ahead of the last read would show up
+    // here as zeroed blocks rather than as a crash -- MADV_DONTNEED hands back
+    // zero-filled pages, so the memory stays addressable and the damage is
+    // silent. Compared against the dense reference AND against what the
+    // non-consuming path produces, because "both wrong the same way" is the one
+    // failure a self-comparison would miss.
+    {
+        BlockSpMat<T> C = A.rarh_upper(B, 0.0);
+        C.complete_hermitian_inplace();
+        std::vector<T> got = densify(C, sizes, offsets, n);
+        sum_over_ranks(got);
+        report("complete_hermitian_inplace vs dense A B A^H",
+               max_abs_diff(got, rarh_want));
+
+        std::vector<T> reference =
+            densify(A.rarh_upper(B, 0.0).complete_hermitian(), sizes, offsets, n);
+        sum_over_ranks(reference);
+        report("complete_hermitian_inplace vs the copying completion",
+               max_abs_diff(got, reference));
     }
 
     // c2 A^2 + c1 A + c0 I. The coefficients are REAL because the kernel

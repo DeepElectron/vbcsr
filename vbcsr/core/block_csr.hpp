@@ -1878,6 +1878,33 @@ public:
         return C;
     }
 
+    // The same completion, with this matrix BECOMING the completed one.
+    //
+    // Not an ergonomic variant of the above -- it is the only honest signature
+    // for the thing it does. The completed matrix is roughly twice the upper
+    // triangle it is built from (every off-diagonal block gains a mirror; the
+    // diagonal does not double), and the caller's upper triangle is dead the
+    // moment its last block has been mirrored. Handing its storage back as that
+    // happens is the whole point, and a `const` method that freed its own
+    // object would be lying about what it does. So the destruction is in the
+    // signature, exactly as spmm/spmm_inplace already split the same way and
+    // for the same reason.
+    //
+    // "In place" means the VARIABLE, not the allocation: the result has a
+    // different graph and about twice the blocks, so it cannot be written into
+    // the old storage. What is in place is that the old storage is released as
+    // the new one fills, instead of the two standing side by side.
+    //
+    // Measured on one Newton-Schulz update at 4096 atoms -- block size 13, 200
+    // neighbours, 48 threads, a 5.72 GB upper triangle completing to 11.43 GB:
+    // the step peaked at 21.50 GB against a floor of 15.55 (its two operands
+    // plus its answer), and the 5.95 GB of excess was the upper triangle, held
+    // whole across a completion that no longer needed it.
+    void complete_hermitian_inplace() {
+        *this = detail::conjugate_transpose(*this, /*mirror=*/true, /*consume=*/this);
+        hermitize_diagonal_blocks();
+    }
+
     // D <- (D + D^H)/2 for every diagonal block, in place.
     void hermitize_diagonal_blocks() {
         const int n_rows = static_cast<int>(graph->adj_ptr.size()) - 1;
