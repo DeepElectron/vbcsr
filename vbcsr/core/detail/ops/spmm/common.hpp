@@ -485,6 +485,10 @@ SymbolicMultiplyResult symbolic_multiply_filtered(
 
     const auto& A_norms = A.get_block_norms();
     const auto& B_local_norms = B.get_block_norms();
+    // Total global block columns: the ceiling on any row's distinct result
+    // columns, and the cap applied to row_width_bound below.
+    const int n_global_blocks =
+        A.graph->block_displs.empty() ? 0 : A.graph->block_displs.back();
 
     std::vector<std::vector<int>> thread_cols(n_rows);
     const int max_threads = omp_get_max_threads();
@@ -521,6 +525,26 @@ SymbolicMultiplyResult symbolic_multiply_filtered(
             const int global_row = A.graph->get_global_index(row);
 
             // Upper bound on this row's distinct result columns.
+            //
+            // The sum below counts multiplication PATHS -- one per (A entry, B
+            // entry) pair -- not distinct columns, and on a saturated row the
+            // two differ by a factor of the row width. A 4096-block row that
+            // reaches every other block accumulates 4096^2 = 16.8M, asks for a
+            // 2N+1 table, rounds up to 67.1M entries, and at 24 bytes an entry
+            // that is 1.5 GiB PER THREAD -- ~72 GiB across 48 threads for a row
+            // that cannot hold more than 4096 distinct columns.
+            //
+            // Measured on a dense 1024-block row before this cap: 4.61 GB peak
+            // against 64 MB of operands at 48 threads, and 0.49 GB at 4 -- the
+            // giveaway that it scales with thread count, not with the problem.
+            //
+            // So cap it by what a row can actually contain. upper_only skips
+            // every column below the diagonal before insertion, so its rows can
+            // only hold what remains above it.
+            const size_t max_distinct =
+                upper_only
+                    ? static_cast<size_t>(std::max(0, n_global_blocks - global_row))
+                    : static_cast<size_t>(std::max(0, n_global_blocks));
             size_t row_width_bound = 0;
             for (int a_slot = start; a_slot < end; ++a_slot) {
                 const int global_col_A = A.graph->get_global_index(A.col_ind()[a_slot]);
@@ -535,6 +559,7 @@ SymbolicMultiplyResult symbolic_multiply_filtered(
                     }
                 }
             }
+            row_width_bound = std::min(row_width_bound, max_distinct);
             const size_t required = std::max<size_t>(
                 kInitialSymbolicHashSize, 2 * row_width_bound + 1);
             if (required > table.size()) {

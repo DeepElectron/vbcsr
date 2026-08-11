@@ -1,6 +1,7 @@
 #ifndef VBCSR_DETAIL_OPS_SPMF_GRAPH_FUNCTION_HPP
 #define VBCSR_DETAIL_OPS_SPMF_GRAPH_FUNCTION_HPP
 
+#include <set>
 #include "../../../block_csr.hpp"
 #include "../../kernels/dense_kernels.hpp"
 #include "subspace.hpp"
@@ -62,10 +63,42 @@ void graph_function_apply(
     if (Result == nullptr) {
         throw std::invalid_argument("graph_function_apply requires a valid output matrix pointer");
     }
-    if (Result->graph != A.graph &&
-        (Result->graph->comm != A.graph->comm ||
-         Result->graph->owned_global_indices.size() != A.graph->owned_global_indices.size())) {
-        throw std::runtime_error("graph_function_apply: Result matrix has incompatible graph structure");
+    // Result must be able to HOLD what this writes, which is more than the
+    // old check (same comm, same owned COUNT) established: two graphs can
+    // agree on both and still disagree on which rows they own, on block sizes,
+    // and on adjacency. That mattered because the scatter below goes through
+    // add_block, which on a block the output graph does not have prints a
+    // warning to stderr and DROPS it -- a silently incomplete f(A) whose only
+    // trace is a line nobody reads. The loop also inserts a diagonal that A's
+    // own pattern may omit, so "Result has A's pattern" is not sufficient
+    // either; it needs pattern(A) union diagonal.
+    if (Result->graph != A.graph) {
+        if (Result->graph->comm != A.graph->comm ||
+            Result->graph->owned_global_indices != A.graph->owned_global_indices) {
+            throw std::runtime_error(
+                "graph_function_apply: Result and A must own the same rows in the same "
+                "order on the same communicator");
+        }
+        const int n_check = static_cast<int>(A.graph->owned_global_indices.size());
+        for (int idx = 0; idx < n_check; ++idx) {
+            const int global_row = A.graph->owned_global_indices[idx];
+            std::set<int> have;
+            for (int k = Result->row_ptr()[idx]; k < Result->row_ptr()[idx + 1]; ++k) {
+                have.insert(Result->graph->get_global_index(Result->col_ind()[k]));
+            }
+            const auto missing = [&](int col) {
+                throw std::runtime_error(
+                    "graph_function_apply: Result is missing block (" +
+                    std::to_string(global_row) + ", " + std::to_string(col) +
+                    "). It must cover pattern(A) union the diagonal, or the result "
+                    "is silently incomplete.");
+            };
+            if (have.count(global_row) == 0) missing(global_row);
+            for (int k = A.row_ptr()[idx]; k < A.row_ptr()[idx + 1]; ++k) {
+                const int col = A.graph->get_global_index(A.col_ind()[k]);
+                if (have.count(col) == 0) missing(col);
+            }
+        }
     }
 
     DistGraph* graph = A.graph;
