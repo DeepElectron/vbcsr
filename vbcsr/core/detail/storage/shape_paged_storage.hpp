@@ -254,6 +254,23 @@ public:
         }
     }
 
+    /// Hand back the storage under the first `block_count` blocks of one shape.
+    ///
+    /// The counterpart of csr/bsr_backend's release_blocks_before, and it has to
+    /// be per shape because that is how this store is packed: a row boundary is
+    /// a prefix of EVERY shape's buffer rather than of one array. The caller
+    /// supplies each shape's count; it is the only party that knows how the
+    /// blocks were laid out. Returns bytes actually returned to the OS, which
+    /// is 0 for a heap-backed buffer and for a prefix shorter than a page --
+    /// the caller keeps the memory, which costs correctness nothing.
+    uint64_t release_shape_blocks_before(int shape_id, size_t block_count) {
+        ShapeRecord& record = require_shape(shape_id);
+        if (block_count == 0 || record.elements_per_block == 0) return 0;
+        if (block_count > record.used_blocks) block_count = record.used_blocks;
+        return record.values.release_pages_before(
+            static_cast<uint64_t>(block_count) * record.elements_per_block);
+    }
+
     template <typename Fn>
     void for_each_page(Fn&& fn) const {
         for (const auto& record : shapes_) {

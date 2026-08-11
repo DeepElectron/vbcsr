@@ -17,6 +17,7 @@ MAINTAINED_TESTS = [
     "test_pb_csr.cpp",
     "test_vendor_batch_gemm.cpp",
     "test_fused_upper.cpp",
+    "test_release_below_row.cpp",
 ]
 
 LEGACY_TESTS = [

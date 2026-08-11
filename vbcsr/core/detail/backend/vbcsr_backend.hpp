@@ -148,10 +148,18 @@ struct VBCSRMatrixBackend {
     VBCSRMatrixBackend(const VBCSRMatrixBackend&) = delete;
     VBCSRMatrixBackend& operator=(const VBCSRMatrixBackend&) = delete;
 
-    // Member-init order follows declaration order (thread_domains is declared
-    // above the private block) so the compiler does not silently reorder.
+    // Member-init order follows declaration order (thread_domains and
+    // shape_domain_offsets are declared above the private block) so the
+    // compiler does not silently reorder.
+    //
+    // These enumerate every member BY HAND, so a member added below and not
+    // added here is silently default-constructed on every move -- and this
+    // backend is moved on the way into the matrix, so "silently" means always.
+    // shape_domain_offsets was lost exactly that way; the release it feeds
+    // returned 0 with no error to show for it.
     VBCSRMatrixBackend(VBCSRMatrixBackend&& other) noexcept
         : thread_domains(std::move(other.thread_domains)),
+          shape_domain_offsets(std::move(other.shape_domain_offsets)),
           graph_block_handles_(std::move(other.graph_block_handles_)),
           storage(std::move(other.storage)) {}
 
@@ -161,6 +169,7 @@ struct VBCSRMatrixBackend {
             storage = std::move(other.storage);
             invalidate_apply_plan();
             thread_domains = std::move(other.thread_domains);
+            shape_domain_offsets = std::move(other.shape_domain_offsets);
         }
         return *this;
     }
@@ -171,8 +180,53 @@ struct VBCSRMatrixBackend {
     // backends built through other paths.
     ThreadDomainPartition thread_domains;
 
+    // Per shape, the number of that shape's blocks lying below each domain
+    // boundary: shape_domain_offsets[shape][d] blocks belong to domains
+    // 0..d-1. Sized (shape_count) x (domain_count + 1).
+    //
+    // This is the whole of what a row-prefix release needs from this store,
+    // and it is why the release lives here rather than being expressible as a
+    // single block index the way it is for CSR and BSR. The build below already
+    // computes it to drive the zero pass; keeping it costs a few hundred bytes
+    // (shapes x domains x 8) and is not a per-nnz cost.
+    std::vector<std::vector<size_t>> shape_domain_offsets;
+
     void set_thread_domains(ThreadDomainPartition domains) {
         thread_domains = std::move(domains);
+    }
+
+    // Hand back the storage under every block belonging to a row below `row`.
+    //
+    // The row-unit counterpart of csr/bsr_backend's release_blocks_before; see
+    // BlockSpMat::release_values_below_row for why the contract is stated in
+    // rows. Returns bytes actually returned to the OS.
+    //
+    // ROUNDED DOWN to the enclosing domain boundary, and deliberately: this
+    // store knows where each shape's blocks stop at a DOMAIN edge, not at an
+    // arbitrary row, and the alternative -- making callers chunk on domain
+    // edges -- would push a layout detail of one backend into code shared with
+    // the two that do not have it. Releasing fewer pages than permitted is
+    // always sound; releasing more never happens. The cost is at most one
+    // domain's blocks kept, ~1/thread_count of the matrix.
+    uint64_t release_blocks_below_row(int row) {
+        if (row <= 0 || shape_domain_offsets.empty()) return 0;
+        if (thread_domains.thread_count <= 0) return 0;
+        // Domains entirely below `row`. They are contiguous ascending row
+        // ranges, so this is a prefix of them.
+        int full_domains = 0;
+        while (full_domains < thread_domains.thread_count &&
+               thread_domains.domain_end(full_domains) <= row) {
+            ++full_domains;
+        }
+        if (full_domains == 0) return 0;
+        uint64_t released = 0;
+        for (size_t shape_id = 0; shape_id < shape_domain_offsets.size(); ++shape_id) {
+            const auto& offsets = shape_domain_offsets[shape_id];
+            if (static_cast<size_t>(full_domains) >= offsets.size()) continue;
+            released += storage.release_shape_blocks_before(
+                static_cast<int>(shape_id), offsets[static_cast<size_t>(full_domains)]);
+        }
+        return released;
     }
 
     // First-touch passthrough: zero the payload of shape blocks
@@ -283,6 +337,12 @@ struct VBCSRMatrixBackend {
                 }
             }
         }
+        // Kept rather than dropped: the walk above is the only place each
+        // shape's row order is known, and release_blocks_below_row needs it.
+        // `this->`, because the local built above has the same name and shadows
+        // the member -- without it this is a self-assignment of the local that
+        // compiles clean, warns nothing, and leaves the member empty.
+        this->shape_domain_offsets = std::move(shape_domain_offsets);
         set_thread_domains(std::move(domains));
     }
 

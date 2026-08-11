@@ -1490,7 +1490,7 @@ public:
                 }
                 // Outside the parallel region, so every row below the boundary
                 // is copied on every thread before its storage goes away.
-                release_value_blocks_before(graph->adj_ptr[chunk_end]);
+                release_values_below_row(chunk_end);
             }
         };
 
@@ -1635,17 +1635,16 @@ public:
             *this = detail::CSRSpMMExecutor<BlockSpMat<T>>::run_consuming(*this, B, threshold);
             return;
         }
-        // VBCSR falls through to the plain product: releasing a prefix of its
-        // values needs release_value_blocks_before, which its shape-packed store
-        // does not support (see there). Correct, just without the page release.
+        // VBCSR falls through to the plain product. NOT for want of a release
+        // any more -- release_values_below_row covers all three kinds -- but
+        // because VBCSRSpMMExecutor has no run_consuming: nothing chunks its
+        // numeric loop, so there is no point at which a prefix of the operand
+        // has been proved dead. Writing that is the remaining work, and it is a
+        // separate piece from the release itself. Correct as it stands, just
+        // without the page release.
         *this = spmm(B, threshold);
     }
 
-    // Hands back the value storage under every block below `block_index`.
-    // Only meaningful mid-product, and only to a caller that has proved those
-    // blocks are dead -- see spmm_inplace, whose BSR and CSR paths both consume
-    // their operand this way. A no-op on backends that do not page their
-    // values, which costs correctness nothing.
     // A matrix whose every block the caller promises to overwrite, allocated
     // without the first-touch zero pass that would otherwise make it resident
     // before it holds anything.
@@ -1744,28 +1743,41 @@ public:
         active_bsr_backend().zero_row_range(graph->adj_ptr, row_begin, row_end);
     }
 
-    void release_value_blocks_before(long long block_index) {
-        if (block_index <= 0) return;
-        const uint64_t boundary = static_cast<uint64_t>(block_index);
-        if (kind == MatrixKind::BSR) {
-            active_bsr_backend().release_blocks_before(boundary);
-        } else if (kind == MatrixKind::CSR) {
-            active_csr_backend().release_blocks_before(boundary);
+    // Hands back the value storage under every block belonging to a row below
+    // `row`. Only meaningful mid-product, and only to a caller that has proved
+    // those rows are dead -- see spmm_inplace, whose paths all consume their
+    // operand this way. Returns bytes actually returned to the OS.
+    //
+    // IN ROWS, and that is the whole reason all three kinds can implement it.
+    // The contract used to be stated as a block index into the value array,
+    // which is a CSR/BSR concept: those two hold one array in adj_ind order, so
+    // a row boundary and a block index are the same number. VBCSR packs values
+    // by SHAPE, so no single index names a row boundary, and it was simply left
+    // out -- while every caller was already writing adj_ptr[row] to build the
+    // argument. Stating the contract in the unit the callers think in makes the
+    // operation total: each backend converts in its own layout, and the VBCSR
+    // fallthrough in spmm_inplace above is gone.
+    //
+    // Release granularity differs and callers do not need to care: CSR and BSR
+    // are exact at any row, VBCSR rounds down to a thread-domain boundary (see
+    // release_blocks_below_row). Releasing fewer pages than permitted is always
+    // sound. Also a no-op for a heap-backed buffer, and for any prefix shorter
+    // than an OS page -- the caller keeps that memory.
+    uint64_t release_values_below_row(int row) {
+        if (row <= 0) return 0;
+        const int n_rows = static_cast<int>(graph->adj_ptr.size()) - 1;
+        if (row > n_rows) row = n_rows;
+        switch (kind) {
+        case MatrixKind::BSR:
+            return active_bsr_backend().release_blocks_before(
+                static_cast<uint64_t>(graph->adj_ptr[row]));
+        case MatrixKind::CSR:
+            return active_csr_backend().release_blocks_before(
+                static_cast<uint64_t>(graph->adj_ptr[row]));
+        case MatrixKind::VBCSR:
+            return active_vbcsr_backend().release_blocks_below_row(row);
         }
-        // VBCSR is not covered YET, and the obstacle is smaller than it looks.
-        // Its store packs values by SHAPE, so "the blocks below row R" is a
-        // prefix of each shape's buffer rather than of one buffer. Those
-        // prefixes do exist: build_first_touch_structure fills shape_blocks by
-        // walking domains in order and rows ascending within each, and the
-        // thread domains are contiguous ascending row ranges, so every shape's
-        // buffer comes out ROW-ORDERED. What is missing is only the per-shape
-        // count below R, which shape_domain_offsets already gives exactly when R
-        // is a domain edge.
-        //
-        // So closing this is: a release_blocks_before(row) on the VBCSR backend
-        // that releases offsets[domain] in each shape, plus a consuming SpGEMM
-        // path whose chunks land on domain edges rather than even row splits.
-        // Correct as is -- it simply keeps the memory.
+        return 0;
     }
 
     // C = c2 (*this)^2 + c1 (*this) + c0 I, upper triangle only, WITHOUT ever

@@ -923,7 +923,7 @@ private:
                 if (consume_A != nullptr) {
                     #pragma omp single
                     {
-                        consume_A->release_value_blocks_before(A.row_ptr()[chunk_end]);
+                        consume_A->release_values_below_row(chunk_end);
                     }
                 }
                 }
