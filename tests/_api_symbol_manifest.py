@@ -169,6 +169,7 @@ SURFACE_MANIFEST: dict[str, SurfaceClass] = {
             SurfaceSymbol("pbc", (), "AtomicData::pbc", ('.def_property_readonly("pbc"',), (), ("- **`pbc`**",), ("tests/test_atomic_surface.py",)),
             SurfaceSymbol("edge_index", (), "AtomicData::edges", ('.def_property_readonly("edge_index"',), (), ("- **`edge_index`**",), ("tests/test_atomic_surface.py",)),
             SurfaceSymbol("edge_shift", (), "AtomicData::edges", ('.def_property_readonly("edge_shift"',), (), ("- **`edge_shift`**",), ("tests/test_atomic_surface.py",)),
+            SurfaceSymbol("edge_vectors", (), "AtomicData::get_edge_vec", ('.def_property_readonly("edge_vectors"',), (), ("- **`edge_vectors`**",), ("tests/test_atomic_surface.py",)),
             SurfaceSymbol("graph", (), "AtomicData::graph", ('.def_readonly("graph"',), (), ("- **`graph`**",), ("tests/test_atomic_surface.py",)),
             SurfaceSymbol("norb", (), "AtomicData::norb", ('.def("norb"',), (), ("#### `norb`",), ("tests/test_atomic_surface.py",)),
             SurfaceSymbol("to_ase", (), "AtomicData::to_ase", ('.def("to_ase"',), (), ("#### `to_ase`",), ("tests/test_atomic_surface.py",)),
@@ -190,4 +191,3 @@ SURFACE_MANIFEST: dict[str, SurfaceClass] = {
         ),
     ),
 }
-

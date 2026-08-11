@@ -4,12 +4,14 @@ SERIAL_TESTS = [
     "test_scipy_adapter.py",
     "test_wrapper_contracts.py",
     "test_atomic_surface.py",
+    "test_inp_nanocrystal_example.py",
     "test_cleanup_guards.py",
     "test_api_serial.py",
     "test_binding.py",
     "test_spmf.py",
     "test_kpm.py",
     "test_spmm.py",
+    "test_spmm_hermitian.py",
     "test_vbcsr.py",
 ]
 
@@ -35,4 +37,3 @@ BASELINE_SMOKE_TESTS = [
 ]
 
 EXCLUDED_TESTS: list[str] = []
-

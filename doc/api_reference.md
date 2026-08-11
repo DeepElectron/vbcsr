@@ -556,6 +556,7 @@ Convenience constructors layered on top of `from_points`.
 - **`pbc`**: periodic-boundary flags.
 - **`edge_index`**: local edge list using local/ghost atom indices.
 - **`edge_shift`**: lattice shifts for the local edge list.
+- **`edge_vectors`**: Cartesian displacements `r_j + R - r_i` for the local directed edges.
 - **`graph`**: backing `DistGraph`.
 
 ### Methods

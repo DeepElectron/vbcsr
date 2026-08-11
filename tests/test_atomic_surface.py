@@ -54,6 +54,7 @@ class TestAtomicSurface(unittest.TestCase):
         np.testing.assert_array_equal(wrapped.atom_indices, np.array([0, 1], dtype=np.int32))
         np.testing.assert_array_equal(wrapped.edge_index, np.array([[0, 1], [1, 0]], dtype=np.int32))
         np.testing.assert_array_equal(wrapped.edge_shift, np.zeros((2, 3), dtype=np.int32))
+        np.testing.assert_allclose(wrapped.edge_vectors, np.array([[1.5, 0.0, 0.0], [-1.5, 0.0, 0.0]]))
         np.testing.assert_array_equal(core.atomic_numbers, wrapped.atomic_numbers)
         np.testing.assert_array_equal(core.atom_types, wrapped.atom_types)
 

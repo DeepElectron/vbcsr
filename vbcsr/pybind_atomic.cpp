@@ -410,6 +410,15 @@ void bind_atomic_module(py::module& m) {
              }
              return shifts;
         })
+        .def_property_readonly("edge_vectors", [](AtomicData& self) {
+             py::array_t<double> vectors({static_cast<py::ssize_t>(self.n_edge), static_cast<py::ssize_t>(3)});
+             auto ptr = vectors.mutable_unchecked<2>();
+
+             for (int i = 0; i < self.n_edge; ++i) {
+                  self.get_edge_vec(i, &ptr(i, 0), &ptr(i, 1), &ptr(i, 2));
+             }
+             return vectors;
+        }, "Cartesian displacement r_j + R - r_i for every local directed edge.")
         // reference_internal (not bare reference): the returned DistGraph is owned
         // by this AtomicData, so any handle to it must keep the AtomicData alive.
         // A BlockSpMat built from this graph uses keep_alive<1,2> to pin the graph
