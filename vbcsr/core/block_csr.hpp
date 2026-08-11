@@ -1566,22 +1566,27 @@ public:
     // fitting in memory and not.
     // The two halves are also available separately, because the peak memory of
     // this operation is not set by the answer but by what is alive while it is
-    // built: the upper triangle U and the completion C exist together, and C's
-    // pattern is U's plus its mirror, so U + C costs about 1.5x the answer on
-    // top of both operands. A caller whose operand dies with U -- a congruence
-    // chain, an iteration that overwrites its own input -- can free it between
-    // the two calls and never pay for the overlap:
+    // built: both operands survive the product, and the completion then adds
+    // the mirrored half. The combined call completes IN PLACE -- the upper
+    // triangle's rows are handed back as the mirror consumes them, so it never
+    // stands whole beside the finished result -- but it cannot free the
+    // OPERANDS, which outlive the product inside one expression. A caller
+    // whose operand dies with U -- a congruence chain, an iteration that
+    // overwrites its own input -- frees it between the two calls:
     //
     //     BlockSpMat U = a.spmm_hermitian_upper(b, tol);
     //     a.reset();                       // a is dead now; b may be too
-    //     a = U.complete_hermitian();
+    //     U.complete_hermitian_inplace();
+    //     a = std::move(U);
     //
     // Fusing the mirror into the numeric phase instead -- writing both slots
     // of each computed block straight into a pre-sized C -- was considered and
     // is worse: it removes U (saving 0.5x the answer) but leaves both operands
     // alive for the whole product, where splitting frees a whole operand.
     BlockSpMat spmm_hermitian(const BlockSpMat& B, double threshold, bool transA = false) const {
-        return spmm_hermitian_upper(B, threshold, transA).complete_hermitian();
+        BlockSpMat upper = spmm_hermitian_upper(B, threshold, transA);
+        upper.complete_hermitian_inplace();
+        return upper;
     }
 
     // Phase 1: only the block columns at or above the diagonal. Half the block
