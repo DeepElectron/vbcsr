@@ -1617,9 +1617,12 @@ public:
     // The saving is real memory, not bookkeeping: pages are independent
     // mmap allocations, so releasing one returns it to the OS.
     //
-    // Currently only the BSR backend releases as it goes; the others compute
-    // the same answer through the ordinary product, correct but without the
-    // memory benefit.
+    // All three kinds release as they go. VBCSR was the last: its executor
+    // defers GEMMs into per-thread batches holding pointers into A, so its
+    // chunk boundary also flushes the batches before releasing, and its result
+    // is built deferred with a per-chunk domain-aligned placing touch -- the
+    // eager zero pass would have made the whole result resident beside the
+    // whole operand, which is the peak this method exists to avoid.
     void spmm_inplace(const BlockSpMat& B, double threshold) {
         ensure_product_operands_compatible(*this, B, "spmm_inplace");
         if (this == &B) {
@@ -1636,14 +1639,7 @@ public:
             *this = detail::CSRSpMMExecutor<BlockSpMat<T>>::run_consuming(*this, B, threshold);
             return;
         }
-        // VBCSR falls through to the plain product. NOT for want of a release
-        // any more -- release_values_below_row covers all three kinds -- but
-        // because VBCSRSpMMExecutor has no run_consuming: nothing chunks its
-        // numeric loop, so there is no point at which a prefix of the operand
-        // has been proved dead. Writing that is the remaining work, and it is a
-        // separate piece from the release itself. Correct as it stands, just
-        // without the page release.
-        *this = spmm(B, threshold);
+        *this = detail::VBCSRSpMMExecutor<BlockSpMat<T>>::run_consuming(*this, B, threshold);
     }
 
     // A matrix whose every block the caller promises to overwrite, allocated

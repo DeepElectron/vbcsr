@@ -63,8 +63,17 @@ private:
     };
 
 public:
+    // `consume_A`, when set, must alias A: the caller is doing A <- A B and
+    // has given up A, so each chunk of A's value pages is handed back as soon
+    // as the rows that read them are accumulated AND their queued product
+    // batches have flushed -- this executor defers its GEMMs into per-thread
+    // batches holding raw pointers into A's storage, so the flush has to move
+    // inside the chunk (see numeric_multiply). The ghost exchange completes
+    // before the numeric loop and A's blocks are never fetched by another
+    // rank, so nothing anyone still needs is released. With consume_A null the
+    // chunk loop runs once and this is the non-consuming path unchanged.
     static Matrix run(const Matrix& A, const Matrix& B, double threshold,
-                      bool upper_only = false) {
+                      bool upper_only = false, Matrix* consume_A = nullptr) {
         const bool profile = std::getenv("VBCSR_PROFILE_VBCSR_SPGEMM") != nullptr;
         const auto t0 = std::chrono::steady_clock::now();
         auto metadata = exchange_ghost_metadata(A, B);
@@ -81,10 +90,12 @@ public:
 
         DistGraph* c_graph = construct_result_graph(A, adjacency, ghost_blocks.sizes, "spmm");
         const auto t_graph = std::chrono::steady_clock::now();
-        Matrix C = make_result_matrix_for_numeric_overwrite(A, c_graph);
+        Matrix C = make_result_matrix_for_numeric_overwrite(
+            A, c_graph, /*defer_zero=*/consume_A != nullptr);
         const auto t_structure = std::chrono::steady_clock::now();
 
-        numeric_multiply(A, B, ghost_blocks.rows, C, threshold, A_norms, B_local_norms);
+        numeric_multiply(A, B, ghost_blocks.rows, C, threshold, A_norms, B_local_norms,
+                         consume_A);
         const auto t_numeric = std::chrono::steady_clock::now();
         C.filter_blocks(threshold);
         const auto t_filter = std::chrono::steady_clock::now();
@@ -108,6 +119,10 @@ public:
         return C;
     }
 
+    static Matrix run_consuming(Matrix& A, const Matrix& B, double threshold) {
+        return run(A, B, threshold, /*upper_only=*/false, /*consume_A=*/&A);
+    }
+
     static void run_numeric(
         const Matrix& A,
         const Matrix& B,
@@ -116,11 +131,27 @@ public:
         double threshold,
         const std::vector<double>& A_norms,
         const std::vector<double>& B_local_norms) {
-        numeric_multiply(A, B, ghost_rows, C, threshold, A_norms, B_local_norms);
+        numeric_multiply(A, B, ghost_rows, C, threshold, A_norms, B_local_norms,
+                         /*consume_A=*/nullptr);
     }
 
 private:
-    static Matrix make_result_matrix_for_numeric_overwrite(const Matrix& A, DistGraph* c_graph) {
+    static Matrix make_result_matrix_for_numeric_overwrite(const Matrix& A, DistGraph* c_graph,
+                                                           bool defer_zero) {
+        if (defer_zero) {
+            // The consuming path. The eager pass below would make the whole
+            // result resident before a single row of the operand has been
+            // released -- the source and the finished result both whole at
+            // once, which is exactly the peak the caller asked to avoid. Every
+            // destination block is std::fill'ed by the numeric loop, so the
+            // pass is redundant for correctness in both modes; what it buys is
+            // deterministic placement, and the consuming numeric loop
+            // re-establishes that with a per-chunk domain-aligned touch (the
+            // same shape bsr.hpp and filter_blocks use).
+            // make_overwritten_result is the deferred build for every kind and
+            // already handles the empty-rank graph without extra collectives.
+            return Matrix::make_overwritten_result(c_graph, A.configured_page_size());
+        }
         std::unique_ptr<DistGraph> graph_guard(c_graph);
         const MatrixKind result_kind = Matrix::detect_matrix_kind(graph_guard.get());
         if (result_kind != MatrixKind::VBCSR) {
@@ -184,7 +215,8 @@ private:
         Matrix& C,
         double threshold,
         const std::vector<double>& A_norms,
-        const std::vector<double>& B_local_norms) {
+        const std::vector<double>& B_local_norms,
+        Matrix* consume_A) {
         const int n_rows = static_cast<int>(A.row_ptr().size()) - 1;
 
         // Numeric products call BLAS (gemm_batched) from inside the OpenMP
@@ -202,6 +234,21 @@ private:
             max_threads,
             std::vector<HashEntry>(hash_size, {-1, -1, 0}));
         std::vector<uint32_t> thread_tags(max_threads, 0);
+
+        // 4 chunks when consuming, one otherwise -- the constant, its
+        // machine-independence, and the trade it prices are recorded at
+        // kConsumeChunks in bsr.hpp, which measured them.
+        constexpr int kConsumeChunks = 4;
+        const int chunk_rows = (consume_A == nullptr || n_rows <= 0)
+                                   ? std::max(1, n_rows)
+                                   : std::max(1, (n_rows + kConsumeChunks - 1) / kConsumeChunks);
+        // The placing touch below wants the result's thread domains; guarded,
+        // like every other consumer of the partition, so an unaligned build
+        // degrades to unplaced pages rather than wrong ones.
+        const auto& domains = C.thread_domain_partition();
+        const bool domains_aligned = domains.thread_count > 0 &&
+                                     static_cast<int>(domains.row_bounds.size()) ==
+                                         domains.thread_count + 1;
 
         const auto run_parallel = [&](auto use_small_product_batches_tag) {
             constexpr bool UseSmallProductBatches =
@@ -222,8 +269,10 @@ private:
                 std::vector<ProductBatch> small_product_batches;
                 std::map<ProductBatchKey, std::vector<ProductTask>> product_batches;
 
+                size_t queued_tasks = 0;
                 const auto enqueue_product =
                     [&](const ProductBatchKey& key, ProductTask task) {
+                        ++queued_tasks;
                         if constexpr (UseSmallProductBatches) {
                             if (is_small_product_key(key)) {
                                 const size_t slot = small_product_key_index(key);
@@ -240,12 +289,57 @@ private:
                         product_batches[key].push_back(task);
                     };
 
+                // This thread's queued products, run and cleared. Once per
+                // numeric pass when nothing is consumed; once per CHUNK when
+                // consuming, because the tasks hold raw pointers into A's
+                // storage and the release at the chunk edge would pull the
+                // pages out from under them.
+                const auto flush_batches = [&] {
+                    if constexpr (UseSmallProductBatches) {
+                        for (auto& batch : small_product_batches) {
+                            run_product_batch_fallback(batch.key, batch.tasks);
+                            small_batch_slots[small_product_key_index(batch.key)] = -1;
+                        }
+                        small_product_batches.clear();
+                    }
+                    for (auto& [key, tasks] : product_batches) {
+                        if (use_direct_product_kernel(key)) {
+                            run_product_batch_fallback(key, tasks);
+                            continue;
+                        }
+                        if constexpr (supports_batched_products()) {
+                            run_product_batch_batched(key, tasks);
+                        } else {
+                            run_product_batch_fallback(key, tasks);
+                        }
+                    }
+                    product_batches.clear();
+                };
+
+                for (int chunk_begin = 0; chunk_begin < n_rows; chunk_begin += chunk_rows) {
+                const int chunk_end = std::min(n_rows, chunk_begin + chunk_rows);
+                // The first touch the deferred constructor no longer does,
+                // per chunk and domain-aligned so each page still lands on
+                // the node whose thread later applies that row, while pages
+                // beyond the chunk stay unmapped. Placement and parallelism
+                // separated exactly as in filter_blocks' copy_kept_blocks:
+                // the touch is static over domains, the numeric loop below
+                // stays dynamic over the whole chunk.
+                if (consume_A != nullptr && domains_aligned) {
+                    #pragma omp for schedule(static)
+                    for (int d = 0; d < domains.thread_count; ++d) {
+                        const int lo = std::max(domains.domain_begin(d), chunk_begin);
+                        const int hi = std::min(domains.domain_end(d), chunk_end);
+                        if (lo < hi) C.touch_row_range(lo, hi);
+                    }
+                }
+
                 // Dynamic, not static: under upper_only the per-row work falls
                 // linearly across the matrix, and a static split roughly
                 // doubles the first thread's share (measured on the BSR
                 // executor as the halved product losing a third of its speed).
                 #pragma omp for schedule(dynamic, 4)
-                for (int row = 0; row < n_rows; ++row) {
+                for (int row = chunk_begin; row < chunk_end; ++row) {
                     ++tag;
                     if (tag == 0) {
                         for (auto& entry : table) {
@@ -343,25 +437,44 @@ private:
                             }
                         }
                     }
+
+                    // Row-boundary flush cap. The queue holds 24 bytes per
+                    // block PAIR, and unbounded it holds every pair of the
+                    // whole pass: measured at 2048 rows x ~820 x ~700
+                    // neighbours, ~29 GB of task queues beside a 4.6 GB
+                    // result -- six times the answer, growing with pairs
+                    // (~flops), the fastest-growing quantity there is.
+                    // Accumulating past this cap buys nothing: execution
+                    // chunks every batch to kTargetScratchBytes anyway, so a
+                    // key's grouping gain saturates thousands of tasks below
+                    // it. The cap only defers flushes long enough for SPARSE
+                    // rows to keep amortising the per-key map walk. Checked
+                    // at row boundaries, so the true bound is the cap plus
+                    // one row's pairs.
+                    constexpr size_t kMaxQueuedTasks = size_t(1) << 18;
+                    if (queued_tasks >= kMaxQueuedTasks) {
+                        flush_batches();
+                        queued_tasks = 0;
+                    }
                 }
 
-                if constexpr (UseSmallProductBatches) {
-                    for (auto& batch : small_product_batches) {
-                        run_product_batch_fallback(batch.key, batch.tasks);
-                    }
-                }
+                flush_batches();
 
-                for (auto& [key, tasks] : product_batches) {
-                    if (use_direct_product_kernel(key)) {
-                        run_product_batch_fallback(key, tasks);
-                        continue;
-                    }
-                    if constexpr (supports_batched_products()) {
-                        run_product_batch_batched(key, tasks);
-                    } else {
-                        run_product_batch_fallback(key, tasks);
+                // The omp for above ends on an implicit barrier, but the flush
+                // is per-thread work after it, so an explicit barrier is what
+                // proves every thread's tasks reading A have run before the
+                // release. single carries its own exit barrier, so no thread
+                // enters the next chunk's touch while the release is in
+                // flight. The boundary is a ROW; how that becomes a byte range
+                // is the backend's business (release_values_below_row).
+                if (consume_A != nullptr) {
+                    #pragma omp barrier
+                    #pragma omp single
+                    {
+                        consume_A->release_values_below_row(chunk_end);
                     }
                 }
+                }  // chunk
             }
         };
 

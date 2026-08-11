@@ -364,6 +364,18 @@ int main(int argc, char** argv) {
                 // and the one measured as the peak of a Newton-Schulz step.
                 filter_lowest_quartile(product);
                 exercised += check_locality("vbcsr filtered result", product);
+
+                // The consuming product builds its result DEFERRED (the eager
+                // zero pass would stand the whole result beside the operand it
+                // exists to release) and re-establishes placement with a
+                // per-chunk domain-aligned touch before its dynamic numeric
+                // loop -- the same split filter_blocks uses. This asserts the
+                // touch actually runs: without it the dynamic loop's fill is
+                // the first touch and placement is race-decided.
+                BlockSpMat<double> other(&graph);
+                other.fill_random();
+                mat.spmm_inplace(other, 0.0);
+                exercised += check_locality("vbcsr consuming spmm result", mat);
             }
         }
     }
