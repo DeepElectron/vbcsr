@@ -57,11 +57,6 @@ private:
         T* c_ptr = nullptr;
     };
 
-    struct ProductBatch {
-        ProductBatchKey key;
-        std::vector<ProductTask> tasks;
-    };
-
 public:
     // `consume_A`, when set, must alias A: the caller is doing A <- A B and
     // has given up A, so each chunk of A's value pages is handed back as soon
@@ -250,9 +245,15 @@ private:
                                      static_cast<int>(domains.row_bounds.size()) ==
                                          domains.thread_count + 1;
 
-        const auto run_parallel = [&](auto use_small_product_batches_tag) {
-            constexpr bool UseSmallProductBatches =
-                decltype(use_small_product_batches_tag)::value;
+        // Invalidated ONCE, here. The per-pair path below never touches C's
+        // members: resolving destinations through mutable_block_data wrote
+        // this shared flag once per surviving PAIR from every thread -- one
+        // cache line ping-ponging under the innermost loop -- and decoded a
+        // storage handle (with a runtime divide) per pair on top. The seeding
+        // loop already resolves every destination block once per output row
+        // for its zero fill; the pairs now index that table.
+        C.norms_valid = false;
+        auto& c_store = C.active_vbcsr_backend();
 
             #pragma omp parallel
             {
@@ -262,30 +263,30 @@ private:
                 #endif
                 auto& table = thread_tables[tid];
                 uint32_t& tag = thread_tags[tid];
-                std::vector<int> small_batch_slots;
-                if constexpr (UseSmallProductBatches) {
-                    small_batch_slots.assign(small_product_key_count(), -1);
-                }
-                std::vector<ProductBatch> small_product_batches;
                 std::map<ProductBatchKey, std::vector<ProductTask>> product_batches;
+                // The current row's destination pointers, resolved by the
+                // seeding loop, indexed by (graph_block_index - c_start).
+                std::vector<T*> c_dest;
 
                 size_t queued_tasks = 0;
-                const auto enqueue_product =
-                    [&](const ProductBatchKey& key, ProductTask task) {
-                        ++queued_tasks;
-                        if constexpr (UseSmallProductBatches) {
-                            if (is_small_product_key(key)) {
-                                const size_t slot = small_product_key_index(key);
-                                int batch_index = small_batch_slots[slot];
-                                if (batch_index < 0) {
-                                    batch_index = static_cast<int>(small_product_batches.size());
-                                    small_batch_slots[slot] = batch_index;
-                                    small_product_batches.push_back(ProductBatch{key, {}});
-                                }
-                                small_product_batches[static_cast<size_t>(batch_index)].tasks.push_back(task);
-                                return;
-                            }
+                // Small blocks -- every dim <= 20, which is every LCAO block
+                // -- run their rm_gemm INLINE. The vendor batch is not
+                // profitable at those shapes (vendor_batch_profitable,
+                // common.hpp), so a queued small task was executed by exactly
+                // the scalar call this makes now, after paying 24 bytes of
+                // queue per pair and losing the B-row's cache locality to the
+                // deferred flush. Only shapes the vendor batch can take are
+                // worth queueing.
+                const auto emit_product =
+                    [&](const ProductBatchKey& key, const ProductTask& task) {
+                        if (use_direct_product_kernel(key)) {
+                            rowmajor_kernels::rm_gemm<T>(
+                                key.row_dim, key.inner_dim, key.col_dim,
+                                task.a_ptr, task.b_ptr, key.col_dim,
+                                task.c_ptr, key.col_dim);
+                            return;
                         }
+                        ++queued_tasks;
                         product_batches[key].push_back(task);
                     };
 
@@ -293,20 +294,10 @@ private:
                 // numeric pass when nothing is consumed; once per CHUNK when
                 // consuming, because the tasks hold raw pointers into A's
                 // storage and the release at the chunk edge would pull the
-                // pages out from under them.
+                // pages out from under them. (Inline products need no such
+                // care: they read A immediately, strictly before any release.)
                 const auto flush_batches = [&] {
-                    if constexpr (UseSmallProductBatches) {
-                        for (auto& batch : small_product_batches) {
-                            run_product_batch_fallback(batch.key, batch.tasks);
-                            small_batch_slots[small_product_key_index(batch.key)] = -1;
-                        }
-                        small_product_batches.clear();
-                    }
                     for (auto& [key, tasks] : product_batches) {
-                        if (use_direct_product_kernel(key)) {
-                            run_product_batch_fallback(key, tasks);
-                            continue;
-                        }
                         if constexpr (supports_batched_products()) {
                             run_product_batch_batched(key, tasks);
                         } else {
@@ -350,10 +341,12 @@ private:
 
                     const int c_start = C.row_ptr()[row];
                     const int c_end = C.row_ptr()[row + 1];
+                    c_dest.resize(static_cast<size_t>(c_end - c_start));
                     for (int graph_block_index = c_start; graph_block_index < c_end; ++graph_block_index) {
                         const int local_col = C.col_ind()[graph_block_index];
                         const int global_col = C.graph->get_global_index(local_col);
-                        T* c_values = C.mutable_block_data(graph_block_index);
+                        T* c_values = c_store.block_ptr_for_graph_block(graph_block_index);
+                        c_dest[static_cast<size_t>(graph_block_index - c_start)] = c_values;
                         std::fill(
                             c_values,
                             c_values + C.block_size_elements(graph_block_index),
@@ -406,9 +399,10 @@ private:
                                     hash_size,
                                     global_col_B,
                                     [&](int c_graph_block) {
-                                        enqueue_product(
+                                        emit_product(
                                             ProductBatchKey{r_dim, inner_dim, c_dim},
-                                            ProductTask{a_val, b_val, C.mutable_block_data(c_graph_block)});
+                                            ProductTask{a_val, b_val,
+                                                        c_dest[static_cast<size_t>(c_graph_block - c_start)]});
                                     },
                                     "local");
                             }
@@ -429,28 +423,26 @@ private:
                                     hash_size,
                                     block.col,
                                     [&](int c_graph_block) {
-                                        enqueue_product(
+                                        emit_product(
                                             ProductBatchKey{r_dim, inner_dim, block.c_dim},
-                                            ProductTask{a_val, block.data, C.mutable_block_data(c_graph_block)});
+                                            ProductTask{a_val, block.data,
+                                                        c_dest[static_cast<size_t>(c_graph_block - c_start)]});
                                     },
                                     "ghost");
                             }
                         }
                     }
 
-                    // Row-boundary flush cap. The queue holds 24 bytes per
-                    // block PAIR, and unbounded it holds every pair of the
-                    // whole pass: measured at 2048 rows x ~820 x ~700
-                    // neighbours, ~29 GB of task queues beside a 4.6 GB
-                    // result -- six times the answer, growing with pairs
-                    // (~flops), the fastest-growing quantity there is.
-                    // Accumulating past this cap buys nothing: execution
-                    // chunks every batch to kTargetScratchBytes anyway, so a
-                    // key's grouping gain saturates thousands of tasks below
-                    // it. The cap only defers flushes long enough for SPARSE
-                    // rows to keep amortising the per-key map walk. Checked
-                    // at row boundaries, so the true bound is the cap plus
-                    // one row's pairs.
+                    // Row-boundary flush cap for the QUEUED (vendor-batchable)
+                    // shapes; small shapes execute inline and never count.
+                    // The queue holds 24 bytes per pair, and unbounded it
+                    // held every pair of the whole pass -- measured at ~29 GB
+                    // of queues beside a 4.6 GB result before the cap.
+                    // Accumulating past it buys nothing: execution chunks
+                    // every batch to its scratch budget anyway, so a key's
+                    // grouping gain saturates far below the cap. Checked at
+                    // row boundaries, so the true bound is the cap plus one
+                    // row's pairs.
                     constexpr size_t kMaxQueuedTasks = size_t(1) << 18;
                     if (queued_tasks >= kMaxQueuedTasks) {
                         flush_batches();
@@ -476,13 +468,6 @@ private:
                 }
                 }  // chunk
             }
-        };
-
-        if (threshold > 0.0) {
-            run_parallel(std::true_type{});
-        } else {
-            run_parallel(std::false_type{});
-        }
     }
 
     static size_t choose_hash_table_size(const Matrix& C) {
@@ -509,29 +494,12 @@ private:
         return hash_size;
     }
 
+    // Below this every dimension's product runs the row-major scalar kernel
+    // whether it is queued or not (the vendor batch only wins above it; see
+    // vendor_batch_profitable in common.hpp) -- so these shapes execute
+    // inline at emission and never enter the task queue.
     static bool use_direct_product_kernel(const ProductBatchKey& key) {
         return key.row_dim <= 20 && key.inner_dim <= 20 && key.col_dim <= 20;
-    }
-
-    static constexpr int kSmallProductDimLimit = 20;
-
-    static constexpr size_t small_product_key_count() {
-        return static_cast<size_t>(kSmallProductDimLimit + 1) *
-               static_cast<size_t>(kSmallProductDimLimit + 1) *
-               static_cast<size_t>(kSmallProductDimLimit + 1);
-    }
-
-    static bool is_small_product_key(const ProductBatchKey& key) {
-        return key.row_dim > 0 && key.row_dim <= kSmallProductDimLimit &&
-               key.inner_dim > 0 && key.inner_dim <= kSmallProductDimLimit &&
-               key.col_dim > 0 && key.col_dim <= kSmallProductDimLimit;
-    }
-
-    static size_t small_product_key_index(const ProductBatchKey& key) {
-        constexpr size_t stride = static_cast<size_t>(kSmallProductDimLimit + 1);
-        return (static_cast<size_t>(key.row_dim) * stride +
-                static_cast<size_t>(key.inner_dim)) * stride +
-               static_cast<size_t>(key.col_dim);
     }
 
     template <typename F>
