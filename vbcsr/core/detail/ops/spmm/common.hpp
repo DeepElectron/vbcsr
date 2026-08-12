@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include <limits>
 #include <map>
+#include <memory>
 #include <set>
 #include <stdexcept>
 #include <utility>
@@ -243,7 +244,16 @@ inline void fused_gemm_accumulate(T* dest, const T* lhs, const T* rhs,
 /// scales with the global column count.
 template <typename T>
 struct FusedRowAccumulator {
-    std::vector<int> slot_of_column;   // global column -> touched index, or -1
+    // Global column -> touched index, as a LAZILY-ALLOCATED page table rather
+    // than a flat array. A flat tag array costs 4 bytes x N_GLOBAL per
+    // accumulator regardless of what is touched, and the triple-product
+    // kernels hold two accumulators per THREAD -- at millions of block rows
+    // that is per-rank gigabytes growing with the global problem while the
+    // work per rank shrinks. Pages allocate on first touch, so memory follows
+    // the columns this thread actually reaches (its rows' halo), and the hot
+    // path pays one indirection over the flat array.
+    static constexpr int kSlotPageBits = 12;  // 4096 columns, 16 KB per page
+    std::vector<std::unique_ptr<int[]>> slot_pages;
     std::vector<int> touched;          // global columns, in first-touch order
     std::vector<size_t> value_offset;  // per touched entry, offset into values
     std::vector<int> col_dim;          // per touched entry
@@ -256,11 +266,14 @@ struct FusedRowAccumulator {
     std::vector<T> values;
 
     void resize(int n_global_blocks) {
-        slot_of_column.assign(static_cast<size_t>(n_global_blocks), -1);
+        const size_t page = size_t(1) << kSlotPageBits;
+        slot_pages.clear();
+        slot_pages.resize(
+            (static_cast<size_t>(std::max(0, n_global_blocks)) + page - 1) >> kSlotPageBits);
     }
 
     void clear() {
-        for (int column : touched) slot_of_column[static_cast<size_t>(column)] = -1;
+        for (int column : touched) slot_entry(column) = -1;
         touched.clear();
         value_offset.clear();
         col_dim.clear();
@@ -268,10 +281,20 @@ struct FusedRowAccumulator {
         values.clear();
     }
 
+    int& slot_entry(int global_column) {
+        auto& page = slot_pages[static_cast<size_t>(global_column) >> kSlotPageBits];
+        if (!page) {
+            const size_t n = size_t(1) << kSlotPageBits;
+            page.reset(new int[n]);
+            std::fill(page.get(), page.get() + n, -1);
+        }
+        return page[static_cast<size_t>(global_column) & ((size_t(1) << kSlotPageBits) - 1)];
+    }
+
     /// Returns the touched-entry SLOT, not the offset: `values` may reallocate
     /// here, so callers must re-read values.data() afterwards.
     int obtain(int global_column, int r_dim, int c_dim) {
-        int& slot = slot_of_column[static_cast<size_t>(global_column)];
+        int& slot = slot_entry(global_column);
         if (slot < 0) {
             slot = static_cast<int>(touched.size());
             touched.push_back(global_column);
