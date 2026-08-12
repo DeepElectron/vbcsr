@@ -499,7 +499,15 @@ struct RARhExecutor {
         };
 
         // ---- Payloads for both rounds, gated: what provably cannot pass the
-        // numeric gates never travels.
+        // numeric gates never travels. Round 2 additionally trims columns
+        // below the first owned row -- its entries are output columns of an
+        // upper-only product, so those are dead on arrival. Round 1's entries
+        // are contraction indices; no trim applies.
+        int min_owned_row = std::numeric_limits<int>::max();
+        for (int i = 0; i < n_rows; ++i) {
+            min_owned_row = std::min(min_owned_row, ga.get_global_index(i));
+        }
+        if (n_rows == 0) min_owned_row = 0;
         auto ghosts_b = build_spmm_ghost_blocks<T>(
             meta_b, fetch_required_block_payloads(
                         B, fused_gated_blocks_of(meta_b, [&](int row) {
@@ -508,7 +516,7 @@ struct RARhExecutor {
                         })));
         auto ghosts_a = build_spmm_ghost_blocks<T>(
             meta_a, fetch_required_block_payloads(
-                        A, fused_gated_blocks_of(meta_a, gate_a)));
+                        A, fused_gated_blocks_of(meta_a, gate_a, min_owned_row)));
 
         RemoteRows remote_b, remote_a;
         remote_b.build(ghosts_b, meta_b, n_global);

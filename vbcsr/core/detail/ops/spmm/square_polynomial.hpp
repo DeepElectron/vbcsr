@@ -12,6 +12,7 @@
 #include <cmath>
 #include <complex>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -228,17 +229,48 @@ struct SquarePolynomialExecutor {
         SpMMGhostBlocks<T> ghosts;
         if (ga.size > 1) {
             // One round: row i of A^2 reads rows of A over A's own columns.
+            // The payload is gated on what the numeric gate could ever keep:
+            // a block of row k ships only if some local pair (i,k) could pass
+            //
+            //     a_norm(i,k) * norm(k,l) >= threshold / a_row_count(i)
+            //
+            // i.e. norm(k,l) >= threshold / max_i [arc(i) * a_norm(i,k)].
+            // An all-zero operand runs with eps = 0 and keeps zero-norm pairs,
+            // so the gate degenerates to keep-everything there, exactly as at
+            // threshold 0. Entries are OUTPUT columns of an upper-only
+            // product, so columns below the first owned row are trimmed too.
             const int rank = ga.rank;
+            const std::vector<double>& a_norms = A.get_block_norms();
+            const bool a_nonzero = has_nonzero_block(A);
             std::set<int> needed;
+            std::map<int, double> colmax_a;
+            int min_owned_row = std::numeric_limits<int>::max();
             for (int i = 0; i < n_rows; ++i) {
+                min_owned_row = std::min(min_owned_row, ga.get_global_index(i));
+                const int arc = ga.adj_ptr[i + 1] - ga.adj_ptr[i];
                 for (int k = ga.adj_ptr[i]; k < ga.adj_ptr[i + 1]; ++k) {
                     const int g_col = ga.get_global_index(ga.adj_ind[k]);
-                    if (ga.find_owner(g_col) != rank) needed.insert(g_col);
+                    if (ga.find_owner(g_col) == rank) continue;
+                    needed.insert(g_col);
+                    const double reach =
+                        static_cast<double>(arc) * a_norms[static_cast<size_t>(k)];
+                    auto [it, fresh] = colmax_a.emplace(g_col, reach);
+                    if (!fresh && reach > it->second) it->second = reach;
                 }
             }
+            if (n_rows == 0) min_owned_row = 0;
+            const auto gate = [&](int g_row) -> double {
+                if (!(threshold > 0.0) || !a_nonzero) return 0.0;
+                auto it = colmax_a.find(g_row);
+                if (it == colmax_a.end() || !(it->second > 0.0)) {
+                    return std::numeric_limits<double>::infinity();
+                }
+                return threshold / it->second;
+            };
             const GhostMetadata meta = fetch_row_patterns(A, needed, ga.comm, ga.size, rank);
             ghosts = build_spmm_ghost_blocks<T>(
-                meta, fetch_required_block_payloads(A, fused_blocks_of(meta)));
+                meta, fetch_required_block_payloads(
+                          A, fused_gated_blocks_of(meta, gate, min_owned_row)));
             remote.build(ghosts, meta, n_global);
             ghost_sizes = ghosts.sizes;
         }

@@ -889,13 +889,22 @@ inline std::vector<BlockID> fused_blocks_of(const GhostMetadata& patterns) {
 /// patterns -- so probes that only need a row to have been answered, like
 /// rarh's hermiticity check, are unaffected by an empty fetch.) A gate of 0
 /// keeps everything, which is what a threshold of 0 must produce.
+///
+/// `min_col` trims columns no output on this rank can use: an upper-only
+/// kernel writes C[i, j >= i] for OWNED i, so a fetched entry with a column
+/// below the rank's first owned row is dead on arrival whatever its norm.
+/// Only sound for fetches whose entries feed the OUTPUT-column position
+/// (stage 2 of the triple products, the single stage of the square); a
+/// contraction-index fetch must pass 0.
 template <typename GateOfRow>
 inline std::vector<BlockID> fused_gated_blocks_of(const GhostMetadata& patterns,
-                                                  GateOfRow&& gate_of_row) {
+                                                  GateOfRow&& gate_of_row,
+                                                  int min_col = 0) {
     std::vector<BlockID> blocks;
     for (const auto& row : patterns) {
         const double gate = gate_of_row(row.first);
         for (const auto& meta : row.second) {
+            if (meta.col < min_col) continue;
             if (meta.norm >= gate) blocks.push_back(BlockID{row.first, meta.col});
         }
     }
