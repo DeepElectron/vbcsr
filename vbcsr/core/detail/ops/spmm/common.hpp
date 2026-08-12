@@ -933,6 +933,16 @@ inline size_t fused_tile_budget_bytes() {
     return size_t(512) << 20;
 }
 
+/// A tile never closes below this many output rows, whatever the budget says.
+///
+/// One output row's reach is the working set the algorithm irreducibly needs
+/// -- a row that alone exceeds the budget must overshoot -- and consecutive
+/// rows share almost all of it, so cutting below a handful of rows buys no
+/// memory while multiplying the collective rounds: measured on a 4-rank band
+/// where boundary rows individually busted a 64 MB budget, one-row tiles
+/// turned a 2.9 s product into 29 s of fetch latency.
+inline constexpr int kMinFusedTileRows = 16;
+
 /// Global block index -> local row, or -1 where the matrix does not own it.
 template <typename Matrix>
 std::vector<int> fused_row_of_global(const Matrix& m, int n_global_blocks) {

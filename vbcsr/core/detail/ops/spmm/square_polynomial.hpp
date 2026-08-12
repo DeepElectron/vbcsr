@@ -314,7 +314,8 @@ struct SquarePolynomialExecutor {
                 size_t acc = 0;
                 for (int i = 0; i < n_rows; ++i) {
                     size_t row_cost = charge_row(i);
-                    if (acc > 0 && acc + row_cost > block_budget) {
+                    if (acc > 0 && acc + row_cost > block_budget &&
+                        i - tile_bound.back() >= kMinFusedTileRows) {
                         tile_bound.push_back(i);
                         for (int g : flagged) row_flag[static_cast<size_t>(g)] = 0;
                         flagged.clear();
