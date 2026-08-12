@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <limits>
+#include <map>
 #include <type_traits>
 #include <cstring>
 #include <map>
@@ -182,15 +184,17 @@ struct RARhExecutor {
                 }
             };
 
-            // How many blocks visit_b would hand over for a row. The stage-one
-            // gate needs it: see the bound where eps1 is set.
+            // The row width the stage-one gate divides by -- the FULL pattern
+            // width, not the fetched entry count: the error budget telescopes
+            // over the row as it exists, and a norm-gated fetch shipping
+            // fewer blocks must not loosen the gate on the ones it shipped.
             auto count_b = [&](int g_row) -> int {
                 const int local = b_row[static_cast<size_t>(g_row)];
                 if (local >= 0) return b_ptr[local + 1] - b_ptr[local];
                 if (remote_b.first.empty()) return 0;
                 const int at = remote_b.first[static_cast<size_t>(g_row)];
                 if (at < 0) return 0;
-                return remote_b.count[static_cast<size_t>(g_row)];
+                return remote_b.pattern_width[static_cast<size_t>(g_row)];
             };
 
             #pragma omp for schedule(dynamic, 8)
@@ -364,51 +368,147 @@ struct RARhExecutor {
         const int n_rows = static_cast<int>(ga.adj_ptr.size()) - 1;
         const int n_global = ga.block_displs.back();
 
-        // ---- Round 1: the rows of B that A's columns reach.
+        // The fetch gates below need the same global bound the numeric gate
+        // uses; taken here (one Allreduce) instead of at the fused_rows call.
+        const double a_max_norm = fused_global_max_norm(A);
+        const std::vector<double>& a_norms = A.get_block_norms();
+        const std::vector<double>& b_norms = B.get_block_norms();
+
+        // ---- Round 1: the rows of B that A's columns reach, and -- per
+        // reached row -- the strongest gate any local pair can put on its
+        // blocks. A block of B row k is worth shipping only if SOME local pair
+        // (i,k) could pass the numeric stage-one gate with it:
+        //
+        //     a_norm(i,k) * b_norm(k,l) >= threshold /
+        //         (2 * a_row_count(i) * width_b(k) * a_max_norm)
+        //
+        // which, taken over all local i, is a per-row norm floor on B[k,l]
+        // with colmax_a(k) = max_i [a_row_count(i) * a_norm(i,k)]. A block
+        // below the floor fails the numeric gate for EVERY local use, so
+        // skipping its payload changes what travels, never what is kept.
         std::set<int> need_b;
+        std::map<int, double> colmax_a;  // needed row of B -> max_i arc(i)*a_norm(i,k)
+        std::vector<double> a_row_sum(static_cast<size_t>(n_rows), 0.0);
+        double s_max = 0.0;      // max_i sum_k a_norm(i,k)
+        double w_bound_d = 0.0;  // max_i sum_k width_b(k): upper bound on |touched_i|
         for (int i = 0; i < n_rows; ++i) {
+            const int arc = ga.adj_ptr[i + 1] - ga.adj_ptr[i];
+            double row_sum = 0.0;
             for (int k = ga.adj_ptr[i]; k < ga.adj_ptr[i + 1]; ++k) {
                 const int g_col = ga.get_global_index(ga.adj_ind[k]);
+                const double reach = static_cast<double>(arc) * a_norms[static_cast<size_t>(k)];
+                row_sum += a_norms[static_cast<size_t>(k)];
+                auto [it, fresh] = colmax_a.emplace(g_col, reach);
+                if (!fresh && reach > it->second) it->second = reach;
                 if (gb.find_owner(g_col) != rank) need_b.insert(g_col);
             }
+            a_row_sum[static_cast<size_t>(i)] = row_sum;
+            s_max = std::max(s_max, row_sum);
         }
         GhostMetadata meta_b = fetch_row_patterns(B, need_b, ga.comm, ga.size, rank);
 
-        // ---- The support of A B, from patterns alone. Only its UNION over
-        // local rows is kept: that is all the next round needs, and it costs
-        // one flag per global block instead of the pattern of every row.
+        const auto gate_b = [&](int g_row, int width) -> double {
+            if (!(threshold > 0.0) || a_max_norm <= 0.0 || width <= 0) return 0.0;
+            auto it = colmax_a.find(g_row);
+            if (it == colmax_a.end() || !(it->second > 0.0)) {
+                return std::numeric_limits<double>::infinity();
+            }
+            return threshold / (2.0 * static_cast<double>(width) * a_max_norm * it->second);
+        };
+
+        // ---- The support of A B, from patterns alone, carrying per column
+        // the largest B-block norm that survives its row's fetch gate. A
+        // column whose every incoming pair is provably below the numeric gate
+        // can never enter a row's accumulator, so it needs neither round-2
+        // pattern nor payload -- the local rows of B go through the SAME gate
+        // for exactly that reason. (colmax doubles as the reach flag: 0 means
+        // unreached or unreachable, and it feeds the round-2 gate below.)
+        //
+        // `reached` is kept SEPARATELY from colmax_b because the two answer
+        // different questions: reached says a kept block exists (at threshold
+        // 0 a ZERO-norm block is numerically kept, enters the accumulator,
+        // and its row must be answerable for the hermiticity probe), colmax
+        // feeds the round-2 norm gate. At threshold > 0 a kept block always
+        // has norm >= gate > 0, so reached implies colmax > 0 there.
         std::vector<char> reached(static_cast<size_t>(n_global), 0);
+        std::vector<double> colmax_b(static_cast<size_t>(n_global), 0.0);
         for (int i = 0; i < n_rows; ++i) {
             for (int k = ga.adj_ptr[i]; k < ga.adj_ptr[i + 1]; ++k) {
                 const int g_mid = ga.get_global_index(ga.adj_ind[k]);
                 auto local = gb.global_to_local.find(g_mid);
                 if (local != gb.global_to_local.end() && local->second < static_cast<int>(gb.adj_ptr.size()) - 1) {
                     const int lb = local->second;
+                    const double gate = gate_b(g_mid, gb.adj_ptr[lb + 1] - gb.adj_ptr[lb]);
                     for (int e = gb.adj_ptr[lb]; e < gb.adj_ptr[lb + 1]; ++e) {
-                        reached[static_cast<size_t>(gb.get_global_index(gb.adj_ind[e]))] = 1;
+                        const double norm = b_norms[static_cast<size_t>(e)];
+                        if (norm < gate) continue;
+                        const size_t col = static_cast<size_t>(gb.get_global_index(gb.adj_ind[e]));
+                        reached[col] = 1;
+                        colmax_b[col] = std::max(colmax_b[col], norm);
                     }
                     continue;
                 }
                 auto pattern = meta_b.find(g_mid);
                 if (pattern == meta_b.end()) continue;
+                const double gate = gate_b(g_mid, static_cast<int>(pattern->second.size()));
                 for (const auto& meta : pattern->second) {
-                    reached[static_cast<size_t>(meta.col)] = 1;
+                    if (meta.norm < gate) continue;
+                    const size_t col = static_cast<size_t>(meta.col);
+                    reached[col] = 1;
+                    colmax_b[col] = std::max(colmax_b[col], meta.norm);
                 }
             }
         }
+        for (int i = 0; i < n_rows; ++i) {
+            double w = 0.0;
+            for (int k = ga.adj_ptr[i]; k < ga.adj_ptr[i + 1]; ++k) {
+                const int g_mid = ga.get_global_index(ga.adj_ind[k]);
+                auto local = gb.global_to_local.find(g_mid);
+                if (local != gb.global_to_local.end() && local->second < static_cast<int>(gb.adj_ptr.size()) - 1) {
+                    w += gb.adj_ptr[local->second + 1] - gb.adj_ptr[local->second];
+                } else if (auto pattern = meta_b.find(g_mid); pattern != meta_b.end()) {
+                    w += static_cast<double>(pattern->second.size());
+                }
+            }
+            w_bound_d = std::max(w_bound_d, w);
+        }
 
-        // ---- Round 2: the rows of A over that support.
+        // ---- Round 2: the rows of A over that support. The fetch gate is
+        // the stage-two numeric gate with every unknown bounded from the safe
+        // side: inner_norm(i,l) <= a_row_sum(i) * colmax_b(l) <= s_max *
+        // colmax_b(l), and |touched_i| <= w_bound, so a block A[l,j] below
+        //
+        //     threshold / (2 * w_bound * s_max * colmax_b(l))
+        //
+        // fails the numeric eps2 gate for every local row that reaches l.
         std::set<int> need_a;
         for (int g = 0; g < n_global; ++g) {
-            if (reached[static_cast<size_t>(g)] && ga.find_owner(g) != rank) need_a.insert(g);
+            if (reached[static_cast<size_t>(g)] && ga.find_owner(g) != rank) {
+                need_a.insert(g);
+            }
         }
         GhostMetadata meta_a = fetch_row_patterns(A, need_a, ga.comm, ga.size, rank);
 
-        // ---- Payloads for both rounds.
+        const auto gate_a = [&](int g_row) -> double {
+            if (!(threshold > 0.0)) return 0.0;
+            const double cm = colmax_b[static_cast<size_t>(g_row)];
+            if (!(cm > 0.0) || !(s_max > 0.0) || !(w_bound_d > 0.0)) {
+                return std::numeric_limits<double>::infinity();
+            }
+            return threshold / (2.0 * w_bound_d * s_max * cm);
+        };
+
+        // ---- Payloads for both rounds, gated: what provably cannot pass the
+        // numeric gates never travels.
         auto ghosts_b = build_spmm_ghost_blocks<T>(
-            meta_b, fetch_required_block_payloads(B, fused_blocks_of(meta_b)));
+            meta_b, fetch_required_block_payloads(
+                        B, fused_gated_blocks_of(meta_b, [&](int row) {
+                            auto it = meta_b.find(row);
+                            return gate_b(row, static_cast<int>(it->second.size()));
+                        })));
         auto ghosts_a = build_spmm_ghost_blocks<T>(
-            meta_a, fetch_required_block_payloads(A, fused_blocks_of(meta_a)));
+            meta_a, fetch_required_block_payloads(
+                        A, fused_gated_blocks_of(meta_a, gate_a)));
 
         RemoteRows remote_b, remote_a;
         remote_b.build(ghosts_b, meta_b, n_global);
@@ -420,8 +520,8 @@ struct RARhExecutor {
         int bad_operand = 0;
         fused_rows(A, B, threshold, remote_a, remote_b,
                    fused_row_of_global(A, n_global), fused_row_of_global(B, n_global),
-                   n_global, A.get_block_norms(), B.get_block_norms(),
-                   fused_global_max_norm(A), row_columns, row_values, bad_operand);
+                   n_global, a_norms, b_norms,
+                   a_max_norm, row_columns, row_values, bad_operand);
         int any_bad = bad_operand;
         MPI_Allreduce(&bad_operand, &any_bad, 1, MPI_INT, MPI_MAX, ga.comm);
         if (any_bad) {

@@ -831,7 +831,14 @@ SpMMGhostBlocks<T> build_spmm_ghost_blocks(
 template <typename T>
 struct FusedRemoteRows {
     std::vector<int> first;   // global row -> first entry; -1 means UNANSWERED
-    std::vector<int> count;   // global row -> number of entries
+    std::vector<int> count;   // global row -> number of FETCHED entries
+    // Global row -> the row's FULL pattern width, before any fetch gate. The
+    // stage-one error budget divides by the width of the row it telescopes
+    // over, and that bound is stated against the row as it exists, not
+    // against the subset a gated fetch shipped -- dividing by the smaller
+    // fetched count would loosen the numeric gate exactly where the fetch
+    // gate already spent the budget.
+    std::vector<int> pattern_width;
     std::vector<int> cols;    // global column of each entry
     std::vector<int> dims;    // its block column dimension
     std::vector<double> norms;  // Frobenius, from the pattern exchange
@@ -841,8 +848,11 @@ struct FusedRemoteRows {
                int n_global) {
         first.assign(static_cast<size_t>(n_global), -1);
         count.assign(static_cast<size_t>(n_global), 0);
+        pattern_width.assign(static_cast<size_t>(n_global), 0);
         for (const auto& row : patterns) {
             first[static_cast<size_t>(row.first)] = 0;
+            pattern_width[static_cast<size_t>(row.first)] =
+                static_cast<int>(row.second.size());
         }
         for (const auto& entry : ghosts.rows) {
             first[static_cast<size_t>(entry.first)] = static_cast<int>(cols.size());
@@ -864,6 +874,29 @@ inline std::vector<BlockID> fused_blocks_of(const GhostMetadata& patterns) {
     for (const auto& row : patterns) {
         for (const auto& meta : row.second) {
             blocks.push_back(BlockID{row.first, meta.col});
+        }
+    }
+    return blocks;
+}
+
+/// The blocks of `patterns` whose norm reaches the row's fetch gate -- the
+/// payload request a norm-gated halo fetch ships instead of fused_blocks_of.
+///
+/// The gate must be CONSERVATIVE against the caller's numeric gate: a block
+/// skipped here is a block whose every use provably fails the numeric prune,
+/// so the fetch changes what travels, never what the kernel would have kept.
+/// (Row PRESENCE is untouched -- FusedRemoteRows::build takes it from the
+/// patterns -- so probes that only need a row to have been answered, like
+/// rarh's hermiticity check, are unaffected by an empty fetch.) A gate of 0
+/// keeps everything, which is what a threshold of 0 must produce.
+template <typename GateOfRow>
+inline std::vector<BlockID> fused_gated_blocks_of(const GhostMetadata& patterns,
+                                                  GateOfRow&& gate_of_row) {
+    std::vector<BlockID> blocks;
+    for (const auto& row : patterns) {
+        const double gate = gate_of_row(row.first);
+        for (const auto& meta : row.second) {
+            if (meta.norm >= gate) blocks.push_back(BlockID{row.first, meta.col});
         }
     }
     return blocks;
