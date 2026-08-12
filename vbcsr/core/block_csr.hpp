@@ -1000,16 +1000,24 @@ public:
     }
 
     // Matrix-Matrix Multiplication (Dense RHS)
+    //
+    // The apply is the one op whose CORRECTNESS rests on the padding invariant:
+    // the dense kernels run the full padded ld width so no vec-axis tail path
+    // is needed, which is only valid while X's pad lanes multiply to exact
+    // zeros -- and that is also what leaves Y's pad zero on the way out. So
+    // both directions are checked: the precondition catches a caller that
+    // bulk-wrote X without repairing it, the postcondition catches a kernel
+    // that stopped preserving it. Both compile away under NDEBUG.
     void mult_dense(DistMultiVector<T>& X, DistMultiVector<T>& Y) {
+        X.assert_padding_zero();
         if (kind == MatrixKind::CSR) {
             detail::csr_mult_dense(graph, active_csr_backend(), X, Y);
-            return;
-        }
-        if (kind == MatrixKind::BSR) {
+        } else if (kind == MatrixKind::BSR) {
             detail::bsr_mult_dense(graph, active_bsr_backend(), X, Y);
-            return;
+        } else {
+            detail::vbcsr_mult_dense(graph, active_vbcsr_backend(), X, Y);
         }
-        detail::vbcsr_mult_dense(graph, active_vbcsr_backend(), X, Y);
+        Y.assert_padding_zero();
     }
 
     // Adjoint Matrix-Vector Multiplication: y = A^dagger * x
@@ -1026,16 +1034,19 @@ public:
     }
 
     // Adjoint Matrix-Matrix Multiplication: Y = A^dagger * X
+    // Same padding pre/postcondition as mult_dense above, and the same reason:
+    // this path additionally reduce_ghosts() into Y, so a broken invariant
+    // would travel between ranks rather than staying local.
     void mult_dense_adjoint(DistMultiVector<T>& X, DistMultiVector<T>& Y) {
+        X.assert_padding_zero();
         if (kind == MatrixKind::CSR) {
             detail::csr_mult_dense_adjoint(graph, active_csr_backend(), X, Y);
-            return;
-        }
-        if (kind == MatrixKind::BSR) {
+        } else if (kind == MatrixKind::BSR) {
             detail::bsr_mult_dense_adjoint(graph, active_bsr_backend(), X, Y);
-            return;
+        } else {
+            detail::vbcsr_mult_dense_adjoint(graph, active_vbcsr_backend(), X, Y);
         }
-        detail::vbcsr_mult_dense_adjoint(graph, active_vbcsr_backend(), X, Y);
+        Y.assert_padding_zero();
     }
 
     // Utilities

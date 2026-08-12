@@ -28,10 +28,23 @@ namespace vbcsr {
 // a new cache line (double: multiple of 8; complex<double>: multiple of 4).
 //
 // PADDING INVARIANT: lanes [num_vectors, ld) of every row are always ZERO.
-// The flat element-wise operations (scale, axpy, axpby, pointwise_mult,
-// copy_from, bdot's accumulation) iterate the whole padded buffer and stay
-// correct because the padding contributes exact zeros. Any code that writes
-// the buffer must preserve the invariant (see zero_padding()).
+//
+// What depends on it is the APPLY: the dense kernels run the full ld width so
+// no vec-axis tail path is needed (detail/kernels/rowmajor_kernels.hpp), and
+// that is only correct while the pad lanes multiply to exact zeros.
+//
+// What does NOT depend on it, contrary to what this comment used to claim: the
+// flat element-wise ops (scale, axpy, axpby, pointwise_mult, copy_from) do run
+// over the whole padded buffer, but lane j only ever touches lane j, so pad
+// garbage would stay in the pad and never reach a live lane. bdot does not
+// touch the pad at all -- it is bounded by num_vectors. The invariant is a
+// correctness requirement for the apply and a hygiene one everywhere else.
+//
+// Any code that BULK-WRITES the raw buffer (a memcpy in, an external dense
+// array) must re-establish it via zero_padding(). No such writer exists in the
+// tree today: every writer here is lane-bounded, and the Python buffer
+// protocol exposes shape (rows, num_vectors) strided over ld, so a numpy write
+// cannot reach a pad lane either. zero_padding() is a hook for future ones.
 template <typename T>
 class DistMultiVector {
 public:
@@ -86,6 +99,37 @@ public:
             T* r = row_data(row);
             std::fill(r + num_vectors, r + ld, T(0));
         }
+    }
+
+    /// True when the padding invariant holds: lanes [num_vectors, ld) of every
+    /// row, owned and ghost, are EXACTLY zero. Trivially true when the row
+    /// happens to fill the line and there are no pad lanes at all.
+    ///
+    /// Not NDEBUG-gated, deliberately: a Release-built test must still be able
+    /// to call it. assert_padding_zero() below is the part that disappears.
+    bool padding_is_zero() const {
+        if (ld == num_vectors) return true;
+        const int total_rows = local_rows + ghost_rows;
+        for (int row = 0; row < total_rows; ++row) {
+            const T* r = row_data(row);
+            for (int v = num_vectors; v < ld; ++v) {
+                if (r[v] != T(0)) return false;
+            }
+        }
+        return true;
+    }
+
+    /// Debug-build guard for the padding invariant, specified in
+    /// doc/row_major_migration_plan.md §2.1 and named in its risk table as the
+    /// mitigation for "padding lanes corrupted".
+    ///
+    /// O(rows * pad lanes), so it is NOT free -- under NDEBUG assert() discards
+    /// the expression unevaluated and this costs nothing, which is the only
+    /// reason it can sit on the apply path. The contract tests #undef NDEBUG,
+    /// so it stays live there; that undef is load-bearing, not decoration (see
+    /// the plan's note on Release builds turning assert-based gates vacuous).
+    void assert_padding_zero() const {
+        assert(padding_is_zero());
     }
 
     void conjugate() {

@@ -156,6 +156,86 @@ void test_dist_multivector_duplicate() {
     }
 }
 
+// The padding invariant (row_major_migration_plan.md §2.1) had no test until
+// now: assert_padding_zero() was specified there, named in the plan's own risk
+// table as the mitigation for "padding lanes corrupted", and never written.
+//
+// This case exists so the apply case below cannot pass vacuously. A checker
+// that always returned true would satisfy "padding is still zero after an
+// apply" perfectly; only deliberate corruption proves it can fail at all.
+void test_padding_checker_detects_corruption() {
+    DistGraph graph(MPI_COMM_SELF);
+    graph.construct_serial(2, {2, 2}, {{0, 1}, {1}});
+
+    // 3 doubles is 24 bytes, which pads out to a 64-byte line: lanes 3..7 are
+    // the padding this whole contract is about.
+    DistMultiVector<double> mv(&graph, 3);
+    assert(mv.num_vectors == 3);
+    assert(mv.ld == 8);
+
+    mv.set_constant(2.0);
+    assert(mv.padding_is_zero());  // set_constant is lane-bounded
+
+    // What a raw bulk write into the buffer would look like.
+    mv.row_data(1)[mv.num_vectors] = 1.0;
+    assert(!mv.padding_is_zero());
+
+    // zero_padding() repairs it, and leaves the live lanes alone.
+    mv.zero_padding();
+    assert(mv.padding_is_zero());
+    for (int row = 0; row < mv.local_rows; ++row) {
+        for (int v = 0; v < mv.num_vectors; ++v) {
+            assert(std::abs(mv(row, v) - 2.0) < 1e-12);
+        }
+    }
+
+    // A row that exactly fills the line has no padding at all: trivially
+    // satisfied, and zero_padding() must not walk off the end trying to fix it.
+    DistMultiVector<double> full(&graph, 8);
+    assert(full.ld == full.num_vectors);
+    assert(full.padding_is_zero());
+    full.zero_padding();
+    assert(full.padding_is_zero());
+}
+
+// The apply is the op whose correctness rests on the invariant -- the dense
+// kernels run the full padded ld width, so the pad lanes have to multiply to
+// exact zeros. Checked both directions, against a matrix whose off-diagonal
+// block makes the rows genuinely mix.
+void test_padding_survives_apply() {
+    DistGraph graph(MPI_COMM_SELF);
+    graph.construct_serial(2, {2, 2}, {{0, 1}, {1}});
+
+    BlockSpMat<double> mat(&graph);
+    fill_reference_matrix(mat);
+
+    DistMultiVector<double> x(&graph, 3), y(&graph, 3), z(&graph, 3);
+    assert(x.ld > x.num_vectors);  // otherwise there is nothing to test
+
+    for (int row = 0; row < x.local_rows; ++row) {
+        for (int v = 0; v < x.num_vectors; ++v) {
+            x(row, v) = 1.0 + row + 0.5 * v;
+        }
+    }
+    assert(x.padding_is_zero());
+
+    mat.mult_dense(x, y);
+    assert(x.padding_is_zero());
+    assert(y.padding_is_zero());
+
+    mat.mult_dense_adjoint(y, z);
+    assert(y.padding_is_zero());
+    assert(z.padding_is_zero());
+
+    // The result must not be all zeros, or "padding is zero" would hold for
+    // the uninteresting reason that everything is.
+    double live = 0.0;
+    for (int row = 0; row < z.local_rows; ++row) {
+        for (int v = 0; v < z.num_vectors; ++v) live += std::abs(z(row, v));
+    }
+    assert(live > 0.0);
+}
+
 BlockSpMat<double> make_shared_graph_duplicate_from_owned_source() {
     DistGraph* graph = new DistGraph(MPI_COMM_SELF);
     graph->construct_serial(2, {1, 1}, {{0, 1}, {1}});
@@ -325,6 +405,8 @@ int main(int argc, char** argv) {
     test_mult_optimized_matches_mult();
     test_construct_serial_root_only();
     test_dist_multivector_duplicate();
+    test_padding_checker_detects_corruption();
+    test_padding_survives_apply();
     test_duplicate_false_keeps_shared_owned_graph_alive();
     test_duplicate_and_copy_from_require_assembled_remote_state();
     test_filter_blocks_requires_assembled_remote_state();
