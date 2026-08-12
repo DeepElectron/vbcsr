@@ -933,6 +933,30 @@ inline size_t fused_tile_budget_bytes() {
     return size_t(512) << 20;
 }
 
+/// Output-column tiling of the fused numeric pass (VBCSR_FUSED_OUTPUT_TILE,
+/// default on; "0" disables -- the A/B lever the prototype was measured
+/// with). Wide accumulator rows spill every cache and pin the numeric loop
+/// to the DRAM roof; slicing the DESTINATION columns to an L2-resident range
+/// and re-walking the contraction per slice touches each destination block
+/// once per slice pass instead of once per pair, while the operand PAYLOADS
+/// are still read exactly once -- the re-walk skips out-of-slice blocks on
+/// metadata alone (12 bytes against a 2.7 KB payload).
+inline bool fused_output_tiling_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("VBCSR_FUSED_OUTPUT_TILE");
+        return v == nullptr || v[0] == '\0' || v[0] != '0';
+    }();
+    return enabled;
+}
+
+/// Destination-column slice width, in block columns: ~384 blocks of 13x13
+/// complex<double> is ~1 MB of accumulator, the L2 the slice must live in.
+inline constexpr int kFusedOutputTileCols = 384;
+
+/// Rows narrower than this keep the single-pass path: their whole
+/// accumulator row is already cache-resident and slicing is pure overhead.
+inline constexpr int kFusedOutputTileMinWidth = 384;
+
 /// A tile never closes below this many output rows, whatever the budget says.
 ///
 /// One output row's reach is the working set the algorithm irreducibly needs

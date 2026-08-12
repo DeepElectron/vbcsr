@@ -140,25 +140,74 @@ struct SquarePolynomialExecutor {
                                        : 0.0;
 
                 // (A^2)[i, :] -- scratch, never leaves the thread.
-                for (int ka = a_ptr[i]; ka < a_ptr[i + 1]; ++ka) {
-                    const int g_mid = ga.get_global_index(a_ind[ka]);
-                    const int m_dim = ga.block_sizes[a_ind[ka]];
-                    const T* a_block = A.block_data(ka);
-                    const double a_norm = a_norms[static_cast<size_t>(ka)];
-                    group.clear();
-                    visit(g_mid, [&](int g_col, int c_dim, const T* b_block, double b_norm) {
-                        if (g_col < g_row) return;  // upper triangle only
-                        if (a_norm * b_norm < eps) return;
-                        // No norm_bound here: the drop below is on the finished
-                        // value, which has to be swept anyway once c1*A and
-                        // c0*I have landed on it, so a running bound would be
-                        // maintained and then never read. (rarh does read one,
-                        // to gate its second contraction.)
-                        const int slot = acc.obtain(g_col, r_dim, c_dim);
-                        group.add(b_block, acc.value_offset[static_cast<size_t>(slot)],
-                                  c_dim, r_dim, m_dim);
-                    });
-                    group.flush(acc.values, a_block, r_dim, m_dim);
+                //
+                // Two shapes of the same contraction. The single pass touches
+                // each destination block once per PAIR; at wide rows the
+                // accumulator spills every cache and those touches are DRAM
+                // round trips -- the numeric loop measured pinned to the
+                // bandwidth roof at >= 1000 neighbours. The tiled pass slices
+                // the destination columns to an L2-resident range and
+                // re-walks the contraction per slice: destinations are
+                // touched once per slice pass, operand payloads still exactly
+                // once (out-of-slice blocks are skipped on metadata alone,
+                // and eps skips are decided before any payload is read).
+                const int a_row_count_i = a_ptr[i + 1] - a_ptr[i];
+                const bool tile_output = fused_output_tiling_enabled() &&
+                                         a_row_count_i >= kFusedOutputTileMinWidth;
+                if (!tile_output) {
+                    for (int ka = a_ptr[i]; ka < a_ptr[i + 1]; ++ka) {
+                        const int g_mid = ga.get_global_index(a_ind[ka]);
+                        const int m_dim = ga.block_sizes[a_ind[ka]];
+                        const T* a_block = A.block_data(ka);
+                        const double a_norm = a_norms[static_cast<size_t>(ka)];
+                        group.clear();
+                        visit(g_mid, [&](int g_col, int c_dim, const T* b_block, double b_norm) {
+                            if (g_col < g_row) return;  // upper triangle only
+                            if (a_norm * b_norm < eps) return;
+                            // No norm_bound here: the drop below is on the
+                            // finished value, which has to be swept anyway once
+                            // c1*A and c0*I have landed on it, so a running
+                            // bound would be maintained and then never read.
+                            // (rarh does read one, to gate its second
+                            // contraction.)
+                            const int slot = acc.obtain(g_col, r_dim, c_dim);
+                            group.add(b_block, acc.value_offset[static_cast<size_t>(slot)],
+                                      c_dim, r_dim, m_dim);
+                        });
+                        group.flush(acc.values, a_block, r_dim, m_dim);
+                    }
+                } else {
+                    // The reach's end, from metadata alone, so the slice loop
+                    // covers [g_row, reach_end) instead of the global width.
+                    int reach_end = g_row + 1;
+                    for (int ka = a_ptr[i]; ka < a_ptr[i + 1]; ++ka) {
+                        visit(ga.get_global_index(a_ind[ka]),
+                              [&](int g_col, int, const T*, double) {
+                                  if (g_col >= reach_end) reach_end = g_col + 1;
+                              });
+                    }
+                    for (int t_lo = g_row; t_lo < reach_end; t_lo += kFusedOutputTileCols) {
+                        const int t_hi =
+                            std::min(reach_end, t_lo + kFusedOutputTileCols);
+                        for (int ka = a_ptr[i]; ka < a_ptr[i + 1]; ++ka) {
+                            const int g_mid = ga.get_global_index(a_ind[ka]);
+                            const int m_dim = ga.block_sizes[a_ind[ka]];
+                            const T* a_block = A.block_data(ka);
+                            const double a_norm = a_norms[static_cast<size_t>(ka)];
+                            group.clear();
+                            visit(g_mid, [&](int g_col, int c_dim, const T* b_block,
+                                             double b_norm) {
+                                if (g_col < t_lo || g_col >= t_hi) return;
+                                if (g_col < g_row) return;  // upper triangle only
+                                if (a_norm * b_norm < eps) return;
+                                const int slot = acc.obtain(g_col, r_dim, c_dim);
+                                group.add(b_block,
+                                          acc.value_offset[static_cast<size_t>(slot)],
+                                          c_dim, r_dim, m_dim);
+                            });
+                            group.flush(acc.values, a_block, r_dim, m_dim);
+                        }
+                    }
                 }
 
                 // Scale by c2, then add c1*A and c0*I on the same row. A's own
