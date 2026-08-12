@@ -2420,7 +2420,7 @@ private:
     bool has_same_logical_structure(const BlockSpMat& other) const;
 
     using GhostBlockRef = detail::GhostBlockRef<T>;
-    using BlockData = detail::FetchedBlock<T>;
+    using BlockData = detail::FetchedBlockRef<T>;
     using FetchContext = detail::FetchedBlockContext<T>;
 
     // Construct a submatrix from fetched data
@@ -2465,7 +2465,7 @@ private:
             int sub_row = global_to_sub[bd->global_row];
             int sub_col = global_to_sub[bd->global_col];
 
-            sub_mat.add_block(sub_row, sub_col, bd->data.data(), bd->r_dim, bd->c_dim, AssemblyMode::INSERT, kCanonicalBlockLayout);
+            sub_mat.add_block(sub_row, sub_col, bd->data, bd->r_dim, bd->c_dim, AssemblyMode::INSERT, kCanonicalBlockLayout);
         }
 
         sub_mat.assemble();

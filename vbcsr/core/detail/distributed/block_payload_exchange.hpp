@@ -47,6 +47,9 @@ inline RequiredColumnsByRow required_columns_from_batches(const std::vector<std:
     return required_cols_by_row;
 }
 
+// Locally-owned blocks are handed back as POINTERS INTO THE MATRIX -- the
+// caller holds the operand for the duration of its product (the contract
+// stated at FetchedBlockRef), so copying them was pure waste.
 template <typename Matrix>
 void append_matching_local_blocks(
         const Matrix& matrix,
@@ -72,15 +75,13 @@ void append_matching_local_blocks(
             continue;
         }
 
-        FetchedBlock<T> block;
+        FetchedBlockRef<T> block;
         block.global_row = gid;
         block.global_col = col_gid;
         block.r_dim = matrix.graph->block_sizes[lid];
         block.c_dim = matrix.graph->block_sizes[col_lid];
-        const size_t size = matrix.block_size_elements(slot);
-        block.data.resize(size);
-        std::memcpy(block.data.data(), matrix.block_data(slot), size * sizeof(T));
-        ctx.blocks.push_back(std::move(block));
+        block.data = matrix.block_data(slot);
+        ctx.blocks.push_back(block);
     }
 }
 
@@ -196,10 +197,15 @@ void write_response(
     std::memcpy(num_blocks_ptr, &total_blocks, sizeof(int));
 }
 
+// One response segment's header walk: records every block's metadata and its
+// payload offset within the segment WITHOUT touching the payload bytes, so
+// the copies can be sized once and run in parallel afterwards.
 template <typename T>
-void unpack_response(
+void scan_response(
         const char* ptr,
-        FetchedBlockContext<T>& ctx) {
+        FetchedBlockContext<T>& ctx,
+        std::vector<size_t>& blob_offset,
+        const char* segment_begin) {
     int num_rows = 0;
     std::memcpy(&num_rows, ptr, sizeof(int));
     ptr += sizeof(int);
@@ -217,7 +223,7 @@ void unpack_response(
     std::memcpy(&num_blocks, ptr, sizeof(int));
     ptr += sizeof(int);
     for (int k = 0; k < num_blocks; ++k) {
-        FetchedBlock<T> block;
+        FetchedBlockRef<T> block;
         std::memcpy(&block.global_row, ptr, sizeof(int));
         ptr += sizeof(int);
         std::memcpy(&block.global_col, ptr, sizeof(int));
@@ -226,10 +232,10 @@ void unpack_response(
         ptr += sizeof(int);
         std::memcpy(&block.c_dim, ptr, sizeof(int));
         ptr += sizeof(int);
-        block.data.resize(static_cast<size_t>(block.r_dim) * block.c_dim);
-        std::memcpy(block.data.data(), ptr, block.data.size() * sizeof(T));
-        ptr += block.data.size() * sizeof(T);
-        ctx.blocks.push_back(std::move(block));
+        block.data = nullptr;  // resolved into the arena after sizing
+        ctx.blocks.push_back(block);
+        blob_offset.push_back(static_cast<size_t>(ptr - segment_begin));
+        ptr += static_cast<size_t>(block.r_dim) * block.c_dim * sizeof(T);
     }
 }
 
@@ -381,11 +387,41 @@ FetchedBlockContext<typename Matrix::value_type> fetch_blocks_by_row_columns(
         resp_recv_blob = resp_send_blob;
     }
 
+    // Unpack in two passes: a serial header walk that records every remote
+    // block's metadata and payload location (touching no payload bytes),
+    // then one sized arena filled by a PARALLEL copy. The per-block heap
+    // vector this replaces was tens of millions of allocations and a
+    // single-threaded memcpy of the entire halo at fused-kernel scale.
+    const size_t local_blocks = ctx.blocks.size();  // refs into the matrix
+    std::vector<size_t> blob_offset;                // remote blocks only
     for (int i = 0; i < size; ++i) {
         if (resp_recv_counts[i] == 0) {
             continue;
         }
-        unpack_response(resp_recv_blob.data() + resp_rdispls[i], ctx);
+        scan_response(resp_recv_blob.data() + resp_rdispls[i], ctx, blob_offset,
+                      resp_recv_blob.data());
+        // scan_response records offsets relative to the whole blob: pass the
+        // blob base as the segment origin so one offset table serves all
+        // segments.
+    }
+
+    const size_t remote_blocks = ctx.blocks.size() - local_blocks;
+    std::vector<size_t> arena_offset(remote_blocks + 1, 0);
+    for (size_t b = 0; b < remote_blocks; ++b) {
+        const auto& blk = ctx.blocks[local_blocks + b];
+        arena_offset[b + 1] =
+            arena_offset[b] + static_cast<size_t>(blk.r_dim) * blk.c_dim;
+    }
+    ctx.arena.resize(arena_offset[remote_blocks]);
+    #pragma omp parallel for schedule(static)
+    for (long long b = 0; b < static_cast<long long>(remote_blocks); ++b) {
+        auto& blk = ctx.blocks[local_blocks + static_cast<size_t>(b)];
+        T* dest = ctx.arena.data() + arena_offset[static_cast<size_t>(b)];
+        std::memcpy(dest,
+                    resp_recv_blob.data() + blob_offset[static_cast<size_t>(b)],
+                    (arena_offset[static_cast<size_t>(b) + 1] -
+                     arena_offset[static_cast<size_t>(b)]) * sizeof(T));
+        blk.data = dest;
     }
 
     return ctx;

@@ -380,7 +380,10 @@ using GhostMetadata = std::map<int, std::vector<BlockMeta>>;
 
 template <typename T>
 struct SpMMGhostBlocks {
-    std::vector<FetchedBlock<T>> owned_blocks;
+    std::vector<FetchedBlockRef<T>> owned_blocks;
+    // Owns the remote payloads owned_blocks/rows point into (local blocks
+    // point into the source matrix; see FetchedBlockRef).
+    std::vector<T> arena;
     GhostSizes sizes;
     std::map<int, std::vector<GhostBlockRef<T>>> rows;
 };
@@ -791,6 +794,7 @@ SpMMGhostBlocks<T> build_spmm_ghost_blocks(
     FetchedBlockContext<T>&& payload_ctx) {
     SpMMGhostBlocks<T> ghost_blocks;
     ghost_blocks.owned_blocks = std::move(payload_ctx.blocks);
+    ghost_blocks.arena = std::move(payload_ctx.arena);
 
     for (const auto& block : ghost_blocks.owned_blocks) {
         double norm = 0.0;
@@ -806,7 +810,7 @@ SpMMGhostBlocks<T> build_spmm_ghost_blocks(
 
         ghost_blocks.sizes[block.global_col] = block.c_dim;
         ghost_blocks.rows[block.global_row].push_back(
-            {block.global_col, block.data.data(), block.c_dim, norm});
+            {block.global_col, block.data, block.c_dim, norm});
     }
 
     return ghost_blocks;
