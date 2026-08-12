@@ -316,6 +316,8 @@ struct RhARExecutor {
     }
 
     // The numeric pass, shared by the serial and distributed entry points.
+    // Computes rows [row_lo, row_hi): the tiled distributed path runs it once
+    // per tile against that tile's fetched halo.
     static void fused_rows(const Matrix& A, const Matrix& B, double threshold,
                            const ColumnView& cols,
                            const RemoteRows& remote_a, const RemoteRows& remote_b,
@@ -323,13 +325,12 @@ struct RhARExecutor {
                            int n_global,
                            const std::vector<double>& a_norms,
                            const std::vector<double>& b_norms,
-                           double a_max_norm,
+                           double a_max_norm, int row_lo, int row_hi,
                            std::vector<std::vector<int>>& row_columns,
                            std::vector<std::vector<T>>& row_values,
                            int& missing_row) {
         const DistGraph& ga = *A.graph;
         const DistGraph& gb = *B.graph;
-        const int n_rows = static_cast<int>(ga.adj_ptr.size()) - 1;
         const std::vector<int>& a_ptr = ga.adj_ptr;
         const auto& a_ind = ga.adj_ind;
         const std::vector<int>& b_ptr = gb.adj_ptr;
@@ -398,7 +399,7 @@ struct RhARExecutor {
             };
 
             #pragma omp for schedule(dynamic, 8)
-            for (int i = 0; i < n_rows; ++i) {
+            for (int i = row_lo; i < row_hi; ++i) {
                 const int g_row = ga.get_global_index(i);
                 const int r_dim = ga.block_sizes[i];
                 inner.clear();
@@ -507,7 +508,8 @@ struct RhARExecutor {
         fused_rows(A, B, threshold, cols, none, none,
                    a_row, fused_row_of_global(B, n_global),
                    n_global, A.get_block_norms(), B.get_block_norms(),
-                   fused_global_max_norm(A), row_columns, row_values, missing_row);
+                   fused_global_max_norm(A), 0, n_rows, row_columns, row_values,
+                   missing_row);
         if (missing_row) {
             throw std::runtime_error(
                 "rhar_upper: internal error, a row in the product support was not visited");
@@ -667,26 +669,163 @@ struct RhARExecutor {
         }
         if (n_rows == 0) min_owned_row = 0;
 
-        auto ghosts_b = build_spmm_ghost_blocks<T>(
-            meta_b, fetch_required_block_payloads(
-                        B, fused_gated_blocks_of(meta_b, [&](int row) {
-                            auto it = meta_b.find(row);
-                            return gate_b(row, static_cast<int>(it->second.size()));
-                        })));
-        auto ghosts_a = build_spmm_ghost_blocks<T>(
-            meta_a, fetch_required_block_payloads(
-                        A, fused_gated_blocks_of(meta_a, gate_a, min_owned_row)));
+        // ---- Payloads, gated and TILED (see rarh for the shape; the only
+        // difference is that a tile's needs walk the COLUMN VIEW, since the
+        // left factors here are columns of A). Kept payload counts per row:
+        const auto kept_b = [&](int g) -> size_t {
+            auto it = meta_b.find(g);
+            if (it == meta_b.end()) return 0;
+            const double gate = gate_b(g, static_cast<int>(it->second.size()));
+            size_t n = 0;
+            for (const auto& m : it->second) {
+                if (m.norm >= gate) ++n;
+            }
+            return n;
+        };
+        const auto kept_a = [&](int g) -> size_t {
+            auto it = meta_a.find(g);
+            if (it == meta_a.end()) return 0;
+            const double gate = gate_a(g);
+            size_t n = 0;
+            for (const auto& m : it->second) {
+                if (m.col >= min_owned_row && m.norm >= gate) ++n;
+            }
+            return n;
+        };
+        const auto for_each_kept_b_col = [&](int g_mid, auto&& fn) {
+            const int lb = b_row[static_cast<size_t>(g_mid)];
+            if (lb >= 0) {
+                const double gate = gate_b(g_mid, gb.adj_ptr[lb + 1] - gb.adj_ptr[lb]);
+                for (int e = gb.adj_ptr[lb]; e < gb.adj_ptr[lb + 1]; ++e) {
+                    if (b_norms[static_cast<size_t>(e)] < gate) continue;
+                    fn(gb.get_global_index(gb.adj_ind[e]));
+                }
+                return;
+            }
+            auto pattern = meta_b.find(g_mid);
+            if (pattern == meta_b.end()) return;
+            const double gate = gate_b(g_mid, static_cast<int>(pattern->second.size()));
+            for (const auto& m : pattern->second) {
+                if (m.norm >= gate) fn(m.col);
+            }
+        };
 
-        RemoteRows remote_b, remote_a;
-        remote_b.build(ghosts_b, meta_b, n_global);
-        remote_a.build(ghosts_a, meta_a, n_global);
+        int bs_max = 1;
+        for (int s : ga.block_sizes) bs_max = std::max(bs_max, s);
+        const size_t budget = fused_tile_budget_bytes();
+        const size_t block_budget =
+            budget == 0 ? 0
+                        : std::max<size_t>(1, budget / (static_cast<size_t>(bs_max) *
+                                                        static_cast<size_t>(bs_max) * sizeof(T)));
+        std::vector<int> tile_bound{0};
+        std::vector<char> bflag(static_cast<size_t>(n_global), 0);
+        std::vector<char> aflag(static_cast<size_t>(n_global), 0);
+        std::vector<int> btouched, atouched;
+        const auto reset_flags = [&] {
+            for (int g : btouched) bflag[static_cast<size_t>(g)] = 0;
+            for (int g : atouched) aflag[static_cast<size_t>(g)] = 0;
+            btouched.clear();
+            atouched.clear();
+        };
+        if (block_budget > 0) {
+            const auto charge_row = [&](int i) -> size_t {
+                size_t c = 0;
+                for (int e = static_cast<int>(cols.ptr[static_cast<size_t>(i)]);
+                     e < static_cast<int>(cols.ptr[static_cast<size_t>(i) + 1]); ++e) {
+                    const int g_mid = cols.src_row[static_cast<size_t>(e)];
+                    if (bflag[static_cast<size_t>(g_mid)]) continue;
+                    bflag[static_cast<size_t>(g_mid)] = 1;
+                    btouched.push_back(g_mid);
+                    if (gb.find_owner(g_mid) != rank) c += kept_b(g_mid);
+                    for_each_kept_b_col(g_mid, [&](int l) {
+                        if (aflag[static_cast<size_t>(l)]) return;
+                        aflag[static_cast<size_t>(l)] = 1;
+                        atouched.push_back(l);
+                        if (ga.find_owner(l) != rank) c += kept_a(l);
+                    });
+                }
+                return c;
+            };
+            size_t acc = 0;
+            for (int i = 0; i < n_rows; ++i) {
+                size_t row_cost = charge_row(i);
+                if (acc > 0 && acc + row_cost > block_budget) {
+                    tile_bound.push_back(i);
+                    reset_flags();
+                    acc = 0;
+                    row_cost = charge_row(i);
+                }
+                acc += row_cost;
+            }
+            reset_flags();
+        }
+        tile_bound.push_back(n_rows);
+
+        long long my_tiles = static_cast<long long>(tile_bound.size()) - 1;
+        long long rounds = my_tiles;
+        MPI_Allreduce(&my_tiles, &rounds, 1, MPI_LONG_LONG, MPI_MAX, ga.comm);
+        while (static_cast<long long>(tile_bound.size()) - 1 < rounds) {
+            tile_bound.push_back(n_rows);
+        }
 
         std::vector<std::vector<int>> row_columns(n_rows);
         std::vector<std::vector<T>> row_values(n_rows);
+        GhostSizes ghost_sizes;
         int missing_row = 0;
-        fused_rows(A, B, threshold, cols, remote_a, remote_b,
-                   a_row, b_row, n_global, a_norms, b_norms,
-                   a_max_norm, row_columns, row_values, missing_row);
+        for (long long r = 0; r < rounds; ++r) {
+            const int lo = tile_bound[static_cast<size_t>(r)];
+            const int hi = tile_bound[static_cast<size_t>(r) + 1];
+            std::vector<BlockID> want_b, want_a;
+            for (int i = lo; i < hi; ++i) {
+                for (int e = static_cast<int>(cols.ptr[static_cast<size_t>(i)]);
+                     e < static_cast<int>(cols.ptr[static_cast<size_t>(i) + 1]); ++e) {
+                    const int g_mid = cols.src_row[static_cast<size_t>(e)];
+                    if (bflag[static_cast<size_t>(g_mid)]) continue;
+                    bflag[static_cast<size_t>(g_mid)] = 1;
+                    btouched.push_back(g_mid);
+                    if (gb.find_owner(g_mid) != rank) {
+                        auto it = meta_b.find(g_mid);
+                        if (it != meta_b.end()) {
+                            const double gate =
+                                gate_b(g_mid, static_cast<int>(it->second.size()));
+                            for (const auto& m : it->second) {
+                                if (m.norm >= gate) want_b.push_back(BlockID{g_mid, m.col});
+                            }
+                        }
+                    }
+                    for_each_kept_b_col(g_mid, [&](int l) {
+                        if (aflag[static_cast<size_t>(l)]) return;
+                        aflag[static_cast<size_t>(l)] = 1;
+                        atouched.push_back(l);
+                        if (ga.find_owner(l) == rank) return;
+                        auto it = meta_a.find(l);
+                        if (it == meta_a.end()) return;
+                        const double gate = gate_a(l);
+                        for (const auto& m : it->second) {
+                            if (m.col >= min_owned_row && m.norm >= gate) {
+                                want_a.push_back(BlockID{l, m.col});
+                            }
+                        }
+                    });
+                }
+            }
+            reset_flags();
+
+            auto ghosts_b = build_spmm_ghost_blocks<T>(
+                meta_b, fetch_required_block_payloads(B, want_b));
+            auto ghosts_a = build_spmm_ghost_blocks<T>(
+                meta_a, fetch_required_block_payloads(A, want_a));
+            for (const auto& [gid, dim] : ghosts_a.sizes) ghost_sizes[gid] = dim;
+
+            RemoteRows remote_b, remote_a;
+            remote_b.build(ghosts_b, meta_b, n_global);
+            remote_a.build(ghosts_a, meta_a, n_global);
+            fused_rows(A, B, threshold, cols, remote_a, remote_b,
+                       a_row, b_row, n_global, a_norms, b_norms,
+                       a_max_norm, lo, hi, row_columns, row_values, missing_row);
+            release_and_drop(ghosts_b.arena);
+            release_and_drop(ghosts_a.arena);
+        }
         int any_missing = missing_row;
         MPI_Allreduce(&missing_row, &any_missing, 1, MPI_INT, MPI_MAX, ga.comm);
         if (any_missing) {
@@ -694,9 +833,9 @@ struct RhARExecutor {
                 "rhar_upper: internal error, a row in the product support was not fetched");
         }
 
-        // Result columns come from A's rows: those of the fetched rows are in
-        // ghosts_a.sizes, those of A's own rows are its graph's ghosts.
-        GhostSizes ghost_sizes = ghosts_a.sizes;
+        // Result columns come from A's rows: those of the fetched rows were
+        // collected per tile above, those of A's own rows are its graph's
+        // ghosts.
         const int n_owned = static_cast<int>(ga.owned_global_indices.size());
         for (size_t g = 0; g < ga.ghost_global_indices.size(); ++g) {
             ghost_sizes[ga.ghost_global_indices[g]] =

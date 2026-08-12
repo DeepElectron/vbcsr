@@ -915,6 +915,24 @@ inline std::vector<BlockID> fused_gated_blocks_of(const GhostMetadata& patterns,
     return blocks;
 }
 
+/// Bytes of fetched halo payload one fused-kernel tile round may hold.
+///
+/// The fused kernels fetch the rows their tile of OUTPUT rows reaches,
+/// compute that tile, release the fetch, and move to the next tile -- so the
+/// halo held at any moment is bounded by this budget instead of by the union
+/// reach of every local row, which at cluster scale has a rank-count-
+/// independent floor of tens to hundreds of GB. VBCSR_FUSED_TILE_MB
+/// overrides; 0 disables tiling outright (one round, the whole reach).
+inline size_t fused_tile_budget_bytes() {
+    const char* env = std::getenv("VBCSR_FUSED_TILE_MB");
+    if (env != nullptr) {
+        const long long mb = std::atoll(env);
+        if (mb <= 0) return 0;
+        return static_cast<size_t>(mb) << 20;
+    }
+    return size_t(512) << 20;
+}
+
 /// Global block index -> local row, or -1 where the matrix does not own it.
 template <typename Matrix>
 std::vector<int> fused_row_of_global(const Matrix& m, int n_global_blocks) {

@@ -65,14 +65,15 @@ struct SquarePolynomialExecutor {
     // construction.
     using RemoteRows = FusedRemoteRows<T>;
 
+    // Computes rows [row_lo, row_hi): the tiled distributed path runs it once
+    // per tile against that tile's fetched halo.
     static void fused_rows(const Matrix& A, T c2, T c1, T c0, double threshold,
                            const RemoteRows& remote, const std::vector<int>& a_row,
                            int n_global, const std::vector<double>& a_norms,
-                           bool a_any_nonzero,
+                           bool a_any_nonzero, int row_lo, int row_hi,
                            std::vector<std::vector<int>>& row_columns,
                            std::vector<std::vector<T>>& row_values) {
         const DistGraph& ga = *A.graph;
-        const int n_rows = static_cast<int>(ga.adj_ptr.size()) - 1;
         const std::vector<int>& a_ptr = ga.adj_ptr;
         const auto& a_ind = ga.adj_ind;
 
@@ -105,7 +106,7 @@ struct SquarePolynomialExecutor {
             };
 
             #pragma omp for schedule(dynamic, 8)
-            for (int i = 0; i < n_rows; ++i) {
+            for (int i = row_lo; i < row_hi; ++i) {
                 const int g_row = ga.get_global_index(i);
                 const int r_dim = ga.block_sizes[i];
                 acc.clear();
@@ -218,19 +219,20 @@ struct SquarePolynomialExecutor {
         const int n_global = ga.block_displs.empty() ? n_rows : ga.block_displs.back();
         std::vector<std::vector<int>> row_columns(n_rows);
         std::vector<std::vector<T>> row_values(n_rows);
-
-        RemoteRows remote;
+        const std::vector<int> a_row = fused_row_of_global(A, n_global);
+        const std::vector<double>& a_norms = A.get_block_norms();
+        const bool a_nonzero = has_nonzero_block(A);
         GhostSizes ghost_sizes;
-        // Declared HERE, not inside the branch below: RemoteRows stores raw
-        // pointers into this payload, so it has to outlive the numeric pass. As
-        // a local of the `if` it was destroyed the moment the fetch finished and
-        // the kernel then read freed memory -- correct on one rank, where there
-        // are no ghosts at all and nothing dangles, and wrong on every other.
-        SpMMGhostBlocks<T> ghosts;
+
         if (ga.size > 1) {
-            // One round: row i of A^2 reads rows of A over A's own columns.
-            // The payload is gated on what the numeric gate could ever keep:
-            // a block of row k ships only if some local pair (i,k) could pass
+            // Row i of A^2 reads rows of A over A's own columns. Patterns are
+            // fetched ONCE, whole -- they are what the gates and the tile plan
+            // are computed from -- and payloads are fetched per TILE of output
+            // rows, so the halo held at any moment is the tile's, not the
+            // union reach (fused_tile_budget_bytes).
+            //
+            // The payload gate keeps only what the numeric gate could: a
+            // block of row k ships iff some local pair (i,k) could pass
             //
             //     a_norm(i,k) * norm(k,l) >= threshold / a_row_count(i)
             //
@@ -240,8 +242,6 @@ struct SquarePolynomialExecutor {
             // threshold 0. Entries are OUTPUT columns of an upper-only
             // product, so columns below the first owned row are trimmed too.
             const int rank = ga.rank;
-            const std::vector<double>& a_norms = A.get_block_norms();
-            const bool a_nonzero = has_nonzero_block(A);
             std::set<int> needed;
             std::map<int, double> colmax_a;
             int min_owned_row = std::numeric_limits<int>::max();
@@ -268,20 +268,121 @@ struct SquarePolynomialExecutor {
                 return threshold / it->second;
             };
             const GhostMetadata meta = fetch_row_patterns(A, needed, ga.comm, ga.size, rank);
-            ghosts = build_spmm_ghost_blocks<T>(
-                meta, fetch_required_block_payloads(
-                          A, fused_gated_blocks_of(meta, gate, min_owned_row)));
-            remote.build(ghosts, meta, n_global);
-            ghost_sizes = ghosts.sizes;
+
+            // Kept (gated + trimmed) block count of one remote row's payload.
+            const auto kept_count = [&](int g) -> size_t {
+                auto it = meta.find(g);
+                if (it == meta.end()) return 0;
+                const double g_gate = gate(g);
+                size_t n = 0;
+                for (const auto& m : it->second) {
+                    if (m.col >= min_owned_row && m.norm >= g_gate) ++n;
+                }
+                return n;
+            };
+
+            // ---- Tile plan: contiguous output-row ranges whose deduplicated
+            // fetch stays under the budget. Dims are not in the patterns, so
+            // the budget is counted in blocks at the largest local block dim
+            // -- a bounded over-estimate, erring toward smaller tiles. Closing
+            // a tile resets the dedup and re-charges the closing row against
+            // the fresh tile. One oversized row overshoots alone, the same
+            // caveat every byte-budgeted exchange here carries.
+            int bs_max = 1;
+            for (int s : ga.block_sizes) bs_max = std::max(bs_max, s);
+            const size_t budget = fused_tile_budget_bytes();
+            const size_t block_budget =
+                budget == 0 ? 0
+                            : std::max<size_t>(1, budget / (static_cast<size_t>(bs_max) *
+                                                            static_cast<size_t>(bs_max) * sizeof(T)));
+            std::vector<int> tile_bound{0};
+            std::vector<char> row_flag(static_cast<size_t>(n_global), 0);
+            std::vector<int> flagged;
+            if (block_budget > 0) {
+                const auto charge_row = [&](int i) -> size_t {
+                    size_t c = 0;
+                    for (int k = ga.adj_ptr[i]; k < ga.adj_ptr[i + 1]; ++k) {
+                        const int g_col = ga.get_global_index(ga.adj_ind[k]);
+                        if (ga.find_owner(g_col) == rank) continue;
+                        if (row_flag[static_cast<size_t>(g_col)]) continue;
+                        row_flag[static_cast<size_t>(g_col)] = 1;
+                        flagged.push_back(g_col);
+                        c += kept_count(g_col);
+                    }
+                    return c;
+                };
+                size_t acc = 0;
+                for (int i = 0; i < n_rows; ++i) {
+                    size_t row_cost = charge_row(i);
+                    if (acc > 0 && acc + row_cost > block_budget) {
+                        tile_bound.push_back(i);
+                        for (int g : flagged) row_flag[static_cast<size_t>(g)] = 0;
+                        flagged.clear();
+                        acc = 0;
+                        row_cost = charge_row(i);
+                    }
+                    acc += row_cost;
+                }
+                for (int g : flagged) row_flag[static_cast<size_t>(g)] = 0;
+                flagged.clear();
+            }
+            tile_bound.push_back(n_rows);
+
+            // The rounds are COLLECTIVE: every payload fetch is, so a rank
+            // that needed fewer tiles runs empty ones.
+            long long my_tiles = static_cast<long long>(tile_bound.size()) - 1;
+            long long rounds = my_tiles;
+            MPI_Allreduce(&my_tiles, &rounds, 1, MPI_LONG_LONG, MPI_MAX, ga.comm);
+            while (static_cast<long long>(tile_bound.size()) - 1 < rounds) {
+                tile_bound.push_back(n_rows);
+            }
+
+            for (long long r = 0; r < rounds; ++r) {
+                const int lo = tile_bound[static_cast<size_t>(r)];
+                const int hi = tile_bound[static_cast<size_t>(r) + 1];
+                std::vector<BlockID> want;
+                for (int i = lo; i < hi; ++i) {
+                    for (int k = ga.adj_ptr[i]; k < ga.adj_ptr[i + 1]; ++k) {
+                        const int g_col = ga.get_global_index(ga.adj_ind[k]);
+                        if (ga.find_owner(g_col) == rank) continue;
+                        if (row_flag[static_cast<size_t>(g_col)]) continue;
+                        row_flag[static_cast<size_t>(g_col)] = 1;
+                        flagged.push_back(g_col);
+                        auto it = meta.find(g_col);
+                        if (it == meta.end()) continue;
+                        const double g_gate = gate(g_col);
+                        for (const auto& m : it->second) {
+                            if (m.col >= min_owned_row && m.norm >= g_gate) {
+                                want.push_back(BlockID{g_col, m.col});
+                            }
+                        }
+                    }
+                }
+                for (int g : flagged) row_flag[static_cast<size_t>(g)] = 0;
+                flagged.clear();
+
+                SpMMGhostBlocks<T> ghosts = build_spmm_ghost_blocks<T>(
+                    meta, fetch_required_block_payloads(A, want));
+                for (const auto& [gid, dim] : ghosts.sizes) ghost_sizes[gid] = dim;
+                RemoteRows remote;
+                remote.build(ghosts, meta, n_global);
+                fused_rows(A, c2, c1, c0, threshold, remote, a_row, n_global,
+                           a_norms, a_nonzero, lo, hi, row_columns, row_values);
+                // Physically back to the OS, not to malloc's free list: the
+                // next tile's arena would otherwise stack on this one's
+                // (release_and_drop records why the dtor alone does not).
+                release_and_drop(ghosts.arena);
+            }
+        } else {
+            RemoteRows none;
+            fused_rows(A, c2, c1, c0, threshold, none, a_row, n_global,
+                       a_norms, a_nonzero, 0, n_rows, row_columns, row_values);
         }
         const int n_owned = static_cast<int>(ga.owned_global_indices.size());
         for (size_t g = 0; g < ga.ghost_global_indices.size(); ++g) {
             ghost_sizes[ga.ghost_global_indices[g]] =
                 ga.block_sizes[static_cast<size_t>(n_owned) + g];
         }
-
-        fused_rows(A, c2, c1, c0, threshold, remote, fused_row_of_global(A, n_global), n_global,
-                   A.get_block_norms(), has_nonzero_block(A), row_columns, row_values);
         return fused_assemble(A, row_columns, row_values, ghost_sizes, "square_polynomial");
     }
 };
