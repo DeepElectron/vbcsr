@@ -848,16 +848,27 @@ struct FusedRemoteRows {
     std::vector<double> norms;  // Frobenius, from the pattern exchange
     std::vector<const T*> data;
 
-    void build(const SpMMGhostBlocks<T>& ghosts, const GhostMetadata& patterns,
-               int n_global) {
+    /// Row PRESENCE and full widths, which the patterns settle once for the
+    /// whole call. Payloads arrive later and possibly in pieces (see
+    /// FusedHaloStream); every row starts answered-with-nothing.
+    void init(const GhostMetadata& patterns, int n_global) {
         first.assign(static_cast<size_t>(n_global), -1);
         count.assign(static_cast<size_t>(n_global), 0);
         pattern_width.assign(static_cast<size_t>(n_global), 0);
+        cols.clear();
+        dims.clear();
+        norms.clear();
+        data.clear();
         for (const auto& row : patterns) {
             first[static_cast<size_t>(row.first)] = 0;
             pattern_width[static_cast<size_t>(row.first)] =
                 static_cast<int>(row.second.size());
         }
+    }
+
+    /// Index one delivery of payloads. Entries are APPENDED, so rows indexed by
+    /// an earlier call keep pointing at their own arena.
+    void append(const SpMMGhostBlocks<T>& ghosts) {
         for (const auto& entry : ghosts.rows) {
             first[static_cast<size_t>(entry.first)] = static_cast<int>(cols.size());
             count[static_cast<size_t>(entry.first)] = static_cast<int>(entry.second.size());
@@ -869,7 +880,210 @@ struct FusedRemoteRows {
             }
         }
     }
+
+    /// Forget a row whose payload arena is going away: back to
+    /// answered-with-nothing, which is what an unfetched row of a present
+    /// pattern already reads as. The stale entries stay in the flat arrays --
+    /// nothing indexes them once `count` is zero -- and they cost the
+    /// metadata's 1% of a payload, not the payload.
+    void drop_row(int global_row) {
+        if (first[static_cast<size_t>(global_row)] < 0) return;
+        first[static_cast<size_t>(global_row)] = 0;
+        count[static_cast<size_t>(global_row)] = 0;
+    }
+
+    void build(const SpMMGhostBlocks<T>& ghosts, const GhostMetadata& patterns,
+               int n_global) {
+        init(patterns, n_global);
+        append(ghosts);
+    }
 };
+
+/// A halo delivered in pieces and released in pieces, with each remote block
+/// crossing the network EXACTLY ONCE.
+///
+/// The predecessor tiled the output rows and re-fetched whatever the next tile
+/// touched. That bounds residency but not traffic, and the two are not
+/// symmetric: consecutive output rows are neighbouring atoms whose halos
+/// overlap almost completely, so a tile's fetch is nearly the previous tile's
+/// fetch again. Traffic became (tiles x halo) where the union is (1 x halo) --
+/// measured at 6.2x on a 4-rank moire pattern and ~24x on an 8-rank 178k-atom
+/// run, all of it in MPI with the cores idle.
+///
+/// What the patterns already know is enough to do better. They name every
+/// block of every reached row before a single payload moves, so each remote
+/// row's FIRST and LAST needing output row are computable up front. Fetch a
+/// row when the round holding its first use begins; release it when the round
+/// holding its last use ends. Then:
+///
+///   traffic  = the union reach, the irreducible minimum
+///   resident = the LIVE set, what the pattern and the row order actually
+///              force to coexist -- never the union, unless the order forces it
+///
+/// which dominates both the one-shot fetch (same traffic, union resident) and
+/// the tiled fetch (same residency at best, multiplied traffic). The budget
+/// stops being a policy that trades one against the other and becomes what it
+/// should always have been: how much NEW payload a round may bring in.
+///
+/// The residency floor is then a property of the ordering, not of this class.
+/// A locality-preserving order makes the live set a sliding window; a scattered
+/// one keeps rows alive from the first output row to the last, and no fetch
+/// schedule can shrink that. That is a partitioning problem, and reporting it
+/// (see fused_halo_stats_enabled) is more honest than re-fetching to hide it.
+template <typename T>
+struct FusedHaloStream {
+    FusedRemoteRows<T> rows;
+
+    /// One round's delivery, held until the last row in it dies.
+    struct Chunk {
+        std::vector<T> arena;
+        std::vector<int> row_ids;
+        long long death_round = -1;
+    };
+    std::vector<Chunk> chunks;
+
+    size_t fetched_blocks = 0;   // total crossing the network: the union
+    size_t live_blocks = 0;      // resident now
+    size_t peak_live_blocks = 0; // the live set's high-water mark
+
+    void init(const GhostMetadata& patterns, int n_global) {
+        rows.init(patterns, n_global);
+    }
+
+    /// Take a delivery, index it, and note when it may go.
+    void absorb(SpMMGhostBlocks<T>&& ghosts, long long death_round) {
+        Chunk chunk;
+        chunk.death_round = death_round;
+        chunk.row_ids.reserve(ghosts.rows.size());
+        size_t blocks = 0;
+        for (const auto& entry : ghosts.rows) {
+            chunk.row_ids.push_back(entry.first);
+            blocks += entry.second.size();
+        }
+        rows.append(ghosts);
+        chunk.arena = std::move(ghosts.arena);
+        fetched_blocks += blocks;
+        live_blocks += blocks;
+        peak_live_blocks = std::max(peak_live_blocks, live_blocks);
+        chunks.push_back(std::move(chunk));
+    }
+
+    /// Release every delivery whose last reader has run.
+    void retire(long long round) {
+        size_t kept = 0;
+        for (size_t c = 0; c < chunks.size(); ++c) {
+            if (chunks[c].death_round > round) {
+                if (kept != c) chunks[kept] = std::move(chunks[c]);
+                ++kept;
+                continue;
+            }
+            for (int g : chunks[c].row_ids) {
+                live_blocks -= static_cast<size_t>(rows.count[static_cast<size_t>(g)]);
+                rows.drop_row(g);
+            }
+            // Physically back to the OS, not to malloc's free list.
+            release_and_drop(chunks[c].arena);
+        }
+        chunks.resize(kept);
+    }
+};
+
+/// Round boundaries that pay for themselves, from the arrival and departure
+/// profiles the use spans give.
+///
+/// A boundary does exactly one thing: it releases the rows that have died
+/// since the last one. So it is worth cutting only where something HAS died
+/// and the halo is over budget -- residency can never fall below the live
+/// set, and cutting where nothing has died pays a round's latency for no
+/// memory at all. That case is not hypothetical: on a scattered ordering
+/// every remote row is needed by both the first output row and the last, the
+/// live set IS the union, and the budget-only plan this replaces cut 12
+/// rounds that freed nothing and cost 4 s each.
+///
+/// A round must also free ENOUGH to be worth its cost. Cutting on any death at
+/// all is nearly as bad as cutting on the budget alone: where deaths trickle in
+/// one row at a time, every row frees a little, stays over budget, and cuts
+/// again -- measured at 414 rounds on a 1024-row band, slower than one round by
+/// 4x. Requiring half a budget's worth caps the rounds at twice the union over
+/// the budget and makes each one a real release.
+///
+/// `arrivals[i]` is what row i first needs, `departures[i]` what dies with it,
+/// both in blocks. Returns the row indices to cut at, starting with 0.
+inline std::vector<int> fused_round_plan(const std::vector<size_t>& arrivals,
+                                         const std::vector<size_t>& departures,
+                                         int n_rows, size_t block_budget) {
+    std::vector<int> bound{0};
+    if (block_budget == 0) return bound;
+
+    // What the ORDERING already forces to coexist. A round can release only
+    // what has died, so no schedule holds less than this, and where it is the
+    // whole union -- a scattered order, where the first output row and the
+    // last need the same remote rows -- every boundary is latency spent for
+    // no memory. One round, and let the stats line say why.
+    size_t union_blocks = 0, live = 0, peak_live = 0;
+    for (int i = 0; i < n_rows; ++i) {
+        live += arrivals[static_cast<size_t>(i)];
+        union_blocks += arrivals[static_cast<size_t>(i)];
+        peak_live = std::max(peak_live, live);
+        live -= departures[static_cast<size_t>(i)];
+    }
+    if (union_blocks <= block_budget || peak_live + block_budget > union_blocks) {
+        return bound;
+    }
+
+    size_t held = 0;       // fetched and not yet released
+    size_t releasable = 0; // dead, but held until a boundary lets it go
+    for (int i = 0; i < n_rows; ++i) {
+        if (held + arrivals[static_cast<size_t>(i)] > block_budget &&
+            releasable * 2 >= block_budget && i > bound.back()) {
+            bound.push_back(i);
+            held -= releasable;
+            releasable = 0;
+        }
+        held += arrivals[static_cast<size_t>(i)];
+        releasable += departures[static_cast<size_t>(i)];
+    }
+    return bound;
+}
+
+/// Per-call halo accounting on stderr (VBCSR_FUSED_STATS).
+///
+/// Traffic, live set, round count and the paper's CV/memA ratio -- all four
+/// computable from patterns before payloads move, and all four things whose
+/// absence cost an 8-hour production run: 1396 rounds were silent, and the
+/// scattered ordering that made the live set the whole union was invisible.
+inline bool fused_halo_stats_enabled() {
+    static const bool enabled = std::getenv("VBCSR_FUSED_STATS") != nullptr;
+    return enabled;
+}
+
+/// One line per fused kernel call, from rank 0, worst rank in each column.
+inline void fused_report_halo(const char* kernel, MPI_Comm comm, int rank,
+                              long long rounds, size_t fetched_blocks,
+                              size_t peak_live_blocks, size_t local_blocks,
+                              size_t block_bytes, double secs_fetch,
+                              double secs_numeric) {
+    if (!fused_halo_stats_enabled()) return;
+    long long mine[3] = {static_cast<long long>(fetched_blocks),
+                         static_cast<long long>(peak_live_blocks),
+                         static_cast<long long>(local_blocks)};
+    long long worst[3] = {0, 0, 0};
+    MPI_Reduce(mine, worst, 3, MPI_LONG_LONG, MPI_MAX, 0, comm);
+    double secs[2] = {secs_fetch, secs_numeric};
+    double secs_worst[2] = {0.0, 0.0};
+    MPI_Reduce(secs, secs_worst, 2, MPI_DOUBLE, MPI_MAX, 0, comm);
+    if (rank != 0) return;
+    const double to_gb = static_cast<double>(block_bytes) / 1073741824.0;
+    const double cv_over_mem =
+        worst[2] > 0 ? static_cast<double>(worst[0]) / static_cast<double>(worst[2]) : 0.0;
+    std::fprintf(stderr,
+                 "VBCSR_FUSED_STATS %s rounds=%lld fetched=%.2f GB live=%.2f GB "
+                 "local=%.2f GB CV/memA=%.0f%% fetch=%.1fs numeric=%.1fs\n",
+                 kernel, rounds, static_cast<double>(worst[0]) * to_gb,
+                 static_cast<double>(worst[1]) * to_gb,
+                 static_cast<double>(worst[2]) * to_gb, cv_over_mem * 100.0,
+                 secs_worst[0], secs_worst[1]);
+}
 
 /// Every block of the rows named in `patterns`, as the payload exchange wants
 /// them.
@@ -917,12 +1131,15 @@ inline std::vector<BlockID> fused_gated_blocks_of(const GhostMetadata& patterns,
 
 /// Bytes of fetched halo payload one fused-kernel tile round may hold.
 ///
-/// The fused kernels fetch the rows their tile of OUTPUT rows reaches,
-/// compute that tile, release the fetch, and move to the next tile -- so the
-/// halo held at any moment is bounded by this budget instead of by the union
-/// reach of every local row, which at cluster scale has a rank-count-
-/// independent floor of tens to hundreds of GB. VBCSR_FUSED_TILE_MB
-/// overrides; 0 disables tiling outright (one round, the whole reach).
+/// How much NEW payload one fetch round may bring in (VBCSR_FUSED_TILE_MB;
+/// 0 fetches the whole reach in a single round).
+///
+/// This bounds the round, not the residency: rows stay until their last reader
+/// has run (FusedHaloStream), so the rounds partition the reach instead of
+/// repeating it, and the count is ceil(union / budget) whatever the pattern
+/// does. Residency is the live set, which the ordering fixes and no budget can
+/// move. Smaller budgets buy finer release granularity at more rounds; they
+/// cannot buy back a live set the partition insists on.
 inline size_t fused_tile_budget_bytes() {
     const char* env = std::getenv("VBCSR_FUSED_TILE_MB");
     if (env != nullptr) {
@@ -957,15 +1174,15 @@ inline constexpr int kFusedOutputTileCols = 384;
 /// accumulator row is already cache-resident and slicing is pure overhead.
 inline constexpr int kFusedOutputTileMinWidth = 384;
 
-/// A tile never closes below this many output rows, whatever the budget says.
+/// Round boundaries need no minimum row count.
 ///
-/// One output row's reach is the working set the algorithm irreducibly needs
-/// -- a row that alone exceeds the budget must overshoot -- and consecutive
-/// rows share almost all of it, so cutting below a handful of rows buys no
-/// memory while multiplying the collective rounds: measured on a 4-rank band
-/// where boundary rows individually busted a 64 MB budget, one-row tiles
-/// turned a 2.9 s product into 29 s of fetch latency.
-inline constexpr int kMinFusedTileRows = 16;
+/// They did while a round re-fetched its whole tile: a one-row tile then paid
+/// a full halo for one row's work, and a 16-row floor was what kept a 64 MB
+/// budget on a 4-rank band from turning a 2.9 s product into 29 s. Charging
+/// rounds for NEW payload only removes the reason -- a round that opens on an
+/// expensive row fetches that row's newcomers and nothing it already holds --
+/// and the floor would now do harm, forcing 16 rows' arrivals through a
+/// boundary meant to cap one budget's worth.
 
 /// Global block index -> local row, or -1 where the matrix does not own it.
 template <typename Matrix>

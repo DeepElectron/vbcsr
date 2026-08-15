@@ -330,13 +330,27 @@ struct SquarePolynomialExecutor {
                 return n;
             };
 
-            // ---- Tile plan: contiguous output-row ranges whose deduplicated
-            // fetch stays under the budget. Dims are not in the patterns, so
-            // the budget is counted in blocks at the largest local block dim
-            // -- a bounded over-estimate, erring toward smaller tiles. Closing
-            // a tile resets the dedup and re-charges the closing row against
-            // the fresh tile. One oversized row overshoots alone, the same
-            // caveat every byte-budgeted exchange here carries.
+            // ---- Use spans and the round plan, as in rarh and rhar: each
+            // remote row's first and last needing output row, from the
+            // patterns; fetch on the round its first use opens, release after
+            // the round its last use closes, and charge a round only for what
+            // is BORN on it. The square's reach is A's own columns, so one
+            // sweep of the local adjacency settles both spans. Dims are not in
+            // the patterns, so the budget counts blocks at the largest local
+            // block dim -- a bounded over-estimate, erring toward more rounds.
+            std::vector<int> birth(static_cast<size_t>(n_global), -1);
+            std::vector<int> death(static_cast<size_t>(n_global), -1);
+            for (int i = 0; i < n_rows; ++i) {
+                for (int k = ga.adj_ptr[i]; k < ga.adj_ptr[i + 1]; ++k) {
+                    const int g_col = ga.get_global_index(ga.adj_ind[k]);
+                    if (ga.find_owner(g_col) == rank) continue;
+                    if (birth[static_cast<size_t>(g_col)] < 0) {
+                        birth[static_cast<size_t>(g_col)] = i;
+                    }
+                    death[static_cast<size_t>(g_col)] = i;
+                }
+            }
+
             int bs_max = 1;
             for (int s : ga.block_sizes) bs_max = std::max(bs_max, s);
             const size_t budget = fused_tile_budget_bytes();
@@ -344,38 +358,20 @@ struct SquarePolynomialExecutor {
                 budget == 0 ? 0
                             : std::max<size_t>(1, budget / (static_cast<size_t>(bs_max) *
                                                             static_cast<size_t>(bs_max) * sizeof(T)));
-            std::vector<int> tile_bound{0};
-            std::vector<char> row_flag(static_cast<size_t>(n_global), 0);
-            std::vector<int> flagged;
-            if (block_budget > 0) {
-                const auto charge_row = [&](int i) -> size_t {
-                    size_t c = 0;
-                    for (int k = ga.adj_ptr[i]; k < ga.adj_ptr[i + 1]; ++k) {
-                        const int g_col = ga.get_global_index(ga.adj_ind[k]);
-                        if (ga.find_owner(g_col) == rank) continue;
-                        if (row_flag[static_cast<size_t>(g_col)]) continue;
-                        row_flag[static_cast<size_t>(g_col)] = 1;
-                        flagged.push_back(g_col);
-                        c += kept_count(g_col);
-                    }
-                    return c;
-                };
-                size_t acc = 0;
-                for (int i = 0; i < n_rows; ++i) {
-                    size_t row_cost = charge_row(i);
-                    if (acc > 0 && acc + row_cost > block_budget &&
-                        i - tile_bound.back() >= kMinFusedTileRows) {
-                        tile_bound.push_back(i);
-                        for (int g : flagged) row_flag[static_cast<size_t>(g)] = 0;
-                        flagged.clear();
-                        acc = 0;
-                        row_cost = charge_row(i);
-                    }
-                    acc += row_cost;
-                }
-                for (int g : flagged) row_flag[static_cast<size_t>(g)] = 0;
-                flagged.clear();
+            std::vector<std::pair<int, int>> born;  // (birth row, global row)
+            std::vector<size_t> arrivals(static_cast<size_t>(n_rows) + 1, 0);
+            std::vector<size_t> departures(static_cast<size_t>(n_rows) + 1, 0);
+            for (int g = 0; g < n_global; ++g) {
+                const int b = birth[static_cast<size_t>(g)];
+                if (b < 0) continue;
+                born.emplace_back(b, g);
+                const size_t blocks = kept_count(g);
+                arrivals[static_cast<size_t>(b)] += blocks;
+                departures[static_cast<size_t>(death[static_cast<size_t>(g)])] += blocks;
             }
+            std::sort(born.begin(), born.end());
+            std::vector<int> tile_bound =
+                fused_round_plan(arrivals, departures, n_rows, block_budget);
             tile_bound.push_back(n_rows);
 
             // The rounds are COLLECTIVE: every payload fetch is, so a rank
@@ -387,19 +383,24 @@ struct SquarePolynomialExecutor {
                 tile_bound.push_back(n_rows);
             }
 
+            const auto round_of_row = [&](int i) -> long long {
+                const auto it = std::upper_bound(tile_bound.begin(), tile_bound.end(), i);
+                return static_cast<long long>(it - tile_bound.begin()) - 1;
+            };
+
+            FusedHaloStream<T> halo;
+            halo.init(meta, n_global);
+            size_t cursor = 0;
+            double secs_fetch = 0.0, secs_numeric = 0.0;
             for (long long r = 0; r < rounds; ++r) {
                 const int lo = tile_bound[static_cast<size_t>(r)];
                 const int hi = tile_bound[static_cast<size_t>(r) + 1];
                 std::vector<BlockID> want;
-                for (int i = lo; i < hi; ++i) {
-                    for (int k = ga.adj_ptr[i]; k < ga.adj_ptr[i + 1]; ++k) {
-                        const int g_col = ga.get_global_index(ga.adj_ind[k]);
-                        if (ga.find_owner(g_col) == rank) continue;
-                        if (row_flag[static_cast<size_t>(g_col)]) continue;
-                        row_flag[static_cast<size_t>(g_col)] = 1;
-                        flagged.push_back(g_col);
-                        auto it = meta.find(g_col);
-                        if (it == meta.end()) continue;
+                long long death_round = r;
+                for (; cursor < born.size() && born[cursor].first < hi; ++cursor) {
+                    const int g_col = born[cursor].second;
+                    auto it = meta.find(g_col);
+                    if (it != meta.end()) {
                         const double g_gate = gate(g_col);
                         for (const auto& m : it->second) {
                             if (m.col >= min_owned_row && m.norm >= g_gate) {
@@ -407,22 +408,28 @@ struct SquarePolynomialExecutor {
                             }
                         }
                     }
+                    death_round =
+                        std::max(death_round, round_of_row(death[static_cast<size_t>(g_col)]));
                 }
-                for (int g : flagged) row_flag[static_cast<size_t>(g)] = 0;
-                flagged.clear();
 
+                const double t_fetch0 = MPI_Wtime();
                 SpMMGhostBlocks<T> ghosts = build_spmm_ghost_blocks<T>(
                     meta, fetch_required_block_payloads(A, want));
                 for (const auto& [gid, dim] : ghosts.sizes) ghost_sizes[gid] = dim;
-                RemoteRows remote;
-                remote.build(ghosts, meta, n_global);
-                fused_rows(A, c2, c1, c0, threshold, remote, a_row, n_global,
+                halo.absorb(std::move(ghosts), death_round);
+                const double t_num0 = MPI_Wtime();
+                secs_fetch += t_num0 - t_fetch0;
+                fused_rows(A, c2, c1, c0, threshold, halo.rows, a_row, n_global,
                            a_norms, a_nonzero, lo, hi, row_columns, row_values);
-                // Physically back to the OS, not to malloc's free list: the
-                // next tile's arena would otherwise stack on this one's
-                // (release_and_drop records why the dtor alone does not).
-                release_and_drop(ghosts.arena);
+                secs_numeric += MPI_Wtime() - t_num0;
+                halo.retire(r);
             }
+            fused_report_halo("square_polynomial", ga.comm, rank, rounds,
+                              halo.fetched_blocks, halo.peak_live_blocks,
+                              a_norms.size(),
+                              static_cast<size_t>(bs_max) * static_cast<size_t>(bs_max) *
+                                  sizeof(T),
+                              secs_fetch, secs_numeric);
         } else {
             RemoteRows none;
             fused_rows(A, c2, c1, c0, threshold, none, a_row, n_global,

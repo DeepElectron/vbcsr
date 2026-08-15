@@ -556,11 +556,39 @@ struct RARhExecutor {
             }
         };
 
-        // ---- Tile plan: contiguous output-row ranges whose deduplicated
-        // two-round fetch stays under the budget, counted in blocks at the
-        // largest local block dim (dims are not in the patterns; the estimate
-        // errs toward smaller tiles). Closing a tile resets the dedup and
-        // re-charges the closing row against the fresh tile.
+        // ---- Use spans: for every remote row, the FIRST and LAST output row
+        // that needs it. Both sides come out of one walk of the same reach the
+        // numeric loop will take -- A's columns for the rows of B, and their
+        // kept columns for the rows of A -- and the walk is over patterns, so
+        // it costs no payload. Output rows are visited in order, which makes
+        // "first" the first write and "last" the latest.
+        std::vector<int> b_birth(static_cast<size_t>(n_global), -1);
+        std::vector<int> b_death(static_cast<size_t>(n_global), -1);
+        std::vector<int> a_birth(static_cast<size_t>(n_global), -1);
+        std::vector<int> a_death(static_cast<size_t>(n_global), -1);
+        for (int i = 0; i < n_rows; ++i) {
+            for (int k = ga.adj_ptr[i]; k < ga.adj_ptr[i + 1]; ++k) {
+                const int g_mid = ga.get_global_index(ga.adj_ind[k]);
+                if (gb.find_owner(g_mid) != rank) {
+                    if (b_birth[static_cast<size_t>(g_mid)] < 0) {
+                        b_birth[static_cast<size_t>(g_mid)] = i;
+                    }
+                    b_death[static_cast<size_t>(g_mid)] = i;
+                }
+                for_each_kept_b_col(g_mid, [&](int l) {
+                    if (ga.find_owner(l) == rank) return;
+                    if (a_birth[static_cast<size_t>(l)] < 0) {
+                        a_birth[static_cast<size_t>(l)] = i;
+                    }
+                    a_death[static_cast<size_t>(l)] = i;
+                });
+            }
+        }
+
+        // ---- Round plan: cut where the NEW payload reaches the budget. Each
+        // row is charged only for what is born on it, so the charges sum to the
+        // union reach and the round count is ceil(union / budget) -- no pattern
+        // can make a round repeat what an earlier round already brought in.
         int bs_max = 1;
         for (int s : ga.block_sizes) bs_max = std::max(bs_max, s);
         const size_t budget = fused_tile_budget_bytes();
@@ -568,49 +596,32 @@ struct RARhExecutor {
             budget == 0 ? 0
                         : std::max<size_t>(1, budget / (static_cast<size_t>(bs_max) *
                                                         static_cast<size_t>(bs_max) * sizeof(T)));
-        std::vector<int> tile_bound{0};
-        std::vector<char> bflag(static_cast<size_t>(n_global), 0);
-        std::vector<char> aflag(static_cast<size_t>(n_global), 0);
-        std::vector<int> btouched, atouched;
-        const auto reset_flags = [&] {
-            for (int g : btouched) bflag[static_cast<size_t>(g)] = 0;
-            for (int g : atouched) aflag[static_cast<size_t>(g)] = 0;
-            btouched.clear();
-            atouched.clear();
-        };
-        if (block_budget > 0) {
-            const auto charge_row = [&](int i) -> size_t {
-                size_t c = 0;
-                for (int k = ga.adj_ptr[i]; k < ga.adj_ptr[i + 1]; ++k) {
-                    const int g_mid = ga.get_global_index(ga.adj_ind[k]);
-                    if (!bflag[static_cast<size_t>(g_mid)]) {
-                        bflag[static_cast<size_t>(g_mid)] = 1;
-                        btouched.push_back(g_mid);
-                        if (gb.find_owner(g_mid) != rank) c += kept_b(g_mid);
-                        for_each_kept_b_col(g_mid, [&](int l) {
-                            if (aflag[static_cast<size_t>(l)]) return;
-                            aflag[static_cast<size_t>(l)] = 1;
-                            atouched.push_back(l);
-                            if (ga.find_owner(l) != rank) c += kept_a(l);
-                        });
-                    }
-                }
-                return c;
-            };
-            size_t acc = 0;
-            for (int i = 0; i < n_rows; ++i) {
-                size_t row_cost = charge_row(i);
-                if (acc > 0 && acc + row_cost > block_budget &&
-                        i - tile_bound.back() >= kMinFusedTileRows) {
-                    tile_bound.push_back(i);
-                    reset_flags();
-                    acc = 0;
-                    row_cost = charge_row(i);
-                }
-                acc += row_cost;
+        // Arrivals ordered by the row they are born on, so both the plan below
+        // and each round's want list read a slice instead of sweeping the
+        // global index once per round.
+        std::vector<std::pair<int, int>> b_born, a_born;  // (birth row, global row)
+        std::vector<size_t> arrivals(static_cast<size_t>(n_rows) + 1, 0);
+        std::vector<size_t> departures(static_cast<size_t>(n_rows) + 1, 0);
+        for (int g = 0; g < n_global; ++g) {
+            const int born_b = b_birth[static_cast<size_t>(g)];
+            if (born_b >= 0) {
+                b_born.emplace_back(born_b, g);
+                const size_t blocks = kept_b(g);
+                arrivals[static_cast<size_t>(born_b)] += blocks;
+                departures[static_cast<size_t>(b_death[static_cast<size_t>(g)])] += blocks;
             }
-            reset_flags();
+            const int born_a = a_birth[static_cast<size_t>(g)];
+            if (born_a >= 0) {
+                a_born.emplace_back(born_a, g);
+                const size_t blocks = kept_a(g);
+                arrivals[static_cast<size_t>(born_a)] += blocks;
+                departures[static_cast<size_t>(a_death[static_cast<size_t>(g)])] += blocks;
+            }
         }
+        std::sort(b_born.begin(), b_born.end());
+        std::sort(a_born.begin(), a_born.end());
+        std::vector<int> tile_bound =
+            fused_round_plan(arrivals, departures, n_rows, block_budget);
         tile_bound.push_back(n_rows);
 
         // The rounds are COLLECTIVE (two payload fetches each), so a rank
@@ -622,6 +633,14 @@ struct RARhExecutor {
             tile_bound.push_back(n_rows);
         }
 
+        // Which round a row's last reader falls in, so a delivery knows when
+        // it may go. Rows are cut in increasing order, so this is a search over
+        // the boundaries.
+        const auto round_of_row = [&](int i) -> long long {
+            const auto it = std::upper_bound(tile_bound.begin(), tile_bound.end(), i);
+            return static_cast<long long>(it - tile_bound.begin()) - 1;
+        };
+
         const double rss_ghosts = profile ? profile_rss_gb() : 0.0;
         const std::vector<int> a_row_map = fused_row_of_global(A, n_global);
         const std::vector<int> b_row_map = fused_row_of_global(B, n_global);
@@ -630,64 +649,70 @@ struct RARhExecutor {
         GhostSizes ghost_sizes;
         int bad_operand = 0;
         double rss_numeric = rss_ghosts;
+        FusedHaloStream<T> halo_b, halo_a;
+        halo_b.init(meta_b, n_global);
+        halo_a.init(meta_a, n_global);
+        size_t b_cursor = 0, a_cursor = 0;
+        double secs_fetch = 0.0, secs_numeric = 0.0;
         for (long long r = 0; r < rounds; ++r) {
             const int lo = tile_bound[static_cast<size_t>(r)];
             const int hi = tile_bound[static_cast<size_t>(r) + 1];
+            // Only what is BORN in this round: everything else either already
+            // arrived and is still held, or is not needed yet.
             std::vector<BlockID> want_b, want_a;
-            for (int i = lo; i < hi; ++i) {
-                for (int k = ga.adj_ptr[i]; k < ga.adj_ptr[i + 1]; ++k) {
-                    const int g_mid = ga.get_global_index(ga.adj_ind[k]);
-                    if (bflag[static_cast<size_t>(g_mid)]) continue;
-                    bflag[static_cast<size_t>(g_mid)] = 1;
-                    btouched.push_back(g_mid);
-                    if (gb.find_owner(g_mid) != rank) {
-                        auto it = meta_b.find(g_mid);
-                        if (it != meta_b.end()) {
-                            const double gate =
-                                gate_b(g_mid, static_cast<int>(it->second.size()));
-                            for (const auto& m : it->second) {
-                                if (m.norm >= gate) want_b.push_back(BlockID{g_mid, m.col});
-                            }
+            long long death_b = r, death_a = r;
+            for (; b_cursor < b_born.size() && b_born[b_cursor].first < hi; ++b_cursor) {
+                const int g = b_born[b_cursor].second;
+                auto it = meta_b.find(g);
+                if (it != meta_b.end()) {
+                    const double gate = gate_b(g, static_cast<int>(it->second.size()));
+                    for (const auto& m : it->second) {
+                        if (m.norm >= gate) want_b.push_back(BlockID{g, m.col});
+                    }
+                }
+                death_b = std::max(death_b, round_of_row(b_death[static_cast<size_t>(g)]));
+            }
+            for (; a_cursor < a_born.size() && a_born[a_cursor].first < hi; ++a_cursor) {
+                const int g = a_born[a_cursor].second;
+                auto it = meta_a.find(g);
+                if (it != meta_a.end()) {
+                    const double gate = gate_a(g);
+                    for (const auto& m : it->second) {
+                        if (m.col >= min_owned_row && m.norm >= gate) {
+                            want_a.push_back(BlockID{g, m.col});
                         }
                     }
-                    for_each_kept_b_col(g_mid, [&](int l) {
-                        if (aflag[static_cast<size_t>(l)]) return;
-                        aflag[static_cast<size_t>(l)] = 1;
-                        atouched.push_back(l);
-                        if (ga.find_owner(l) == rank) return;
-                        auto it = meta_a.find(l);
-                        if (it == meta_a.end()) return;
-                        const double gate = gate_a(l);
-                        for (const auto& m : it->second) {
-                            if (m.col >= min_owned_row && m.norm >= gate) {
-                                want_a.push_back(BlockID{l, m.col});
-                            }
-                        }
-                    });
                 }
+                death_a = std::max(death_a, round_of_row(a_death[static_cast<size_t>(g)]));
             }
-            reset_flags();
 
+            const double t_fetch0 = MPI_Wtime();
             auto ghosts_b = build_spmm_ghost_blocks<T>(
                 meta_b, fetch_required_block_payloads(B, want_b));
             auto ghosts_a = build_spmm_ghost_blocks<T>(
                 meta_a, fetch_required_block_payloads(A, want_a));
-            // Result columns come from A's rows; collected per tile since
-            // only this tile's payload carries their sizes.
+            // Result columns come from A's rows; collected per round since
+            // only the round that fetches a row carries its sizes.
             for (const auto& [gid, dim] : ghosts_a.sizes) ghost_sizes[gid] = dim;
 
-            RemoteRows remote_b, remote_a;
-            remote_b.build(ghosts_b, meta_b, n_global);
-            remote_a.build(ghosts_a, meta_a, n_global);
-            fused_rows(A, B, threshold, remote_a, remote_b,
+            halo_b.absorb(std::move(ghosts_b), death_b);
+            halo_a.absorb(std::move(ghosts_a), death_a);
+            const double t_num0 = MPI_Wtime();
+            secs_fetch += t_num0 - t_fetch0;
+            fused_rows(A, B, threshold, halo_a.rows, halo_b.rows,
                        a_row_map, b_row_map, n_global, a_norms, b_norms,
                        a_max_norm, lo, hi, row_columns, row_values, bad_operand);
             rss_numeric = profile ? std::max(rss_numeric, profile_rss_gb()) : 0.0;
-            // Physically back to the OS, not to malloc's free list, so the
-            // next tile's arenas do not stack on these.
-            release_and_drop(ghosts_b.arena);
-            release_and_drop(ghosts_a.arena);
+            secs_numeric += MPI_Wtime() - t_num0;
+            halo_b.retire(r);
+            halo_a.retire(r);
         }
+        fused_report_halo("rarh", ga.comm, rank, rounds,
+                          halo_b.fetched_blocks + halo_a.fetched_blocks,
+                          halo_b.peak_live_blocks + halo_a.peak_live_blocks,
+                          A.get_block_norms().size(),
+                          static_cast<size_t>(bs_max) * static_cast<size_t>(bs_max) * sizeof(T),
+                          secs_fetch, secs_numeric);
         int any_bad = bad_operand;
         MPI_Allreduce(&bad_operand, &any_bad, 1, MPI_INT, MPI_MAX, ga.comm);
         if (any_bad) {
