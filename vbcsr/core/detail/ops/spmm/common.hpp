@@ -1007,6 +1007,14 @@ struct FusedHaloStream {
 /// 4x. Requiring half a budget's worth caps the rounds at twice the union over
 /// the budget and makes each one a real release.
 ///
+/// A round must also carry enough OUTPUT ROWS to fill the thread team. The
+/// numeric loop runs `schedule(dynamic, 8)` over the round's rows, so a round
+/// of 60 rows hands ~7 chunks to 12 threads and most of the team idles; split
+/// 17 ways, a 1024-row band spent 51.4 s mean in the numeric loop against
+/// 33.1 s as one round -- 55% more for identical arithmetic, with the rank
+/// spread widening from 1.2x to 1.85x. That, and not the transfer (1.7 s of a
+/// 100 s call), is what rounds actually cost.
+///
 /// `arrivals[i]` is what row i first needs, `departures[i]` what dies with it,
 /// both in blocks. Returns the row indices to cut at, starting with 0.
 inline std::vector<int> fused_round_plan(const std::vector<size_t>& arrivals,
@@ -1031,11 +1039,16 @@ inline std::vector<int> fused_round_plan(const std::vector<size_t>& arrivals,
         return bound;
     }
 
+    // Two chunks per thread, so the dynamic schedule has something to balance
+    // with even in the round that ends up smallest.
+    const int min_rows = std::max(1, omp_get_max_threads() * 2 * 8);
+
     size_t held = 0;       // fetched and not yet released
     size_t releasable = 0; // dead, but held until a boundary lets it go
     for (int i = 0; i < n_rows; ++i) {
         if (held + arrivals[static_cast<size_t>(i)] > block_budget &&
-            releasable * 2 >= block_budget && i > bound.back()) {
+            releasable * 2 >= block_budget && i - bound.back() >= min_rows &&
+            n_rows - i >= min_rows) {
             bound.push_back(i);
             held -= releasable;
             releasable = 0;
@@ -1072,17 +1085,23 @@ inline void fused_report_halo(const char* kernel, MPI_Comm comm, int rank,
     double secs[2] = {secs_fetch, secs_numeric};
     double secs_worst[2] = {0.0, 0.0};
     MPI_Reduce(secs, secs_worst, 2, MPI_DOUBLE, MPI_MAX, 0, comm);
+    double secs_min[2] = {0.0, 0.0}, secs_sum[2] = {0.0, 0.0};
+    MPI_Reduce(secs, secs_min, 2, MPI_DOUBLE, MPI_MIN, 0, comm);
+    MPI_Reduce(secs, secs_sum, 2, MPI_DOUBLE, MPI_SUM, 0, comm);
+    int nranks = 1;
+    MPI_Comm_size(comm, &nranks);
     if (rank != 0) return;
     const double to_gb = static_cast<double>(block_bytes) / 1073741824.0;
     const double cv_over_mem =
         worst[2] > 0 ? static_cast<double>(worst[0]) / static_cast<double>(worst[2]) : 0.0;
     std::fprintf(stderr,
                  "VBCSR_FUSED_STATS %s rounds=%lld fetched=%.2f GB live=%.2f GB "
-                 "local=%.2f GB CV/memA=%.0f%% fetch=%.1fs numeric=%.1fs\n",
+                 "local=%.2f GB CV/memA=%.0f%% fetch=%.1fs "
+                 "numeric max/mean/min=%.1f/%.1f/%.1fs\n",
                  kernel, rounds, static_cast<double>(worst[0]) * to_gb,
                  static_cast<double>(worst[1]) * to_gb,
                  static_cast<double>(worst[2]) * to_gb, cv_over_mem * 100.0,
-                 secs_worst[0], secs_worst[1]);
+                 secs_worst[0], secs_worst[1], secs_sum[1] / nranks, secs_min[1]);
 }
 
 /// Every block of the rows named in `patterns`, as the payload exchange wants

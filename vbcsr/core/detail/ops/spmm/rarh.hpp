@@ -653,7 +653,7 @@ struct RARhExecutor {
         halo_b.init(meta_b, n_global);
         halo_a.init(meta_a, n_global);
         size_t b_cursor = 0, a_cursor = 0;
-        double secs_fetch = 0.0, secs_numeric = 0.0;
+        double secs_fetch = 0.0, secs_numeric = 0.0, secs_wait = 0.0;
         for (long long r = 0; r < rounds; ++r) {
             const int lo = tile_bound[static_cast<size_t>(r)];
             const int hi = tile_bound[static_cast<size_t>(r) + 1];
@@ -686,7 +686,16 @@ struct RARhExecutor {
                 death_a = std::max(death_a, round_of_row(a_death[static_cast<size_t>(g)]));
             }
 
+            // How long the team spends waiting for its slowest rank, apart
+            // from moving bytes. Worth separating because the two have
+            // different fixes -- a one-sided transport would remove the wait
+            // and nothing else, and measuring it is how we found the wait was
+            // never the problem. Only under the stats flag: the barrier itself
+            // perturbs what it measures.
+            const double t_bar0 = MPI_Wtime();
+            if (fused_halo_stats_enabled()) MPI_Barrier(ga.comm);
             const double t_fetch0 = MPI_Wtime();
+            secs_wait += t_fetch0 - t_bar0;
             auto ghosts_b = build_spmm_ghost_blocks<T>(
                 meta_b, fetch_required_block_payloads(B, want_b));
             auto ghosts_a = build_spmm_ghost_blocks<T>(
@@ -713,6 +722,18 @@ struct RARhExecutor {
                           A.get_block_norms().size(),
                           static_cast<size_t>(bs_max) * static_cast<size_t>(bs_max) * sizeof(T),
                           secs_fetch, secs_numeric);
+        if (fused_halo_stats_enabled()) {
+            double w = secs_wait, wmax = 0.0;
+            MPI_Reduce(&w, &wmax, 1, MPI_DOUBLE, MPI_MAX, 0, ga.comm);
+            double wsum = 0.0;
+            MPI_Reduce(&w, &wsum, 1, MPI_DOUBLE, MPI_SUM, 0, ga.comm);
+            if (rank == 0) {
+                std::fprintf(stderr,
+                             "VBCSR_FUSED_STATS rarh   imbalance-wait max=%.1fs "
+                             "mean=%.1fs\n",
+                             wmax, wsum / ga.size);
+            }
+        }
         int any_bad = bad_operand;
         MPI_Allreduce(&bad_operand, &any_bad, 1, MPI_INT, MPI_MAX, ga.comm);
         if (any_bad) {
