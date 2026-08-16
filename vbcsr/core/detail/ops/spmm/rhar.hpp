@@ -16,6 +16,7 @@
 #include <limits>
 #include <map>
 #include <set>
+#include <unordered_map>
 #include <stdexcept>
 #include <vector>
 
@@ -595,48 +596,97 @@ struct RhARExecutor {
         // threshold 0 a zero-norm block is numerically kept and its row must
         // remain answerable (the missing_row check); at threshold > 0 a kept
         // block always has norm >= gate > 0, so reached implies colmax > 0.
-        std::vector<char> reached(static_cast<size_t>(n_global), 0);
-        std::vector<double> colmax_b(static_cast<size_t>(n_global), 0.0);
-        std::vector<char> row_seen(static_cast<size_t>(n_global), 0);
+        //
+        // Dense numberings, not global ones: the mid rows are the distinct
+        // entries of cols.src_row and the reachable columns come straight from
+        // B's local rows and the fetched patterns, so both tables cost O(halo)
+        // instead of a fixed price per row of the whole system (see rarh).
+        // Every slot is resolved once per ENTRY -- a search inside the walks
+        // below would sit in a cross product.
+        FusedDenseIds mid_ids, cand;
+        {
+            std::vector<int> scratch(cols.src_row.begin(), cols.src_row.end());
+            mid_ids.build(scratch);
+            scratch.clear();
+            for (const auto& row : meta_b) {
+                for (const auto& meta : row.second) scratch.push_back(meta.col);
+            }
+            const int b_rows = static_cast<int>(gb.adj_ptr.size()) - 1;
+            for (int lb = 0; lb < b_rows; ++lb) {
+                for (int e = gb.adj_ptr[lb]; e < gb.adj_ptr[lb + 1]; ++e) {
+                    scratch.push_back(gb.get_global_index(gb.adj_ind[e]));
+                }
+            }
+            cand.build(scratch);
+        }
+        std::vector<int> src_slot(cols.src_row.size(), -1);
+        for (size_t e = 0; e < cols.src_row.size(); ++e) {
+            src_slot[e] = mid_ids.of(cols.src_row[e]);
+        }
+        const size_t b_local_entries = static_cast<size_t>(gb.adj_ptr.back());
+        std::unordered_map<int, size_t> b_entry_base;
+        size_t b_total_entries = b_local_entries;
+        for (const auto& row : meta_b) {
+            b_entry_base[row.first] = b_total_entries;
+            b_total_entries += row.second.size();
+        }
+        std::vector<int> entry_cand(b_total_entries, -1);
+        for (size_t e = 0; e < b_local_entries; ++e) {
+            entry_cand[e] = cand.of(gb.get_global_index(gb.adj_ind[e]));
+        }
+        for (const auto& row : meta_b) {
+            size_t at = b_entry_base[row.first];
+            for (const auto& meta : row.second) entry_cand[at++] = cand.of(meta.col);
+        }
+
+        std::vector<char> reached(cand.size(), 0);
+        std::vector<double> colmax_b(cand.size(), 0.0);
+        std::vector<char> row_seen(mid_ids.size(), 0);
         double w_bound = 0.0;  // max_i sum_e width_b(src_row(e)): bound on |touched_i|
         {
-            std::vector<double> width_of_row(static_cast<size_t>(n_global), 0.0);
+            std::vector<double> width_of_row(mid_ids.size(), 0.0);
             for (size_t e = 0; e < cols.src_row.size(); ++e) {
                 const int g_mid = cols.src_row[e];
-                if (row_seen[static_cast<size_t>(g_mid)]) continue;
-                row_seen[static_cast<size_t>(g_mid)] = 1;
+                const int mid = src_slot[e];
+                if (mid < 0 || row_seen[static_cast<size_t>(mid)]) continue;
+                row_seen[static_cast<size_t>(mid)] = 1;
                 const int lb = b_row[static_cast<size_t>(g_mid)];
                 if (lb >= 0) {
                     const int width = gb.adj_ptr[lb + 1] - gb.adj_ptr[lb];
-                    width_of_row[static_cast<size_t>(g_mid)] = width;
+                    width_of_row[static_cast<size_t>(mid)] = width;
                     const double gate = gate_b(g_mid, width);
                     for (int k = gb.adj_ptr[lb]; k < gb.adj_ptr[lb + 1]; ++k) {
                         const double norm = b_norms[static_cast<size_t>(k)];
                         if (norm < gate) continue;
-                        const size_t col =
-                            static_cast<size_t>(gb.get_global_index(gb.adj_ind[k]));
-                        reached[col] = 1;
-                        colmax_b[col] = std::max(colmax_b[col], norm);
+                        const int slot = entry_cand[static_cast<size_t>(k)];
+                        if (slot < 0) continue;
+                        reached[static_cast<size_t>(slot)] = 1;
+                        colmax_b[static_cast<size_t>(slot)] =
+                            std::max(colmax_b[static_cast<size_t>(slot)], norm);
                     }
                     continue;
                 }
                 auto pattern = meta_b.find(g_mid);
                 if (pattern == meta_b.end()) continue;
                 const int width = static_cast<int>(pattern->second.size());
-                width_of_row[static_cast<size_t>(g_mid)] = width;
+                width_of_row[static_cast<size_t>(mid)] = width;
                 const double gate = gate_b(g_mid, width);
+                size_t at = b_entry_base.at(g_mid);
                 for (const auto& meta : pattern->second) {
+                    const int slot = entry_cand[at++];
                     if (meta.norm < gate) continue;
-                    const size_t col = static_cast<size_t>(meta.col);
-                    reached[col] = 1;
-                    colmax_b[col] = std::max(colmax_b[col], meta.norm);
+                    if (slot < 0) continue;
+                    reached[static_cast<size_t>(slot)] = 1;
+                    colmax_b[static_cast<size_t>(slot)] =
+                        std::max(colmax_b[static_cast<size_t>(slot)], meta.norm);
                 }
             }
             for (int i = 0; i < n_rows; ++i) {
                 double w = 0.0;
                 for (int e = static_cast<int>(cols.ptr[static_cast<size_t>(i)]);
                      e < static_cast<int>(cols.ptr[static_cast<size_t>(i) + 1]); ++e) {
-                    w += width_of_row[static_cast<size_t>(cols.src_row[static_cast<size_t>(e)])];
+                    const int mid = src_slot[static_cast<size_t>(e)];
+                    if (mid >= 0) w += width_of_row[static_cast<size_t>(mid)];
                 }
                 w_bound = std::max(w_bound, w);
             }
@@ -646,14 +696,17 @@ struct RhARExecutor {
         // gate bounded from the safe side: inner_norm(i,l) <= col_sum(i) *
         // colmax_b(l) <= s_max * colmax_b(l) and |touched_i| <= w_bound.
         std::set<int> need_a;
-        for (int g = 0; g < n_global; ++g) {
-            if (reached[static_cast<size_t>(g)] && ga.find_owner(g) != rank) need_a.insert(g);
+        for (size_t slot = 0; slot < cand.size(); ++slot) {
+            if (!reached[slot]) continue;
+            const int g = cand.ids[slot];
+            if (ga.find_owner(g) != rank) need_a.insert(g);
         }
         GhostMetadata meta_a = fetch_row_patterns(A, need_a, ga.comm, ga.size, rank);
 
         const auto gate_a = [&](int g_row) -> double {
             if (!(threshold > 0.0)) return 0.0;
-            const double cm = colmax_b[static_cast<size_t>(g_row)];
+            const int slot = cand.of(g_row);
+            const double cm = slot < 0 ? 0.0 : colmax_b[static_cast<size_t>(slot)];
             if (!(cm > 0.0) || !(s_max > 0.0) || !(w_bound > 0.0)) {
                 return std::numeric_limits<double>::infinity();
             }
@@ -692,6 +745,28 @@ struct RhARExecutor {
             }
             return n;
         };
+        // (col, flat entry index), so the birth/death cross product reads a
+        // precomputed slot instead of searching per visit.
+        const auto for_each_kept_b_entry = [&](int g_mid, auto&& fn) {
+            const int lb = b_row[static_cast<size_t>(g_mid)];
+            if (lb >= 0) {
+                const double gate = gate_b(g_mid, gb.adj_ptr[lb + 1] - gb.adj_ptr[lb]);
+                for (int e = gb.adj_ptr[lb]; e < gb.adj_ptr[lb + 1]; ++e) {
+                    if (b_norms[static_cast<size_t>(e)] < gate) continue;
+                    fn(gb.get_global_index(gb.adj_ind[e]), static_cast<size_t>(e));
+                }
+                return;
+            }
+            auto pattern = meta_b.find(g_mid);
+            if (pattern == meta_b.end()) return;
+            const double gate = gate_b(g_mid, static_cast<int>(pattern->second.size()));
+            size_t at = b_entry_base.at(g_mid);
+            for (const auto& m : pattern->second) {
+                const size_t here = at++;
+                if (m.norm >= gate) fn(m.col, here);
+            }
+        };
+
         const auto for_each_kept_b_col = [&](int g_mid, auto&& fn) {
             const int lb = b_row[static_cast<size_t>(g_mid)];
             if (lb >= 0) {
@@ -717,26 +792,45 @@ struct RhARExecutor {
         // BORN on it. Traffic is then the union reach exactly, and residency
         // the live set. (rhar walks A^H's columns rather than A's rows -- the
         // reach is the transposed one -- but the schedule is identical.)
-        std::vector<int> b_birth(static_cast<size_t>(n_global), -1);
-        std::vector<int> b_death(static_cast<size_t>(n_global), -1);
-        std::vector<int> a_birth(static_cast<size_t>(n_global), -1);
-        std::vector<int> a_death(static_cast<size_t>(n_global), -1);
+        FusedDenseIds b_ids, a_ids;
+        {
+            std::vector<int> scratch;
+            for (const auto& row : meta_b) scratch.push_back(row.first);
+            b_ids.build(scratch);
+            scratch.clear();
+            for (const auto& row : meta_a) scratch.push_back(row.first);
+            a_ids.build(scratch);
+        }
+        std::vector<int> entry_aslot(b_total_entries, -1);
+        for (size_t e = 0; e < b_total_entries; ++e) {
+            const int slot = entry_cand[e];
+            if (slot >= 0) entry_aslot[e] = a_ids.of(cand.ids[static_cast<size_t>(slot)]);
+        }
+        std::vector<int> b_birth(b_ids.size(), -1);
+        std::vector<int> b_death(b_ids.size(), -1);
+        std::vector<int> a_birth(a_ids.size(), -1);
+        std::vector<int> a_death(a_ids.size(), -1);
         for (int i = 0; i < n_rows; ++i) {
             for (int e = static_cast<int>(cols.ptr[static_cast<size_t>(i)]);
                  e < static_cast<int>(cols.ptr[static_cast<size_t>(i) + 1]); ++e) {
                 const int g_mid = cols.src_row[static_cast<size_t>(e)];
                 if (gb.find_owner(g_mid) != rank) {
-                    if (b_birth[static_cast<size_t>(g_mid)] < 0) {
-                        b_birth[static_cast<size_t>(g_mid)] = i;
+                    const int s_b = b_ids.of(g_mid);
+                    if (s_b >= 0) {
+                        if (b_birth[static_cast<size_t>(s_b)] < 0) {
+                            b_birth[static_cast<size_t>(s_b)] = i;
+                        }
+                        b_death[static_cast<size_t>(s_b)] = i;
                     }
-                    b_death[static_cast<size_t>(g_mid)] = i;
                 }
-                for_each_kept_b_col(g_mid, [&](int l) {
+                for_each_kept_b_entry(g_mid, [&](int l, size_t entry) {
                     if (ga.find_owner(l) == rank) return;
-                    if (a_birth[static_cast<size_t>(l)] < 0) {
-                        a_birth[static_cast<size_t>(l)] = i;
+                    const int s_a = entry_aslot[entry];
+                    if (s_a < 0) return;
+                    if (a_birth[static_cast<size_t>(s_a)] < 0) {
+                        a_birth[static_cast<size_t>(s_a)] = i;
                     }
-                    a_death[static_cast<size_t>(l)] = i;
+                    a_death[static_cast<size_t>(s_a)] = i;
                 });
             }
         }
@@ -751,21 +845,23 @@ struct RhARExecutor {
         std::vector<std::pair<int, int>> b_born, a_born;  // (birth row, global row)
         std::vector<size_t> arrivals(static_cast<size_t>(n_rows) + 1, 0);
         std::vector<size_t> departures(static_cast<size_t>(n_rows) + 1, 0);
-        for (int g = 0; g < n_global; ++g) {
-            const int born_b = b_birth[static_cast<size_t>(g)];
-            if (born_b >= 0) {
-                b_born.emplace_back(born_b, g);
-                const size_t blocks = kept_b(g);
-                arrivals[static_cast<size_t>(born_b)] += blocks;
-                departures[static_cast<size_t>(b_death[static_cast<size_t>(g)])] += blocks;
-            }
-            const int born_a = a_birth[static_cast<size_t>(g)];
-            if (born_a >= 0) {
-                a_born.emplace_back(born_a, g);
-                const size_t blocks = kept_a(g);
-                arrivals[static_cast<size_t>(born_a)] += blocks;
-                departures[static_cast<size_t>(a_death[static_cast<size_t>(g)])] += blocks;
-            }
+        for (size_t slot = 0; slot < b_ids.size(); ++slot) {
+            const int born_b = b_birth[slot];
+            if (born_b < 0) continue;
+            const int g = b_ids.ids[slot];
+            b_born.emplace_back(born_b, g);
+            const size_t blocks = kept_b(g);
+            arrivals[static_cast<size_t>(born_b)] += blocks;
+            departures[static_cast<size_t>(b_death[slot])] += blocks;
+        }
+        for (size_t slot = 0; slot < a_ids.size(); ++slot) {
+            const int born_a = a_birth[slot];
+            if (born_a < 0) continue;
+            const int g = a_ids.ids[slot];
+            a_born.emplace_back(born_a, g);
+            const size_t blocks = kept_a(g);
+            arrivals[static_cast<size_t>(born_a)] += blocks;
+            departures[static_cast<size_t>(a_death[slot])] += blocks;
         }
         std::sort(b_born.begin(), b_born.end());
         std::sort(a_born.begin(), a_born.end());
@@ -808,7 +904,8 @@ struct RhARExecutor {
                         if (m.norm >= gate) want_b.push_back(BlockID{g, m.col});
                     }
                 }
-                death_b = std::max(death_b, round_of_row(b_death[static_cast<size_t>(g)]));
+                death_b = std::max(death_b,
+                                   round_of_row(b_death[static_cast<size_t>(b_ids.of(g))]));
             }
             for (; a_cursor < a_born.size() && a_born[a_cursor].first < hi; ++a_cursor) {
                 const int g = a_born[a_cursor].second;
@@ -821,7 +918,8 @@ struct RhARExecutor {
                         }
                     }
                 }
-                death_a = std::max(death_a, round_of_row(a_death[static_cast<size_t>(g)]));
+                death_a = std::max(death_a,
+                                   round_of_row(a_death[static_cast<size_t>(a_ids.of(g))]));
             }
 
             const double t_fetch0 = MPI_Wtime();

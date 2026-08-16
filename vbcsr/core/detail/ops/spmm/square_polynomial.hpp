@@ -342,16 +342,35 @@ struct SquarePolynomialExecutor {
             // sweep of the local adjacency settles both spans. Dims are not in
             // the patterns, so the budget counts blocks at the largest local
             // block dim -- a bounded over-estimate, erring toward more rounds.
-            std::vector<int> birth(static_cast<size_t>(n_global), -1);
-            std::vector<int> death(static_cast<size_t>(n_global), -1);
+            //
+            // Keyed by a dense numbering over the rows whose patterns we hold
+            // -- the only remote rows the square can reach -- rather than by
+            // global id, which would cost 8 bytes per row of the whole system
+            // per rank however small this rank's share of it (see rarh). The
+            // slot of an adjacency entry depends only on the entry, so it is
+            // resolved once per entry rather than once per visit.
+            FusedDenseIds col_ids;
+            {
+                std::vector<int> scratch;
+                for (const auto& row : meta) scratch.push_back(row.first);
+                col_ids.build(scratch);
+            }
+            std::vector<int> entry_slot(static_cast<size_t>(ga.adj_ptr.back()), -1);
+            for (int e = 0; e < ga.adj_ptr.back(); ++e) {
+                const int g_col = ga.get_global_index(ga.adj_ind[e]);
+                if (ga.find_owner(g_col) == rank) continue;
+                entry_slot[static_cast<size_t>(e)] = col_ids.of(g_col);
+            }
+            std::vector<int> birth(col_ids.size(), -1);
+            std::vector<int> death(col_ids.size(), -1);
             for (int i = 0; i < n_rows; ++i) {
                 for (int k = ga.adj_ptr[i]; k < ga.adj_ptr[i + 1]; ++k) {
-                    const int g_col = ga.get_global_index(ga.adj_ind[k]);
-                    if (ga.find_owner(g_col) == rank) continue;
-                    if (birth[static_cast<size_t>(g_col)] < 0) {
-                        birth[static_cast<size_t>(g_col)] = i;
+                    const int slot = entry_slot[static_cast<size_t>(k)];
+                    if (slot < 0) continue;
+                    if (birth[static_cast<size_t>(slot)] < 0) {
+                        birth[static_cast<size_t>(slot)] = i;
                     }
-                    death[static_cast<size_t>(g_col)] = i;
+                    death[static_cast<size_t>(slot)] = i;
                 }
             }
 
@@ -365,13 +384,14 @@ struct SquarePolynomialExecutor {
             std::vector<std::pair<int, int>> born;  // (birth row, global row)
             std::vector<size_t> arrivals(static_cast<size_t>(n_rows) + 1, 0);
             std::vector<size_t> departures(static_cast<size_t>(n_rows) + 1, 0);
-            for (int g = 0; g < n_global; ++g) {
-                const int b = birth[static_cast<size_t>(g)];
+            for (size_t slot = 0; slot < col_ids.size(); ++slot) {
+                const int b = birth[slot];
                 if (b < 0) continue;
+                const int g = col_ids.ids[slot];
                 born.emplace_back(b, g);
                 const size_t blocks = kept_count(g);
                 arrivals[static_cast<size_t>(b)] += blocks;
-                departures[static_cast<size_t>(death[static_cast<size_t>(g)])] += blocks;
+                departures[static_cast<size_t>(death[slot])] += blocks;
             }
             std::sort(born.begin(), born.end());
             std::vector<int> tile_bound =
@@ -412,8 +432,9 @@ struct SquarePolynomialExecutor {
                             }
                         }
                     }
-                    death_round =
-                        std::max(death_round, round_of_row(death[static_cast<size_t>(g_col)]));
+                    death_round = std::max(
+                        death_round,
+                        round_of_row(death[static_cast<size_t>(col_ids.of(g_col))]));
                 }
 
                 const double t_fetch0 = MPI_Wtime();
