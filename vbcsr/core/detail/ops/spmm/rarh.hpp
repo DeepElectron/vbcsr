@@ -18,6 +18,7 @@
 #include <cstring>
 #include <map>
 #include <set>
+#include <unordered_map>
 #include <stdexcept>
 #include <vector>
 #include <cstdio>
@@ -431,8 +432,74 @@ struct RARhExecutor {
         // and its row must be answerable for the hermiticity probe), colmax
         // feeds the round-2 norm gate. At threshold > 0 a kept block always
         // has norm >= gate > 0, so reached implies colmax > 0 there.
-        std::vector<char> reached(static_cast<size_t>(n_global), 0);
-        std::vector<double> colmax_b(static_cast<size_t>(n_global), 0.0);
+        //
+        // Both are indexed by a dense numbering over the columns that could
+        // possibly be reached -- enumerable straight from the patterns and the
+        // local rows of B, without the cross product below -- rather than by
+        // global id. Same answers, memory proportional to the halo instead of
+        // to the system.
+        FusedDenseIds cand;
+        {
+            std::vector<int> scratch;
+            for (const auto& row : meta_b) {
+                for (const auto& meta : row.second) scratch.push_back(meta.col);
+            }
+            const int b_rows = static_cast<int>(gb.adj_ptr.size()) - 1;
+            for (int lb = 0; lb < b_rows; ++lb) {
+                for (int e = gb.adj_ptr[lb]; e < gb.adj_ptr[lb + 1]; ++e) {
+                    scratch.push_back(gb.get_global_index(gb.adj_ind[e]));
+                }
+            }
+            cand.build(scratch);
+        }
+        // One slot lookup per B ENTRY, not per visit. The walk below is the
+        // cross product (local rows x A's columns x those rows' columns), so a
+        // binary search inside it costs ~1.5e8 searches on a 1024-row rank --
+        // about 3 seconds, serial, for an answer that depends only on the
+        // entry. Resolved once here into a flat table instead: local blocks
+        // first, then each fetched pattern's blocks.
+        const size_t b_local_entries = static_cast<size_t>(gb.adj_ptr.back());
+        std::unordered_map<int, size_t> b_entry_base;
+        size_t b_total_entries = b_local_entries;
+        for (const auto& row : meta_b) {
+            b_entry_base[row.first] = b_total_entries;
+            b_total_entries += row.second.size();
+        }
+        std::vector<int> entry_cand(b_total_entries, -1);
+        for (size_t e = 0; e < b_local_entries; ++e) {
+            entry_cand[e] = cand.of(gb.get_global_index(gb.adj_ind[e]));
+        }
+        for (const auto& row : meta_b) {
+            size_t at = b_entry_base[row.first];
+            for (const auto& meta : row.second) entry_cand[at++] = cand.of(meta.col);
+        }
+
+        // (col, flat entry index) for the kept blocks of a B row, so callers
+        // index whichever slot table they need without searching.
+        const auto for_each_kept_b_entry = [&](int g_mid, auto&& fn) {
+            auto local = gb.global_to_local.find(g_mid);
+            if (local != gb.global_to_local.end() &&
+                local->second < static_cast<int>(gb.adj_ptr.size()) - 1) {
+                const int lb = local->second;
+                const double gate = gate_b(g_mid, gb.adj_ptr[lb + 1] - gb.adj_ptr[lb]);
+                for (int e = gb.adj_ptr[lb]; e < gb.adj_ptr[lb + 1]; ++e) {
+                    if (b_norms[static_cast<size_t>(e)] < gate) continue;
+                    fn(gb.get_global_index(gb.adj_ind[e]), static_cast<size_t>(e));
+                }
+                return;
+            }
+            auto pattern = meta_b.find(g_mid);
+            if (pattern == meta_b.end()) return;
+            const double gate = gate_b(g_mid, static_cast<int>(pattern->second.size()));
+            size_t at = b_entry_base.at(g_mid);
+            for (const auto& meta : pattern->second) {
+                const size_t here = at++;
+                if (meta.norm >= gate) fn(meta.col, here);
+            }
+        };
+
+        std::vector<char> reached(cand.size(), 0);
+        std::vector<double> colmax_b(cand.size(), 0.0);
         for (int i = 0; i < n_rows; ++i) {
             for (int k = ga.adj_ptr[i]; k < ga.adj_ptr[i + 1]; ++k) {
                 const int g_mid = ga.get_global_index(ga.adj_ind[k]);
@@ -443,20 +510,25 @@ struct RARhExecutor {
                     for (int e = gb.adj_ptr[lb]; e < gb.adj_ptr[lb + 1]; ++e) {
                         const double norm = b_norms[static_cast<size_t>(e)];
                         if (norm < gate) continue;
-                        const size_t col = static_cast<size_t>(gb.get_global_index(gb.adj_ind[e]));
-                        reached[col] = 1;
-                        colmax_b[col] = std::max(colmax_b[col], norm);
+                        const int slot = entry_cand[static_cast<size_t>(e)];
+                        if (slot < 0) continue;
+                        reached[static_cast<size_t>(slot)] = 1;
+                        colmax_b[static_cast<size_t>(slot)] =
+                            std::max(colmax_b[static_cast<size_t>(slot)], norm);
                     }
                     continue;
                 }
                 auto pattern = meta_b.find(g_mid);
                 if (pattern == meta_b.end()) continue;
                 const double gate = gate_b(g_mid, static_cast<int>(pattern->second.size()));
+                size_t at = b_entry_base.at(g_mid);
                 for (const auto& meta : pattern->second) {
+                    const int slot = entry_cand[at++];
                     if (meta.norm < gate) continue;
-                    const size_t col = static_cast<size_t>(meta.col);
-                    reached[col] = 1;
-                    colmax_b[col] = std::max(colmax_b[col], meta.norm);
+                    if (slot < 0) continue;
+                    reached[static_cast<size_t>(slot)] = 1;
+                    colmax_b[static_cast<size_t>(slot)] =
+                        std::max(colmax_b[static_cast<size_t>(slot)], meta.norm);
                 }
             }
         }
@@ -483,16 +555,17 @@ struct RARhExecutor {
         //
         // fails the numeric eps2 gate for every local row that reaches l.
         std::set<int> need_a;
-        for (int g = 0; g < n_global; ++g) {
-            if (reached[static_cast<size_t>(g)] && ga.find_owner(g) != rank) {
-                need_a.insert(g);
-            }
+        for (size_t slot = 0; slot < cand.size(); ++slot) {
+            if (!reached[slot]) continue;
+            const int g = cand.ids[slot];
+            if (ga.find_owner(g) != rank) need_a.insert(g);
         }
         GhostMetadata meta_a = fetch_row_patterns(A, need_a, ga.comm, ga.size, rank);
 
         const auto gate_a = [&](int g_row) -> double {
             if (!(threshold > 0.0)) return 0.0;
-            const double cm = colmax_b[static_cast<size_t>(g_row)];
+            const int slot = cand.of(g_row);
+            const double cm = slot < 0 ? 0.0 : colmax_b[static_cast<size_t>(slot)];
             if (!(cm > 0.0) || !(s_max > 0.0) || !(w_bound_d > 0.0)) {
                 return std::numeric_limits<double>::infinity();
             }
@@ -562,25 +635,49 @@ struct RARhExecutor {
         // kept columns for the rows of A -- and the walk is over patterns, so
         // it costs no payload. Output rows are visited in order, which makes
         // "first" the first write and "last" the latest.
-        std::vector<int> b_birth(static_cast<size_t>(n_global), -1);
-        std::vector<int> b_death(static_cast<size_t>(n_global), -1);
-        std::vector<int> a_birth(static_cast<size_t>(n_global), -1);
-        std::vector<int> a_death(static_cast<size_t>(n_global), -1);
+        //
+        // Keyed by a dense numbering over the rows whose patterns we hold --
+        // the only rows that can have a span at all -- rather than by global
+        // id, so these four tables cost O(halo) instead of 16 bytes per global
+        // row per rank.
+        FusedDenseIds b_ids, a_ids;
+        {
+            std::vector<int> scratch;
+            for (const auto& row : meta_b) scratch.push_back(row.first);
+            b_ids.build(scratch);
+            scratch.clear();
+            for (const auto& row : meta_a) scratch.push_back(row.first);
+            a_ids.build(scratch);
+        }
+        std::vector<int> entry_aslot(b_total_entries, -1);
+        for (size_t e = 0; e < b_total_entries; ++e) {
+            const int slot = entry_cand[e];
+            if (slot >= 0) entry_aslot[e] = a_ids.of(cand.ids[static_cast<size_t>(slot)]);
+        }
+        std::vector<int> b_birth(b_ids.size(), -1);
+        std::vector<int> b_death(b_ids.size(), -1);
+        std::vector<int> a_birth(a_ids.size(), -1);
+        std::vector<int> a_death(a_ids.size(), -1);
         for (int i = 0; i < n_rows; ++i) {
             for (int k = ga.adj_ptr[i]; k < ga.adj_ptr[i + 1]; ++k) {
                 const int g_mid = ga.get_global_index(ga.adj_ind[k]);
                 if (gb.find_owner(g_mid) != rank) {
-                    if (b_birth[static_cast<size_t>(g_mid)] < 0) {
-                        b_birth[static_cast<size_t>(g_mid)] = i;
+                    const int s_b = b_ids.of(g_mid);
+                    if (s_b >= 0) {
+                        if (b_birth[static_cast<size_t>(s_b)] < 0) {
+                            b_birth[static_cast<size_t>(s_b)] = i;
+                        }
+                        b_death[static_cast<size_t>(s_b)] = i;
                     }
-                    b_death[static_cast<size_t>(g_mid)] = i;
                 }
-                for_each_kept_b_col(g_mid, [&](int l) {
+                for_each_kept_b_entry(g_mid, [&](int l, size_t entry) {
                     if (ga.find_owner(l) == rank) return;
-                    if (a_birth[static_cast<size_t>(l)] < 0) {
-                        a_birth[static_cast<size_t>(l)] = i;
+                    const int s_a = entry_aslot[entry];
+                    if (s_a < 0) return;
+                    if (a_birth[static_cast<size_t>(s_a)] < 0) {
+                        a_birth[static_cast<size_t>(s_a)] = i;
                     }
-                    a_death[static_cast<size_t>(l)] = i;
+                    a_death[static_cast<size_t>(s_a)] = i;
                 });
             }
         }
@@ -602,21 +699,23 @@ struct RARhExecutor {
         std::vector<std::pair<int, int>> b_born, a_born;  // (birth row, global row)
         std::vector<size_t> arrivals(static_cast<size_t>(n_rows) + 1, 0);
         std::vector<size_t> departures(static_cast<size_t>(n_rows) + 1, 0);
-        for (int g = 0; g < n_global; ++g) {
-            const int born_b = b_birth[static_cast<size_t>(g)];
-            if (born_b >= 0) {
-                b_born.emplace_back(born_b, g);
-                const size_t blocks = kept_b(g);
-                arrivals[static_cast<size_t>(born_b)] += blocks;
-                departures[static_cast<size_t>(b_death[static_cast<size_t>(g)])] += blocks;
-            }
-            const int born_a = a_birth[static_cast<size_t>(g)];
-            if (born_a >= 0) {
-                a_born.emplace_back(born_a, g);
-                const size_t blocks = kept_a(g);
-                arrivals[static_cast<size_t>(born_a)] += blocks;
-                departures[static_cast<size_t>(a_death[static_cast<size_t>(g)])] += blocks;
-            }
+        for (size_t slot = 0; slot < b_ids.size(); ++slot) {
+            const int born_b = b_birth[slot];
+            if (born_b < 0) continue;
+            const int g = b_ids.ids[slot];
+            b_born.emplace_back(born_b, g);
+            const size_t blocks = kept_b(g);
+            arrivals[static_cast<size_t>(born_b)] += blocks;
+            departures[static_cast<size_t>(b_death[slot])] += blocks;
+        }
+        for (size_t slot = 0; slot < a_ids.size(); ++slot) {
+            const int born_a = a_birth[slot];
+            if (born_a < 0) continue;
+            const int g = a_ids.ids[slot];
+            a_born.emplace_back(born_a, g);
+            const size_t blocks = kept_a(g);
+            arrivals[static_cast<size_t>(born_a)] += blocks;
+            departures[static_cast<size_t>(a_death[slot])] += blocks;
         }
         std::sort(b_born.begin(), b_born.end());
         std::sort(a_born.begin(), a_born.end());
@@ -670,7 +769,8 @@ struct RARhExecutor {
                         if (m.norm >= gate) want_b.push_back(BlockID{g, m.col});
                     }
                 }
-                death_b = std::max(death_b, round_of_row(b_death[static_cast<size_t>(g)]));
+                death_b = std::max(death_b,
+                                   round_of_row(b_death[static_cast<size_t>(b_ids.of(g))]));
             }
             for (; a_cursor < a_born.size() && a_born[a_cursor].first < hi; ++a_cursor) {
                 const int g = a_born[a_cursor].second;
@@ -683,7 +783,8 @@ struct RARhExecutor {
                         }
                     }
                 }
-                death_a = std::max(death_a, round_of_row(a_death[static_cast<size_t>(g)]));
+                death_a = std::max(death_a,
+                                   round_of_row(a_death[static_cast<size_t>(a_ids.of(g))]));
             }
 
             // How long the team spends waiting for its slowest rank, apart

@@ -988,6 +988,39 @@ struct FusedHaloStream {
     }
 };
 
+/// A dense numbering over the global block ids a rank actually touches.
+///
+/// The plan-time tables here were all indexed by GLOBAL block id, which costs
+/// 57 bytes per global row per rank in the fused kernels -- 285 MB at five
+/// million atoms, and not a byte less for adding ranks, because the array is
+/// sized by the system rather than by the share. That is a ceiling rather than
+/// a slowdown: it does not go away by scaling out.
+///
+/// The touched set is O(local + halo), orders of magnitude smaller, and for
+/// plan-time tables a binary search is affordable -- these are walked once per
+/// row or once per pattern, not once per block pair. (The numeric loop's
+/// tables are a separate problem: it probes by global id thousands of times
+/// per row, and the fix there is to resolve the dense id where the id is
+/// STORED rather than where it is used.)
+struct FusedDenseIds {
+    std::vector<int> ids;  ///< sorted, unique
+
+    void build(std::vector<int>& scratch) {
+        std::sort(scratch.begin(), scratch.end());
+        scratch.erase(std::unique(scratch.begin(), scratch.end()), scratch.end());
+        ids.swap(scratch);
+    }
+
+    /// Dense slot of `g`, or -1 where this rank never named it.
+    int of(int g) const {
+        const auto it = std::lower_bound(ids.begin(), ids.end(), g);
+        if (it == ids.end() || *it != g) return -1;
+        return static_cast<int>(it - ids.begin());
+    }
+
+    size_t size() const { return ids.size(); }
+};
+
 /// Chunk of the numeric loop's `schedule(dynamic, ...)` over output rows.
 ///
 /// Named because the round plan has to know it: a round below a few chunks per
