@@ -988,6 +988,13 @@ struct FusedHaloStream {
     }
 };
 
+/// Chunk of the numeric loop's `schedule(dynamic, ...)` over output rows.
+///
+/// Named because the round plan has to know it: a round below a few chunks per
+/// thread cannot fill the team, and a floor derived from a stale copy of this
+/// number would starve the loop silently.
+inline constexpr int kFusedRowChunk = 8;
+
 /// Round boundaries that pay for themselves, from the arrival and departure
 /// profiles the use spans give.
 ///
@@ -1040,8 +1047,18 @@ inline std::vector<int> fused_round_plan(const std::vector<size_t>& arrivals,
     }
 
     // Two chunks per thread, so the dynamic schedule has something to balance
-    // with even in the round that ends up smallest.
-    const int min_rows = std::max(1, omp_get_max_threads() * 2 * 8);
+    // with even in the round that ends up smallest -- but never so large a
+    // floor that it vetoes the memory bound outright.
+    //
+    // The floor grows with the team and the rows do not: a cluster rank with
+    // 60 threads wants 960 rows per round, and at high rank counts it may own
+    // barely that many. Left absolute, the bound would silently vanish exactly
+    // where memory is tightest and thread counts are highest. Capping it at an
+    // eighth of the rank's rows keeps up to eight rounds reachable on any
+    // machine, and where the two disagree the memory bound wins -- a starved
+    // thread team is slow, an unbounded halo is fatal.
+    const int min_rows = std::max(
+        1, std::min(omp_get_max_threads() * 2 * kFusedRowChunk, n_rows / 8));
 
     size_t held = 0;       // fetched and not yet released
     size_t releasable = 0; // dead, but held until a boundary lets it go
@@ -1185,13 +1202,30 @@ inline bool fused_output_tiling_enabled() {
     return enabled;
 }
 
-/// Destination-column slice width, in block columns: ~384 blocks of 13x13
-/// complex<double> is ~1 MB of accumulator, the L2 the slice must live in.
-inline constexpr int kFusedOutputTileCols = 384;
-
-/// Rows narrower than this keep the single-pass path: their whole
-/// accumulator row is already cache-resident and slicing is pure overhead.
-inline constexpr int kFusedOutputTileMinWidth = 384;
+/// Destination-column slice width, in BLOCK columns, for an accumulator slice
+/// that stays in L2.
+///
+/// The invariant is bytes, not blocks: one slice is `cols * r_dim * c_dim *
+/// sizeof(T)`. Hardcoding 384 encoded three things at once -- this machine's
+/// L2, 13x13 blocks, and complex<double> -- and is wrong on any of BSR at
+/// bs 32, a real scalar type, or a different cache. Derive it instead, from
+/// the cache the machine reports and the block size actually in hand.
+inline int fused_output_tile_cols(int block_dim, size_t scalar_bytes) {
+    static const size_t l2_bytes = [] {
+#ifdef _SC_LEVEL2_CACHE_SIZE
+        const long reported = ::sysconf(_SC_LEVEL2_CACHE_SIZE);
+        if (reported > 0) return static_cast<size_t>(reported);
+#endif
+        return static_cast<size_t>(1) << 20;
+    }();
+    const size_t per_col =
+        std::max<size_t>(1, static_cast<size_t>(block_dim) *
+                                static_cast<size_t>(block_dim) * scalar_bytes);
+    const size_t cols = l2_bytes / per_col;
+    // Below a few dozen columns the re-walk per slice costs more than the
+    // locality it buys, whatever the cache says.
+    return static_cast<int>(std::max<size_t>(64, std::min<size_t>(cols, 1 << 20)));
+}
 
 /// Round boundaries need no minimum row count.
 ///

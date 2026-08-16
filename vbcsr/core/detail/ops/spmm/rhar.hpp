@@ -398,7 +398,7 @@ struct RhARExecutor {
                 return remote_b.pattern_width[static_cast<size_t>(g_row)];
             };
 
-            #pragma omp for schedule(dynamic, 8)
+            #pragma omp for schedule(dynamic, kFusedRowChunk)
             for (int i = row_lo; i < row_hi; ++i) {
                 const int g_row = ga.get_global_index(i);
                 const int r_dim = ga.block_sizes[i];

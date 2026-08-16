@@ -105,7 +105,7 @@ struct SquarePolynomialExecutor {
                 }
             };
 
-            #pragma omp for schedule(dynamic, 8)
+            #pragma omp for schedule(dynamic, kFusedRowChunk)
             for (int i = row_lo; i < row_hi; ++i) {
                 const int g_row = ga.get_global_index(i);
                 const int r_dim = ga.block_sizes[i];
@@ -152,8 +152,13 @@ struct SquarePolynomialExecutor {
                 // once (out-of-slice blocks are skipped on metadata alone,
                 // and eps skips are decided before any payload is read).
                 const int a_row_count_i = a_ptr[i + 1] - a_ptr[i];
+                // Slice width from the machine's L2 and THIS row's block dim,
+                // not from a constant that silently assumed 13x13
+                // complex<double> on one machine. A row narrower than a slice
+                // is already cache-resident, so slicing it is pure overhead.
+                const int tile_cols = fused_output_tile_cols(r_dim, sizeof(T));
                 const bool tile_output = fused_output_tiling_enabled() &&
-                                         a_row_count_i >= kFusedOutputTileMinWidth;
+                                         a_row_count_i >= tile_cols;
                 if (!tile_output) {
                     for (int ka = a_ptr[i]; ka < a_ptr[i + 1]; ++ka) {
                         const int g_mid = ga.get_global_index(a_ind[ka]);
@@ -186,9 +191,8 @@ struct SquarePolynomialExecutor {
                                   if (g_col >= reach_end) reach_end = g_col + 1;
                               });
                     }
-                    for (int t_lo = g_row; t_lo < reach_end; t_lo += kFusedOutputTileCols) {
-                        const int t_hi =
-                            std::min(reach_end, t_lo + kFusedOutputTileCols);
+                    for (int t_lo = g_row; t_lo < reach_end; t_lo += tile_cols) {
+                        const int t_hi = std::min(reach_end, t_lo + tile_cols);
                         for (int ka = a_ptr[i]; ka < a_ptr[i + 1]; ++ka) {
                             const int g_mid = ga.get_global_index(a_ind[ka]);
                             const int m_dim = ga.block_sizes[a_ind[ka]];
