@@ -383,7 +383,7 @@ struct SquarePolynomialExecutor {
                                                             static_cast<size_t>(bs_max) * sizeof(T)));
             std::vector<std::pair<int, int>> born;  // (birth row, global row)
             std::vector<size_t> arrivals(static_cast<size_t>(n_rows) + 1, 0);
-            std::vector<size_t> departures(static_cast<size_t>(n_rows) + 1, 0);
+            std::vector<int> max_death_at(static_cast<size_t>(n_rows) + 1, -1);
             for (size_t slot = 0; slot < col_ids.size(); ++slot) {
                 const int b = birth[slot];
                 if (b < 0) continue;
@@ -391,10 +391,12 @@ struct SquarePolynomialExecutor {
                 born.emplace_back(b, g);
                 const size_t blocks = kept_count(g);
                 arrivals[static_cast<size_t>(b)] += blocks;
-                departures[static_cast<size_t>(death[slot])] += blocks;
+                max_death_at[static_cast<size_t>(b)] =
+                    std::max(max_death_at[static_cast<size_t>(b)], death[slot]);
             }
             std::sort(born.begin(), born.end());
-            const bool refetch_halo = fused_must_refetch(arrivals, departures, n_rows, block_budget);
+            const FusedFetchPlan fetch_plan = fused_fetch_plan(arrivals, max_death_at, n_rows, block_budget);
+        const bool refetch_halo = fetch_plan.refetch;
 
             // Refetch regime: tiles whose own halo fits the budget, dropped
             // and re-fetched. Only when the live set itself does not fit --
@@ -438,7 +440,7 @@ struct SquarePolynomialExecutor {
                 }
                 reset_flags();
             } else {
-                tile_bound = fused_round_plan(arrivals, departures, n_rows, block_budget);
+                tile_bound = fetch_plan.bound;
             }
             tile_bound.push_back(n_rows);
 

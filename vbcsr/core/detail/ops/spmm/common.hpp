@@ -1031,114 +1031,83 @@ struct FusedDenseIds {
 inline constexpr int kFusedRowChunk = 8;
 
 
-/// Must this fetch re-read blocks to stay inside the budget?
+/// The fetch schedule: where to cut rounds, and whether streaming can hold the
+/// budget at all.
 ///
-/// There is one real fork. Normally a block crosses the network exactly once:
-/// fetched when its first reader arrives, released after its last, so
-/// residency follows the LIVE set. But the live set is a property of the
-/// input -- the pattern, the partition and the row order fix it -- and
-/// releasing is the only tool that schedule has. When even the live set
-/// exceeds the budget there is nothing left to release, so the only way to
-/// bound residency is to fetch per tile and drop it again, paying for some
-/// blocks more than once. Slow, and the alternative is being OOM-killed,
-/// which is what a 178k-atom job got when this returned false unconditionally.
+/// One simulation answers both, because they are the same question. Walk the
+/// output rows carrying `held` (fetched, not yet released) and `releasable`
+/// (dead, but held until a boundary lets it go). Cut a round exactly when the
+/// next row's arrivals would put `held` over the budget -- that is the fewest
+/// cuts that keep residency inside it, so rounds stay long and the numeric
+/// loop's thread team stays fed. If a cut releases everything releasable and
+/// `held` is STILL over, no release schedule can bound this fetch: the rows
+/// are all wanted at once, and the caller must re-fetch per tile instead.
 ///
-/// False therefore means "stream": one round if the whole reach fits, several
-/// if releases are needed along the way. A budget of 0 is the caller saying
-/// the reach fits and not to check -- it streams, unbounded.
-inline bool fused_must_refetch(const std::vector<size_t>& arrivals,
-                               const std::vector<size_t>& departures,
-                               int n_rows, size_t block_budget) {
-    if (block_budget == 0) return false;
-    size_t live = 0, peak_live = 0;
+/// Deciding feasibility by simulation rather than by comparing the budget to
+/// the theoretical live-set floor is the point. The floor is what a schedule
+/// could achieve with infinitely fine rounds; what a real schedule achieves is
+/// higher, because releases only happen at boundaries. Comparing against the
+/// floor reported "stream is enough" and then streamed 1.09 GB through a
+/// 0.75 GB budget -- the bound quietly not holding, which is how the previous
+/// version of this got a job OOM-killed.
+///
+/// A budget of 0 is the caller declaring the reach fits: one round, no checks.
+struct FusedFetchPlan {
+    std::vector<int> bound{0};  ///< round boundaries, starting at row 0
+    bool refetch = false;       ///< streaming cannot hold the budget
+};
+
+inline FusedFetchPlan fused_fetch_plan(const std::vector<size_t>& arrivals,
+                                       const std::vector<int>& max_death_at,
+                                       int n_rows, size_t block_budget) {
+    FusedFetchPlan plan;
+    if (block_budget == 0) return plan;
+
+    // Simulate what the RUNTIME does, which is coarser than releasing each row
+    // at its last reader: a round's arrivals share one arena, and that arena
+    // goes only when the longest-lived row in it is done. Modelling per-row
+    // release made the plan optimistic, and the bound then did not hold --
+    // 1.09 GB streamed through a 0.75 GB budget, reported as if it fit.
+    std::vector<std::pair<size_t, int>> open;  // (blocks, last reader row)
+    size_t held = 0;      // blocks in closed rounds still resident
+    size_t current = 0;   // blocks arriving for the round being built
+    int current_death = -1;
+
     for (int i = 0; i < n_rows; ++i) {
-        live += arrivals[static_cast<size_t>(i)];
-        peak_live = std::max(peak_live, live);
-        live -= departures[static_cast<size_t>(i)];
-    }
-    return peak_live > block_budget;
-}
-
-/// Round boundaries that pay for themselves, from the arrival and departure
-/// profiles the use spans give.
-///
-/// A boundary does exactly one thing: it releases the rows that have died
-/// since the last one. So it is worth cutting only where something HAS died
-/// and the halo is over budget -- residency can never fall below the live
-/// set, and cutting where nothing has died pays a round's latency for no
-/// memory at all. That case is not hypothetical: on a scattered ordering
-/// every remote row is needed by both the first output row and the last, the
-/// live set IS the union, and the budget-only plan this replaces cut 12
-/// rounds that freed nothing and cost 4 s each.
-///
-/// A round must also free ENOUGH to be worth its cost. Cutting on any death at
-/// all is nearly as bad as cutting on the budget alone: where deaths trickle in
-/// one row at a time, every row frees a little, stays over budget, and cuts
-/// again -- measured at 414 rounds on a 1024-row band, slower than one round by
-/// 4x. Requiring half a budget's worth caps the rounds at twice the union over
-/// the budget and makes each one a real release.
-///
-/// A round must also carry enough OUTPUT ROWS to fill the thread team. The
-/// numeric loop runs `schedule(dynamic, 8)` over the round's rows, so a round
-/// of 60 rows hands ~7 chunks to 12 threads and most of the team idles; split
-/// 17 ways, a 1024-row band spent 51.4 s mean in the numeric loop against
-/// 33.1 s as one round -- 55% more for identical arithmetic, with the rank
-/// spread widening from 1.2x to 1.85x. That, and not the transfer (1.7 s of a
-/// 100 s call), is what rounds actually cost.
-///
-/// `arrivals[i]` is what row i first needs, `departures[i]` what dies with it,
-/// both in blocks. Returns the row indices to cut at, starting with 0.
-inline std::vector<int> fused_round_plan(const std::vector<size_t>& arrivals,
-                                         const std::vector<size_t>& departures,
-                                         int n_rows, size_t block_budget) {
-    std::vector<int> bound{0};
-    if (block_budget == 0) return bound;
-
-    // One round only when the whole union fits. A round is also the ONLY
-    // thing that triggers a release, so "rounds cannot get below the live set"
-    // is not a reason to stop cutting them -- with one round nothing is
-    // released at all and residency is the union, which is how this returned a
-    // single round for a 250 GB halo and OOM'd a 178k-atom job that the
-    // re-fetching predecessor had survived. Where the live set itself does not
-    // fit, the caller re-fetches per tile instead (fused_must_refetch).
-    size_t union_blocks = 0, live = 0, peak_live = 0;
-    for (int i = 0; i < n_rows; ++i) {
-        live += arrivals[static_cast<size_t>(i)];
-        union_blocks += arrivals[static_cast<size_t>(i)];
-        peak_live = std::max(peak_live, live);
-        live -= departures[static_cast<size_t>(i)];
-    }
-    if (union_blocks <= block_budget) return bound;
-
-    // Two chunks per thread, so the dynamic schedule has something to balance
-    // with even in the round that ends up smallest -- but never so large a
-    // floor that it vetoes the memory bound outright.
-    //
-    // The floor grows with the team and the rows do not: a cluster rank with
-    // 60 threads wants 960 rows per round, and at high rank counts it may own
-    // barely that many. Left absolute, the bound would silently vanish exactly
-    // where memory is tightest and thread counts are highest. Capping it at an
-    // eighth of the rank's rows keeps up to eight rounds reachable on any
-    // machine, and where the two disagree the memory bound wins -- a starved
-    // thread team is slow, an unbounded halo is fatal.
-    const int min_rows = std::max(
-        1, std::min(omp_get_max_threads() * 2 * kFusedRowChunk, n_rows / 8));
-
-
-    size_t held = 0;       // fetched and not yet released
-    size_t releasable = 0; // dead, but held until a boundary lets it go
-    for (int i = 0; i < n_rows; ++i) {
-        if (held + arrivals[static_cast<size_t>(i)] > block_budget &&
-            releasable * 2 >= block_budget && i - bound.back() >= min_rows &&
-            n_rows - i >= min_rows) {
-            bound.push_back(i);
-            held -= releasable;
-            releasable = 0;
+        const size_t incoming = arrivals[static_cast<size_t>(i)];
+        if (held + current + incoming > block_budget) {
+            if (current > 0) {
+                open.emplace_back(current, current_death);
+                held += current;
+                current = 0;
+                current_death = -1;
+            }
+            size_t freed = 0;
+            std::vector<std::pair<size_t, int>> keep;
+            keep.reserve(open.size());
+            for (const auto& chunk : open) {
+                if (chunk.second < i) {
+                    freed += chunk.first;
+                } else {
+                    keep.push_back(chunk);
+                }
+            }
+            open.swap(keep);
+            held -= freed;
+            if (i > plan.bound.back()) plan.bound.push_back(i);
+            if (held + incoming > block_budget) {
+                // Nothing left to release and still over: streaming is out.
+                plan.refetch = true;
+                plan.bound.assign(1, 0);
+                return plan;
+            }
         }
-        held += arrivals[static_cast<size_t>(i)];
-        releasable += departures[static_cast<size_t>(i)];
+        current += incoming;
+        if (incoming > 0) {
+            current_death = std::max(current_death, max_death_at[static_cast<size_t>(i)]);
+        }
     }
-    return bound;
+    return plan;
 }
 
 /// Per-call halo accounting on stderr (VBCSR_FUSED_STATS).

@@ -698,7 +698,7 @@ struct RARhExecutor {
         // global index once per round.
         std::vector<std::pair<int, int>> b_born, a_born;  // (birth row, global row)
         std::vector<size_t> arrivals(static_cast<size_t>(n_rows) + 1, 0);
-        std::vector<size_t> departures(static_cast<size_t>(n_rows) + 1, 0);
+        std::vector<int> max_death_at(static_cast<size_t>(n_rows) + 1, -1);
         for (size_t slot = 0; slot < b_ids.size(); ++slot) {
             const int born_b = b_birth[slot];
             if (born_b < 0) continue;
@@ -706,7 +706,8 @@ struct RARhExecutor {
             b_born.emplace_back(born_b, g);
             const size_t blocks = kept_b(g);
             arrivals[static_cast<size_t>(born_b)] += blocks;
-            departures[static_cast<size_t>(b_death[slot])] += blocks;
+            max_death_at[static_cast<size_t>(born_b)] =
+                std::max(max_death_at[static_cast<size_t>(born_b)], b_death[slot]);
         }
         for (size_t slot = 0; slot < a_ids.size(); ++slot) {
             const int born_a = a_birth[slot];
@@ -715,11 +716,13 @@ struct RARhExecutor {
             a_born.emplace_back(born_a, g);
             const size_t blocks = kept_a(g);
             arrivals[static_cast<size_t>(born_a)] += blocks;
-            departures[static_cast<size_t>(a_death[slot])] += blocks;
+            max_death_at[static_cast<size_t>(born_a)] =
+                std::max(max_death_at[static_cast<size_t>(born_a)], a_death[slot]);
         }
         std::sort(b_born.begin(), b_born.end());
         std::sort(a_born.begin(), a_born.end());
-        const bool refetch_halo = fused_must_refetch(arrivals, departures, n_rows, block_budget);
+        const FusedFetchPlan fetch_plan = fused_fetch_plan(arrivals, max_death_at, n_rows, block_budget);
+        const bool refetch_halo = fetch_plan.refetch;
 
         // ---- Refetch regime: tiles whose OWN halo fits the budget, dropped
         // and re-fetched per tile. Reached only when the live set itself does
@@ -790,7 +793,7 @@ struct RARhExecutor {
             }
             reset_flags();
         } else {
-            tile_bound = fused_round_plan(arrivals, departures, n_rows, block_budget);
+            tile_bound = fetch_plan.bound;
         }
         tile_bound.push_back(n_rows);
 
