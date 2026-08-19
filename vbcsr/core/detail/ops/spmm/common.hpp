@@ -1227,42 +1227,48 @@ inline size_t fused_tile_budget_bytes(MPI_Comm comm = MPI_COMM_NULL) {
         return static_cast<size_t>(mb) << 20;
     }
 
-    // Otherwise derive it from the memory a rank actually has. A fixed 512 MB
-    // default was set with no reference to the machine: on a 250 GiB node it
-    // asks for hundreds of re-fetching rounds where a handful would do. Take
-    // the node's RAM, divide by the ranks sharing it, and keep a quarter for
-    // one round's halo -- operands, answer and staging need the rest.
-    static const size_t derived = [comm]() -> size_t {
-        size_t mem_total = 0;
-        if (std::FILE* f = std::fopen("/proc/meminfo", "r")) {
-            char label[64];
-            unsigned long long kb = 0;
-            while (std::fscanf(f, "%63s %llu kB\n", label, &kb) == 2) {
-                if (std::strncmp(label, "MemTotal", 8) == 0) {
-                    mem_total = static_cast<size_t>(kb) * 1024;
-                    break;
-                }
-            }
-            std::fclose(f);
-        }
-        if (mem_total == 0) return size_t(512) << 20;
-
-        int local_ranks = 1;
-        int initialized = 0;
+    // Otherwise derive it from the memory that is actually FREE, now.
+    //
+    // MemTotal, read once, was wrong in the way that matters: it answers "what
+    // could a rank have had" and the halo is fetched when the loop is already
+    // holding its operands and staging its result. On a 250 GiB node it kept
+    // offering 62 GiB to a kernel whose operands and output already needed
+    // ~210. MemAvailable, read per call, answers "what is left", so the budget
+    // shrinks as the step fills up.
+    //
+    // Still only the halo. The operands, the staged result and the rest of the
+    // Newton-Schulz working set are outside it, so this bounds one term of the
+    // footprint and cannot rescue a rank count that is too small for the rest.
+    static const int local_ranks = [comm]() -> int {
+        int ranks = 1, initialized = 0;
         MPI_Initialized(&initialized);
         if (initialized && comm != MPI_COMM_NULL) {
             MPI_Comm shared = MPI_COMM_NULL;
             if (MPI_Comm_split_type(comm, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL,
                                     &shared) == MPI_SUCCESS &&
                 shared != MPI_COMM_NULL) {
-                MPI_Comm_size(shared, &local_ranks);
+                MPI_Comm_size(shared, &ranks);
                 MPI_Comm_free(&shared);
             }
         }
-        const size_t per_rank = mem_total / static_cast<size_t>(std::max(1, local_ranks));
-        return std::max<size_t>(size_t(256) << 20, per_rank / 4);
+        return std::max(1, ranks);
     }();
-    return derived;
+
+    size_t available = 0;
+    if (std::FILE* f = std::fopen("/proc/meminfo", "r")) {
+        char label[64];
+        unsigned long long kb = 0;
+        while (std::fscanf(f, "%63s %llu kB\n", label, &kb) == 2) {
+            if (std::strncmp(label, "MemAvailable", 12) == 0) {
+                available = static_cast<size_t>(kb) * 1024;
+                break;
+            }
+        }
+        std::fclose(f);
+    }
+    if (available == 0) return size_t(512) << 20;
+    return std::max<size_t>(size_t(256) << 20,
+                            available / static_cast<size_t>(local_ranks) / 4);
 }
 
 /// Output-column tiling of the fused numeric pass (VBCSR_FUSED_OUTPUT_TILE,
