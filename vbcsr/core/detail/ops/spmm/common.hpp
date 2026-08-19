@@ -56,48 +56,6 @@ inline double profile_rss_gb() {
     return static_cast<double>(resident) * page_bytes / 1073741824.0;
 }
 
-/// Hand a staged row's physical pages back to the OS, then drop the vector.
-///
-/// `std::vector<T>().swap(v)` releases the capacity to the ALLOCATOR, which is
-/// not the same as releasing it to the kernel, and on the staged rows of a
-/// fused product the difference is most of the peak. glibc returns a large
-/// block by munmap only while it is above the mmap threshold, and that
-/// threshold is DYNAMIC: freeing one mmapped chunk raises it to that chunk's
-/// size, so the first staged row returned is also the last one returned --
-/// every row after it is served from the arena and its free() is bookkeeping.
-/// Measured on a 4096-block product with 200 neighbours per row: the copy pass
-/// wrote a 5.72 GB result while freeing 5.72 GB of staging and RSS still rose
-/// 3.9 GB.
-///
-/// MADV_DONTNEED is the same instrument PagedBuffer::release_pages_before uses,
-/// for the same reason, and it is a statement to the kernel rather than to
-/// malloc: the mapping and the pointer stay valid, the physical pages go, and a
-/// later touch faults in zeroes. That is exactly the contract free() needs --
-/// it writes its own metadata into the chunk afterwards (a page or two, faulted
-/// straight back) and never reads what the caller left there.
-///
-/// Interior pages only: the partial pages at either end may be shared with a
-/// neighbouring live allocation, and MADV_DONTNEED would discard that too.
-template <typename T>
-inline void release_and_drop(std::vector<T>& v) {
-#ifdef __linux__
-    if (!v.empty()) {
-        static const long os_page = ::sysconf(_SC_PAGESIZE);
-        if (os_page > 0) {
-            const uintptr_t mask = static_cast<uintptr_t>(os_page) - 1;
-            const uintptr_t begin = reinterpret_cast<uintptr_t>(v.data());
-            const uintptr_t end = begin + v.size() * sizeof(T);
-            const uintptr_t lo = (begin + mask) & ~mask;
-            const uintptr_t hi = end & ~mask;
-            if (hi > lo) {
-                ::madvise(reinterpret_cast<void*>(lo), static_cast<size_t>(hi - lo),
-                          MADV_DONTNEED);
-            }
-        }
-    }
-#endif
-    std::vector<T>().swap(v);
-}
 
 // ---------------------------------------------------------------------------
 // Block-product dispatch, shared by every SpGEMM-shaped kernel here.
@@ -1030,6 +988,23 @@ struct FusedDenseIds {
 /// number would starve the loop silently.
 inline constexpr int kFusedRowChunk = 8;
 
+
+/// Blocks one round may hold, from a byte budget.
+///
+/// HALVED, because a fetch peaks at about twice the arena it produces: the
+/// received blob and the arena being filled from it are both live through the
+/// unpack. Charging only the arena is what let a "62 GB" budget put ~124 GB of
+/// transient buffers on a node beside 176 GB of operands -- a peak comfortably
+/// under the limit on paper and over it in practice. (The blob this rank
+/// SERVES used to be live here too; it is released the moment the exchange
+/// returns, which is the third copy gone.)
+inline size_t fused_block_budget(size_t budget_bytes, int bs_max,
+                                 size_t scalar_bytes) {
+    if (budget_bytes == 0) return 0;
+    const size_t per_block = std::max<size_t>(
+        1, static_cast<size_t>(bs_max) * static_cast<size_t>(bs_max) * scalar_bytes);
+    return std::max<size_t>(1, budget_bytes / per_block / 2);
+}
 
 /// The fetch schedule: where to cut rounds, and whether streaming can hold the
 /// budget at all.

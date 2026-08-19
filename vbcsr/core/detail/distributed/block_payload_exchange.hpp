@@ -386,6 +386,12 @@ FetchedBlockContext<typename Matrix::value_type> fetch_blocks_by_row_columns(
     } else {
         resp_recv_blob = resp_send_blob;
     }
+    // What this rank SERVES is dead the moment the exchange returns, and it is
+    // the same order of size as what it receives. Holding it through the
+    // unpack put three copies of a fused kernel's halo on the node at once --
+    // the served blob, the received blob, and the arena being filled from it.
+    // Physically back to the OS, not just to malloc's free list.
+    release_and_drop(resp_send_blob);
 
     // Unpack in two passes: a serial header walk that records every remote
     // block's metadata and payload location (touching no payload bytes),

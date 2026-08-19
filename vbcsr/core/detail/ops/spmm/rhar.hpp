@@ -838,10 +838,7 @@ struct RhARExecutor {
         int bs_max = 1;
         for (int s : ga.block_sizes) bs_max = std::max(bs_max, s);
         const size_t budget = fused_tile_budget_bytes(ga.comm);
-        const size_t block_budget =
-            budget == 0 ? 0
-                        : std::max<size_t>(1, budget / (static_cast<size_t>(bs_max) *
-                                                        static_cast<size_t>(bs_max) * sizeof(T)));
+        const size_t block_budget = fused_block_budget(budget, bs_max, sizeof(T));
         std::vector<std::pair<int, int>> b_born, a_born;  // (birth row, global row)
         std::vector<size_t> arrivals(static_cast<size_t>(n_rows) + 1, 0);
         std::vector<int> max_death_at(static_cast<size_t>(n_rows) + 1, -1);
