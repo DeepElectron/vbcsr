@@ -688,7 +688,7 @@ struct RARhExecutor {
         // can make a round repeat what an earlier round already brought in.
         int bs_max = 1;
         for (int s : ga.block_sizes) bs_max = std::max(bs_max, s);
-        const size_t budget = fused_tile_budget_bytes();
+        const size_t budget = fused_tile_budget_bytes(ga.comm);
         const size_t block_budget =
             budget == 0 ? 0
                         : std::max<size_t>(1, budget / (static_cast<size_t>(bs_max) *
@@ -719,8 +719,80 @@ struct RARhExecutor {
         }
         std::sort(b_born.begin(), b_born.end());
         std::sort(a_born.begin(), a_born.end());
-        std::vector<int> tile_bound =
-            fused_round_plan(arrivals, departures, n_rows, block_budget);
+        const FusedPlanMode plan_mode =
+            fused_plan_mode(arrivals, departures, n_rows, block_budget);
+
+        // ---- Refetch regime: tiles whose OWN halo fits the budget, dropped
+        // and re-fetched per tile. Reached only when the live set itself does
+        // not fit, where no release schedule can bound residency and the
+        // choice is between paying for a block twice and being OOM-killed.
+        const int b_local_rows = static_cast<int>(gb.adj_ptr.size()) - 1;
+        std::vector<char> bflag(b_ids.size(), 0), aflag(a_ids.size(), 0);
+        std::vector<char> midflag(static_cast<size_t>(std::max(0, b_local_rows)), 0);
+        std::vector<int> btouched, atouched, midtouched;
+        const auto reset_flags = [&] {
+            for (int t : btouched) bflag[static_cast<size_t>(t)] = 0;
+            for (int t : atouched) aflag[static_cast<size_t>(t)] = 0;
+            for (int t : midtouched) midflag[static_cast<size_t>(t)] = 0;
+            btouched.clear();
+            atouched.clear();
+            midtouched.clear();
+        };
+        // One output row's reach, deduplicated against the tile so far.
+        const auto walk_row = [&](int i, auto&& on_b_row, auto&& on_a_row) {
+            for (int k = ga.adj_ptr[i]; k < ga.adj_ptr[i + 1]; ++k) {
+                const int g_mid = ga.get_global_index(ga.adj_ind[k]);
+                const int s_b = b_ids.of(g_mid);
+                if (s_b >= 0) {
+                    if (bflag[static_cast<size_t>(s_b)]) continue;
+                    bflag[static_cast<size_t>(s_b)] = 1;
+                    btouched.push_back(s_b);
+                    on_b_row(g_mid);
+                } else {
+                    auto local = gb.global_to_local.find(g_mid);
+                    if (local == gb.global_to_local.end() ||
+                        local->second >= b_local_rows) {
+                        continue;
+                    }
+                    if (midflag[static_cast<size_t>(local->second)]) continue;
+                    midflag[static_cast<size_t>(local->second)] = 1;
+                    midtouched.push_back(local->second);
+                }
+                for_each_kept_b_entry(g_mid, [&](int l, size_t entry) {
+                    const int s_a = entry_aslot[entry];
+                    if (s_a < 0 || aflag[static_cast<size_t>(s_a)]) return;
+                    aflag[static_cast<size_t>(s_a)] = 1;
+                    atouched.push_back(s_a);
+                    on_a_row(l);
+                });
+            }
+        };
+
+        std::vector<int> tile_bound;
+        if (plan_mode == FusedPlanMode::kRefetch) {
+            tile_bound.push_back(0);
+            const auto charge = [&](int i) -> size_t {
+                size_t c = 0;
+                walk_row(i, [&](int g) { c += kept_b(g); },
+                         [&](int l) { c += kept_a(l); });
+                return c;
+            };
+            size_t acc = 0;
+            for (int i = 0; i < n_rows; ++i) {
+                size_t row_cost = charge(i);
+                if (acc > 0 && acc + row_cost > block_budget &&
+                    i - tile_bound.back() >= kFusedRowChunk) {
+                    tile_bound.push_back(i);
+                    reset_flags();
+                    acc = 0;
+                    row_cost = charge(i);
+                }
+                acc += row_cost;
+            }
+            reset_flags();
+        } else {
+            tile_bound = fused_round_plan(arrivals, departures, n_rows, block_budget);
+        }
         tile_bound.push_back(n_rows);
 
         // The rounds are COLLECTIVE (two payload fetches each), so a rank
@@ -760,7 +832,35 @@ struct RARhExecutor {
             // arrived and is still held, or is not needed yet.
             std::vector<BlockID> want_b, want_a;
             long long death_b = r, death_a = r;
-            for (; b_cursor < b_born.size() && b_born[b_cursor].first < hi; ++b_cursor) {
+            if (plan_mode == FusedPlanMode::kRefetch) {
+                // Everything this tile reads, and everything goes at its end.
+                for (int i = lo; i < hi; ++i) {
+                    walk_row(
+                        i,
+                        [&](int g) {
+                            auto it = meta_b.find(g);
+                            if (it == meta_b.end()) return;
+                            const double gate =
+                                gate_b(g, static_cast<int>(it->second.size()));
+                            for (const auto& m : it->second) {
+                                if (m.norm >= gate) want_b.push_back(BlockID{g, m.col});
+                            }
+                        },
+                        [&](int l) {
+                            auto it = meta_a.find(l);
+                            if (it == meta_a.end()) return;
+                            const double gate = gate_a(l);
+                            for (const auto& m : it->second) {
+                                if (m.col >= min_owned_row && m.norm >= gate) {
+                                    want_a.push_back(BlockID{l, m.col});
+                                }
+                            }
+                        });
+                }
+                reset_flags();
+            }
+            for (; plan_mode != FusedPlanMode::kRefetch &&
+                   b_cursor < b_born.size() && b_born[b_cursor].first < hi; ++b_cursor) {
                 const int g = b_born[b_cursor].second;
                 auto it = meta_b.find(g);
                 if (it != meta_b.end()) {
@@ -772,7 +872,8 @@ struct RARhExecutor {
                 death_b = std::max(death_b,
                                    round_of_row(b_death[static_cast<size_t>(b_ids.of(g))]));
             }
-            for (; a_cursor < a_born.size() && a_born[a_cursor].first < hi; ++a_cursor) {
+            for (; plan_mode != FusedPlanMode::kRefetch &&
+                   a_cursor < a_born.size() && a_born[a_cursor].first < hi; ++a_cursor) {
                 const int g = a_born[a_cursor].second;
                 auto it = meta_a.find(g);
                 if (it != meta_a.end()) {
@@ -822,7 +923,7 @@ struct RARhExecutor {
                           halo_b.peak_live_blocks + halo_a.peak_live_blocks,
                           A.get_block_norms().size(),
                           static_cast<size_t>(bs_max) * static_cast<size_t>(bs_max) * sizeof(T),
-                          secs_fetch, secs_numeric);
+                          secs_fetch, secs_numeric, plan_mode);
         if (fused_halo_stats_enabled()) {
             double w = secs_wait, wmax = 0.0;
             MPI_Reduce(&w, &wmax, 1, MPI_DOUBLE, MPI_MAX, 0, ga.comm);

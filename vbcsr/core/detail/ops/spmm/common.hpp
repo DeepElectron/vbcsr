@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <complex>
 #include <type_traits>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <unistd.h>
@@ -21,6 +22,7 @@
 #include <stdexcept>
 #include <utility>
 #include <vector>
+#include <mpi.h>
 #include <omp.h>
 #ifdef __linux__
 #include <sys/mman.h>
@@ -1028,6 +1030,39 @@ struct FusedDenseIds {
 /// number would starve the loop silently.
 inline constexpr int kFusedRowChunk = 8;
 
+
+/// Which of the three regimes a fetch is in.
+///
+/// They are genuinely different, and collapsing any two of them breaks
+/// something:
+///
+///   kSingleRound  the union fits the budget. Fetch it once, hold it, done.
+///   kStream       the union does not fit but the LIVE set does. Cut rounds at
+///                 release points: every block still crosses the network
+///                 exactly once, and residency follows the live set.
+///   kRefetch      not even the live set fits. No release schedule can help --
+///                 the rows are all wanted at once -- so the only way to bound
+///                 residency is to fetch per tile and drop it again, paying
+///                 the same block more than once. Slow, and the alternative is
+///                 being killed.
+enum class FusedPlanMode { kUnbounded, kSingleRound, kStream, kRefetch };
+
+inline FusedPlanMode fused_plan_mode(const std::vector<size_t>& arrivals,
+                                     const std::vector<size_t>& departures,
+                                     int n_rows, size_t block_budget) {
+    if (block_budget == 0) return FusedPlanMode::kUnbounded;
+    size_t union_blocks = 0, live = 0, peak_live = 0;
+    for (int i = 0; i < n_rows; ++i) {
+        live += arrivals[static_cast<size_t>(i)];
+        union_blocks += arrivals[static_cast<size_t>(i)];
+        peak_live = std::max(peak_live, live);
+        live -= departures[static_cast<size_t>(i)];
+    }
+    if (union_blocks <= block_budget) return FusedPlanMode::kSingleRound;
+    if (peak_live <= block_budget) return FusedPlanMode::kStream;
+    return FusedPlanMode::kRefetch;
+}
+
 /// Round boundaries that pay for themselves, from the arrival and departure
 /// profiles the use spans give.
 ///
@@ -1063,11 +1098,13 @@ inline std::vector<int> fused_round_plan(const std::vector<size_t>& arrivals,
     std::vector<int> bound{0};
     if (block_budget == 0) return bound;
 
-    // What the ORDERING already forces to coexist. A round can release only
-    // what has died, so no schedule holds less than this, and where it is the
-    // whole union -- a scattered order, where the first output row and the
-    // last need the same remote rows -- every boundary is latency spent for
-    // no memory. One round, and let the stats line say why.
+    // One round only when the whole union fits. A round is also the ONLY
+    // thing that triggers a release, so "rounds cannot get below the live set"
+    // is not a reason to stop cutting them -- with one round nothing is
+    // released at all and residency is the union, which is how this returned a
+    // single round for a 250 GB halo and OOM'd a 178k-atom job that the
+    // re-fetching predecessor had survived. Where the live set itself does not
+    // fit, the caller runs kRefetch instead (fused_plan_mode).
     size_t union_blocks = 0, live = 0, peak_live = 0;
     for (int i = 0; i < n_rows; ++i) {
         live += arrivals[static_cast<size_t>(i)];
@@ -1075,9 +1112,7 @@ inline std::vector<int> fused_round_plan(const std::vector<size_t>& arrivals,
         peak_live = std::max(peak_live, live);
         live -= departures[static_cast<size_t>(i)];
     }
-    if (union_blocks <= block_budget || peak_live + block_budget > union_blocks) {
-        return bound;
-    }
+    if (union_blocks <= block_budget) return bound;
 
     // Two chunks per thread, so the dynamic schedule has something to balance
     // with even in the round that ends up smallest -- but never so large a
@@ -1092,6 +1127,7 @@ inline std::vector<int> fused_round_plan(const std::vector<size_t>& arrivals,
     // thread team is slow, an unbounded halo is fatal.
     const int min_rows = std::max(
         1, std::min(omp_get_max_threads() * 2 * kFusedRowChunk, n_rows / 8));
+
 
     size_t held = 0;       // fetched and not yet released
     size_t releasable = 0; // dead, but held until a boundary lets it go
@@ -1125,7 +1161,7 @@ inline void fused_report_halo(const char* kernel, MPI_Comm comm, int rank,
                               long long rounds, size_t fetched_blocks,
                               size_t peak_live_blocks, size_t local_blocks,
                               size_t block_bytes, double secs_fetch,
-                              double secs_numeric) {
+                              double secs_numeric, FusedPlanMode mode) {
     if (!fused_halo_stats_enabled()) return;
     long long mine[3] = {static_cast<long long>(fetched_blocks),
                          static_cast<long long>(peak_live_blocks),
@@ -1145,10 +1181,16 @@ inline void fused_report_halo(const char* kernel, MPI_Comm comm, int rank,
     const double cv_over_mem =
         worst[2] > 0 ? static_cast<double>(worst[0]) / static_cast<double>(worst[2]) : 0.0;
     std::fprintf(stderr,
-                 "VBCSR_FUSED_STATS %s rounds=%lld fetched=%.2f GB live=%.2f GB "
-                 "local=%.2f GB CV/memA=%.0f%% fetch=%.1fs "
+                 "VBCSR_FUSED_STATS %s mode=%s rounds=%lld fetched=%.2f GB "
+                 "live=%.2f GB local=%.2f GB CV/memA=%.0f%% fetch=%.1fs "
                  "numeric max/mean/min=%.1f/%.1f/%.1fs\n",
-                 kernel, rounds, static_cast<double>(worst[0]) * to_gb,
+                 kernel,
+                 mode == FusedPlanMode::kUnbounded
+                     ? "UNBOUNDED(VBCSR_FUSED_TILE_MB=0)"
+                     : (mode == FusedPlanMode::kSingleRound
+                            ? "single(reach fits budget)"
+                            : (mode == FusedPlanMode::kStream ? "stream" : "refetch")),
+                 rounds, static_cast<double>(worst[0]) * to_gb,
                  static_cast<double>(worst[1]) * to_gb,
                  static_cast<double>(worst[2]) * to_gb, cv_over_mem * 100.0,
                  secs_worst[0], secs_worst[1], secs_sum[1] / nranks, secs_min[1]);
@@ -1209,14 +1251,54 @@ inline std::vector<BlockID> fused_gated_blocks_of(const GhostMetadata& patterns,
 /// does. Residency is the live set, which the ordering fixes and no budget can
 /// move. Smaller budgets buy finer release granularity at more rounds; they
 /// cannot buy back a live set the partition insists on.
-inline size_t fused_tile_budget_bytes() {
+inline size_t fused_tile_budget_bytes(MPI_Comm comm = MPI_COMM_NULL) {
+    // Explicit wins, including 0 -- which means "hold the whole reach, I know
+    // it fits". That is a real option and a loaded gun: it is what a 178k-atom
+    // job was run with, and holding the union halo took the node past 250 GiB
+    // and got it OOM-killed.
     const char* env = std::getenv("VBCSR_FUSED_TILE_MB");
     if (env != nullptr) {
         const long long mb = std::atoll(env);
         if (mb <= 0) return 0;
         return static_cast<size_t>(mb) << 20;
     }
-    return size_t(512) << 20;
+
+    // Otherwise derive it from the memory a rank actually has. A fixed 512 MB
+    // default was set with no reference to the machine: on a 250 GiB node it
+    // asks for hundreds of re-fetching rounds where a handful would do. Take
+    // the node's RAM, divide by the ranks sharing it, and keep a quarter for
+    // one round's halo -- operands, answer and staging need the rest.
+    static const size_t derived = [comm]() -> size_t {
+        size_t mem_total = 0;
+        if (std::FILE* f = std::fopen("/proc/meminfo", "r")) {
+            char label[64];
+            unsigned long long kb = 0;
+            while (std::fscanf(f, "%63s %llu kB\n", label, &kb) == 2) {
+                if (std::strncmp(label, "MemTotal", 8) == 0) {
+                    mem_total = static_cast<size_t>(kb) * 1024;
+                    break;
+                }
+            }
+            std::fclose(f);
+        }
+        if (mem_total == 0) return size_t(512) << 20;
+
+        int local_ranks = 1;
+        int initialized = 0;
+        MPI_Initialized(&initialized);
+        if (initialized && comm != MPI_COMM_NULL) {
+            MPI_Comm shared = MPI_COMM_NULL;
+            if (MPI_Comm_split_type(comm, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL,
+                                    &shared) == MPI_SUCCESS &&
+                shared != MPI_COMM_NULL) {
+                MPI_Comm_size(shared, &local_ranks);
+                MPI_Comm_free(&shared);
+            }
+        }
+        const size_t per_rank = mem_total / static_cast<size_t>(std::max(1, local_ranks));
+        return std::max<size_t>(size_t(256) << 20, per_rank / 4);
+    }();
+    return derived;
 }
 
 /// Output-column tiling of the fused numeric pass (VBCSR_FUSED_OUTPUT_TILE,
