@@ -1037,7 +1037,7 @@ struct RhARExecutor {
                           halo_b.peak_live_blocks + halo_a.peak_live_blocks,
                           A.get_block_norms().size(),
                           static_cast<size_t>(bs_max) * static_cast<size_t>(bs_max) * sizeof(T),
-                          secs_fetch, secs_numeric, budget, refetch_halo);
+                          secs_fetch, secs_numeric, block_budget, refetch_halo);
         int any_missing = missing_row;
         MPI_Allreduce(&missing_row, &any_missing, 1, MPI_INT, MPI_MAX, ga.comm);
         if (any_missing) {

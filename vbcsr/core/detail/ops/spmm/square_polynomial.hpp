@@ -513,7 +513,7 @@ struct SquarePolynomialExecutor {
                               a_norms.size(),
                               static_cast<size_t>(bs_max) * static_cast<size_t>(bs_max) *
                                   sizeof(T),
-                              secs_fetch, secs_numeric, budget, refetch_halo);
+                              secs_fetch, secs_numeric, block_budget, refetch_halo);
         } else {
             RemoteRows none;
             fused_rows(A, c2, c1, c0, threshold, none, a_row, n_global,

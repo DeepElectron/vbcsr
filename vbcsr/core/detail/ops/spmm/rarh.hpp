@@ -922,7 +922,7 @@ struct RARhExecutor {
                           halo_b.peak_live_blocks + halo_a.peak_live_blocks,
                           A.get_block_norms().size(),
                           static_cast<size_t>(bs_max) * static_cast<size_t>(bs_max) * sizeof(T),
-                          secs_fetch, secs_numeric, budget, refetch_halo);
+                          secs_fetch, secs_numeric, block_budget, refetch_halo);
         if (fused_halo_stats_enabled()) {
             double w = secs_wait, wmax = 0.0;
             MPI_Reduce(&w, &wmax, 1, MPI_DOUBLE, MPI_MAX, 0, ga.comm);

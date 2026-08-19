@@ -411,23 +411,16 @@ FetchedBlockContext<typename Matrix::value_type> fetch_blocks_by_row_columns(
         // segments.
     }
 
+    // The blob IS the arena. The copy this replaces made the payload exist
+    // twice at once -- blob and arena both live across the memcpy -- so the
+    // fetch peaked at double what it delivered, and a full pass over the halo
+    // was spent moving bytes that were already in the right layout.
     const size_t remote_blocks = ctx.blocks.size() - local_blocks;
-    std::vector<size_t> arena_offset(remote_blocks + 1, 0);
+    ctx.arena = std::move(resp_recv_blob);
     for (size_t b = 0; b < remote_blocks; ++b) {
-        const auto& blk = ctx.blocks[local_blocks + b];
-        arena_offset[b + 1] =
-            arena_offset[b] + static_cast<size_t>(blk.r_dim) * blk.c_dim;
-    }
-    ctx.arena.resize(arena_offset[remote_blocks]);
-    #pragma omp parallel for schedule(static)
-    for (long long b = 0; b < static_cast<long long>(remote_blocks); ++b) {
-        auto& blk = ctx.blocks[local_blocks + static_cast<size_t>(b)];
-        T* dest = ctx.arena.data() + arena_offset[static_cast<size_t>(b)];
-        std::memcpy(dest,
-                    resp_recv_blob.data() + blob_offset[static_cast<size_t>(b)],
-                    (arena_offset[static_cast<size_t>(b) + 1] -
-                     arena_offset[static_cast<size_t>(b)]) * sizeof(T));
-        blk.data = dest;
+        auto& blk = ctx.blocks[local_blocks + b];
+        blk.data = reinterpret_cast<const T*>(ctx.arena.data() +
+                                             blob_offset[b]);
     }
 
     return ctx;

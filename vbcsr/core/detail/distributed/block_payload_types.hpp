@@ -1,6 +1,7 @@
 #ifndef VBCSR_DETAIL_DISTRIBUTED_BLOCK_PAYLOAD_TYPES_HPP
 #define VBCSR_DETAIL_DISTRIBUTED_BLOCK_PAYLOAD_TYPES_HPP
 
+#include <cstdint>
 #include <cstdlib>
 #include <map>
 #include <unistd.h>
@@ -101,7 +102,17 @@ struct FetchedBlockContext {
     // replaces one heap vector per fetched block -- at halo scale, tens of
     // millions of allocations and a serial copy loop -- with a single sized
     // arena filled by a parallel copy.
-    std::vector<T> arena;
+    // The received response blob itself, kept as the owning storage: block
+    // refs point INTO it. Copying it out into a typed arena doubled the peak
+    // of every fetch, because the blob and the arena were both live through
+    // the copy, and a budget that charged only the arena was therefore
+    // measuring half of what the fetch actually held.
+    //
+    // Pointing into it is safe: payload offsets inside the blob are 8-aligned
+    // (the header is 4 + 8*rows + 4 bytes, each block adds 16, and a payload
+    // is r*c*sizeof(T)), and alignof(std::complex<double>) is 8. The values
+    // were memcpy'd in by the sender, which is the same access this makes.
+    std::vector<char> arena;
 };
 
 } // namespace detail

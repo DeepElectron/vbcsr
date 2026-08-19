@@ -341,9 +341,9 @@ using GhostMetadata = std::map<int, std::vector<BlockMeta>>;
 template <typename T>
 struct SpMMGhostBlocks {
     std::vector<FetchedBlockRef<T>> owned_blocks;
-    // Owns the remote payloads owned_blocks/rows point into (local blocks
-    // point into the source matrix; see FetchedBlockRef).
-    std::vector<T> arena;
+    // Owns the remote payloads owned_blocks/rows point into, as the received
+    // bytes (local blocks point into the source matrix; see FetchedBlockRef).
+    std::vector<char> arena;
     GhostSizes sizes;
     std::map<int, std::vector<GhostBlockRef<T>>> rows;
 };
@@ -896,7 +896,7 @@ struct FusedHaloStream {
 
     /// One round's delivery, held until the last row in it dies.
     struct Chunk {
-        std::vector<T> arena;
+        std::vector<char> arena;
         std::vector<int> row_ids;
         long long death_round = -1;
     };
@@ -991,13 +991,13 @@ inline constexpr int kFusedRowChunk = 8;
 
 /// Blocks one round may hold, from a byte budget.
 ///
-/// HALVED, because a fetch peaks at about twice the arena it produces: the
-/// received blob and the arena being filled from it are both live through the
-/// unpack. Charging only the arena is what let a "62 GB" budget put ~124 GB of
-/// transient buffers on a node beside 176 GB of operands -- a peak comfortably
-/// under the limit on paper and over it in practice. (The blob this rank
-/// SERVES used to be live here too; it is released the moment the exchange
-/// returns, which is the third copy gone.)
+/// HALVED, because a fetch peaks at about twice what it delivers: the blob a
+/// rank SERVES its peers and the blob it RECEIVES are both live across the
+/// exchange, and on a symmetric pattern they are comparable. Charging one of
+/// two is what let a "62 GB" budget put well over 100 GB of transient buffers
+/// on a node beside 176 GB of operands -- a peak under the limit on paper and
+/// over it in practice. (There used to be a third copy, the typed arena the
+/// received blob was unpacked into; refs now point into the blob itself.)
 inline size_t fused_block_budget(size_t budget_bytes, int bs_max,
                                  size_t scalar_bytes) {
     if (budget_bytes == 0) return 0;
@@ -1122,13 +1122,15 @@ inline void fused_report_halo(const char* kernel, MPI_Comm comm, int rank,
     const double cv_over_mem =
         worst[2] > 0 ? static_cast<double>(worst[0]) / static_cast<double>(worst[2]) : 0.0;
     std::fprintf(stderr,
-                 "VBCSR_FUSED_STATS %s mode=%s rounds=%lld fetched=%.2f GB "
+                 "VBCSR_FUSED_STATS %s mode=%s budget=%.2f GB rounds=%lld "
+                 "fetched=%.2f GB "
                  "live=%.2f GB local=%.2f GB CV/memA=%.0f%% fetch=%.1fs "
                  "numeric max/mean/min=%.1f/%.1f/%.1fs\n",
                  kernel,
                  block_budget == 0 ? "UNBOUNDED(VBCSR_FUSED_TILE_MB=0)"
                                    : (refetch ? "refetch"
                                               : (rounds == 1 ? "single" : "stream")),
+                 static_cast<double>(block_budget) * to_gb,
                  rounds, static_cast<double>(worst[0]) * to_gb,
                  static_cast<double>(worst[1]) * to_gb,
                  static_cast<double>(worst[2]) * to_gb, cv_over_mem * 100.0,
