@@ -394,13 +394,12 @@ struct SquarePolynomialExecutor {
                 departures[static_cast<size_t>(death[slot])] += blocks;
             }
             std::sort(born.begin(), born.end());
-            const FusedPlanMode plan_mode =
-                fused_plan_mode(arrivals, departures, n_rows, block_budget);
+            const bool refetch_halo = fused_must_refetch(arrivals, departures, n_rows, block_budget);
 
             // Refetch regime: tiles whose own halo fits the budget, dropped
             // and re-fetched. Only when the live set itself does not fit --
             // there no release schedule bounds residency, and one round would
-            // hold the whole union (see fused_plan_mode).
+            // hold the whole union (see fused_must_refetch).
             std::vector<char> colflag(col_ids.size(), 0);
             std::vector<int> coltouched;
             const auto reset_flags = [&] {
@@ -418,7 +417,7 @@ struct SquarePolynomialExecutor {
             };
 
             std::vector<int> tile_bound;
-            if (plan_mode == FusedPlanMode::kRefetch) {
+            if (refetch_halo) {
                 tile_bound.push_back(0);
                 const auto charge = [&](int i) -> size_t {
                     size_t c = 0;
@@ -466,7 +465,7 @@ struct SquarePolynomialExecutor {
                 const int hi = tile_bound[static_cast<size_t>(r) + 1];
                 std::vector<BlockID> want;
                 long long death_round = r;
-                if (plan_mode == FusedPlanMode::kRefetch) {
+                if (refetch_halo) {
                     for (int i = lo; i < hi; ++i) {
                         walk_row(i, [&](int g_col) {
                             auto it = meta.find(g_col);
@@ -481,7 +480,7 @@ struct SquarePolynomialExecutor {
                     }
                     reset_flags();
                 }
-                for (; plan_mode != FusedPlanMode::kRefetch &&
+                for (; !refetch_halo &&
                        cursor < born.size() && born[cursor].first < hi; ++cursor) {
                     const int g_col = born[cursor].second;
                     auto it = meta.find(g_col);
@@ -515,7 +514,7 @@ struct SquarePolynomialExecutor {
                               a_norms.size(),
                               static_cast<size_t>(bs_max) * static_cast<size_t>(bs_max) *
                                   sizeof(T),
-                              secs_fetch, secs_numeric, plan_mode);
+                              secs_fetch, secs_numeric, budget, refetch_halo);
         } else {
             RemoteRows none;
             fused_rows(A, c2, c1, c0, threshold, none, a_row, n_global,

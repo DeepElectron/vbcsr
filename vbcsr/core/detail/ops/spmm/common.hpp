@@ -1031,36 +1031,32 @@ struct FusedDenseIds {
 inline constexpr int kFusedRowChunk = 8;
 
 
-/// Which of the three regimes a fetch is in.
+/// Must this fetch re-read blocks to stay inside the budget?
 ///
-/// They are genuinely different, and collapsing any two of them breaks
-/// something:
+/// There is one real fork. Normally a block crosses the network exactly once:
+/// fetched when its first reader arrives, released after its last, so
+/// residency follows the LIVE set. But the live set is a property of the
+/// input -- the pattern, the partition and the row order fix it -- and
+/// releasing is the only tool that schedule has. When even the live set
+/// exceeds the budget there is nothing left to release, so the only way to
+/// bound residency is to fetch per tile and drop it again, paying for some
+/// blocks more than once. Slow, and the alternative is being OOM-killed,
+/// which is what a 178k-atom job got when this returned false unconditionally.
 ///
-///   kSingleRound  the union fits the budget. Fetch it once, hold it, done.
-///   kStream       the union does not fit but the LIVE set does. Cut rounds at
-///                 release points: every block still crosses the network
-///                 exactly once, and residency follows the live set.
-///   kRefetch      not even the live set fits. No release schedule can help --
-///                 the rows are all wanted at once -- so the only way to bound
-///                 residency is to fetch per tile and drop it again, paying
-///                 the same block more than once. Slow, and the alternative is
-///                 being killed.
-enum class FusedPlanMode { kUnbounded, kSingleRound, kStream, kRefetch };
-
-inline FusedPlanMode fused_plan_mode(const std::vector<size_t>& arrivals,
-                                     const std::vector<size_t>& departures,
-                                     int n_rows, size_t block_budget) {
-    if (block_budget == 0) return FusedPlanMode::kUnbounded;
-    size_t union_blocks = 0, live = 0, peak_live = 0;
+/// False therefore means "stream": one round if the whole reach fits, several
+/// if releases are needed along the way. A budget of 0 is the caller saying
+/// the reach fits and not to check -- it streams, unbounded.
+inline bool fused_must_refetch(const std::vector<size_t>& arrivals,
+                               const std::vector<size_t>& departures,
+                               int n_rows, size_t block_budget) {
+    if (block_budget == 0) return false;
+    size_t live = 0, peak_live = 0;
     for (int i = 0; i < n_rows; ++i) {
         live += arrivals[static_cast<size_t>(i)];
-        union_blocks += arrivals[static_cast<size_t>(i)];
         peak_live = std::max(peak_live, live);
         live -= departures[static_cast<size_t>(i)];
     }
-    if (union_blocks <= block_budget) return FusedPlanMode::kSingleRound;
-    if (peak_live <= block_budget) return FusedPlanMode::kStream;
-    return FusedPlanMode::kRefetch;
+    return peak_live > block_budget;
 }
 
 /// Round boundaries that pay for themselves, from the arrival and departure
@@ -1104,7 +1100,7 @@ inline std::vector<int> fused_round_plan(const std::vector<size_t>& arrivals,
     // released at all and residency is the union, which is how this returned a
     // single round for a 250 GB halo and OOM'd a 178k-atom job that the
     // re-fetching predecessor had survived. Where the live set itself does not
-    // fit, the caller runs kRefetch instead (fused_plan_mode).
+    // fit, the caller re-fetches per tile instead (fused_must_refetch).
     size_t union_blocks = 0, live = 0, peak_live = 0;
     for (int i = 0; i < n_rows; ++i) {
         live += arrivals[static_cast<size_t>(i)];
@@ -1161,7 +1157,8 @@ inline void fused_report_halo(const char* kernel, MPI_Comm comm, int rank,
                               long long rounds, size_t fetched_blocks,
                               size_t peak_live_blocks, size_t local_blocks,
                               size_t block_bytes, double secs_fetch,
-                              double secs_numeric, FusedPlanMode mode) {
+                              double secs_numeric, size_t block_budget,
+                              bool refetch) {
     if (!fused_halo_stats_enabled()) return;
     long long mine[3] = {static_cast<long long>(fetched_blocks),
                          static_cast<long long>(peak_live_blocks),
@@ -1185,11 +1182,9 @@ inline void fused_report_halo(const char* kernel, MPI_Comm comm, int rank,
                  "live=%.2f GB local=%.2f GB CV/memA=%.0f%% fetch=%.1fs "
                  "numeric max/mean/min=%.1f/%.1f/%.1fs\n",
                  kernel,
-                 mode == FusedPlanMode::kUnbounded
-                     ? "UNBOUNDED(VBCSR_FUSED_TILE_MB=0)"
-                     : (mode == FusedPlanMode::kSingleRound
-                            ? "single(reach fits budget)"
-                            : (mode == FusedPlanMode::kStream ? "stream" : "refetch")),
+                 block_budget == 0 ? "UNBOUNDED(VBCSR_FUSED_TILE_MB=0)"
+                                   : (refetch ? "refetch"
+                                              : (rounds == 1 ? "single" : "stream")),
                  rounds, static_cast<double>(worst[0]) * to_gb,
                  static_cast<double>(worst[1]) * to_gb,
                  static_cast<double>(worst[2]) * to_gb, cv_over_mem * 100.0,

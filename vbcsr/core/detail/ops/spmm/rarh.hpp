@@ -719,8 +719,7 @@ struct RARhExecutor {
         }
         std::sort(b_born.begin(), b_born.end());
         std::sort(a_born.begin(), a_born.end());
-        const FusedPlanMode plan_mode =
-            fused_plan_mode(arrivals, departures, n_rows, block_budget);
+        const bool refetch_halo = fused_must_refetch(arrivals, departures, n_rows, block_budget);
 
         // ---- Refetch regime: tiles whose OWN halo fits the budget, dropped
         // and re-fetched per tile. Reached only when the live set itself does
@@ -769,7 +768,7 @@ struct RARhExecutor {
         };
 
         std::vector<int> tile_bound;
-        if (plan_mode == FusedPlanMode::kRefetch) {
+        if (refetch_halo) {
             tile_bound.push_back(0);
             const auto charge = [&](int i) -> size_t {
                 size_t c = 0;
@@ -832,7 +831,7 @@ struct RARhExecutor {
             // arrived and is still held, or is not needed yet.
             std::vector<BlockID> want_b, want_a;
             long long death_b = r, death_a = r;
-            if (plan_mode == FusedPlanMode::kRefetch) {
+            if (refetch_halo) {
                 // Everything this tile reads, and everything goes at its end.
                 for (int i = lo; i < hi; ++i) {
                     walk_row(
@@ -859,7 +858,7 @@ struct RARhExecutor {
                 }
                 reset_flags();
             }
-            for (; plan_mode != FusedPlanMode::kRefetch &&
+            for (; !refetch_halo &&
                    b_cursor < b_born.size() && b_born[b_cursor].first < hi; ++b_cursor) {
                 const int g = b_born[b_cursor].second;
                 auto it = meta_b.find(g);
@@ -872,7 +871,7 @@ struct RARhExecutor {
                 death_b = std::max(death_b,
                                    round_of_row(b_death[static_cast<size_t>(b_ids.of(g))]));
             }
-            for (; plan_mode != FusedPlanMode::kRefetch &&
+            for (; !refetch_halo &&
                    a_cursor < a_born.size() && a_born[a_cursor].first < hi; ++a_cursor) {
                 const int g = a_born[a_cursor].second;
                 auto it = meta_a.find(g);
@@ -923,7 +922,7 @@ struct RARhExecutor {
                           halo_b.peak_live_blocks + halo_a.peak_live_blocks,
                           A.get_block_norms().size(),
                           static_cast<size_t>(bs_max) * static_cast<size_t>(bs_max) * sizeof(T),
-                          secs_fetch, secs_numeric, plan_mode);
+                          secs_fetch, secs_numeric, budget, refetch_halo);
         if (fused_halo_stats_enabled()) {
             double w = secs_wait, wmax = 0.0;
             MPI_Reduce(&w, &wmax, 1, MPI_DOUBLE, MPI_MAX, 0, ga.comm);
