@@ -991,19 +991,28 @@ inline constexpr int kFusedRowChunk = 8;
 
 /// Blocks one round may hold, from a byte budget.
 ///
-/// HALVED, because a fetch peaks at about twice what it delivers: the blob a
-/// rank SERVES its peers and the blob it RECEIVES are both live across the
-/// exchange, and on a symmetric pattern they are comparable. Charging one of
-/// two is what let a "62 GB" budget put well over 100 GB of transient buffers
-/// on a node beside 176 GB of operands -- a peak under the limit on paper and
-/// over it in practice. (There used to be a third copy, the typed arena the
-/// received blob was unpacked into; refs now point into the blob itself.)
+/// The whole budget, because a fetch now costs about what it delivers.
+///
+/// It used to cost three times that, and the budget was halved to cover it: a
+/// rank held the blob it SERVES its peers, the blob it RECEIVES, and the typed
+/// arena the received blob was unpacked into. Charging one of three is what
+/// let a "62 GB" budget put well over 100 GB of transient buffers on a node
+/// beside 176 GB of operands -- a peak under the limit on paper and over it in
+/// practice.
+///
+/// Both extra copies are gone. The received blob IS the arena, and the served
+/// response is streamed out through a fixed pool of slices rather than packed
+/// whole, so what a rank holds to serve its peers is a hundred megabytes or so
+/// whatever the rank count. Keeping the halving would now be charging twice
+/// for a copy that no longer exists -- and the budget is the scarce thing: it
+/// decides the round count, and the round count is superlinear in it (halving
+/// the budget cost 4x the rounds on the moire pattern, not 2x).
 inline size_t fused_block_budget(size_t budget_bytes, int bs_max,
                                  size_t scalar_bytes) {
     if (budget_bytes == 0) return 0;
     const size_t per_block = std::max<size_t>(
         1, static_cast<size_t>(bs_max) * static_cast<size_t>(bs_max) * scalar_bytes);
-    return std::max<size_t>(1, budget_bytes / per_block / 2);
+    return std::max<size_t>(1, budget_bytes / per_block);
 }
 
 /// The fetch schedule: where to cut rounds, and whether streaming can hold the
