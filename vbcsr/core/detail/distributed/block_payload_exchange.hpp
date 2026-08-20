@@ -153,143 +153,157 @@ inline size_t response_slice_bytes() {
 /// Tag for response payloads, distinct from the request exchange's.
 inline constexpr int kResponsePayloadTag = 1;
 
-/// Packs one peer's response as a byte STREAM rather than into a buffer.
+/// Packs one peer's response as a byte stream that can be PAUSED.
 ///
-/// The point is that the whole response never exists at once. Packing it whole
-/// cost two things: the served blob sat beside the received one for the length
-/// of the exchange -- which is why the halo budget carries a factor of two --
-/// and nothing went on the wire until the LAST byte was packed, so a
-/// single-threaded memcpy of tens of GB ran with the network idle and then the
-/// network ran with the CPU idle.
+/// Two things force this shape. The response must not exist whole -- packing
+/// it whole put the served blob beside the received one for the length of the
+/// exchange, which is why the halo budget used to be halved. And the pack must
+/// be resumable, because a rank has to keep every peer supplied at once: the
+/// exchange this replaced posted all its sends together, and finishing one
+/// peer before starting the next turns a full all-to-all into a queue of
+/// point-to-point transfers -- every rank shipping to peer 0 while the rest
+/// idle, then all to peer 1. On a network that is an incast, and it cost 3-4x
+/// on the fetches large enough to show it.
 ///
-/// `sink.append` takes bytes; it is free to cut them into fixed-size slices
-/// wherever it likes, including inside a block, because the receiver walks the
-/// reassembled segment and never learns where the cuts were.
-template <typename Matrix, typename Sink>
-void stream_response(
-        const Matrix& matrix,
-        const int* req_buffer,
-        int total_blocks,
-        Sink& sink) {
+/// So `emit` fills a caller's buffer with the next `capacity` bytes and
+/// remembers where it stopped, down to the middle of a block payload. The cut
+/// points never reach the receiver, which walks the reassembled segment.
+template <typename Matrix>
+class ResponseWalker {
+public:
     using T = typename Matrix::value_type;
 
-    const int num_rows = req_buffer[0];
-    const int* req_start = req_buffer + 1;
-
-    sink.append(&num_rows, sizeof(int));
-
-    const int* req_ptr = req_start;
-    for (int r = 0; r < num_rows; ++r) {
-        const int gid = *req_ptr++;
-        const int num_cols = *req_ptr++;
-        req_ptr += num_cols;
-
-        int size = 0;
-        auto row_it = matrix.graph->global_to_local.find(gid);
-        if (row_it != matrix.graph->global_to_local.end()) {
-            size = matrix.graph->block_sizes[row_it->second];
+    ResponseWalker(const Matrix& matrix, const int* req_buffer, int total_blocks)
+        : matrix_(&matrix), num_rows_(req_buffer[0]) {
+        // The prelude -- row count, the row/size table, the block count -- is
+        // staged whole because it is small (8 bytes a row) and because
+        // total_blocks has to be written ahead of the blocks it counts.
+        prelude_.resize(sizeof(int) + static_cast<size_t>(num_rows_) * 2 * sizeof(int) +
+                        sizeof(int));
+        char* out = prelude_.data();
+        std::memcpy(out, &num_rows_, sizeof(int));
+        out += sizeof(int);
+        const int* req_ptr = req_buffer + 1;
+        for (int r = 0; r < num_rows_; ++r) {
+            const int gid = *req_ptr++;
+            const int num_cols = *req_ptr++;
+            req_ptr += num_cols;
+            int size = 0;
+            auto row_it = matrix.graph->global_to_local.find(gid);
+            if (row_it != matrix.graph->global_to_local.end()) {
+                size = matrix.graph->block_sizes[row_it->second];
+            }
+            std::memcpy(out, &gid, sizeof(int));
+            out += sizeof(int);
+            std::memcpy(out, &size, sizeof(int));
+            out += sizeof(int);
         }
-        sink.append(&gid, sizeof(int));
-        sink.append(&size, sizeof(int));
+        std::memcpy(out, &total_blocks, sizeof(int));
+
+        req_ptr_ = req_buffer + 1;
     }
-    sink.append(&total_blocks, sizeof(int));
 
-    req_ptr = req_start;
-    for (int r = 0; r < num_rows; ++r) {
-        const int gid = *req_ptr++;
-        const int num_cols = *req_ptr++;
-        const int* cols_begin = req_ptr;
-        const int* cols_end = req_ptr + num_cols;
-        req_ptr = cols_end;
+    bool done() const { return done_; }
 
-        auto row_it = matrix.graph->global_to_local.find(gid);
-        if (row_it == matrix.graph->global_to_local.end()) {
-            continue;
+    /// Next `capacity` bytes of this response. Returns fewer only when the
+    /// response is finished, so every slice but the last is exactly full --
+    /// which is what lets the receiver post its slices from the total alone.
+    size_t emit(char* out, size_t capacity) {
+        size_t written = 0;
+        if (prelude_off_ < prelude_.size()) {
+            const size_t take = std::min(capacity, prelude_.size() - prelude_off_);
+            std::memcpy(out, prelude_.data() + prelude_off_, take);
+            prelude_off_ += take;
+            written += take;
         }
-
-        const int lid = row_it->second;
-        for (int slot = matrix.row_ptr()[lid]; slot < matrix.row_ptr()[lid + 1]; ++slot) {
-            const int col_lid = matrix.col_ind()[slot];
-            const int col_gid = matrix.graph->get_global_index(col_lid);
-            if (!std::binary_search(cols_begin, cols_end, col_gid)) {
+        while (written < capacity) {
+            if (head_off_ == head_len_ && pay_off_ == pay_len_ && !advance()) {
+                done_ = true;
+                break;
+            }
+            if (head_off_ < head_len_) {
+                const size_t take = std::min(capacity - written, head_len_ - head_off_);
+                std::memcpy(out + written, head_ + head_off_, take);
+                head_off_ += take;
+                written += take;
                 continue;
             }
-
-            const int r_dim = matrix.graph->block_sizes[lid];
-            const int c_dim = matrix.graph->block_sizes[col_lid];
-            const size_t elems = matrix.block_size_elements(slot);
-
-            sink.append(&gid, sizeof(int));
-            sink.append(&col_gid, sizeof(int));
-            sink.append(&r_dim, sizeof(int));
-            sink.append(&c_dim, sizeof(int));
-            sink.append(matrix.block_data(slot), elems * sizeof(T));
+            const size_t take = std::min(capacity - written, pay_len_ - pay_off_);
+            std::memcpy(out + written, pay_ + pay_off_, take);
+            pay_off_ += take;
+            written += take;
         }
-    }
-}
-
-/// Sink that cuts a response into fixed slices and ships each as it fills.
-///
-/// The buffers are a small fixed pool, so what a rank holds for SENDING is
-/// `pool x slice` -- a hundred megabytes or so -- rather than its whole
-/// response, whatever the rank count or the system size. Filling the next
-/// slice while the last one is in flight is what overlaps the pack with the
-/// wire.
-class ResponseSliceSink {
-public:
-    ResponseSliceSink(std::vector<std::vector<char>>& pool,
-                      std::vector<MPI_Request>& reqs, size_t slice, int peer,
-                      MPI_Comm comm)
-        : pool_(pool), reqs_(reqs), slice_(slice), peer_(peer), comm_(comm) {}
-
-    void append(const void* src, size_t n) {
-        const char* p = static_cast<const char*>(src);
-        while (n > 0) {
-            if (current_ < 0) current_ = acquire();
-            const size_t room = slice_ - filled_;
-            const size_t take = std::min(room, n);
-            std::memcpy(pool_[static_cast<size_t>(current_)].data() + filled_, p, take);
-            filled_ += take;
-            p += take;
-            n -= take;
-            if (filled_ == slice_) ship();
-        }
-    }
-
-    /// Ships whatever is left, which is the only slice allowed to be short.
-    void finish() {
-        if (current_ >= 0 && filled_ > 0) ship();
+        return written;
     }
 
 private:
-    int acquire() {
-        for (size_t k = 0; k < reqs_.size(); ++k) {
-            if (reqs_[k] == MPI_REQUEST_NULL) return static_cast<int>(k);
+    static constexpr int kRowUnopened = -1;
+
+    /// Positions the next block the requester asked for, or reports there is
+    /// none left.
+    bool advance() {
+        for (;;) {
+            if (lid_ == kRowUnopened) {
+                if (row_ >= num_rows_) return false;
+                gid_ = *req_ptr_++;
+                const int num_cols = *req_ptr_++;
+                cols_begin_ = req_ptr_;
+                cols_end_ = req_ptr_ + num_cols;
+                req_ptr_ = cols_end_;
+                auto row_it = matrix_->graph->global_to_local.find(gid_);
+                if (row_it == matrix_->graph->global_to_local.end()) {
+                    ++row_;
+                    continue;  // stays unopened, so the next pass reads the next row
+                }
+                lid_ = row_it->second;
+                slot_ = matrix_->row_ptr()[lid_];
+                slot_end_ = matrix_->row_ptr()[lid_ + 1];
+            }
+            while (slot_ < slot_end_) {
+                const int slot = slot_++;
+                const int col_lid = matrix_->col_ind()[slot];
+                const int col_gid = matrix_->graph->get_global_index(col_lid);
+                if (!std::binary_search(cols_begin_, cols_end_, col_gid)) continue;
+
+                const int r_dim = matrix_->graph->block_sizes[lid_];
+                const int c_dim = matrix_->graph->block_sizes[col_lid];
+                std::memcpy(head_ + 0 * sizeof(int), &gid_, sizeof(int));
+                std::memcpy(head_ + 1 * sizeof(int), &col_gid, sizeof(int));
+                std::memcpy(head_ + 2 * sizeof(int), &r_dim, sizeof(int));
+                std::memcpy(head_ + 3 * sizeof(int), &c_dim, sizeof(int));
+                head_off_ = 0;
+                head_len_ = 4 * sizeof(int);
+                pay_ = reinterpret_cast<const char*>(matrix_->block_data(slot));
+                pay_off_ = 0;
+                pay_len_ = matrix_->block_size_elements(slot) * sizeof(T);
+                return true;
+            }
+            ++row_;
+            lid_ = kRowUnopened;
         }
-        int idx = MPI_UNDEFINED;
-        MPI_Waitany(static_cast<int>(reqs_.size()), reqs_.data(), &idx,
-                    MPI_STATUS_IGNORE);
-        // Unreachable -- the scan above proved one request is active, so
-        // Waitany has something to complete -- but a negative index here would
-        // be a wild write rather than an error.
-        return idx >= 0 ? idx : 0;
     }
 
-    void ship() {
-        MPI_Isend(pool_[static_cast<size_t>(current_)].data(),
-                  static_cast<int>(filled_), MPI_BYTE, peer_, kResponsePayloadTag,
-                  comm_, &reqs_[static_cast<size_t>(current_)]);
-        current_ = -1;
-        filled_ = 0;
-    }
+    const Matrix* matrix_;
+    int num_rows_ = 0;
+    std::vector<char> prelude_;
+    size_t prelude_off_ = 0;
 
-    std::vector<std::vector<char>>& pool_;
-    std::vector<MPI_Request>& reqs_;
-    size_t slice_;
-    int peer_;
-    MPI_Comm comm_;
-    int current_ = -1;
-    size_t filled_ = 0;
+    const int* req_ptr_ = nullptr;
+    const int* cols_begin_ = nullptr;
+    const int* cols_end_ = nullptr;
+    int row_ = 0;
+    int gid_ = 0;
+    int lid_ = kRowUnopened;
+    int slot_ = 0;
+    int slot_end_ = 0;
+
+    char head_[4 * sizeof(int)];
+    size_t head_off_ = 0;
+    size_t head_len_ = 0;
+    const char* pay_ = nullptr;
+    size_t pay_off_ = 0;
+    size_t pay_len_ = 0;
+    bool done_ = false;
 };
 
 // One response segment's header walk: records every block's metadata and its
@@ -489,29 +503,60 @@ FetchedBlockContext<typename Matrix::value_type> fetch_blocks_by_row_columns(
             }
         }
 
-        // Deep enough that a slice is always being packed while another is in
-        // flight, shallow enough that pool x slice stays a rounding error
-        // against the halo it is serving.
-        constexpr size_t kSendPoolSlices = 4;
-        // A buffer only ever has to hold a full slice if some peer's response
-        // is at least that big; below that the pool costs what it ships.
-        size_t widest = 0;
-        for (int i = 0; i < size; ++i) {
-            widest = std::max(widest, resp_send_counts[i]);
+        // Peers in ROTATED order, so rank r starts at r+1 rather than every
+        // rank starting at 0 and making peer 0 an incast target while the rest
+        // of the fabric is idle. Round-robin below then keeps them all
+        // supplied, which is the concurrency the one-shot exchange had for
+        // free by posting every send at once.
+        std::vector<int> active;
+        std::vector<ResponseWalker<Matrix>> walkers;
+        active.reserve(size);
+        walkers.reserve(size);
+        for (int step = 1; step <= size; ++step) {
+            const int i = (rank + step) % size;
+            if (recv_counts[i] == 0 || resp_send_counts[i] == 0) continue;
+            active.push_back(i);
+            walkers.emplace_back(matrix, recv_blob.data() + rdispls[i],
+                                 resp_send_blocks[i]);
         }
-        const size_t buf_bytes = std::min(slice, widest);
-        std::vector<std::vector<char>> pool(kSendPoolSlices);
-        std::vector<MPI_Request> send_reqs(kSendPoolSlices, MPI_REQUEST_NULL);
-        for (auto& buf : pool) buf.resize(buf_bytes);
 
-        for (int i = 0; i < size; ++i) {
-            if (recv_counts[i] == 0 || resp_send_counts[i] == 0) {
-                continue;
+        // Two slices per peer keeps one on the wire while the next is packed.
+        // Capped so a rank's send-side stays a fixed cost -- it does not grow
+        // with the halo, the system, or the rank count; past the cap the peers
+        // are simply served in rotated waves.
+        const size_t pool_slices =
+            std::min<size_t>(8, std::max<size_t>(2, 2 * active.size()));
+        std::vector<std::vector<char>> pool(pool_slices);
+        std::vector<MPI_Request> send_reqs(pool_slices, MPI_REQUEST_NULL);
+        for (auto& buf : pool) buf.resize(slice);
+
+        size_t turn = 0;
+        while (!active.empty()) {
+            int k = -1;
+            for (size_t b = 0; b < send_reqs.size(); ++b) {
+                if (send_reqs[b] == MPI_REQUEST_NULL) { k = static_cast<int>(b); break; }
             }
-            ResponseSliceSink sink(pool, send_reqs, slice, i, matrix.graph->comm);
-            stream_response(matrix, recv_blob.data() + rdispls[i],
-                            resp_send_blocks[i], sink);
-            sink.finish();
+            if (k < 0) {
+                MPI_Waitany(static_cast<int>(send_reqs.size()), send_reqs.data(), &k,
+                            MPI_STATUS_IGNORE);
+                if (k < 0) k = 0;  // unreachable: the scan proved one is in flight
+            }
+
+            if (turn >= active.size()) turn = 0;
+            const size_t which = turn;
+            const int peer = active[which];
+            const size_t n = walkers[which].emit(pool[static_cast<size_t>(k)].data(), slice);
+            if (n > 0) {
+                MPI_Isend(pool[static_cast<size_t>(k)].data(), static_cast<int>(n),
+                          MPI_BYTE, peer, kResponsePayloadTag, matrix.graph->comm,
+                          &send_reqs[static_cast<size_t>(k)]);
+            }
+            if (walkers[which].done()) {
+                active.erase(active.begin() + static_cast<long>(which));
+                walkers.erase(walkers.begin() + static_cast<long>(which));
+            } else {
+                ++turn;
+            }
         }
 
         MPI_Waitall(static_cast<int>(send_reqs.size()), send_reqs.data(),
