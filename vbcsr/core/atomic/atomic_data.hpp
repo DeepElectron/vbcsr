@@ -322,8 +322,15 @@ public:
         
         std::vector<int> part(my_n_atom);
         std::fill(part.begin(), part.end(), rank);
-        
-        partition_graph(vtxdist, xadj, adjncy, size, part, comm, my_pos, n_global);
+
+        // Balance orbitals, not atoms -- the same weight the inertial
+        // bisection above used, so the refinement improves the edge cut of
+        // that partition instead of rebalancing it against a different
+        // objective.
+        std::vector<int> my_vwgt(my_n_atom);
+        for (int i = 0; i < my_n_atom; ++i) my_vwgt[i] = type_norb[my_types[i]];
+
+        partition_graph(vtxdist, xadj, adjncy, size, part, comm, my_pos, n_global, my_vwgt);
         
         // 3. Redistribute Atoms
         std::vector<double> r_pos;
@@ -1028,8 +1035,33 @@ private:
         return graph->ghost_global_indices[lid - n_atom];
     }
 
+public:
+    // partition_graph is public so its weighting can be unit-tested. It is a
+    // pure function of its arguments -- no AtomicData state is touched -- so
+    // exposing it costs no encapsulation, and the alternative was a weighting
+    // whose only coverage was an end-to-end balance check that passed with
+    // the weights disconnected.
+    /// Refines a partition for edge cut, balancing VERTEX WEIGHT rather than
+    /// vertex count.
+    ///
+    /// `vwgt` is one weight per owned atom, normally its orbital count: every
+    /// cost that matters downstream -- the block rows of H and S, the matvec,
+    /// the grid collocation -- scales with orbitals, not with atoms. Balancing
+    /// atom count instead leaves a cell of mixed species imbalanced in
+    /// proportion to the spread in orbitals per species, silently. Inertial
+    /// bisection already weights by the same quantity, so passing it here is
+    /// also what stops the refinement from optimising a different objective
+    /// than the partition it refines.
+    ///
+    /// `vwgt` is required, and weighting is unconditional, because wgtflag is
+    /// a COLLECTIVE argument: every rank must pass the same value. Deciding it
+    /// from whether this rank's weights are empty would flip it on exactly the
+    /// ranks that own no atoms -- a cell with fewer atoms than ranks -- and
+    /// ParMETIS then hangs on mismatched flags. Same hazard the dummy pointers
+    /// below exist for, one level up.
     static void partition_graph(const std::vector<int>& vtxdist, const std::vector<int>& xadj, const std::vector<int>& adjncy, 
-                                int nparts, std::vector<int>& part, MPI_Comm comm, const std::vector<double>& pos, int n_global) {
+                                int nparts, std::vector<int>& part, MPI_Comm comm, const std::vector<double>& pos, int n_global,
+                                const std::vector<int>& vwgt) {
         int initialized = 0;
         MPI_Initialized(&initialized);
         if (nparts <= 1 || !initialized || comm == MPI_COMM_NULL) {
@@ -1038,7 +1070,9 @@ private:
         }
 #ifdef VBCSR_HAVE_PARMETIS
         // ParMETIS Implementation
-        idx_t wgtflag = 0; 
+        // wgtflag 2 = weights on the vertices only (adjwgt stays null).
+        // Unconditional: see the note on the signature.
+        idx_t wgtflag = 2;
         idx_t numflag = 0; 
         idx_t ncon = 1;    
         idx_t nparts_t = nparts;
@@ -1070,14 +1104,32 @@ private:
         idx_t dummy_part = 0;
         if (part_t.empty()) part_ptr = &dummy_part;
 
+        // Weights are clamped to 1: ParMETIS balances a sum of these, and a
+        // zero-weight vertex is free to pile up anywhere without registering
+        // as imbalance.
+        if (vwgt.size() != part.size()) {
+            throw std::runtime_error(
+                "partition_graph: one vertex weight per owned atom is required.");
+        }
+        std::vector<idx_t> vwgt_t;
+        vwgt_t.reserve(vwgt.size());
+        for (int w : vwgt) vwgt_t.push_back(static_cast<idx_t>(std::max(1, w)));
+        idx_t dummy_vwgt = 1;
+        idx_t* vwgt_ptr = vwgt_t.empty() ? &dummy_vwgt : vwgt_t.data();
+
         ParMETIS_V3_RefineKway(vtxdist_t.data(), xadj_t.data(), adjncy_ptr,
-                               NULL, NULL, &wgtflag, &numflag, &ncon, &nparts_t,
+                               vwgt_ptr, NULL, &wgtflag, &numflag, &ncon, &nparts_t,
                                tpwgts.data(), ubvec, options, &edgecut, part_ptr, &comm_);
 
                        
         for(size_t i=0; i<part.size(); ++i) part[i] = part_t[i];
 #else
         // Hilbert Curve Fallback Implementation
+        //
+        // Balances atom COUNT, not `vwgt`: it splits a Morton ordering into
+        // equal-sized runs. Only reached when ParMETIS is absent, and the
+        // difference shows only for a cell of mixed species.
+        (void)vwgt;
         int rank, size;
         if (initialized) {
             MPI_Comm_rank(comm, &rank);
@@ -1232,6 +1284,8 @@ private:
         
 #endif
     }
+
+private:
 
     // Spreads the atoms over the ranks and builds their edges, with no rank
     // ever holding the whole geometry.

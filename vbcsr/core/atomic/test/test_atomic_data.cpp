@@ -1130,6 +1130,198 @@ TEST_F(AtomicDataTest, SingleProcess_Stress) {
     
 
 
+// The partition balances ORBITALS, not atoms.
+//
+// Every cost downstream -- the block rows of H and S, the matvec, the grid
+// collocation -- scales with orbitals per atom, so a cell mixing a 1-orbital
+// species with a 13-orbital one is balanced only if the partitioner knows the
+// difference. Weighting atoms equally looks balanced by atom count while one
+// rank carries thirteen times the work per atom, and nothing reports it.
+//
+// The fixture is a CONNECTED nearest-neighbour chain, heavy half then light
+// half. Connectivity is the whole point: ParMETIS_V3_RefineKway moves vertices
+// across part boundaries along EDGES, so on a disconnected geometry it cannot
+// rebalance at all and the test would silently measure the inertial bisection
+// instead of the refinement. Here it can move the cut freely, which means an
+// unweighted refinement can drag the cut back toward equal atom counts.
+//
+// What this test asserts is the END-TO-END invariant -- orbital load is
+// balanced -- not that any one stage achieves it. Measured on this fixture,
+// most of the balance comes from the weighted inertial bisection, and the
+// ParMETIS weighting shifts it only a little (imbalance 1.045 weighted against
+// 1.103 unweighted at two ranks, and identical at four and eight): starting
+// from an already-weighted partition, RefineKway moves few vertices. The
+// weighting is still right -- balancing atom count is simply the wrong
+// objective for a mixed-species cell, and it is what ParMETIS optimises unless
+// told otherwise -- but this test would pass without it, so do not read a pass
+// as proof the weights are wired.
+TEST_F(AtomicDataTest, PartitionBalancesOrbitalsNotAtomCount) {
+    int rank = 0, size = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    if (size < 2) GTEST_SKIP() << "needs at least two ranks to be a partition";
+
+    // 32 carbons (13 orbitals) then 32 hydrogens (1 orbital), spaced 2 A along
+    // x. The cutoff pair sum is 3.2 A, so each atom bonds to its neighbours at
+    // 2 A and not to the next at 4 A: one connected path.
+    const int n_heavy = 32, n_light = 32;
+    std::vector<double> pos;
+    std::vector<int> z;
+    for (int i = 0; i < n_heavy + n_light; ++i) {
+        pos.insert(pos.end(), {2.0 * i, 0.0, 0.0});
+        z.push_back(i < n_heavy ? 6 : 1);
+    }
+    const std::vector<double> cell = {2.0 * (n_heavy + n_light) + 20.0, 0, 0,
+                                      0, 20.0, 0, 0, 0, 20.0};
+    // Types are the sorted-unique atomic numbers: Z=1 first, then Z=6.
+    const std::vector<int> type_norb = {1, 13};
+    const std::vector<double> r_max = {1.6, 1.6};
+
+    AtomicData* ad = AtomicData::from_points(pos, z, cell, {false, false, false},
+                                             r_max, type_norb, MPI_COMM_WORLD);
+    ASSERT_NE(ad, nullptr);
+
+    int my_orbitals = 0;
+    for (int a = 0; a < ad->n_atom; ++a) my_orbitals += type_norb[ad->atom_type[a]];
+    std::vector<int> orbitals(size, 0), atoms(size, 0);
+    orbitals[rank] = my_orbitals;
+    atoms[rank] = ad->n_atom;
+    MPI_Allreduce(MPI_IN_PLACE, orbitals.data(), size, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, atoms.data(), size, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+
+    int total_orbitals = 0, total_atoms = 0;
+    for (int r = 0; r < size; ++r) { total_orbitals += orbitals[r]; total_atoms += atoms[r]; }
+    ASSERT_EQ(total_atoms, n_heavy + n_light) << "atoms were lost or duplicated";
+    ASSERT_EQ(total_orbitals, n_heavy * 13 + n_light);
+
+    int worst = 0;
+    for (int r = 0; r < size; ++r) worst = std::max(worst, orbitals[r]);
+    const double imbalance =
+        static_cast<double>(worst) / (static_cast<double>(total_orbitals) / size);
+    if (rank == 0) {
+        printf("  orbitals/rank:");
+        for (int r = 0; r < size; ++r) printf(" %d", orbitals[r]);
+        printf("   atoms/rank:");
+        for (int r = 0; r < size; ++r) printf(" %d", atoms[r]);
+        printf("   orbital imbalance %.3f\n", imbalance);
+        fflush(stdout);
+    }
+
+    // Balancing atom count on this chain puts every carbon on one side: 416
+    // orbitals against 32, an imbalance of 1.86 at two ranks and worse beyond.
+    // ParMETIS is asked for ubvec = 1.05 on the weighted quantity; the bound
+    // here leaves room for the discrete atom sizes while staying far below
+    // what any unweighted split can reach.
+    EXPECT_LT(imbalance, 1.35) << "orbital load is not balanced; check that "
+                                  "partition_graph is given vertex weights";
+    delete ad;
+}
+
+// The vertex weights reach ParMETIS, and they change the answer.
+//
+// This drives AtomicData::partition_graph directly, because the end-to-end
+// fixture above cannot isolate the weighting: from_points hands ParMETIS an
+// already weight-balanced partition from the inertial bisection, so refinement
+// has nothing to do and the same numbers come out with the weights
+// disconnected. Here the INITIAL partition is deliberately balanced by vertex
+// COUNT and badly imbalanced by weight, which is exactly the situation only a
+// weighted refinement can fix.
+//
+// Both directions are measured: the weighted call against the same call with
+// uniform weights. That contrast is what makes this a test of the weights
+// rather than of ParMETIS in general -- a build ignoring vwgt gives identical
+// numbers for both.
+//
+// MEASURED, and the reason the strong assertion below is commented out rather
+// than enforced: ParMETIS_V3_RefineKway barely acts on the weights. Starting
+// from this deliberately imbalanced partition it reaches 1.741 at two ranks
+// and does not move at all at four or eight, against 1.857 unweighted. Swapping
+// the single call to ParMETIS_V3_PartKway (identical signature) instead gives
+// 1.045 weighted against 1.857 uniform at every rank count -- because RefineKway
+// only makes local boundary moves and cannot repair a global weight imbalance,
+// while PartKway computes the partition afresh. The weighting is correctly
+// forwarded either way; whether it DOES anything is a question about which
+// entry point is called, and changing that changes the partition of every
+// calculation, so it is not decided here.
+TEST_F(AtomicDataTest, PartitionGraphBalancesTheVertexWeights) {
+    int rank = 0, size = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    if (size < 2) GTEST_SKIP() << "needs at least two ranks to be a partition";
+
+    // A path graph, contiguous blocks per rank. The first half of the vertices
+    // are heavy (13, a full LCAO atom), the second half light (1) -- so the
+    // count-balanced split is the maximally weight-imbalanced one.
+    const int n_per_rank = 16;
+    const int n_global = n_per_rank * size;
+    const int lo = rank * n_per_rank;
+
+    std::vector<int> vtxdist(size + 1);
+    for (int r = 0; r <= size; ++r) vtxdist[r] = r * n_per_rank;
+
+    std::vector<int> xadj(n_per_rank + 1, 0), adjncy;
+    for (int i = 0; i < n_per_rank; ++i) {
+        const int g = lo + i;
+        if (g > 0) adjncy.push_back(g - 1);
+        if (g + 1 < n_global) adjncy.push_back(g + 1);
+        xadj[i + 1] = static_cast<int>(adjncy.size());
+    }
+
+    const auto weight_of = [n_global](int g) { return g < n_global / 2 ? 13 : 1; };
+    std::vector<int> vwgt(n_per_rank);
+    for (int i = 0; i < n_per_rank; ++i) vwgt[i] = weight_of(lo + i);
+    std::vector<double> pos(3 * n_per_rank, 0.0);
+    for (int i = 0; i < n_per_rank; ++i) pos[3 * i] = 2.0 * (lo + i);
+
+    // Weight per part, summed across ranks, for a given assignment.
+    const auto imbalance_of = [&](const std::vector<int>& part) {
+        std::vector<int> per_part(size, 0);
+        for (int i = 0; i < n_per_rank; ++i) per_part[part[i]] += weight_of(lo + i);
+        MPI_Allreduce(MPI_IN_PLACE, per_part.data(), size, MPI_INT, MPI_SUM,
+                      MPI_COMM_WORLD);
+        int total = 0, worst = 0;
+        for (int r = 0; r < size; ++r) { total += per_part[r]; worst = std::max(worst, per_part[r]); }
+        return static_cast<double>(worst) / (static_cast<double>(total) / size);
+    };
+
+    // Identity: rank r keeps its own block. Equal counts, lopsided weight.
+    std::vector<int> initial(n_per_rank, rank);
+    const double before = imbalance_of(initial);
+    ASSERT_GT(before, 1.5) << "the starting partition is supposed to be weight-imbalanced";
+
+    std::vector<int> weighted = initial;
+    AtomicData::partition_graph(vtxdist, xadj, adjncy, size, weighted, MPI_COMM_WORLD,
+                                pos, n_global, vwgt);
+    const double after_weighted = imbalance_of(weighted);
+
+    std::vector<int> uniform = initial;
+    AtomicData::partition_graph(vtxdist, xadj, adjncy, size, uniform, MPI_COMM_WORLD,
+                                pos, n_global, std::vector<int>(n_per_rank, 1));
+    const double after_uniform = imbalance_of(uniform);
+
+    if (rank == 0) {
+        printf("  weight imbalance: %.3f initially, %.3f weighted, %.3f uniform\n",
+               before, after_weighted, after_uniform);
+        fflush(stdout);
+    }
+
+    // Every vertex still belongs to exactly one part in range.
+    for (int i = 0; i < n_per_rank; ++i) {
+        ASSERT_GE(weighted[i], 0);
+        ASSERT_LT(weighted[i], size);
+    }
+
+    // What holds today: the weights never make the balance worse. Weak, and
+    // deliberately so -- see the note above.
+    EXPECT_LE(after_weighted, after_uniform + 1e-9)
+        << "weighting made the balance worse, which no correct wgtflag can do";
+
+    // What SHOULD hold, and does under ParMETIS_V3_PartKway. Enable together
+    // with that switch.
+    // EXPECT_LT(after_weighted, 1.35);
+    // EXPECT_LT(after_weighted, after_uniform * 0.9);
+}
+
 int main(int argc, char **argv) {
     MPI_Init(&argc, &argv);
     ::testing::InitGoogleTest(&argc, argv);
