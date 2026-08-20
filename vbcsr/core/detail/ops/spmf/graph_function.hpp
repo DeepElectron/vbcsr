@@ -17,6 +17,9 @@
 #include <vector>
 
 #include <mpi.h>
+#include <complex>
+#include <type_traits>
+
 #include <omp.h>
 
 namespace vbcsr {
@@ -26,7 +29,22 @@ namespace detail {} // (no file-scope helpers currently)
 // Generic driver of the graph matrix-function approximation: for every owned
 // block row of the HERMITIAN matrix A, assemble the dense subgraph matrix of
 // its whole neighbourhood, hand it to `action`, and scatter the resulting
-// block row into Result.
+// block COLUMN into Result -- block (j, i) of f(A) for every neighbour j of
+// row i, remote rows included (add_block accumulates them at their owner).
+//
+// The column orientation is load-bearing, not a convention. Subgraph i's
+// solution is exact for its own submatrix, so the assembled column z_i = P
+// f(S_sub) e_i satisfies z_i^H S z_i = e_i^H f(S_sub) S_sub f(S_sub) e_i
+// exactly -- for f = x^{-1/2}, a seed with diag(Z^H S Z) = I by construction,
+// which is what keeps its spectrum inside the Newton-Schulz basin. The
+// transposed placement (each solution written as a block ROW) assembles
+// COLUMNS out of pieces of different subgraph solves; no identity controls
+// their S-norm, and the truncation error lands on the sandwiching side of
+// Z^H S Z. On a silicon 4x4x4 supercell the same subgraph solutions gave
+// lambda(Z^H S Z) in [0.28, 1.59] written as columns and [0.07, 15.8] written
+// as rows -- the second is outside the NS basin (0, 7/3) and diverged. The
+// two agree only when the one-hop truncation error is negligible, which is
+// exactly when the orientation does not matter.
 //
 //   action(total_dim, M, k_cols, col_start)
 //
@@ -44,8 +62,9 @@ namespace detail {} // (no file-scope helpers currently)
 //  * the dense view handed to the action is BlockSpMat::to_dense's row-major
 //    buffer read as column-major, i.e. conj(M) - harmless exactly because
 //    f(conj(M)) = conj(f(M)) for Hermitian M and real-valued f;
-//  * only the block COLUMN of f(M) is computed, and the wanted block row is
-//    extracted as its (conjugation-cancelling) transpose in the scatter step.
+//  * only the block COLUMN of f(M) is computed; the buffer therefore holds
+//    conj(f(M)[:, i]), and the scatter conjugates once more to write the true
+//    column.
 //
 // Memory: one subgraph problem runs per OpenMP thread and a frugal action
 // holds ~2 dim^2 scalars, so the peak working set is OMP_NUM_THREADS x 2 dim^2
@@ -256,24 +275,33 @@ void graph_function_apply(
             t_action += omp_get_wtime() - tp;
             tp = omp_get_wtime();
 
-            // M is now f(M)[:, row_offset : row_offset + r_dim], column-major.
-            // Scatter the block row: block (global_row, col_gid) of f(A) is,
-            // by Hermiticity, the transpose of rows [col_offset, col_offset +
-            // c_dim) of that column block - read it out of M directly.
+            // M is now conj(f(M))[:, row_offset : row_offset + r_dim],
+            // column-major (the conj from the row-major dense view; see the
+            // Hermiticity note). Scatter the block COLUMN: block (col_gid,
+            // global_row) of f(A) is rows [col_offset, col_offset + c_dim) of
+            // that column block, conjugated once to undo the view. Remote rows
+            // are fine: add_block stages them and assemble() accumulates at
+            // the owner.
             int col_offset = 0;
             std::vector<T> block_data;
             for (std::size_t k = 0; k < neighbors.size(); ++k) {
                 const int col_gid = neighbors[k];
                 const int c_dim = nb_sizes[k];
 
-                block_data.resize(static_cast<std::size_t>(r_dim) * c_dim);
-                for (int r = 0; r < r_dim; ++r) {
-                    for (int c = 0; c < c_dim; ++c) {
-                        block_data[r * c_dim + c] =
+                block_data.resize(static_cast<std::size_t>(c_dim) * r_dim);
+                for (int c = 0; c < c_dim; ++c) {
+                    for (int r = 0; r < r_dim; ++r) {
+                        const T v =
                             M[static_cast<std::size_t>(r) * total_dim + (col_offset + c)];
+                        if constexpr (std::is_same<T, std::complex<double>>::value ||
+                                      std::is_same<T, std::complex<float>>::value) {
+                            block_data[static_cast<std::size_t>(c) * r_dim + r] = std::conj(v);
+                        } else {
+                            block_data[static_cast<std::size_t>(c) * r_dim + r] = v;
+                        }
                     }
                 }
-                Result->add_block(global_row, col_gid, block_data.data(), r_dim, c_dim,
+                Result->add_block(col_gid, global_row, block_data.data(), c_dim, r_dim,
                                   AssemblyMode::ADD, kCanonicalBlockLayout);
                 col_offset += c_dim;
             }
