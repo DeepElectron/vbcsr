@@ -522,33 +522,33 @@ void bsr_mult_adjoint_impl(DistGraph* graph, const BSRMatrixBackend<T>& backend,
     x.bind_to_graph(graph);
     y.bind_to_graph(graph);
 
-    const auto& plan = backend.ensure_apply_plan(graph->adj_ptr, graph->adj_ind);
-    const auto& domains = backend.ensure_thread_domains(graph->adj_ptr);
-    const int n_rows = graph->adj_ptr.empty() ? 0 : static_cast<int>(graph->adj_ptr.size()) - 1;
     const int thread_count =
 #ifdef _OPENMP
         std::max(1, omp_get_max_threads());
 #else
         1;
 #endif
-
     if (thread_count == 1) {
-        // Single thread: accumulate straight into y, no scatter buffers.
+        // One writer, so there is nothing to divide: walk the value pages in
+        // storage order and accumulate straight into y. The column plan below
+        // exists only to give each thread its own output blocks, which buys
+        // nothing here and costs an indirection per block plus a traversal
+        // that reads the matrix out of order.
+        const auto& forward = backend.ensure_apply_plan(graph->adj_ptr, graph->adj_ind);
         std::fill(y.data.begin(), y.data.end(), T(0));
-        for (const auto& batch_entry : plan.batches) {
+        for (const auto& batch_entry : forward.batches) {
             const auto& batch = batch_entry.batch;
             for (int row = batch.row_begin; row < batch.row_end; ++row) {
                 const T* x_block = x.local_data() + graph->block_offsets[row];
                 const uint32_t block_begin = batch.row_block_start(row);
                 const uint32_t block_end = batch.row_block_end(row);
                 for (uint32_t local_block = block_begin; local_block < block_end; ++local_block) {
-                    const int col = batch.cols[local_block];
                     rowmajor_kernels::rm_gemv_adjoint<T>(
                         bs,
                         bs,
                         batch.block_ptr(local_block),
                         x_block,
-                        y.data.data() + graph->block_offsets[col]);
+                        y.data.data() + graph->block_offsets[batch.cols[local_block]]);
                 }
             }
         }
@@ -556,51 +556,40 @@ void bsr_mult_adjoint_impl(DistGraph* graph, const BSRMatrixBackend<T>& backend,
         return;
     }
 
-    // Buffers are sized inside the parallel region: each thread zero-fills
-    // its own scatter buffer (parallel fill, NUMA-local first touch) instead
-    // of the calling thread serially zeroing thread_count full-Y copies.
-    std::vector<std::vector<T>> thread_buffers(static_cast<size_t>(thread_count));
+    const int block_count = static_cast<int>(graph->block_sizes.size());
+    const auto& plan =
+        backend.ensure_adjoint_apply_plan(graph->adj_ptr, graph->adj_ind, block_count);
 
-    #pragma omp parallel
-    {
-#ifdef _OPENMP
-        const int thread_id = omp_get_thread_num();
-#else
-        const int thread_id = 0;
-#endif
-        auto& y_local = thread_buffers[static_cast<size_t>(thread_id)];
-        y_local.assign(y.data.size(), T(0));
-        const auto [thread_row_begin, thread_row_end] = thread_domain_range(n_rows, domains);
+    // The column loop skips columns that receive nothing, so the whole buffer
+    // -- ghost tail included -- is zeroed up front (parallel fill, NUMA-local
+    // first touch).
+    parallel_zero(y.data.data(), y.data.size());
 
-        for (const auto& batch_entry : plan.batches) {
-            const auto& batch = batch_entry.batch;
-            const int row_begin = std::max(batch.row_begin, thread_row_begin);
-            const int row_end = std::min(batch.row_end, thread_row_end);
-            for (int row = row_begin; row < row_end; ++row) {
-                const T* x_block = x.local_data() + graph->block_offsets[row];
-                const uint32_t block_begin = batch.row_block_start(row);
-                const uint32_t block_end = batch.row_block_end(row);
-                for (uint32_t local_block = block_begin; local_block < block_end; ++local_block) {
-                    const int col = batch.cols[local_block];
-                    const T* block = batch.block_ptr(local_block);
-                    T* y_block = y_local.data() + graph->block_offsets[col];
-                    rowmajor_kernels::rm_gemv_adjoint<T>(bs, bs, block, x_block, y_block);
-                }
-            }
+    const T* x_local = x.local_data();
+    const auto& block_offsets = graph->block_offsets;
+    const int* incoming_ptr = plan.incoming_ptr.data();
+    const int* incoming_rows = plan.incoming_rows.data();
+    const T* const* incoming_blocks = plan.incoming_blocks.data();
+
+    // One block column per iteration: each output block has exactly one
+    // writer, so there is no race whatever the schedule, no per-thread copy of
+    // y, and no merge pass. See BSRAdjointApplyPlan for what this replaced.
+    #pragma omp parallel for schedule(static)
+    for (int col = 0; col < block_count; ++col) {
+        const int begin = incoming_ptr[col];
+        const int end = incoming_ptr[col + 1];
+        if (begin == end) {
+            continue;
         }
-    }
-
-    #pragma omp parallel for
-    for (size_t index = 0; index < y.data.size(); ++index) {
-        T sum = T(0);
-        for (const auto& thread_buffer : thread_buffers) {
-            // A buffer stays empty when the region ran with fewer threads
-            // than thread_count.
-            if (!thread_buffer.empty()) {
-                sum += thread_buffer[index];
-            }
+        T* y_block = y.data.data() + block_offsets[col];
+        for (int incoming = begin; incoming < end; ++incoming) {
+            rowmajor_kernels::rm_gemv_adjoint<T>(
+                bs,
+                bs,
+                incoming_blocks[incoming],
+                x_local + block_offsets[incoming_rows[incoming]],
+                y_block);
         }
-        y.data[index] = sum;
     }
 
     y.reduce_ghosts();
@@ -645,11 +634,8 @@ void bsr_mult_dense_adjoint_impl(
     x.bind_to_graph(graph);
     y.bind_to_graph(graph);
 
-    const auto& plan = backend.ensure_apply_plan(graph->adj_ptr, graph->adj_ind);
-    const auto& domains = backend.ensure_thread_domains(graph->adj_ptr);
-    const int n_rows = graph->adj_ptr.empty() ? 0 : static_cast<int>(graph->adj_ptr.size()) - 1;
-    const int runtime_block_size = backend.block_size;
-    const int nv = x.ld;
+    const int bs = backend.block_size;
+    const int nv = x.ld;  // padded ld; pad lanes are zero and stay zero
     const int x_ld = x.ld;
     const int y_ld = y.ld;
     const int thread_count =
@@ -658,28 +644,32 @@ void bsr_mult_dense_adjoint_impl(
 #else
         1;
 #endif
-
     if (thread_count == 1) {
-        // Single thread owns every output row: accumulate straight into y and
-        // skip the scatter buffers + merge (two full passes over y otherwise).
+        // One writer, so there is nothing to divide: walk the value pages in
+        // storage order and accumulate straight into y. The column plan below
+        // exists only to give each thread its own output blocks, which buys
+        // nothing here and costs an indirection per block plus a traversal
+        // that reads the matrix out of order.
+        const auto& forward = backend.ensure_apply_plan(graph->adj_ptr, graph->adj_ind);
         std::fill(y.data.begin(), y.data.end(), T(0));
-        for (const auto& batch_entry : plan.batches) {
+        for (const auto& batch_entry : forward.batches) {
             const auto& batch = batch_entry.batch;
             for (int row = batch.row_begin; row < batch.row_end; ++row) {
-                const T* x_rows = x.data.data() +
-                    static_cast<size_t>(graph->block_offsets[row]) * x_ld;
+                const T* x_rows =
+                    x.data.data() + static_cast<size_t>(graph->block_offsets[row]) * x_ld;
                 const uint32_t block_begin = batch.row_block_start(row);
                 const uint32_t block_end = batch.row_block_end(row);
                 for (uint32_t local_block = block_begin; local_block < block_end; ++local_block) {
-                    const int col = batch.cols[local_block];
                     rowmajor_kernels::rm_gemm_adjoint<T>(
-                        runtime_block_size,
-                        runtime_block_size,
+                        bs,
+                        bs,
                         nv,
                         batch.block_ptr(local_block),
                         x_rows,
                         x_ld,
-                        y.data.data() + static_cast<size_t>(graph->block_offsets[col]) * y_ld,
+                        y.data.data() +
+                            static_cast<size_t>(
+                                graph->block_offsets[batch.cols[local_block]]) * y_ld,
                         y_ld);
                 }
             }
@@ -688,58 +678,42 @@ void bsr_mult_dense_adjoint_impl(
         return;
     }
 
-    // Row-driven scatter: per-thread ROW-major accumulation buffers (same
-    // layout as y), merged with one flat contiguous reduction. Each thread
-    // sizes its own buffer in-region (parallel fill, NUMA-local first touch).
-    std::vector<std::vector<T>> thread_buffers(static_cast<size_t>(thread_count));
+    const int block_count = static_cast<int>(graph->block_sizes.size());
+    const auto& plan =
+        backend.ensure_adjoint_apply_plan(graph->adj_ptr, graph->adj_ind, block_count);
 
-    #pragma omp parallel
-    {
-#ifdef _OPENMP
-        const int thread_id = omp_get_thread_num();
-#else
-        const int thread_id = 0;
-#endif
-        auto& y_local = thread_buffers[static_cast<size_t>(thread_id)];
-        y_local.assign(y.data.size(), T(0));
-        const auto [thread_row_begin, thread_row_end] = thread_domain_range(n_rows, domains);
+    parallel_zero(y.data.data(), y.data.size());
 
-        for (const auto& batch_entry : plan.batches) {
-            const auto& batch = batch_entry.batch;
-            const int row_begin = std::max(batch.row_begin, thread_row_begin);
-            const int row_end = std::min(batch.row_end, thread_row_end);
-            for (int row = row_begin; row < row_end; ++row) {
-                const T* x_rows = x.data.data() +
-                    static_cast<size_t>(graph->block_offsets[row]) * x_ld;
-                const uint32_t block_begin = batch.row_block_start(row);
-                const uint32_t block_end = batch.row_block_end(row);
-                for (uint32_t local_block = block_begin; local_block < block_end; ++local_block) {
-                    const int col = batch.cols[local_block];
-                    rowmajor_kernels::rm_gemm_adjoint<T>(
-                        runtime_block_size,
-                        runtime_block_size,
-                        nv,
-                        batch.block_ptr(local_block),
-                        x_rows,
-                        x_ld,
-                        y_local.data() + static_cast<size_t>(graph->block_offsets[col]) * y_ld,
-                        y_ld);
-                }
-            }
+    const auto& block_offsets = graph->block_offsets;
+    const T* x_data = x.data.data();
+    T* y_data = y.data.data();
+    const int* incoming_ptr = plan.incoming_ptr.data();
+    const int* incoming_rows = plan.incoming_rows.data();
+    const T* const* incoming_blocks = plan.incoming_blocks.data();
+
+    // Column-per-iteration, as in the SpMV above. This is the path the block
+    // real-space runs take, and the one the private-buffer form hurt most:
+    // its scratch was threads x |Y|, which at nv = 8 is measured in hundreds
+    // of MB before the calculation itself.
+    #pragma omp parallel for schedule(static)
+    for (int col = 0; col < block_count; ++col) {
+        const int begin = incoming_ptr[col];
+        const int end = incoming_ptr[col + 1];
+        if (begin == end) {
+            continue;
         }
-    }
-
-    #pragma omp parallel for
-    for (size_t index = 0; index < y.data.size(); ++index) {
-        T sum = T(0);
-        for (const auto& thread_buffer : thread_buffers) {
-            // A buffer stays empty when the region ran with fewer threads
-            // than thread_count.
-            if (!thread_buffer.empty()) {
-                sum += thread_buffer[index];
-            }
+        T* y_rows = y_data + static_cast<size_t>(block_offsets[col]) * y_ld;
+        for (int incoming = begin; incoming < end; ++incoming) {
+            rowmajor_kernels::rm_gemm_adjoint<T>(
+                bs,
+                bs,
+                nv,
+                incoming_blocks[incoming],
+                x_data + static_cast<size_t>(block_offsets[incoming_rows[incoming]]) * x_ld,
+                x_ld,
+                y_rows,
+                y_ld);
         }
-        y.data[index] = sum;
     }
 
     y.reduce_ghosts();
