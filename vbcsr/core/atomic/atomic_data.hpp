@@ -290,6 +290,24 @@ public:
         // alternative -- one neighbour list over every atom on rank 0 -- costs
         // that rank N * <neighbours>, which at 1e6 atoms is gigabytes and tens
         // of seconds before any other rank has done anything.
+        //
+        // That contract covers the cell and the pbc flags too: from_file reads
+        // them on rank 0 only, and every rank's neighbour search needs them, so
+        // broadcast here rather than requiring callers to replicate them.
+        std::vector<double> cell_all = cell;
+        std::vector<bool> pbc_all = pbc;
+        if (initialized && size > 1) {
+            cell_all.resize(9, 0.0);
+            MPI_Bcast(cell_all.data(), 9, MPI_DOUBLE, 0, comm);
+            int pbc_flags[3] = {0, 0, 0};
+            if (rank == 0) {
+                for (int d = 0; d < 3; ++d) pbc_flags[d] = (d < (int)pbc.size() && pbc[d]) ? 1 : 0;
+            }
+            MPI_Bcast(pbc_flags, 3, MPI_INT, 0, comm);
+            pbc_all.assign(3, false);
+            for (int d = 0; d < 3; ++d) pbc_all[d] = pbc_flags[d] != 0;
+        }
+
         std::vector<int> type_norb = type_norb_in;
         std::vector<double> my_pos;
         std::vector<int> my_z;
@@ -299,7 +317,7 @@ public:
         int my_n_atom = 0;
         int n_global = 0;
 
-        distribute_and_build_edges(comm, rank, size, pos, z, cell, pbc, r_max_per_type,
+        distribute_and_build_edges(comm, rank, size, pos, z, cell_all, pbc_all, r_max_per_type,
                                    type_norb, n_global, my_n_atom, my_pos, my_z, my_types,
                                    my_indices, my_edges_flat);
 
@@ -383,8 +401,8 @@ public:
             comm,
             rank,
             size,
-            cell,
-            pbc,
+            cell_all,
+            pbc_all,
             total_recv,
             r_indices,
             r_z,
@@ -658,6 +676,13 @@ public:
     // Rewrites a Cartesian vector in fractional coordinates. A degenerate cell
     // is left alone rather than raised on, which is what the callers here
     // expect: a cell-less (molecular) system has nothing to reduce.
+    //
+    // The cell stores lattice vectors as ROWS (get_edge_vec composes
+    // r = sum_i R_i a_i, i.e. r = C^T f), so recovering fractionals takes the
+    // TRANSPOSED inverse: f = (C^-1)^T r. Applying the plain inverse instead is
+    // invisible for symmetric cells -- every cubic test -- and silently maps
+    // lattice translations of a triclinic cell to non-integer fractionals,
+    // which corrupts any Bloch phase built from a full bond vector.
     void invert_cell(double *x, double *y, double *z) {
         std::array<double, 9> inv;
         try {
@@ -666,9 +691,9 @@ public:
             return;
         }
 
-        const double a = inv[0]*(*x) + inv[1]*(*y) + inv[2]*(*z);
-        const double b = inv[3]*(*x) + inv[4]*(*y) + inv[5]*(*z);
-        const double c = inv[6]*(*x) + inv[7]*(*y) + inv[8]*(*z);
+        const double a = inv[0]*(*x) + inv[3]*(*y) + inv[6]*(*z);
+        const double b = inv[1]*(*x) + inv[4]*(*y) + inv[7]*(*z);
+        const double c = inv[2]*(*x) + inv[5]*(*y) + inv[8]*(*z);
 
         *x = a;
         *y = b;

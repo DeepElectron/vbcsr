@@ -716,12 +716,23 @@ TEST_F(AtomicDataTest, Robustness) {
     delete ad;
 
     // 2. Zero Volume Cell
-    if (rank == 0) {
+    //
+    // from_points is COLLECTIVE. An earlier version ran this block on rank 0
+    // only; rank 0's internal broadcasts then paired with rank 1's broadcasts
+    // from the NEXT test's from_points call, shipping this zero cell into that
+    // test and desynchronizing every collective after it (ThreeBodyGraph and
+    // Consistency failed, PressureTest_Random hung). The damage was masked for
+    // as long as the IO_POSCAR crash stopped multi-rank runs from ever getting
+    // this far. Every rank must make the call and throw at the same point.
+    {
         std::vector<double> zero_cell = {0,0,0, 0,0,0, 0,0,0};
-        std::vector<double> pos = {0,0,0};
-        std::vector<int> z = {1};
-        std::vector<int> type_norb = {13};
-        // NeighborList throws invalid_argument on zero volume
+        std::vector<double> pos;
+        std::vector<int> z;
+        if (rank == 0) {
+            pos = {0,0,0};
+            z = {1};
+        }
+        // NeighborList throws invalid_argument on zero volume, on every rank.
         EXPECT_THROW({
             AtomicData::from_points(pos, z, zero_cell, pbc, r_max, type_norb, MPI_COMM_WORLD);
         }, std::invalid_argument);
@@ -1102,18 +1113,25 @@ TEST_F(AtomicDataTest, SingleProcess_Stress) {
     std::sort(expected_3b.begin(), expected_3b.end());
     expected_3b.erase(std::unique(expected_3b.begin(), expected_3b.end()), expected_3b.end());
 
-    // 3. Collect Actual 3-body edges from g3 and map to original indices
+    // 3. Collect Actual 3-body edges from g3 and map to original indices.
+    //
+    // This must read g3's OWN adjacency -- an earlier version of this test
+    // read ad->graph (the 2-body graph) here, so it compared the 3-body
+    // expectation against the 2-body adjacency and failed on any system where
+    // the shared-neighbor closure adds edges, which is to say any dense one.
+    // g3's columns are its own local indices; map local -> global id, then
+    // global id -> original index through the 2-body graph's ownership.
     std::vector<std::pair<int, int>> actual_3b;
     for(int i=0; i<N; ++i) {
-        // g3->adj_list[i] contains neighbors of atom i (local index i)
-        int orig_i = ad->atom_index[i];
-        for(int inei=ad->graph->adj_ptr[i]; inei<ad->graph->adj_ptr[i+1]; ++inei) {
-            int neighbor = ad->graph->adj_ind[inei];
-            int orig_neighbor = ad->atom_index[neighbor];
+        int orig_i = ad->atom_index[ad->graph->global_to_local.at(g3->get_global_index(i))];
+        for(int inei=g3->adj_ptr[i]; inei<g3->adj_ptr[i+1]; ++inei) {
+            int gid_neighbor = g3->get_global_index(g3->adj_ind[inei]);
+            int orig_neighbor = ad->atom_index[ad->graph->global_to_local.at(gid_neighbor)];
             actual_3b.push_back({orig_i, orig_neighbor});
         }
     }
     std::sort(actual_3b.begin(), actual_3b.end());
+    actual_3b.erase(std::unique(actual_3b.begin(), actual_3b.end()), actual_3b.end());
     
     // 4. Compare
     EXPECT_EQ(actual_3b.size(), expected_3b.size());
@@ -1320,6 +1338,61 @@ TEST_F(AtomicDataTest, PartitionGraphBalancesTheVertexWeights) {
     // with that switch.
     // EXPECT_LT(after_weighted, 1.35);
     // EXPECT_LT(after_weighted, after_uniform * 0.9);
+}
+
+// invert_cell must be the inverse of the composition get_edge_vec performs:
+// cartesian = sum_i R_i a_i with lattice vectors as cell ROWS, so fractional
+// recovery takes the TRANSPOSED inverse. A symmetric cell hides a missing
+// transpose completely -- the regression only bites on a triclinic cell, where
+// the lattice vectors themselves must map back to the identity. This was a
+// real defect: every Bloch phase built from a full Cartesian bond vector
+// (LCAO velocity and position assembly) was corrupted at k != Gamma in
+// non-symmetric cells while all cubic tests stayed green.
+TEST_F(AtomicDataTest, InvertCellIsTransposedInverseOnTriclinicCell) {
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    std::vector<double> pos;
+    std::vector<int> z;
+    if (rank == 0) {
+        pos = {0.0, 0.0, 0.0};
+        z = {1};
+    }
+    // Diamond's primitive cell: lower-triangular row-major, maximally
+    // asymmetric among the cells in real use here.
+    std::vector<double> cell = {2.52685,   0.0,      0.0,
+                                1.263425,  2.188316, 0.0,
+                                1.263425,  0.729439, 2.063165};
+    std::vector<bool> pbc = {true, true, true};
+    std::vector<double> r_max = {1.0};
+    std::vector<int> type_norb = {1};
+
+    AtomicData* ad = AtomicData::from_points(pos, z, cell, pbc, r_max, type_norb, MPI_COMM_WORLD);
+
+    // Each lattice vector is (row i of the cell) and must invert to e_i.
+    for (int i = 0; i < 3; ++i) {
+        double x = cell[3 * i], y = cell[3 * i + 1], zc = cell[3 * i + 2];
+        ad->invert_cell(&x, &y, &zc);
+        const double frac[3] = {x, y, zc};
+        for (int j = 0; j < 3; ++j) {
+            EXPECT_NEAR(frac[j], i == j ? 1.0 : 0.0, 1e-12);
+        }
+    }
+
+    // And a generic Cartesian point must round-trip through the composition
+    // get_edge_vec uses: r_alpha = sum_i f_i * cell[3i + alpha].
+    {
+        double x = 0.7, y = -1.3, zc = 2.1;
+        double fx = x, fy = y, fz = zc;
+        ad->invert_cell(&fx, &fy, &fz);
+        for (int alpha = 0; alpha < 3; ++alpha) {
+            const double back = fx * cell[alpha] + fy * cell[3 + alpha] + fz * cell[6 + alpha];
+            const double orig = alpha == 0 ? x : (alpha == 1 ? y : zc);
+            EXPECT_NEAR(back, orig, 1e-12);
+        }
+    }
+
+    delete ad;
 }
 
 int main(int argc, char **argv) {
