@@ -307,6 +307,32 @@ TEST_F(AtomicDataTest, SingleProcess) {
     delete ad;
 }
 
+TEST_F(AtomicDataTest, VolumeAxes) {
+    // Triclinic on purpose: an orthogonal pair would let a |v x w| = |v||w|
+    // mixup slip through.
+    std::vector<double> pos = {0,0,0};
+    std::vector<int> z = {1};
+    std::vector<double> cell = {2.0, 0.0, 0.0,  1.0, 3.0, 0.0,  0.5, 0.25, 4.0};
+    std::vector<bool> pbc = {true, true, true};
+    std::vector<double> r_max = {1.0};
+    std::vector<int> type_norb = {1};
+    AtomicData* ad = AtomicData::from_points(pos, z, cell, pbc, r_max, type_norb, MPI_COMM_WORLD);
+
+    EXPECT_NEAR(ad->volume(), 24.0, 1e-12);               // |a . (b x c)|
+    EXPECT_NEAR(ad->volume("abc"), 24.0, 1e-12);
+    EXPECT_NEAR(ad->volume("ab"), 6.0, 1e-12);            // |a x b|
+    EXPECT_NEAR(ad->volume("bc"), std::sqrt(161.5625), 1e-12);
+    EXPECT_NEAR(ad->volume("ca"), std::sqrt(64.25), 1e-12);
+    EXPECT_NEAR(ad->volume("a"), 2.0, 1e-12);
+    EXPECT_NEAR(ad->volume("b"), std::sqrt(10.0), 1e-12);
+    EXPECT_NEAR(ad->volume("c"), std::sqrt(16.3125), 1e-12);
+
+    EXPECT_THROW(ad->volume("x"), std::runtime_error);    // Cartesian letters are not cell axes
+    EXPECT_THROW(ad->volume("ac"), std::runtime_error);   // pairs are cyclic: ca
+
+    delete ad;
+}
+
 TEST_F(AtomicDataTest, NeighborListNonPeriodic) {
     int rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);

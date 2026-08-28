@@ -715,22 +715,26 @@ public:
         return global_norb;
     }
 
-    // Compute cell volume
+    // Measure of the cell along the named lattice axes: "abc" is the cell
+    // volume, a cyclic pair ("ab", "bc", "ca") the area of that lattice
+    // plane, a single letter the length of that lattice vector.
     double volume(std::string axis="abc") {
-        // compute cross product of cell vectors
-        if (axis == "ab") return std::sqrt(std::pow(cell[1]*cell[5] - cell[2]*cell[4], 2) 
-            + std::pow(cell[2]*cell[3] - cell[0]*cell[5], 2) 
+        if (axis == "a") return std::sqrt(cell[0]*cell[0] + cell[1]*cell[1] + cell[2]*cell[2]);
+        if (axis == "b") return std::sqrt(cell[3]*cell[3] + cell[4]*cell[4] + cell[5]*cell[5]);
+        if (axis == "c") return std::sqrt(cell[6]*cell[6] + cell[7]*cell[7] + cell[8]*cell[8]);
+        if (axis == "ab") return std::sqrt(std::pow(cell[1]*cell[5] - cell[2]*cell[4], 2)
+            + std::pow(cell[2]*cell[3] - cell[0]*cell[5], 2)
             + std::pow(cell[0]*cell[4] - cell[1]*cell[3], 2));
-        if (axis == "bc") return std::sqrt(std::pow(cell[4]*cell[8] - cell[5]*cell[7], 2) 
-            + std::pow(cell[5]*cell[6] - cell[3]*cell[8], 2) 
+        if (axis == "bc") return std::sqrt(std::pow(cell[4]*cell[8] - cell[5]*cell[7], 2)
+            + std::pow(cell[5]*cell[6] - cell[3]*cell[8], 2)
             + std::pow(cell[3]*cell[7] - cell[4]*cell[6], 2));
-        if (axis == "ca") return std::sqrt(std::pow(cell[7]*cell[2] - cell[8]*cell[1], 2) 
-            + std::pow(cell[8]*cell[0] - cell[6]*cell[2], 2) 
+        if (axis == "ca") return std::sqrt(std::pow(cell[7]*cell[2] - cell[8]*cell[1], 2)
+            + std::pow(cell[8]*cell[0] - cell[6]*cell[2], 2)
             + std::pow(cell[6]*cell[1] - cell[7]*cell[0], 2));
         if (axis == "abc") return std::abs(cell[0] * (cell[4] * cell[8] - cell[5] * cell[7])
                    - cell[1] * (cell[3] * cell[8] - cell[5] * cell[6])
                    + cell[2] * (cell[3] * cell[7] - cell[4] * cell[6]));
-        throw std::runtime_error("Invalid axis");
+        throw std::runtime_error("volume axis must be one of: abc, ab, bc, ca, a, b, c; got '" + axis + "'");
     }
 
     DistGraph* get_graph3b(const std::vector<double>& r_max_left, const std::vector<double>& r_max_right) {
