@@ -396,12 +396,19 @@ public:
     // so every rank builds the edges of ITS OWNED atoms locally; the persistent
     // storage is owned + ghost only. ``my_input_index[li]`` is the original
     // input-order index of owned atom ``li`` (fills AtomicData.atom_index).
+    // ``z_of_type`` (optional) is the type table: type t is the element ``z_of_type[t]``,
+    // and ``r_max_per_type``/``type_norb_in`` are indexed by it. At the Python surface it is
+    // not a separate argument — it is the key set of whatever per-type MAPPING the caller
+    // passed for those two, since a caller that keys its own tables by element has already
+    // said what its types are. It matters because this constructor takes a caller-chosen
+    // SUBSET of the atoms: left empty, the table is inferred from the atoms present
+    // (sorted-unique Z), which is a different numbering for every subset.
     static AtomicData* from_distributed(
         const std::vector<double>& my_pos, const std::vector<int>& my_z,
         const std::vector<int>& my_input_index,
         const std::vector<double>& cell, const std::vector<bool>& pbc,
         const std::vector<double>& r_max_per_type, const std::vector<int>& type_norb_in,
-        MPI_Comm comm) {
+        MPI_Comm comm, const std::vector<int>& z_of_type = {}) {
         int rank = 0, size = 1, initialized = 0;
         MPI_Initialized(&initialized);
         if (initialized) { MPI_Comm_rank(comm, &rank); MPI_Comm_size(comm, &size); }
@@ -425,10 +432,29 @@ public:
             MPI_Allgatherv(my_z.data(), my_n, MPI_INT, all_z.data(), counts.data(), displs.data(), MPI_INT, comm);
         } else { all_pos = my_pos; all_z = my_z; }
 
-        // 3. Global z -> type (sorted-unique z; identical on every rank).
-        std::vector<int> uz = all_z; std::sort(uz.begin(), uz.end());
-        uz.erase(std::unique(uz.begin(), uz.end()), uz.end());
-        std::map<int, int> z2t; for (size_t i = 0; i < uz.size(); ++i) z2t[uz[i]] = static_cast<int>(i);
+        // 3. z -> type. DECLARED by the caller when ``z_of_type`` is given (the table is then
+        //    the same on every rank and for every subset of atoms); otherwise inferred from
+        //    the atoms present, as sorted-unique Z.
+        std::vector<int> uz;
+        std::map<int, int> z2t;
+        if (!z_of_type.empty()) {
+            uz = z_of_type;
+            for (size_t i = 0; i < uz.size(); ++i) {
+                if (!z2t.emplace(uz[i], static_cast<int>(i)).second)
+                    throw std::runtime_error("from_distributed: duplicate atomic number "
+                                             + std::to_string(uz[i]) + " in z_of_type");
+            }
+            for (int g = 0; g < total; ++g) {
+                if (z2t.find(all_z[g]) == z2t.end())
+                    throw std::runtime_error("from_distributed: atom with Z=" +
+                                             std::to_string(all_z[g]) +
+                                             " is not in the declared z_of_type table");
+            }
+        } else {
+            uz = all_z; std::sort(uz.begin(), uz.end());
+            uz.erase(std::unique(uz.begin(), uz.end()), uz.end());
+            for (size_t i = 0; i < uz.size(); ++i) z2t[uz[i]] = static_cast<int>(i);
+        }
         std::vector<int> all_types(total); for (int g = 0; g < total; ++g) all_types[g] = z2t[all_z[g]];
         std::vector<int> type_norb = type_norb_in;
         if (type_norb.empty()) type_norb.assign(uz.size(), 1);

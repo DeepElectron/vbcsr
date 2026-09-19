@@ -27,6 +27,73 @@ def _normalize_pbc(pbc):
     return [bool(value) for value in values]
 
 
+def _declared_z(*params):
+    """The Z table a caller DECLARED through its per-type quantities, or ``None``.
+
+    A per-type quantity given as a mapping is keyed by element (Z or symbol), so its keys
+    are the caller's type table — the one the caller's own code is already indexed by. That
+    is the only way the table can reach a constructor that is handed an arbitrary SUBSET of
+    a system's atoms: the atoms alone cannot distinguish "no Cu here" from "no Cu at all".
+    Scalars and arrays carry no such information and leave the table to be inferred.
+    """
+    tables = []
+    for param in params:
+        if not isinstance(param, dict):
+            continue
+        keys = [k for k in param if k != "default"]
+        if not keys:
+            continue
+        z = sorted(
+            int(k) if not isinstance(k, str) else int(ase.data.atomic_numbers[k]) for k in keys
+        )
+        tables.append(z)
+    if not tables:
+        return None
+    if any(t != tables[0] for t in tables[1:]):
+        raise ValueError(
+            "per-type mappings declare different element sets: " + repr(tables)
+        )
+    return np.asarray(tables[0], dtype=np.int32)
+
+
+def _per_type_values(param, z_of_type, name, dtype):
+    """``param`` read out over the type table ``z_of_type`` (a scalar, an array already in
+    type order, or a mapping keyed by Z / chemical symbol, with an optional "default")."""
+    values = np.zeros(len(z_of_type), dtype=dtype)
+
+    if np.isscalar(param):
+        values.fill(param)
+        return values
+
+    if isinstance(param, dict):
+        default_value = param.get("default")
+        if default_value is not None:
+            values.fill(default_value)
+        for idx, atomic_number in enumerate(z_of_type):
+            if atomic_number in param:
+                values[idx] = param[atomic_number]
+                continue
+            symbol = ase.data.chemical_symbols[int(atomic_number)]
+            if symbol in param:
+                values[idx] = param[symbol]
+                continue
+            if default_value is None:
+                raise ValueError(
+                    f"{name} missing for Z={atomic_number} ({ase.data.chemical_symbols[int(atomic_number)]})"
+                )
+        return values
+
+    array = np.asarray(param)
+    if array.ndim == 1 and array.size == 1:
+        values.fill(array.reshape(-1)[0])
+        return values
+    if array.ndim != 1 or array.size != len(z_of_type):
+        raise ValueError(
+            f"{name} length {array.size} does not match the number of unique atomic types {len(z_of_type)}"
+        )
+    return np.ascontiguousarray(array.astype(dtype, copy=False))
+
+
 class AtomicData(vbcsr_core.AtomicData):
     """
     Python wrapper for ``vbcsr_core.AtomicData``.
@@ -51,46 +118,8 @@ class AtomicData(vbcsr_core.AtomicData):
         else:
             sorted_unique_z = np.unique(atomic_numbers)
 
-        def parse_param(param, name, dtype):
-            values = np.zeros(len(sorted_unique_z), dtype=dtype)
-
-            if np.isscalar(param):
-                values.fill(param)
-                return values
-
-            if isinstance(param, dict):
-                default_value = param.get("default")
-                if default_value is not None:
-                    values.fill(default_value)
-
-                for idx, atomic_number in enumerate(sorted_unique_z):
-                    if atomic_number in param:
-                        values[idx] = param[atomic_number]
-                        continue
-
-                    symbol = ase.data.chemical_symbols[int(atomic_number)]
-                    if symbol in param:
-                        values[idx] = param[symbol]
-                        continue
-
-                    if default_value is None:
-                        raise ValueError(
-                            f"{name} missing for Z={atomic_number} ({ase.data.chemical_symbols[int(atomic_number)]})"
-                        )
-                return values
-
-            array = np.asarray(param)
-            if array.ndim == 1 and array.size == 1:
-                values.fill(array.reshape(-1)[0])
-                return values
-            if array.ndim != 1 or array.size != len(sorted_unique_z):
-                raise ValueError(
-                    f"{name} length {array.size} does not match the number of unique atomic types {len(sorted_unique_z)}"
-                )
-            return np.ascontiguousarray(array.astype(dtype, copy=False))
-
-        r_max_vec = parse_param(r_max, "r_max", np.float64)
-        type_norb_vec = parse_param(type_norb, "type_norb", np.int32)
+        r_max_vec = _per_type_values(r_max, sorted_unique_z, "r_max", np.float64)
+        type_norb_vec = _per_type_values(type_norb, sorted_unique_z, "type_norb", np.int32)
         cell_array = np.ascontiguousarray(np.asarray(cell, dtype=np.float64).reshape(3, 3))
 
         return super().from_points(
@@ -171,8 +200,15 @@ class AtomicData(vbcsr_core.AtomicData):
 
         Each rank passes ONLY its owned atoms: ``pos`` (n_owned, 3), ``z`` (n_owned,),
         and ``input_index`` (n_owned,) — the original input-order index of each owned
-        atom (fills ``atom_index``/``indices``). ``r_max``/``type_norb`` are per-type
-        (global, indexed by sorted-unique-Z). Global ids are assigned contiguously by
+        atom (fills ``atom_index``/``indices``).
+
+        ``r_max``/``type_norb`` are per-type. Give them as MAPPINGS keyed by element (Z or
+        symbol) whenever the caller may hand over a SUBSET of a system's atoms: the keys are
+        then the type table, so every AtomicData built from the same mapping numbers its
+        types the same way, whether it holds all the atoms or a few. Given as plain arrays
+        the table is instead inferred from the atoms present (sorted-unique Z), which is a
+        different numbering for every subset — ``atom_type`` is then meaningful only within
+        the one object. Global ids are assigned contiguously by
         rank and the edge graph + ghosts are built distributed (no rank-0 gather, no
         ParMETIS). The partition (which atom each rank owns) is the caller's choice.
         """
@@ -181,12 +217,18 @@ class AtomicData(vbcsr_core.AtomicData):
         z = np.ascontiguousarray(np.asarray(z, dtype=np.int32).reshape(-1))
         input_index = np.ascontiguousarray(np.asarray(input_index, dtype=np.int32).reshape(-1))
         cell = np.ascontiguousarray(np.asarray(cell, dtype=np.float64).reshape(3, 3))
-        r_max_vec = np.ascontiguousarray(np.asarray(r_max, dtype=np.float64).reshape(-1))
-        type_norb_vec = np.ascontiguousarray(np.asarray(type_norb, dtype=np.int32).reshape(-1))
         if z.size != pos.shape[0] or input_index.size != pos.shape[0]:
             raise ValueError("from_distributed: pos/z/input_index must share n_owned")
+        z_of_type = _declared_z(r_max, type_norb)
+        if z_of_type is None:
+            r_max_vec = np.ascontiguousarray(np.asarray(r_max, dtype=np.float64).reshape(-1))
+            type_norb_vec = np.ascontiguousarray(np.asarray(type_norb, dtype=np.int32).reshape(-1))
+        else:
+            r_max_vec = _per_type_values(r_max, z_of_type, "r_max", np.float64)
+            type_norb_vec = _per_type_values(type_norb, z_of_type, "type_norb", np.int32)
         return super().from_distributed(
-            pos, z, input_index, cell, _normalize_pbc(pbc), r_max_vec, type_norb_vec, comm
+            pos, z, input_index, cell, _normalize_pbc(pbc), r_max_vec, type_norb_vec, comm,
+            z_of_type,
         )
 
     @classmethod

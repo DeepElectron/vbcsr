@@ -331,7 +331,8 @@ void bind_atomic_module(py::module& m) {
         .def_static("from_distributed", [](
                 py::array_t<double> pos, py::array_t<int> z, py::array_t<int> input_index,
                 py::array_t<double> cell, py::object pbc_obj,
-                py::object r_max_obj, py::object type_norb_obj, py::object comm_obj) {
+                py::object r_max_obj, py::object type_norb_obj, py::object comm_obj,
+                py::object z_of_type_obj) {
             MPI_Comm comm = get_mpi_comm(comm_obj);
             auto r_pos = pos.unchecked<2>();
             if (r_pos.ndim() != 2 || r_pos.shape(1) != 3) throw std::runtime_error("pos must be (n_owned, 3)");
@@ -354,10 +355,22 @@ void bind_atomic_module(py::module& m) {
             std::vector<int> type_norb_vec = to_ivec(type_norb_obj, "from_distributed type_norb");
             if (vec_idx.size() != vec_z.size())
                 throw std::runtime_error("from_distributed: input_index size must equal n_owned");
+            // Declared type table (optional): type t is the element z_of_type[t], so r_max /
+            // type_norb are indexed by the CALLER's numbering rather than by one inferred from
+            // whichever atoms this rank happens to hold.
+            std::vector<int> z_of_type_vec;
+            if (!z_of_type_obj.is_none()) {
+                z_of_type_vec = to_ivec(z_of_type_obj, "from_distributed z_of_type");
+                if (z_of_type_vec.size() != type_norb_vec.size() ||
+                    z_of_type_vec.size() != r_max_vec.size())
+                    throw std::runtime_error("from_distributed: z_of_type, type_norb and r_max "
+                                             "must have one entry per declared type");
+            }
             return AtomicData::from_distributed(vec_pos, vec_z, vec_idx, vec_cell, vec_pbc,
-                                                r_max_vec, type_norb_vec, comm);
+                                                r_max_vec, type_norb_vec, comm, z_of_type_vec);
         }, py::arg("pos"), py::arg("z"), py::arg("input_index"), py::arg("cell"),
-           py::arg("pbc"), py::arg("r_max"), py::arg("type_norb"), py::arg("comm") = py::none())
+           py::arg("pbc"), py::arg("r_max"), py::arg("type_norb"), py::arg("comm") = py::none(),
+           py::arg("z_of_type") = py::none())
 
         // Properties
         .def_property_readonly("pos", owned_positions)
