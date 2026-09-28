@@ -308,6 +308,7 @@ public:
             for (int d = 0; d < 3; ++d) pbc_all[d] = pbc_flags[d] != 0;
         }
 
+        detail::GraphProfile prof(comm);
         std::vector<int> type_norb = type_norb_in;
         std::vector<double> my_pos;
         std::vector<int> my_z;
@@ -320,6 +321,7 @@ public:
         distribute_and_build_edges(comm, rank, size, pos, z, cell_all, pbc_all, r_max_per_type,
                                    type_norb, n_global, my_n_atom, my_pos, my_z, my_types,
                                    my_indices, my_edges_flat);
+        prof.lap("distribute_and_build_edges", static_cast<long long>(my_edges_flat.size() / 5));
 
         if (n_global == 0) {
             return new AtomicData(comm);
@@ -337,6 +339,7 @@ public:
         
         // this step build temporary graph for partitioning
         build_parmetis_graph(comm, rank, size, my_n_atom, my_edges_flat, vtxdist, xadj, adjncy, my_start);
+        prof.lap("parmetis/graph");
         
         std::vector<int> part(my_n_atom);
         std::fill(part.begin(), part.end(), rank);
@@ -349,6 +352,7 @@ public:
         for (int i = 0; i < my_n_atom; ++i) my_vwgt[i] = type_norb[my_types[i]];
 
         partition_graph(vtxdist, xadj, adjncy, size, part, comm, my_pos, n_global, my_vwgt);
+        prof.lap("parmetis/partition");
         
         // 3. Redistribute Atoms
         std::vector<double> r_pos;
@@ -365,8 +369,10 @@ public:
                            r_pos, r_z, r_types, r_indices, r_inter_indices, total_recv);
         
         // 4. Redistribute Edges
+        prof.lap("redistribute/atoms");
         std::vector<int> r_edges;
         redistribute_edges(comm, rank, size, my_start, my_edges_flat, part, r_edges);
+        prof.lap("redistribute/edges", static_cast<long long>(r_edges.size() / 5));
         
         // 5. Re-map IDs to be contiguous on each rank
         std::vector<int> all_recv_counts(size);
@@ -395,9 +401,10 @@ public:
             r_edges[5*k] = inter_to_final[r_edges[5*k]];
             r_edges[5*k+1] = inter_to_final[r_edges[5*k+1]];
         }
+        prof.lap("final/index_map");
                       
         // 6. Construct AtomicData
-        return construct_final_object(
+        AtomicData* built = construct_final_object(
             comm,
             rank,
             size,
@@ -410,6 +417,8 @@ public:
             r_pos,
             r_edges,
             type_norb);
+        prof.lap("final/assemble");
+        return built;
     }
 
     // Distributed construction from a CALLER-GIVEN partition (doc/design/42 §4).
@@ -1418,9 +1427,13 @@ private:
             weights[i] = static_cast<double>(type_norb[it->second]);
         }
 
+        detail::GraphProfile prof(comm);
+        prof.lap("scatter", n_block);
         std::unique_ptr<InertialCut> tree;
         LocalAtoms owned = RedistributeByInertia(mine, weights, comm, &tree);
+        prof.lap("inertial_bisection", owned.n_local());
         LocalEdges edges = BuildLocalEdges(owned, *tree, cell, pbc, r_max_type, comm);
+        prof.lap("build_local_edges", edges.n_edge());
 
         my_n_atom = owned.n_local();
         my_pos = owned.pos;
@@ -1473,6 +1486,7 @@ private:
             my_edges_flat[5 * static_cast<size_t>(e) + 3] = edges.shift[3 * static_cast<size_t>(e) + 1];
             my_edges_flat[5 * static_cast<size_t>(e) + 4] = edges.shift[3 * static_cast<size_t>(e) + 2];
         }
+        prof.lap("input_to_intermediate_ids");
     }
 
     static void build_parmetis_graph(
