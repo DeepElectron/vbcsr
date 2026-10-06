@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <complex>
 #include <type_traits>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <unistd.h>
@@ -21,6 +22,7 @@
 #include <stdexcept>
 #include <utility>
 #include <vector>
+#include <mpi.h>
 #include <omp.h>
 #ifdef __linux__
 #include <sys/mman.h>
@@ -54,48 +56,6 @@ inline double profile_rss_gb() {
     return static_cast<double>(resident) * page_bytes / 1073741824.0;
 }
 
-/// Hand a staged row's physical pages back to the OS, then drop the vector.
-///
-/// `std::vector<T>().swap(v)` releases the capacity to the ALLOCATOR, which is
-/// not the same as releasing it to the kernel, and on the staged rows of a
-/// fused product the difference is most of the peak. glibc returns a large
-/// block by munmap only while it is above the mmap threshold, and that
-/// threshold is DYNAMIC: freeing one mmapped chunk raises it to that chunk's
-/// size, so the first staged row returned is also the last one returned --
-/// every row after it is served from the arena and its free() is bookkeeping.
-/// Measured on a 4096-block product with 200 neighbours per row: the copy pass
-/// wrote a 5.72 GB result while freeing 5.72 GB of staging and RSS still rose
-/// 3.9 GB.
-///
-/// MADV_DONTNEED is the same instrument PagedBuffer::release_pages_before uses,
-/// for the same reason, and it is a statement to the kernel rather than to
-/// malloc: the mapping and the pointer stay valid, the physical pages go, and a
-/// later touch faults in zeroes. That is exactly the contract free() needs --
-/// it writes its own metadata into the chunk afterwards (a page or two, faulted
-/// straight back) and never reads what the caller left there.
-///
-/// Interior pages only: the partial pages at either end may be shared with a
-/// neighbouring live allocation, and MADV_DONTNEED would discard that too.
-template <typename T>
-inline void release_and_drop(std::vector<T>& v) {
-#ifdef __linux__
-    if (!v.empty()) {
-        static const long os_page = ::sysconf(_SC_PAGESIZE);
-        if (os_page > 0) {
-            const uintptr_t mask = static_cast<uintptr_t>(os_page) - 1;
-            const uintptr_t begin = reinterpret_cast<uintptr_t>(v.data());
-            const uintptr_t end = begin + v.size() * sizeof(T);
-            const uintptr_t lo = (begin + mask) & ~mask;
-            const uintptr_t hi = end & ~mask;
-            if (hi > lo) {
-                ::madvise(reinterpret_cast<void*>(lo), static_cast<size_t>(hi - lo),
-                          MADV_DONTNEED);
-            }
-        }
-    }
-#endif
-    std::vector<T>().swap(v);
-}
 
 // ---------------------------------------------------------------------------
 // Block-product dispatch, shared by every SpGEMM-shaped kernel here.
@@ -381,9 +341,9 @@ using GhostMetadata = std::map<int, std::vector<BlockMeta>>;
 template <typename T>
 struct SpMMGhostBlocks {
     std::vector<FetchedBlockRef<T>> owned_blocks;
-    // Owns the remote payloads owned_blocks/rows point into (local blocks
-    // point into the source matrix; see FetchedBlockRef).
-    std::vector<T> arena;
+    // Owns the remote payloads owned_blocks/rows point into, as the received
+    // bytes (local blocks point into the source matrix; see FetchedBlockRef).
+    std::vector<char> arena;
     GhostSizes sizes;
     std::map<int, std::vector<GhostBlockRef<T>>> rows;
 };
@@ -936,7 +896,7 @@ struct FusedHaloStream {
 
     /// One round's delivery, held until the last row in it dies.
     struct Chunk {
-        std::vector<T> arena;
+        std::vector<char> arena;
         std::vector<int> row_ids;
         long long death_round = -1;
     };
@@ -1028,85 +988,110 @@ struct FusedDenseIds {
 /// number would starve the loop silently.
 inline constexpr int kFusedRowChunk = 8;
 
-/// Round boundaries that pay for themselves, from the arrival and departure
-/// profiles the use spans give.
-///
-/// A boundary does exactly one thing: it releases the rows that have died
-/// since the last one. So it is worth cutting only where something HAS died
-/// and the halo is over budget -- residency can never fall below the live
-/// set, and cutting where nothing has died pays a round's latency for no
-/// memory at all. That case is not hypothetical: on a scattered ordering
-/// every remote row is needed by both the first output row and the last, the
-/// live set IS the union, and the budget-only plan this replaces cut 12
-/// rounds that freed nothing and cost 4 s each.
-///
-/// A round must also free ENOUGH to be worth its cost. Cutting on any death at
-/// all is nearly as bad as cutting on the budget alone: where deaths trickle in
-/// one row at a time, every row frees a little, stays over budget, and cuts
-/// again -- measured at 414 rounds on a 1024-row band, slower than one round by
-/// 4x. Requiring half a budget's worth caps the rounds at twice the union over
-/// the budget and makes each one a real release.
-///
-/// A round must also carry enough OUTPUT ROWS to fill the thread team. The
-/// numeric loop runs `schedule(dynamic, 8)` over the round's rows, so a round
-/// of 60 rows hands ~7 chunks to 12 threads and most of the team idles; split
-/// 17 ways, a 1024-row band spent 51.4 s mean in the numeric loop against
-/// 33.1 s as one round -- 55% more for identical arithmetic, with the rank
-/// spread widening from 1.2x to 1.85x. That, and not the transfer (1.7 s of a
-/// 100 s call), is what rounds actually cost.
-///
-/// `arrivals[i]` is what row i first needs, `departures[i]` what dies with it,
-/// both in blocks. Returns the row indices to cut at, starting with 0.
-inline std::vector<int> fused_round_plan(const std::vector<size_t>& arrivals,
-                                         const std::vector<size_t>& departures,
-                                         int n_rows, size_t block_budget) {
-    std::vector<int> bound{0};
-    if (block_budget == 0) return bound;
 
-    // What the ORDERING already forces to coexist. A round can release only
-    // what has died, so no schedule holds less than this, and where it is the
-    // whole union -- a scattered order, where the first output row and the
-    // last need the same remote rows -- every boundary is latency spent for
-    // no memory. One round, and let the stats line say why.
-    size_t union_blocks = 0, live = 0, peak_live = 0;
+/// Blocks one round may hold, from a byte budget.
+///
+/// The whole budget, because a fetch now costs about what it delivers.
+///
+/// It used to cost three times that, and the budget was halved to cover it: a
+/// rank held the blob it SERVES its peers, the blob it RECEIVES, and the typed
+/// arena the received blob was unpacked into. Charging one of three is what
+/// let a "62 GB" budget put well over 100 GB of transient buffers on a node
+/// beside 176 GB of operands -- a peak under the limit on paper and over it in
+/// practice.
+///
+/// Both extra copies are gone. The received blob IS the arena, and the served
+/// response is streamed out through a fixed pool of slices rather than packed
+/// whole, so what a rank holds to serve its peers is a hundred megabytes or so
+/// whatever the rank count. Keeping the halving would now be charging twice
+/// for a copy that no longer exists -- and the budget is the scarce thing: it
+/// decides the round count, and the round count is superlinear in it (halving
+/// the budget cost 4x the rounds on the moire pattern, not 2x).
+inline size_t fused_block_budget(size_t budget_bytes, int bs_max,
+                                 size_t scalar_bytes) {
+    if (budget_bytes == 0) return 0;
+    const size_t per_block = std::max<size_t>(
+        1, static_cast<size_t>(bs_max) * static_cast<size_t>(bs_max) * scalar_bytes);
+    return std::max<size_t>(1, budget_bytes / per_block);
+}
+
+/// The fetch schedule: where to cut rounds, and whether streaming can hold the
+/// budget at all.
+///
+/// One simulation answers both, because they are the same question. Walk the
+/// output rows carrying `held` (fetched, not yet released) and `releasable`
+/// (dead, but held until a boundary lets it go). Cut a round exactly when the
+/// next row's arrivals would put `held` over the budget -- that is the fewest
+/// cuts that keep residency inside it, so rounds stay long and the numeric
+/// loop's thread team stays fed. If a cut releases everything releasable and
+/// `held` is STILL over, no release schedule can bound this fetch: the rows
+/// are all wanted at once, and the caller must re-fetch per tile instead.
+///
+/// Deciding feasibility by simulation rather than by comparing the budget to
+/// the theoretical live-set floor is the point. The floor is what a schedule
+/// could achieve with infinitely fine rounds; what a real schedule achieves is
+/// higher, because releases only happen at boundaries. Comparing against the
+/// floor reported "stream is enough" and then streamed 1.09 GB through a
+/// 0.75 GB budget -- the bound quietly not holding, which is how the previous
+/// version of this got a job OOM-killed.
+///
+/// A budget of 0 is the caller declaring the reach fits: one round, no checks.
+struct FusedFetchPlan {
+    std::vector<int> bound{0};  ///< round boundaries, starting at row 0
+    bool refetch = false;       ///< streaming cannot hold the budget
+};
+
+inline FusedFetchPlan fused_fetch_plan(const std::vector<size_t>& arrivals,
+                                       const std::vector<int>& max_death_at,
+                                       int n_rows, size_t block_budget) {
+    FusedFetchPlan plan;
+    if (block_budget == 0) return plan;
+
+    // Simulate what the RUNTIME does, which is coarser than releasing each row
+    // at its last reader: a round's arrivals share one arena, and that arena
+    // goes only when the longest-lived row in it is done. Modelling per-row
+    // release made the plan optimistic, and the bound then did not hold --
+    // 1.09 GB streamed through a 0.75 GB budget, reported as if it fit.
+    std::vector<std::pair<size_t, int>> open;  // (blocks, last reader row)
+    size_t held = 0;      // blocks in closed rounds still resident
+    size_t current = 0;   // blocks arriving for the round being built
+    int current_death = -1;
+
     for (int i = 0; i < n_rows; ++i) {
-        live += arrivals[static_cast<size_t>(i)];
-        union_blocks += arrivals[static_cast<size_t>(i)];
-        peak_live = std::max(peak_live, live);
-        live -= departures[static_cast<size_t>(i)];
-    }
-    if (union_blocks <= block_budget || peak_live + block_budget > union_blocks) {
-        return bound;
-    }
-
-    // Two chunks per thread, so the dynamic schedule has something to balance
-    // with even in the round that ends up smallest -- but never so large a
-    // floor that it vetoes the memory bound outright.
-    //
-    // The floor grows with the team and the rows do not: a cluster rank with
-    // 60 threads wants 960 rows per round, and at high rank counts it may own
-    // barely that many. Left absolute, the bound would silently vanish exactly
-    // where memory is tightest and thread counts are highest. Capping it at an
-    // eighth of the rank's rows keeps up to eight rounds reachable on any
-    // machine, and where the two disagree the memory bound wins -- a starved
-    // thread team is slow, an unbounded halo is fatal.
-    const int min_rows = std::max(
-        1, std::min(omp_get_max_threads() * 2 * kFusedRowChunk, n_rows / 8));
-
-    size_t held = 0;       // fetched and not yet released
-    size_t releasable = 0; // dead, but held until a boundary lets it go
-    for (int i = 0; i < n_rows; ++i) {
-        if (held + arrivals[static_cast<size_t>(i)] > block_budget &&
-            releasable * 2 >= block_budget && i - bound.back() >= min_rows &&
-            n_rows - i >= min_rows) {
-            bound.push_back(i);
-            held -= releasable;
-            releasable = 0;
+        const size_t incoming = arrivals[static_cast<size_t>(i)];
+        if (held + current + incoming > block_budget) {
+            if (current > 0) {
+                open.emplace_back(current, current_death);
+                held += current;
+                current = 0;
+                current_death = -1;
+            }
+            size_t freed = 0;
+            std::vector<std::pair<size_t, int>> keep;
+            keep.reserve(open.size());
+            for (const auto& chunk : open) {
+                if (chunk.second < i) {
+                    freed += chunk.first;
+                } else {
+                    keep.push_back(chunk);
+                }
+            }
+            open.swap(keep);
+            held -= freed;
+            if (i > plan.bound.back()) plan.bound.push_back(i);
+            if (held + incoming > block_budget) {
+                // Nothing left to release and still over: streaming is out.
+                plan.refetch = true;
+                plan.bound.assign(1, 0);
+                return plan;
+            }
         }
-        held += arrivals[static_cast<size_t>(i)];
-        releasable += departures[static_cast<size_t>(i)];
+        current += incoming;
+        if (incoming > 0) {
+            current_death = std::max(current_death, max_death_at[static_cast<size_t>(i)]);
+        }
     }
-    return bound;
+    return plan;
 }
 
 /// Per-call halo accounting on stderr (VBCSR_FUSED_STATS).
@@ -1125,7 +1110,8 @@ inline void fused_report_halo(const char* kernel, MPI_Comm comm, int rank,
                               long long rounds, size_t fetched_blocks,
                               size_t peak_live_blocks, size_t local_blocks,
                               size_t block_bytes, double secs_fetch,
-                              double secs_numeric) {
+                              double secs_numeric, size_t block_budget,
+                              bool refetch) {
     if (!fused_halo_stats_enabled()) return;
     long long mine[3] = {static_cast<long long>(fetched_blocks),
                          static_cast<long long>(peak_live_blocks),
@@ -1145,10 +1131,16 @@ inline void fused_report_halo(const char* kernel, MPI_Comm comm, int rank,
     const double cv_over_mem =
         worst[2] > 0 ? static_cast<double>(worst[0]) / static_cast<double>(worst[2]) : 0.0;
     std::fprintf(stderr,
-                 "VBCSR_FUSED_STATS %s rounds=%lld fetched=%.2f GB live=%.2f GB "
-                 "local=%.2f GB CV/memA=%.0f%% fetch=%.1fs "
+                 "VBCSR_FUSED_STATS %s mode=%s budget=%.2f GB rounds=%lld "
+                 "fetched=%.2f GB "
+                 "live=%.2f GB local=%.2f GB CV/memA=%.0f%% fetch=%.1fs "
                  "numeric max/mean/min=%.1f/%.1f/%.1fs\n",
-                 kernel, rounds, static_cast<double>(worst[0]) * to_gb,
+                 kernel,
+                 block_budget == 0 ? "UNBOUNDED(VBCSR_FUSED_TILE_MB=0)"
+                                   : (refetch ? "refetch"
+                                              : (rounds == 1 ? "single" : "stream")),
+                 static_cast<double>(block_budget) * to_gb,
+                 rounds, static_cast<double>(worst[0]) * to_gb,
                  static_cast<double>(worst[1]) * to_gb,
                  static_cast<double>(worst[2]) * to_gb, cv_over_mem * 100.0,
                  secs_worst[0], secs_worst[1], secs_sum[1] / nranks, secs_min[1]);
@@ -1209,14 +1201,60 @@ inline std::vector<BlockID> fused_gated_blocks_of(const GhostMetadata& patterns,
 /// does. Residency is the live set, which the ordering fixes and no budget can
 /// move. Smaller budgets buy finer release granularity at more rounds; they
 /// cannot buy back a live set the partition insists on.
-inline size_t fused_tile_budget_bytes() {
+inline size_t fused_tile_budget_bytes(MPI_Comm comm = MPI_COMM_NULL) {
+    // Explicit wins, including 0 -- which means "hold the whole reach, I know
+    // it fits". That is a real option and a loaded gun: it is what a 178k-atom
+    // job was run with, and holding the union halo took the node past 250 GiB
+    // and got it OOM-killed.
     const char* env = std::getenv("VBCSR_FUSED_TILE_MB");
     if (env != nullptr) {
         const long long mb = std::atoll(env);
         if (mb <= 0) return 0;
         return static_cast<size_t>(mb) << 20;
     }
-    return size_t(512) << 20;
+
+    // Otherwise derive it from the memory that is actually FREE, now.
+    //
+    // MemTotal, read once, was wrong in the way that matters: it answers "what
+    // could a rank have had" and the halo is fetched when the loop is already
+    // holding its operands and staging its result. On a 250 GiB node it kept
+    // offering 62 GiB to a kernel whose operands and output already needed
+    // ~210. MemAvailable, read per call, answers "what is left", so the budget
+    // shrinks as the step fills up.
+    //
+    // Still only the halo. The operands, the staged result and the rest of the
+    // Newton-Schulz working set are outside it, so this bounds one term of the
+    // footprint and cannot rescue a rank count that is too small for the rest.
+    static const int local_ranks = [comm]() -> int {
+        int ranks = 1, initialized = 0;
+        MPI_Initialized(&initialized);
+        if (initialized && comm != MPI_COMM_NULL) {
+            MPI_Comm shared = MPI_COMM_NULL;
+            if (MPI_Comm_split_type(comm, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL,
+                                    &shared) == MPI_SUCCESS &&
+                shared != MPI_COMM_NULL) {
+                MPI_Comm_size(shared, &ranks);
+                MPI_Comm_free(&shared);
+            }
+        }
+        return std::max(1, ranks);
+    }();
+
+    size_t available = 0;
+    if (std::FILE* f = std::fopen("/proc/meminfo", "r")) {
+        char label[64];
+        unsigned long long kb = 0;
+        while (std::fscanf(f, "%63s %llu kB\n", label, &kb) == 2) {
+            if (std::strncmp(label, "MemAvailable", 12) == 0) {
+                available = static_cast<size_t>(kb) * 1024;
+                break;
+            }
+        }
+        std::fclose(f);
+    }
+    if (available == 0) return size_t(512) << 20;
+    return std::max<size_t>(size_t(256) << 20,
+                            available / static_cast<size_t>(local_ranks) / 4);
 }
 
 /// Output-column tiling of the fused numeric pass (VBCSR_FUSED_OUTPUT_TILE,

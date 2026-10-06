@@ -37,14 +37,45 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <vector>
 
 #include <mpi.h>
 
+#include <cstdio>
+#include <cstdlib>
+
 namespace vbcsr {
 namespace atomic {
+
+namespace detail {
+
+/// Wall-clock phases of the atomic-graph build, printed to stderr per rank
+/// when VBCSR_PROFILE_ATOMIC_GRAPH is set (the convention of the other
+/// VBCSR_PROFILE_* switches). Off, it costs one getenv per build.
+struct GraphProfile {
+    bool on = std::getenv("VBCSR_PROFILE_ATOMIC_GRAPH") != nullptr;
+    int rank = 0;
+    double t0 = 0.0;
+    explicit GraphProfile(MPI_Comm comm) {
+        if (comm != MPI_COMM_NULL) MPI_Comm_rank(comm, &rank);
+        t0 = MPI_Wtime();
+    }
+    void lap(const char* phase, long long count = -1) {
+        if (!on) return;
+        const double t1 = MPI_Wtime();
+        if (count >= 0) {
+            std::fprintf(stderr, "VBCSR_PROFILE_ATOMIC_GRAPH rank %d %-28s %8.3f s  n=%lld\n", rank, phase, t1 - t0, count);
+        } else {
+            std::fprintf(stderr, "VBCSR_PROFILE_ATOMIC_GRAPH rank %d %-28s %8.3f s\n", rank, phase, t1 - t0);
+        }
+        t0 = t1;
+    }
+};
+
+}  // namespace detail
 
 /// One rank's share of a distributed atom set.
 ///
@@ -218,6 +249,7 @@ inline LocalEdges BuildLocalEdges(const LocalAtoms& owned,
                                   MPI_Comm comm) {
     const int rank = detail::CommRank(comm);
     const int size = detail::CommSize(comm);
+    detail::GraphProfile prof(comm);
     double r_max = 0.0;
     for (double r : r_max_per_type) r_max = std::max(r_max, r);
     const double cutoff = 2.0 * r_max;
@@ -231,6 +263,48 @@ inline LocalEdges BuildLocalEdges(const LocalAtoms& owned,
     std::vector<double> send_pos;
     std::vector<int> send_meta;  // global_id, type, shift(3)
     std::vector<int> dest;
+
+    // The cut tree answers "which region is this point in", and its regions
+    // are unbounded: every leaf is an intersection of half-spaces, so the
+    // regions at the rim of the atom cloud extend to infinity. A lattice image
+    // of an INTERIOR atom, a whole cell away from any atom, therefore lands in
+    // some rim rank's region and was offered to it -- 26 images of every atom,
+    // all delivered to the O(sqrt P) rim ranks (to itself on one rank), where
+    // the non-periodic search then clamped them into the cell's boundary bins
+    // and paired them quadratically. Hours at a million atoms.
+    //
+    // An image can only bond with an atom of rank q if it lies within `cutoff`
+    // of that atom, hence within `cutoff` of q's bounding box: test that too.
+    // The box is over q's atoms, not its region, so the offered halo is the
+    // shell that can actually bond -- O(surface) -- and the edge set is
+    // unchanged (a pair (i, j) needs |r_i - r_j| <= r_i + r_j <= cutoff).
+    std::vector<double> box(static_cast<size_t>(size) * 6);
+    {
+        const double inf = std::numeric_limits<double>::infinity();
+        double mine[6] = {inf, inf, inf, -inf, -inf, -inf};
+        for (int i = 0; i < owned.n_local(); ++i) {
+            for (int d = 0; d < 3; ++d) {
+                const double v = owned.pos[3 * static_cast<size_t>(i) + d];
+                mine[d] = std::min(mine[d], v);
+                mine[3 + d] = std::max(mine[3 + d], v);
+            }
+        }
+        if (comm != MPI_COMM_NULL && size > 1) {
+            MPI_Allgather(mine, 6, MPI_DOUBLE, box.data(), 6, MPI_DOUBLE, comm);
+        } else {
+            std::copy(mine, mine + 6, box.begin());
+        }
+    }
+    // Same tolerance as the edge test below, so no pair at exactly the cutoff
+    // is decided differently here.
+    const double reach = cutoff + 1e-9;
+    auto near_atoms_of = [&](int q, const double* p) {
+        const double* b = &box[static_cast<size_t>(q) * 6];
+        for (int d = 0; d < 3; ++d) {
+            if (p[d] < b[d] - reach || p[d] > b[3 + d] + reach) return false;
+        }
+        return true;  // false for a rank without atoms: its box is empty
+    };
 
     std::vector<char> wanted(size, 0);
     for (int i = 0; i < owned.n_local(); ++i) {
@@ -248,6 +322,7 @@ inline LocalEdges BuildLocalEdges(const LocalAtoms& owned,
                 // itself (a shift that is not the identity) need sending back.
                 const bool identity = (s[0] == 0 && s[1] == 0 && s[2] == 0);
                 if (!wanted[q] || (q == rank && identity)) continue;
+                if (!near_atoms_of(q, p)) continue;
                 send_pos.insert(send_pos.end(), {p[0], p[1], p[2]});
                 send_meta.insert(send_meta.end(),
                                  {owned.global_id[i], owned.type[i], s[0], s[1], s[2]});
@@ -256,9 +331,11 @@ inline LocalEdges BuildLocalEdges(const LocalAtoms& owned,
         }
     }
 
+    prof.lap("edges/offer_images", static_cast<long long>(dest.size()));
     const std::vector<double> halo_pos = detail::Alltoallv(send_pos, dest, 3, MPI_DOUBLE, comm);
     const std::vector<int> halo_meta = detail::Alltoallv(send_meta, dest, 5, MPI_INT, comm);
     const int n_halo = static_cast<int>(halo_meta.size() / 5);
+    prof.lap("edges/halo_exchange", n_halo);
 
     // --- neighbour search over owned + halo, without periodicity ---
     //
@@ -301,6 +378,7 @@ inline LocalEdges BuildLocalEdges(const LocalAtoms& owned,
                                {all_shift[j][0], all_shift[j][1], all_shift[j][2]});
         }
     }
+    prof.lap("edges/filter", static_cast<long long>(edges.n_edge()));
     return edges;
 }
 

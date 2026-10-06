@@ -86,6 +86,29 @@ struct BSRApplyPlan {
     std::vector<BSRApplyBatchEntry<T>> batches;
 };
 
+// The apply structure transposed: for every block COLUMN, which blocks land
+// in it and which row each came from. Built once per structure from the
+// forward plan.
+//
+// This is what lets an adjoint apply partition by OUTPUT column. Every column
+// is written by exactly one iteration, so threads never collide whatever the
+// schedule, no thread needs a private copy of y, and the result does not
+// depend on how many threads ran.
+//
+// The row-driven form this replaced gave each thread a full-size private y and
+// merged them afterwards. That costs threads x |y| of scratch and a merge pass
+// over all of it, so its memory AND its added work both grow with the thread
+// count -- an adjoint apply could take longer on many threads than on one.
+// The equivalent VBCSR kernel already worked by column; this is that
+// algorithm, kept on the fixed-size BSR block kernels.
+template <typename T>
+struct BSRAdjointApplyPlan {
+    std::vector<int> incoming_ptr;          // block_count + 1, CSR over columns
+    std::vector<int> incoming_rows;         // one entry per block-nonzero
+    std::vector<const T*> incoming_blocks;  // one entry per block-nonzero
+    int block_count = 0;
+};
+
 } // namespace vbcsr::detail
 
 #include "bsr_vendor_cache.hpp"
@@ -135,6 +158,7 @@ struct BSRMatrixBackend {
     // apply access. Cleared with the apply plan on structure changes.
     mutable ThreadDomainPartition thread_domains;
     mutable std::unique_ptr<BSRApplyPlan<T>> apply_plan;
+    mutable std::unique_ptr<BSRAdjointApplyPlan<T>> adjoint_apply_plan;
     mutable std::mutex apply_plan_mutex;
     mutable std::unique_ptr<BSRVendorCache<T>> vendor_cache;
     mutable std::mutex vendor_cache_mutex;
@@ -496,6 +520,73 @@ struct BSRMatrixBackend {
         return *apply_plan;
     }
 
+    /// The column-oriented transpose of the apply plan; see
+    /// BSRAdjointApplyPlan. `block_count` counts owned AND ghost blocks,
+    /// because an adjoint writes ghost columns before reducing them.
+    const BSRAdjointApplyPlan<T>& ensure_adjoint_apply_plan(
+        const std::vector<int>& row_ptr,
+        IndexSpan col_ind,
+        int block_count) const {
+        // Outside the lock: ensure_apply_plan takes the same mutex, which is
+        // not recursive.
+        const BSRApplyPlan<T>& forward = ensure_apply_plan(row_ptr, col_ind);
+
+        std::lock_guard<std::mutex> lock(apply_plan_mutex);
+        if (adjoint_apply_plan != nullptr &&
+            adjoint_apply_plan->block_count == block_count) {
+            return *adjoint_apply_plan;
+        }
+
+        auto plan = std::make_unique<BSRAdjointApplyPlan<T>>();
+        plan->block_count = block_count;
+        plan->incoming_ptr.assign(static_cast<size_t>(block_count) + 1, 0);
+
+        // Counting pass, then prefix sum, then a placement pass -- the usual
+        // CSR transpose. Both passes walk the batches by row so they visit
+        // exactly the same blocks.
+        for (const auto& batch_entry : forward.batches) {
+            const auto& batch = batch_entry.batch;
+            for (int row = batch.row_begin; row < batch.row_end; ++row) {
+                const uint32_t block_begin = batch.row_block_start(row);
+                const uint32_t block_end = batch.row_block_end(row);
+                for (uint32_t local_block = block_begin; local_block < block_end; ++local_block) {
+                    ++plan->incoming_ptr[static_cast<size_t>(batch.cols[local_block]) + 1];
+                }
+            }
+        }
+        for (int col = 0; col < block_count; ++col) {
+            plan->incoming_ptr[static_cast<size_t>(col) + 1] +=
+                plan->incoming_ptr[static_cast<size_t>(col)];
+        }
+
+        const size_t block_nnz =
+            static_cast<size_t>(plan->incoming_ptr[static_cast<size_t>(block_count)]);
+        plan->incoming_rows.assign(block_nnz, 0);
+        plan->incoming_blocks.assign(block_nnz, nullptr);
+
+        std::vector<int> cursor(plan->incoming_ptr.begin(), plan->incoming_ptr.end() - 1);
+        for (const auto& batch_entry : forward.batches) {
+            const auto& batch = batch_entry.batch;
+            for (int row = batch.row_begin; row < batch.row_end; ++row) {
+                const uint32_t block_begin = batch.row_block_start(row);
+                const uint32_t block_end = batch.row_block_end(row);
+                for (uint32_t local_block = block_begin; local_block < block_end; ++local_block) {
+                    const int col = batch.cols[local_block];
+                    const int dest = cursor[static_cast<size_t>(col)]++;
+                    plan->incoming_rows[static_cast<size_t>(dest)] = row;
+                    // A pointer into the value pages, exactly as the forward
+                    // batches hold: any change that moves them also calls
+                    // invalidate_apply_plan(), which drops this plan.
+                    plan->incoming_blocks[static_cast<size_t>(dest)] =
+                        batch.block_ptr(local_block);
+                }
+            }
+        }
+
+        adjoint_apply_plan = std::move(plan);
+        return *adjoint_apply_plan;
+    }
+
     const BSRVendorCache<T>& ensure_vendor_cache(
         const std::vector<int>& row_ptr,
         IndexSpan col_ind,
@@ -542,6 +633,7 @@ private:
         {
             std::lock_guard<std::mutex> lock(apply_plan_mutex);
             apply_plan.reset();
+            adjoint_apply_plan.reset();
             thread_domains = ThreadDomainPartition{};
         }
         invalidate_vendor_cache();

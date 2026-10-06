@@ -307,6 +307,32 @@ TEST_F(AtomicDataTest, SingleProcess) {
     delete ad;
 }
 
+TEST_F(AtomicDataTest, VolumeAxes) {
+    // Triclinic on purpose: an orthogonal pair would let a |v x w| = |v||w|
+    // mixup slip through.
+    std::vector<double> pos = {0,0,0};
+    std::vector<int> z = {1};
+    std::vector<double> cell = {2.0, 0.0, 0.0,  1.0, 3.0, 0.0,  0.5, 0.25, 4.0};
+    std::vector<bool> pbc = {true, true, true};
+    std::vector<double> r_max = {1.0};
+    std::vector<int> type_norb = {1};
+    AtomicData* ad = AtomicData::from_points(pos, z, cell, pbc, r_max, type_norb, MPI_COMM_WORLD);
+
+    EXPECT_NEAR(ad->volume(), 24.0, 1e-12);               // |a . (b x c)|
+    EXPECT_NEAR(ad->volume("abc"), 24.0, 1e-12);
+    EXPECT_NEAR(ad->volume("ab"), 6.0, 1e-12);            // |a x b|
+    EXPECT_NEAR(ad->volume("bc"), std::sqrt(161.5625), 1e-12);
+    EXPECT_NEAR(ad->volume("ca"), std::sqrt(64.25), 1e-12);
+    EXPECT_NEAR(ad->volume("a"), 2.0, 1e-12);
+    EXPECT_NEAR(ad->volume("b"), std::sqrt(10.0), 1e-12);
+    EXPECT_NEAR(ad->volume("c"), std::sqrt(16.3125), 1e-12);
+
+    EXPECT_THROW(ad->volume("x"), std::runtime_error);    // Cartesian letters are not cell axes
+    EXPECT_THROW(ad->volume("ac"), std::runtime_error);   // pairs are cyclic: ca
+
+    delete ad;
+}
+
 TEST_F(AtomicDataTest, NeighborListNonPeriodic) {
     int rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -716,12 +742,23 @@ TEST_F(AtomicDataTest, Robustness) {
     delete ad;
 
     // 2. Zero Volume Cell
-    if (rank == 0) {
+    //
+    // from_points is COLLECTIVE. An earlier version ran this block on rank 0
+    // only; rank 0's internal broadcasts then paired with rank 1's broadcasts
+    // from the NEXT test's from_points call, shipping this zero cell into that
+    // test and desynchronizing every collective after it (ThreeBodyGraph and
+    // Consistency failed, PressureTest_Random hung). The damage was masked for
+    // as long as the IO_POSCAR crash stopped multi-rank runs from ever getting
+    // this far. Every rank must make the call and throw at the same point.
+    {
         std::vector<double> zero_cell = {0,0,0, 0,0,0, 0,0,0};
-        std::vector<double> pos = {0,0,0};
-        std::vector<int> z = {1};
-        std::vector<int> type_norb = {13};
-        // NeighborList throws invalid_argument on zero volume
+        std::vector<double> pos;
+        std::vector<int> z;
+        if (rank == 0) {
+            pos = {0,0,0};
+            z = {1};
+        }
+        // NeighborList throws invalid_argument on zero volume, on every rank.
         EXPECT_THROW({
             AtomicData::from_points(pos, z, zero_cell, pbc, r_max, type_norb, MPI_COMM_WORLD);
         }, std::invalid_argument);
@@ -1102,18 +1139,25 @@ TEST_F(AtomicDataTest, SingleProcess_Stress) {
     std::sort(expected_3b.begin(), expected_3b.end());
     expected_3b.erase(std::unique(expected_3b.begin(), expected_3b.end()), expected_3b.end());
 
-    // 3. Collect Actual 3-body edges from g3 and map to original indices
+    // 3. Collect Actual 3-body edges from g3 and map to original indices.
+    //
+    // This must read g3's OWN adjacency -- an earlier version of this test
+    // read ad->graph (the 2-body graph) here, so it compared the 3-body
+    // expectation against the 2-body adjacency and failed on any system where
+    // the shared-neighbor closure adds edges, which is to say any dense one.
+    // g3's columns are its own local indices; map local -> global id, then
+    // global id -> original index through the 2-body graph's ownership.
     std::vector<std::pair<int, int>> actual_3b;
     for(int i=0; i<N; ++i) {
-        // g3->adj_list[i] contains neighbors of atom i (local index i)
-        int orig_i = ad->atom_index[i];
-        for(int inei=ad->graph->adj_ptr[i]; inei<ad->graph->adj_ptr[i+1]; ++inei) {
-            int neighbor = ad->graph->adj_ind[inei];
-            int orig_neighbor = ad->atom_index[neighbor];
+        int orig_i = ad->atom_index[ad->graph->global_to_local.at(g3->get_global_index(i))];
+        for(int inei=g3->adj_ptr[i]; inei<g3->adj_ptr[i+1]; ++inei) {
+            int gid_neighbor = g3->get_global_index(g3->adj_ind[inei]);
+            int orig_neighbor = ad->atom_index[ad->graph->global_to_local.at(gid_neighbor)];
             actual_3b.push_back({orig_i, orig_neighbor});
         }
     }
     std::sort(actual_3b.begin(), actual_3b.end());
+    actual_3b.erase(std::unique(actual_3b.begin(), actual_3b.end()), actual_3b.end());
     
     // 4. Compare
     EXPECT_EQ(actual_3b.size(), expected_3b.size());
@@ -1129,6 +1173,253 @@ TEST_F(AtomicDataTest, SingleProcess_Stress) {
 }
     
 
+
+// The partition balances ORBITALS, not atoms.
+//
+// Every cost downstream -- the block rows of H and S, the matvec, the grid
+// collocation -- scales with orbitals per atom, so a cell mixing a 1-orbital
+// species with a 13-orbital one is balanced only if the partitioner knows the
+// difference. Weighting atoms equally looks balanced by atom count while one
+// rank carries thirteen times the work per atom, and nothing reports it.
+//
+// The fixture is a CONNECTED nearest-neighbour chain, heavy half then light
+// half. Connectivity is the whole point: ParMETIS_V3_RefineKway moves vertices
+// across part boundaries along EDGES, so on a disconnected geometry it cannot
+// rebalance at all and the test would silently measure the inertial bisection
+// instead of the refinement. Here it can move the cut freely, which means an
+// unweighted refinement can drag the cut back toward equal atom counts.
+//
+// What this test asserts is the END-TO-END invariant -- orbital load is
+// balanced -- not that any one stage achieves it. Measured on this fixture,
+// most of the balance comes from the weighted inertial bisection, and the
+// ParMETIS weighting shifts it only a little (imbalance 1.045 weighted against
+// 1.103 unweighted at two ranks, and identical at four and eight): starting
+// from an already-weighted partition, RefineKway moves few vertices. The
+// weighting is still right -- balancing atom count is simply the wrong
+// objective for a mixed-species cell, and it is what ParMETIS optimises unless
+// told otherwise -- but this test would pass without it, so do not read a pass
+// as proof the weights are wired.
+TEST_F(AtomicDataTest, PartitionBalancesOrbitalsNotAtomCount) {
+    int rank = 0, size = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    if (size < 2) GTEST_SKIP() << "needs at least two ranks to be a partition";
+
+    // 32 carbons (13 orbitals) then 32 hydrogens (1 orbital), spaced 2 A along
+    // x. The cutoff pair sum is 3.2 A, so each atom bonds to its neighbours at
+    // 2 A and not to the next at 4 A: one connected path.
+    const int n_heavy = 32, n_light = 32;
+    std::vector<double> pos;
+    std::vector<int> z;
+    for (int i = 0; i < n_heavy + n_light; ++i) {
+        pos.insert(pos.end(), {2.0 * i, 0.0, 0.0});
+        z.push_back(i < n_heavy ? 6 : 1);
+    }
+    const std::vector<double> cell = {2.0 * (n_heavy + n_light) + 20.0, 0, 0,
+                                      0, 20.0, 0, 0, 0, 20.0};
+    // Types are the sorted-unique atomic numbers: Z=1 first, then Z=6.
+    const std::vector<int> type_norb = {1, 13};
+    const std::vector<double> r_max = {1.6, 1.6};
+
+    AtomicData* ad = AtomicData::from_points(pos, z, cell, {false, false, false},
+                                             r_max, type_norb, MPI_COMM_WORLD);
+    ASSERT_NE(ad, nullptr);
+
+    int my_orbitals = 0;
+    for (int a = 0; a < ad->n_atom; ++a) my_orbitals += type_norb[ad->atom_type[a]];
+    std::vector<int> orbitals(size, 0), atoms(size, 0);
+    orbitals[rank] = my_orbitals;
+    atoms[rank] = ad->n_atom;
+    MPI_Allreduce(MPI_IN_PLACE, orbitals.data(), size, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, atoms.data(), size, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+
+    int total_orbitals = 0, total_atoms = 0;
+    for (int r = 0; r < size; ++r) { total_orbitals += orbitals[r]; total_atoms += atoms[r]; }
+    ASSERT_EQ(total_atoms, n_heavy + n_light) << "atoms were lost or duplicated";
+    ASSERT_EQ(total_orbitals, n_heavy * 13 + n_light);
+
+    int worst = 0;
+    for (int r = 0; r < size; ++r) worst = std::max(worst, orbitals[r]);
+    const double imbalance =
+        static_cast<double>(worst) / (static_cast<double>(total_orbitals) / size);
+    if (rank == 0) {
+        printf("  orbitals/rank:");
+        for (int r = 0; r < size; ++r) printf(" %d", orbitals[r]);
+        printf("   atoms/rank:");
+        for (int r = 0; r < size; ++r) printf(" %d", atoms[r]);
+        printf("   orbital imbalance %.3f\n", imbalance);
+        fflush(stdout);
+    }
+
+    // Balancing atom count on this chain puts every carbon on one side: 416
+    // orbitals against 32, an imbalance of 1.86 at two ranks and worse beyond.
+    // ParMETIS is asked for ubvec = 1.05 on the weighted quantity; the bound
+    // here leaves room for the discrete atom sizes while staying far below
+    // what any unweighted split can reach.
+    EXPECT_LT(imbalance, 1.35) << "orbital load is not balanced; check that "
+                                  "partition_graph is given vertex weights";
+    delete ad;
+}
+
+// The vertex weights reach ParMETIS, and they change the answer.
+//
+// This drives AtomicData::partition_graph directly, because the end-to-end
+// fixture above cannot isolate the weighting: from_points hands ParMETIS an
+// already weight-balanced partition from the inertial bisection, so refinement
+// has nothing to do and the same numbers come out with the weights
+// disconnected. Here the INITIAL partition is deliberately balanced by vertex
+// COUNT and badly imbalanced by weight, which is exactly the situation only a
+// weighted refinement can fix.
+//
+// Both directions are measured: the weighted call against the same call with
+// uniform weights. That contrast is what makes this a test of the weights
+// rather than of ParMETIS in general -- a build ignoring vwgt gives identical
+// numbers for both.
+//
+// MEASURED, and the reason the strong assertion below is commented out rather
+// than enforced: ParMETIS_V3_RefineKway barely acts on the weights. Starting
+// from this deliberately imbalanced partition it reaches 1.741 at two ranks
+// and does not move at all at four or eight, against 1.857 unweighted. Swapping
+// the single call to ParMETIS_V3_PartKway (identical signature) instead gives
+// 1.045 weighted against 1.857 uniform at every rank count -- because RefineKway
+// only makes local boundary moves and cannot repair a global weight imbalance,
+// while PartKway computes the partition afresh. The weighting is correctly
+// forwarded either way; whether it DOES anything is a question about which
+// entry point is called, and changing that changes the partition of every
+// calculation, so it is not decided here.
+TEST_F(AtomicDataTest, PartitionGraphBalancesTheVertexWeights) {
+    int rank = 0, size = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    if (size < 2) GTEST_SKIP() << "needs at least two ranks to be a partition";
+
+    // A path graph, contiguous blocks per rank. The first half of the vertices
+    // are heavy (13, a full LCAO atom), the second half light (1) -- so the
+    // count-balanced split is the maximally weight-imbalanced one.
+    const int n_per_rank = 16;
+    const int n_global = n_per_rank * size;
+    const int lo = rank * n_per_rank;
+
+    std::vector<int> vtxdist(size + 1);
+    for (int r = 0; r <= size; ++r) vtxdist[r] = r * n_per_rank;
+
+    std::vector<int> xadj(n_per_rank + 1, 0), adjncy;
+    for (int i = 0; i < n_per_rank; ++i) {
+        const int g = lo + i;
+        if (g > 0) adjncy.push_back(g - 1);
+        if (g + 1 < n_global) adjncy.push_back(g + 1);
+        xadj[i + 1] = static_cast<int>(adjncy.size());
+    }
+
+    const auto weight_of = [n_global](int g) { return g < n_global / 2 ? 13 : 1; };
+    std::vector<int> vwgt(n_per_rank);
+    for (int i = 0; i < n_per_rank; ++i) vwgt[i] = weight_of(lo + i);
+    std::vector<double> pos(3 * n_per_rank, 0.0);
+    for (int i = 0; i < n_per_rank; ++i) pos[3 * i] = 2.0 * (lo + i);
+
+    // Weight per part, summed across ranks, for a given assignment.
+    const auto imbalance_of = [&](const std::vector<int>& part) {
+        std::vector<int> per_part(size, 0);
+        for (int i = 0; i < n_per_rank; ++i) per_part[part[i]] += weight_of(lo + i);
+        MPI_Allreduce(MPI_IN_PLACE, per_part.data(), size, MPI_INT, MPI_SUM,
+                      MPI_COMM_WORLD);
+        int total = 0, worst = 0;
+        for (int r = 0; r < size; ++r) { total += per_part[r]; worst = std::max(worst, per_part[r]); }
+        return static_cast<double>(worst) / (static_cast<double>(total) / size);
+    };
+
+    // Identity: rank r keeps its own block. Equal counts, lopsided weight.
+    std::vector<int> initial(n_per_rank, rank);
+    const double before = imbalance_of(initial);
+    ASSERT_GT(before, 1.5) << "the starting partition is supposed to be weight-imbalanced";
+
+    std::vector<int> weighted = initial;
+    AtomicData::partition_graph(vtxdist, xadj, adjncy, size, weighted, MPI_COMM_WORLD,
+                                pos, n_global, vwgt);
+    const double after_weighted = imbalance_of(weighted);
+
+    std::vector<int> uniform = initial;
+    AtomicData::partition_graph(vtxdist, xadj, adjncy, size, uniform, MPI_COMM_WORLD,
+                                pos, n_global, std::vector<int>(n_per_rank, 1));
+    const double after_uniform = imbalance_of(uniform);
+
+    if (rank == 0) {
+        printf("  weight imbalance: %.3f initially, %.3f weighted, %.3f uniform\n",
+               before, after_weighted, after_uniform);
+        fflush(stdout);
+    }
+
+    // Every vertex still belongs to exactly one part in range.
+    for (int i = 0; i < n_per_rank; ++i) {
+        ASSERT_GE(weighted[i], 0);
+        ASSERT_LT(weighted[i], size);
+    }
+
+    // What holds today: the weights never make the balance worse. Weak, and
+    // deliberately so -- see the note above.
+    EXPECT_LE(after_weighted, after_uniform + 1e-9)
+        << "weighting made the balance worse, which no correct wgtflag can do";
+
+    // What SHOULD hold, and does under ParMETIS_V3_PartKway. Enable together
+    // with that switch.
+    // EXPECT_LT(after_weighted, 1.35);
+    // EXPECT_LT(after_weighted, after_uniform * 0.9);
+}
+
+// invert_cell must be the inverse of the composition get_edge_vec performs:
+// cartesian = sum_i R_i a_i with lattice vectors as cell ROWS, so fractional
+// recovery takes the TRANSPOSED inverse. A symmetric cell hides a missing
+// transpose completely -- the regression only bites on a triclinic cell, where
+// the lattice vectors themselves must map back to the identity. This was a
+// real defect: every Bloch phase built from a full Cartesian bond vector
+// (LCAO velocity and position assembly) was corrupted at k != Gamma in
+// non-symmetric cells while all cubic tests stayed green.
+TEST_F(AtomicDataTest, InvertCellIsTransposedInverseOnTriclinicCell) {
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    std::vector<double> pos;
+    std::vector<int> z;
+    if (rank == 0) {
+        pos = {0.0, 0.0, 0.0};
+        z = {1};
+    }
+    // Diamond's primitive cell: lower-triangular row-major, maximally
+    // asymmetric among the cells in real use here.
+    std::vector<double> cell = {2.52685,   0.0,      0.0,
+                                1.263425,  2.188316, 0.0,
+                                1.263425,  0.729439, 2.063165};
+    std::vector<bool> pbc = {true, true, true};
+    std::vector<double> r_max = {1.0};
+    std::vector<int> type_norb = {1};
+
+    AtomicData* ad = AtomicData::from_points(pos, z, cell, pbc, r_max, type_norb, MPI_COMM_WORLD);
+
+    // Each lattice vector is (row i of the cell) and must invert to e_i.
+    for (int i = 0; i < 3; ++i) {
+        double x = cell[3 * i], y = cell[3 * i + 1], zc = cell[3 * i + 2];
+        ad->invert_cell(&x, &y, &zc);
+        const double frac[3] = {x, y, zc};
+        for (int j = 0; j < 3; ++j) {
+            EXPECT_NEAR(frac[j], i == j ? 1.0 : 0.0, 1e-12);
+        }
+    }
+
+    // And a generic Cartesian point must round-trip through the composition
+    // get_edge_vec uses: r_alpha = sum_i f_i * cell[3i + alpha].
+    {
+        double x = 0.7, y = -1.3, zc = 2.1;
+        double fx = x, fy = y, fz = zc;
+        ad->invert_cell(&fx, &fy, &fz);
+        for (int alpha = 0; alpha < 3; ++alpha) {
+            const double back = fx * cell[alpha] + fy * cell[3 + alpha] + fz * cell[6 + alpha];
+            const double orig = alpha == 0 ? x : (alpha == 1 ? y : zc);
+            EXPECT_NEAR(back, orig, 1e-12);
+        }
+    }
+
+    delete ad;
+}
 
 int main(int argc, char **argv) {
     MPI_Init(&argc, &argv);

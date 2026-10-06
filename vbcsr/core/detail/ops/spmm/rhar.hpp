@@ -837,14 +837,11 @@ struct RhARExecutor {
 
         int bs_max = 1;
         for (int s : ga.block_sizes) bs_max = std::max(bs_max, s);
-        const size_t budget = fused_tile_budget_bytes();
-        const size_t block_budget =
-            budget == 0 ? 0
-                        : std::max<size_t>(1, budget / (static_cast<size_t>(bs_max) *
-                                                        static_cast<size_t>(bs_max) * sizeof(T)));
+        const size_t budget = fused_tile_budget_bytes(ga.comm);
+        const size_t block_budget = fused_block_budget(budget, bs_max, sizeof(T));
         std::vector<std::pair<int, int>> b_born, a_born;  // (birth row, global row)
         std::vector<size_t> arrivals(static_cast<size_t>(n_rows) + 1, 0);
-        std::vector<size_t> departures(static_cast<size_t>(n_rows) + 1, 0);
+        std::vector<int> max_death_at(static_cast<size_t>(n_rows) + 1, -1);
         for (size_t slot = 0; slot < b_ids.size(); ++slot) {
             const int born_b = b_birth[slot];
             if (born_b < 0) continue;
@@ -852,7 +849,8 @@ struct RhARExecutor {
             b_born.emplace_back(born_b, g);
             const size_t blocks = kept_b(g);
             arrivals[static_cast<size_t>(born_b)] += blocks;
-            departures[static_cast<size_t>(b_death[slot])] += blocks;
+            max_death_at[static_cast<size_t>(born_b)] =
+                std::max(max_death_at[static_cast<size_t>(born_b)], b_death[slot]);
         }
         for (size_t slot = 0; slot < a_ids.size(); ++slot) {
             const int born_a = a_birth[slot];
@@ -861,12 +859,78 @@ struct RhARExecutor {
             a_born.emplace_back(born_a, g);
             const size_t blocks = kept_a(g);
             arrivals[static_cast<size_t>(born_a)] += blocks;
-            departures[static_cast<size_t>(a_death[slot])] += blocks;
+            max_death_at[static_cast<size_t>(born_a)] =
+                std::max(max_death_at[static_cast<size_t>(born_a)], a_death[slot]);
         }
         std::sort(b_born.begin(), b_born.end());
         std::sort(a_born.begin(), a_born.end());
-        std::vector<int> tile_bound =
-            fused_round_plan(arrivals, departures, n_rows, block_budget);
+        const FusedFetchPlan fetch_plan = fused_fetch_plan(arrivals, max_death_at, n_rows, block_budget);
+        const bool refetch_halo = fetch_plan.refetch;
+
+        // Refetch regime, as in rarh: tiles whose own halo fits the budget,
+        // dropped and re-fetched, for when the live set itself does not fit.
+        std::vector<char> bflag(b_ids.size(), 0), aflag(a_ids.size(), 0);
+        std::vector<char> midflag(
+            static_cast<size_t>(std::max(0, static_cast<int>(gb.adj_ptr.size()) - 1)), 0);
+        std::vector<int> btouched, atouched, midtouched;
+        const auto reset_flags = [&] {
+            for (int t : btouched) bflag[static_cast<size_t>(t)] = 0;
+            for (int t : atouched) aflag[static_cast<size_t>(t)] = 0;
+            for (int t : midtouched) midflag[static_cast<size_t>(t)] = 0;
+            btouched.clear();
+            atouched.clear();
+            midtouched.clear();
+        };
+        const auto walk_row = [&](int i, auto&& on_b_row, auto&& on_a_row) {
+            for (int e = static_cast<int>(cols.ptr[static_cast<size_t>(i)]);
+                 e < static_cast<int>(cols.ptr[static_cast<size_t>(i) + 1]); ++e) {
+                const int g_mid = cols.src_row[static_cast<size_t>(e)];
+                const int s_b = b_ids.of(g_mid);
+                if (s_b >= 0) {
+                    if (bflag[static_cast<size_t>(s_b)]) continue;
+                    bflag[static_cast<size_t>(s_b)] = 1;
+                    btouched.push_back(s_b);
+                    on_b_row(g_mid);
+                } else {
+                    const int lb = b_row[static_cast<size_t>(g_mid)];
+                    if (lb < 0 || midflag[static_cast<size_t>(lb)]) continue;
+                    midflag[static_cast<size_t>(lb)] = 1;
+                    midtouched.push_back(lb);
+                }
+                for_each_kept_b_entry(g_mid, [&](int l, size_t entry) {
+                    const int s_a = entry_aslot[entry];
+                    if (s_a < 0 || aflag[static_cast<size_t>(s_a)]) return;
+                    aflag[static_cast<size_t>(s_a)] = 1;
+                    atouched.push_back(s_a);
+                    on_a_row(l);
+                });
+            }
+        };
+
+        std::vector<int> tile_bound;
+        if (refetch_halo) {
+            tile_bound.push_back(0);
+            const auto charge = [&](int i) -> size_t {
+                size_t c = 0;
+                walk_row(i, [&](int g) { c += kept_b(g); }, [&](int l) { c += kept_a(l); });
+                return c;
+            };
+            size_t acc = 0;
+            for (int i = 0; i < n_rows; ++i) {
+                size_t row_cost = charge(i);
+                if (acc > 0 && acc + row_cost > block_budget &&
+                    i - tile_bound.back() >= kFusedRowChunk) {
+                    tile_bound.push_back(i);
+                    reset_flags();
+                    acc = 0;
+                    row_cost = charge(i);
+                }
+                acc += row_cost;
+            }
+            reset_flags();
+        } else {
+            tile_bound = fetch_plan.bound;
+        }
         tile_bound.push_back(n_rows);
 
         long long my_tiles = static_cast<long long>(tile_bound.size()) - 1;
@@ -895,7 +959,34 @@ struct RhARExecutor {
             const int hi = tile_bound[static_cast<size_t>(r) + 1];
             std::vector<BlockID> want_b, want_a;
             long long death_b = r, death_a = r;
-            for (; b_cursor < b_born.size() && b_born[b_cursor].first < hi; ++b_cursor) {
+            if (refetch_halo) {
+                for (int i = lo; i < hi; ++i) {
+                    walk_row(
+                        i,
+                        [&](int g) {
+                            auto it = meta_b.find(g);
+                            if (it == meta_b.end()) return;
+                            const double gate =
+                                gate_b(g, static_cast<int>(it->second.size()));
+                            for (const auto& m : it->second) {
+                                if (m.norm >= gate) want_b.push_back(BlockID{g, m.col});
+                            }
+                        },
+                        [&](int l) {
+                            auto it = meta_a.find(l);
+                            if (it == meta_a.end()) return;
+                            const double gate = gate_a(l);
+                            for (const auto& m : it->second) {
+                                if (m.col >= min_owned_row && m.norm >= gate) {
+                                    want_a.push_back(BlockID{l, m.col});
+                                }
+                            }
+                        });
+                }
+                reset_flags();
+            }
+            for (; !refetch_halo &&
+                   b_cursor < b_born.size() && b_born[b_cursor].first < hi; ++b_cursor) {
                 const int g = b_born[b_cursor].second;
                 auto it = meta_b.find(g);
                 if (it != meta_b.end()) {
@@ -907,7 +998,8 @@ struct RhARExecutor {
                 death_b = std::max(death_b,
                                    round_of_row(b_death[static_cast<size_t>(b_ids.of(g))]));
             }
-            for (; a_cursor < a_born.size() && a_born[a_cursor].first < hi; ++a_cursor) {
+            for (; !refetch_halo &&
+                   a_cursor < a_born.size() && a_born[a_cursor].first < hi; ++a_cursor) {
                 const int g = a_born[a_cursor].second;
                 auto it = meta_a.find(g);
                 if (it != meta_a.end()) {
@@ -945,7 +1037,7 @@ struct RhARExecutor {
                           halo_b.peak_live_blocks + halo_a.peak_live_blocks,
                           A.get_block_norms().size(),
                           static_cast<size_t>(bs_max) * static_cast<size_t>(bs_max) * sizeof(T),
-                          secs_fetch, secs_numeric);
+                          secs_fetch, secs_numeric, block_budget, refetch_halo);
         int any_missing = missing_row;
         MPI_Allreduce(&missing_row, &any_missing, 1, MPI_INT, MPI_MAX, ga.comm);
         if (any_missing) {

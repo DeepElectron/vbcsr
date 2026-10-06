@@ -290,6 +290,25 @@ public:
         // alternative -- one neighbour list over every atom on rank 0 -- costs
         // that rank N * <neighbours>, which at 1e6 atoms is gigabytes and tens
         // of seconds before any other rank has done anything.
+        //
+        // That contract covers the cell and the pbc flags too: from_file reads
+        // them on rank 0 only, and every rank's neighbour search needs them, so
+        // broadcast here rather than requiring callers to replicate them.
+        std::vector<double> cell_all = cell;
+        std::vector<bool> pbc_all = pbc;
+        if (initialized && size > 1) {
+            cell_all.resize(9, 0.0);
+            MPI_Bcast(cell_all.data(), 9, MPI_DOUBLE, 0, comm);
+            int pbc_flags[3] = {0, 0, 0};
+            if (rank == 0) {
+                for (int d = 0; d < 3; ++d) pbc_flags[d] = (d < (int)pbc.size() && pbc[d]) ? 1 : 0;
+            }
+            MPI_Bcast(pbc_flags, 3, MPI_INT, 0, comm);
+            pbc_all.assign(3, false);
+            for (int d = 0; d < 3; ++d) pbc_all[d] = pbc_flags[d] != 0;
+        }
+
+        detail::GraphProfile prof(comm);
         std::vector<int> type_norb = type_norb_in;
         std::vector<double> my_pos;
         std::vector<int> my_z;
@@ -299,9 +318,10 @@ public:
         int my_n_atom = 0;
         int n_global = 0;
 
-        distribute_and_build_edges(comm, rank, size, pos, z, cell, pbc, r_max_per_type,
+        distribute_and_build_edges(comm, rank, size, pos, z, cell_all, pbc_all, r_max_per_type,
                                    type_norb, n_global, my_n_atom, my_pos, my_z, my_types,
                                    my_indices, my_edges_flat);
+        prof.lap("distribute_and_build_edges", static_cast<long long>(my_edges_flat.size() / 5));
 
         if (n_global == 0) {
             return new AtomicData(comm);
@@ -319,11 +339,20 @@ public:
         
         // this step build temporary graph for partitioning
         build_parmetis_graph(comm, rank, size, my_n_atom, my_edges_flat, vtxdist, xadj, adjncy, my_start);
+        prof.lap("parmetis/graph");
         
         std::vector<int> part(my_n_atom);
         std::fill(part.begin(), part.end(), rank);
-        
-        partition_graph(vtxdist, xadj, adjncy, size, part, comm, my_pos, n_global);
+
+        // Balance orbitals, not atoms -- the same weight the inertial
+        // bisection above used, so the refinement improves the edge cut of
+        // that partition instead of rebalancing it against a different
+        // objective.
+        std::vector<int> my_vwgt(my_n_atom);
+        for (int i = 0; i < my_n_atom; ++i) my_vwgt[i] = type_norb[my_types[i]];
+
+        partition_graph(vtxdist, xadj, adjncy, size, part, comm, my_pos, n_global, my_vwgt);
+        prof.lap("parmetis/partition");
         
         // 3. Redistribute Atoms
         std::vector<double> r_pos;
@@ -340,8 +369,10 @@ public:
                            r_pos, r_z, r_types, r_indices, r_inter_indices, total_recv);
         
         // 4. Redistribute Edges
+        prof.lap("redistribute/atoms");
         std::vector<int> r_edges;
         redistribute_edges(comm, rank, size, my_start, my_edges_flat, part, r_edges);
+        prof.lap("redistribute/edges", static_cast<long long>(r_edges.size() / 5));
         
         // 5. Re-map IDs to be contiguous on each rank
         std::vector<int> all_recv_counts(size);
@@ -370,14 +401,15 @@ public:
             r_edges[5*k] = inter_to_final[r_edges[5*k]];
             r_edges[5*k+1] = inter_to_final[r_edges[5*k+1]];
         }
+        prof.lap("final/index_map");
                       
         // 6. Construct AtomicData
-        return construct_final_object(
+        AtomicData* built = construct_final_object(
             comm,
             rank,
             size,
-            cell,
-            pbc,
+            cell_all,
+            pbc_all,
             total_recv,
             r_indices,
             r_z,
@@ -385,6 +417,8 @@ public:
             r_pos,
             r_edges,
             type_norb);
+        prof.lap("final/assemble");
+        return built;
     }
 
     // Distributed construction from a CALLER-GIVEN partition (doc/design/42 §4).
@@ -677,6 +711,13 @@ public:
     // Rewrites a Cartesian vector in fractional coordinates. A degenerate cell
     // is left alone rather than raised on, which is what the callers here
     // expect: a cell-less (molecular) system has nothing to reduce.
+    //
+    // The cell stores lattice vectors as ROWS (get_edge_vec composes
+    // r = sum_i R_i a_i, i.e. r = C^T f), so recovering fractionals takes the
+    // TRANSPOSED inverse: f = (C^-1)^T r. Applying the plain inverse instead is
+    // invisible for symmetric cells -- every cubic test -- and silently maps
+    // lattice translations of a triclinic cell to non-integer fractionals,
+    // which corrupts any Bloch phase built from a full bond vector.
     void invert_cell(double *x, double *y, double *z) {
         std::array<double, 9> inv;
         try {
@@ -685,9 +726,9 @@ public:
             return;
         }
 
-        const double a = inv[0]*(*x) + inv[1]*(*y) + inv[2]*(*z);
-        const double b = inv[3]*(*x) + inv[4]*(*y) + inv[5]*(*z);
-        const double c = inv[6]*(*x) + inv[7]*(*y) + inv[8]*(*z);
+        const double a = inv[0]*(*x) + inv[3]*(*y) + inv[6]*(*z);
+        const double b = inv[1]*(*x) + inv[4]*(*y) + inv[7]*(*z);
+        const double c = inv[2]*(*x) + inv[5]*(*y) + inv[8]*(*z);
 
         *x = a;
         *y = b;
@@ -709,22 +750,26 @@ public:
         return global_norb;
     }
 
-    // Compute cell volume
+    // Measure of the cell along the named lattice axes: "abc" is the cell
+    // volume, a cyclic pair ("ab", "bc", "ca") the area of that lattice
+    // plane, a single letter the length of that lattice vector.
     double volume(std::string axis="abc") {
-        // compute cross product of cell vectors
-        if (axis == "ab") return std::sqrt(std::pow(cell[1]*cell[5] - cell[2]*cell[4], 2) 
-            + std::pow(cell[2]*cell[3] - cell[0]*cell[5], 2) 
+        if (axis == "a") return std::sqrt(cell[0]*cell[0] + cell[1]*cell[1] + cell[2]*cell[2]);
+        if (axis == "b") return std::sqrt(cell[3]*cell[3] + cell[4]*cell[4] + cell[5]*cell[5]);
+        if (axis == "c") return std::sqrt(cell[6]*cell[6] + cell[7]*cell[7] + cell[8]*cell[8]);
+        if (axis == "ab") return std::sqrt(std::pow(cell[1]*cell[5] - cell[2]*cell[4], 2)
+            + std::pow(cell[2]*cell[3] - cell[0]*cell[5], 2)
             + std::pow(cell[0]*cell[4] - cell[1]*cell[3], 2));
-        if (axis == "bc") return std::sqrt(std::pow(cell[4]*cell[8] - cell[5]*cell[7], 2) 
-            + std::pow(cell[5]*cell[6] - cell[3]*cell[8], 2) 
+        if (axis == "bc") return std::sqrt(std::pow(cell[4]*cell[8] - cell[5]*cell[7], 2)
+            + std::pow(cell[5]*cell[6] - cell[3]*cell[8], 2)
             + std::pow(cell[3]*cell[7] - cell[4]*cell[6], 2));
-        if (axis == "ca") return std::sqrt(std::pow(cell[7]*cell[2] - cell[8]*cell[1], 2) 
-            + std::pow(cell[8]*cell[0] - cell[6]*cell[2], 2) 
+        if (axis == "ca") return std::sqrt(std::pow(cell[7]*cell[2] - cell[8]*cell[1], 2)
+            + std::pow(cell[8]*cell[0] - cell[6]*cell[2], 2)
             + std::pow(cell[6]*cell[1] - cell[7]*cell[0], 2));
         if (axis == "abc") return std::abs(cell[0] * (cell[4] * cell[8] - cell[5] * cell[7])
                    - cell[1] * (cell[3] * cell[8] - cell[5] * cell[6])
                    + cell[2] * (cell[3] * cell[7] - cell[4] * cell[6]));
-        throw std::runtime_error("Invalid axis");
+        throw std::runtime_error("volume axis must be one of: abc, ab, bc, ca, a, b, c; got '" + axis + "'");
     }
 
     DistGraph* get_graph3b(const std::vector<double>& r_max_left, const std::vector<double>& r_max_right) {
@@ -1054,8 +1099,33 @@ private:
         return graph->ghost_global_indices[lid - n_atom];
     }
 
+public:
+    // partition_graph is public so its weighting can be unit-tested. It is a
+    // pure function of its arguments -- no AtomicData state is touched -- so
+    // exposing it costs no encapsulation, and the alternative was a weighting
+    // whose only coverage was an end-to-end balance check that passed with
+    // the weights disconnected.
+    /// Refines a partition for edge cut, balancing VERTEX WEIGHT rather than
+    /// vertex count.
+    ///
+    /// `vwgt` is one weight per owned atom, normally its orbital count: every
+    /// cost that matters downstream -- the block rows of H and S, the matvec,
+    /// the grid collocation -- scales with orbitals, not with atoms. Balancing
+    /// atom count instead leaves a cell of mixed species imbalanced in
+    /// proportion to the spread in orbitals per species, silently. Inertial
+    /// bisection already weights by the same quantity, so passing it here is
+    /// also what stops the refinement from optimising a different objective
+    /// than the partition it refines.
+    ///
+    /// `vwgt` is required, and weighting is unconditional, because wgtflag is
+    /// a COLLECTIVE argument: every rank must pass the same value. Deciding it
+    /// from whether this rank's weights are empty would flip it on exactly the
+    /// ranks that own no atoms -- a cell with fewer atoms than ranks -- and
+    /// ParMETIS then hangs on mismatched flags. Same hazard the dummy pointers
+    /// below exist for, one level up.
     static void partition_graph(const std::vector<int>& vtxdist, const std::vector<int>& xadj, const std::vector<int>& adjncy, 
-                                int nparts, std::vector<int>& part, MPI_Comm comm, const std::vector<double>& pos, int n_global) {
+                                int nparts, std::vector<int>& part, MPI_Comm comm, const std::vector<double>& pos, int n_global,
+                                const std::vector<int>& vwgt) {
         int initialized = 0;
         MPI_Initialized(&initialized);
         if (nparts <= 1 || !initialized || comm == MPI_COMM_NULL) {
@@ -1064,7 +1134,9 @@ private:
         }
 #ifdef VBCSR_HAVE_PARMETIS
         // ParMETIS Implementation
-        idx_t wgtflag = 0; 
+        // wgtflag 2 = weights on the vertices only (adjwgt stays null).
+        // Unconditional: see the note on the signature.
+        idx_t wgtflag = 2;
         idx_t numflag = 0; 
         idx_t ncon = 1;    
         idx_t nparts_t = nparts;
@@ -1096,14 +1168,32 @@ private:
         idx_t dummy_part = 0;
         if (part_t.empty()) part_ptr = &dummy_part;
 
+        // Weights are clamped to 1: ParMETIS balances a sum of these, and a
+        // zero-weight vertex is free to pile up anywhere without registering
+        // as imbalance.
+        if (vwgt.size() != part.size()) {
+            throw std::runtime_error(
+                "partition_graph: one vertex weight per owned atom is required.");
+        }
+        std::vector<idx_t> vwgt_t;
+        vwgt_t.reserve(vwgt.size());
+        for (int w : vwgt) vwgt_t.push_back(static_cast<idx_t>(std::max(1, w)));
+        idx_t dummy_vwgt = 1;
+        idx_t* vwgt_ptr = vwgt_t.empty() ? &dummy_vwgt : vwgt_t.data();
+
         ParMETIS_V3_RefineKway(vtxdist_t.data(), xadj_t.data(), adjncy_ptr,
-                               NULL, NULL, &wgtflag, &numflag, &ncon, &nparts_t,
+                               vwgt_ptr, NULL, &wgtflag, &numflag, &ncon, &nparts_t,
                                tpwgts.data(), ubvec, options, &edgecut, part_ptr, &comm_);
 
                        
         for(size_t i=0; i<part.size(); ++i) part[i] = part_t[i];
 #else
         // Hilbert Curve Fallback Implementation
+        //
+        // Balances atom COUNT, not `vwgt`: it splits a Morton ordering into
+        // equal-sized runs. Only reached when ParMETIS is absent, and the
+        // difference shows only for a cell of mixed species.
+        (void)vwgt;
         int rank, size;
         if (initialized) {
             MPI_Comm_rank(comm, &rank);
@@ -1259,6 +1349,8 @@ private:
 #endif
     }
 
+private:
+
     // Spreads the atoms over the ranks and builds their edges, with no rank
     // ever holding the whole geometry.
     //
@@ -1361,9 +1453,13 @@ private:
             weights[i] = static_cast<double>(type_norb[it->second]);
         }
 
+        detail::GraphProfile prof(comm);
+        prof.lap("scatter", n_block);
         std::unique_ptr<InertialCut> tree;
         LocalAtoms owned = RedistributeByInertia(mine, weights, comm, &tree);
+        prof.lap("inertial_bisection", owned.n_local());
         LocalEdges edges = BuildLocalEdges(owned, *tree, cell, pbc, r_max_type, comm);
+        prof.lap("build_local_edges", edges.n_edge());
 
         my_n_atom = owned.n_local();
         my_pos = owned.pos;
@@ -1416,6 +1512,7 @@ private:
             my_edges_flat[5 * static_cast<size_t>(e) + 3] = edges.shift[3 * static_cast<size_t>(e) + 1];
             my_edges_flat[5 * static_cast<size_t>(e) + 4] = edges.shift[3 * static_cast<size_t>(e) + 2];
         }
+        prof.lap("input_to_intermediate_ids");
     }
 
     static void build_parmetis_graph(
