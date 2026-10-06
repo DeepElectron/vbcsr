@@ -32,10 +32,17 @@ public:
     // cell: 3x3 matrix (row-major: ax, ay, az, bx, by, bz, cx, cy, cz)
     // pbc: 3 bools
     // cutoff: search radius
+    // n_sources: when >= 0, only atoms with index < n_sources receive a neighbour
+    //   list (every atom still acts as a neighbour). A distributed build passes its
+    //   owned atoms, which come first, and the halo points after them: listing the
+    //   halo's neighbours among themselves is never read and at a long cutoff it is
+    //   the largest allocation of the whole build (a 4-atom cell with a 51-bohr
+    //   cutoff carries ~24k halo images; their mutual lists were 4 GB).
     void build(const std::vector<double>& positions, 
                const std::vector<double>& cell, 
                const std::vector<bool>& pbc, 
-               double cutoff) {
+               double cutoff,
+               int n_sources = -1) {
         
         // Input Validation
         if (positions.size() % 3 != 0) {
@@ -320,6 +327,7 @@ public:
 
                                 // Check pairs
                                 for(int i : atoms_in_current_bin) {
+                                    if (n_sources >= 0 && i >= n_sources) continue;
                                     double ix = working_positions[3*i];
                                     double iy = working_positions[3*i+1];
                                     double iz = working_positions[3*i+2];

@@ -279,8 +279,10 @@ inline LocalEdges BuildLocalEdges(const LocalAtoms& owned,
                              halo_meta[5 * static_cast<size_t>(h) + 4]});
     }
 
+    // Only the owned atoms (the first n_own points) need their lists; see
+    // NeighborList::build's n_sources.
     NeighborList nl;
-    nl.build(all_pos, cell, {false, false, false}, cutoff);
+    nl.build(all_pos, cell, {false, false, false}, cutoff, n_own);
 
     LocalEdges edges;
     for (int i = 0; i < n_own; ++i) {
