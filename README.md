@@ -15,6 +15,10 @@ Distributed variable-block sparse matrices with fast block kernels + thresholded
 
 VBCSR is designed for complex physics and engineering simulations where block-sparse structures are natural.
 
+## Research background
+
+For a short explanation of the electronic-structure problems behind VBCSR, see [VBCSR: distributed sparse matrices for scientific computing](https://floatingcatty.github.io/research/vbcsr/) (English / 中文). The [project preprint](https://arxiv.org/abs/2609.04397) discusses its larger-scale applications.
+
 ### 1. Linear-Scaling Quantum Chemistry (McWeeny Purification)
 Compute the density matrix of a large-scale system using **McWeeny Purification**. VBCSR's filtered SpMM ensures the matrix remains sparse throughout the iteration. See `/examples/ex07_graphene_purification.py` for a full implementation.
 
