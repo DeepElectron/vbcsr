@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use VBCSR in research, please cite the associated preprint listed under preferred-citation."
+title: "VBCSR: Variable-Block Sparse Matrix Library"
+type: software
+authors:
+  - family-names: Zhouyin
+    given-names: Zhanghao
+  - family-names: Guo
+    given-names: Hong
+repository-code: "https://github.com/DeepElectron/vbcsr"
+url: "https://github.com/DeepElectron/vbcsr"
+license: AGPL-3.0-only
+abstract: "Distributed variable-block sparse matrix library for localized-orbital atomistic and scientific simulation."
+preferred-citation:
+  type: generic
+  title: "Accelerating Atom Simulations with Variable-Block Sparse Matrix Library"
+  authors:
+    - family-names: Zhouyin
+      given-names: Zhanghao
+    - family-names: Guo
+      given-names: Hong
+  year: 2026
+  doi: "10.48550/arXiv.2609.04397"
+  url: "https://arxiv.org/abs/2609.04397"
